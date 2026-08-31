@@ -1021,7 +1021,7 @@ export function AnalysisView({ resumeJobId }: Props = {}) {
                   transition: "all 0.2s ease",
                 }}
               >
-                📋 Platform / Incident Format (Takedown)
+                📋 Platform Format
               </button>
 
               <button
@@ -1039,7 +1039,7 @@ export function AnalysisView({ resumeJobId }: Props = {}) {
                   transition: "all 0.2s ease",
                 }}
               >
-                📊 Legacy Format (Raw Analysis)
+                📊 Old Format
               </button>
             </div>
 
