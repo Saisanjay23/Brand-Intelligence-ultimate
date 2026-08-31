@@ -3,22 +3,23 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
 // Relative paths so the bundle can be served from any origin (see
-// src/api.ts's API_BASE) -- this dev proxy is local convenience only, not
-// what makes the app work. Every prefix here is a real backend router
-// (backend/api/routes_*.py); none of them sit under /api -- this is a
-// headless engine, not a UI-serving app (see backend/main.py's docstring).
+// src/api/httpClient.ts's API_BASE) -- this dev proxy is local convenience
+// only, not what makes the app work. /discovery, /analysis, /sessions,
+// /health are real backend routers on the rebuilt backend
+// (backend/api/{discovery,analysis,sessions,health}.py). /clients, /jobs,
+// /scheduler are NOT -- the old frontend pages that call them (Clients,
+// Scheduler) were restored for their UI/layout, but that backend layer
+// (client_routes.py/job_routes.py/scheduler_routes.py + controllers/dto)
+// was not rebuilt alongside them, so those three stay proxied here only so
+// a request reaches the real backend's clean 404 JSON instead of falling
+// through to Vite's SPA fallback and getting index.html back ("Unexpected
+// token '<'... is not valid JSON") -- a clear error toast, not a crash.
 const BACKEND = "http://127.0.0.1:8000";
 const proxy = Object.fromEntries(
   [
-    "/clients", "/discovery", "/analysis", "/jobs", "/profiles", "/sessions", "/health",
-    "/incidents", "/metrics", "/docs", "/redoc", "/openapi.json",
-    // Scheduler and Mail-settings admin tabs -- missing here meant every
-    // request to them fell through to Vite's own SPA fallback and got
-    // index.html back instead of JSON (confirmed live: "Unexpected token
-    // '<', \"<!doctype \"... is not valid JSON" on the Scheduler tab).
-    // Never surfaced in production because the built app is served
-    // same-origin by the backend itself there, with no proxy involved.
-    "/scheduler", "/settings",
+    "/discovery", "/analysis", "/sessions", "/health",
+    "/clients", "/jobs", "/scheduler",
+    "/docs", "/redoc", "/openapi.json",
   ].map((path) => [path, { target: BACKEND, changeOrigin: true }]),
 );
 

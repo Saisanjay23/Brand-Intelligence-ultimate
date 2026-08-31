@@ -43,6 +43,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from backend.shared.models.row import Row
+from backend.platforms.scan_options import captures_screenshot
 from backend.shared.text import name_score, normalized_host, parse_count, parse_normalized_url
 from backend.platforms.tiktok.discovery_engine import (RE_CHECKPOINT, RE_GONE,
                                                         RE_LOGIN, TikTokSession,
@@ -128,7 +129,7 @@ class Scraper:
         self._anon_cm = None
         self._anon_ctx = None
         self.session = None if anonymous else TikTokSession(
-            args, cookies, load_images=bool(self.evidence), session_id=session_id, proxy=proxy,
+            args, cookies, load_images=captures_screenshot(args), session_id=session_id, proxy=proxy,
         )
         self._proxy = proxy
 
@@ -235,11 +236,23 @@ class Scraper:
 
     # ───────────────────────────── per URL ────────────────────────────── #
 
-    async def process(self, raw_url: str, target: str, feed: str) -> Row:
+    async def process(
+        self, raw_url: str, target: str, feed: str, known: Optional[dict] = None,
+    ) -> Row:
         """WHAT: one profile URL -> a scored Row. HOW: a single page load,
         then an ordered fallback -- TikTok own hydration payload first (it
         arrives with the page, so there is no XHR to race), the rendered
         header second.
+
+        `known` (whatever discovery already read for this URL, see
+        analysis/runner.py's `seed_by_url`) is accepted for interface
+        consistency with the other platforms, but there's nothing here it
+        lets this profile skip: the single page visit below is mandatory
+        regardless (status/screenshot/last-post all need it), TikTok
+        exposes no creation date at all, and there's no separate
+        location fetch on this platform the way Twitter/Instagram/
+        Facebook have. Runner.py's own `_populate` fallback still covers
+        `known` for whatever this visit itself comes back blank on.
 
         When the payload is missing, the page text is classified BEFORE
         falling back, because the four reasons it can be missing need four
@@ -478,14 +491,14 @@ class Scraper:
 
     # ─────────────────────────── orchestration ────────────────────────── #
 
-    async def one(self, u: str, tgt: str, feed: str) -> Row:
+    async def one(self, u: str, tgt: str, feed: str, known: Optional[dict] = None) -> Row:
         """WHAT: process() that never raises -- always a Row. HOW: any
         exception becomes an ERROR row carrying the exception type and
         message, so one unreachable profile cannot end a job and the
         reason survives into the results grid. LINKED TO: called by run(),
         and directly by services/analysis_service.py on the API path."""
         try:
-            return await self.process(u, tgt, feed)
+            return await self.process(u, tgt, feed, known)
         except Exception as e:
             row = Row(url=normalize_url(u), target=tgt, original_feed=feed)
             row.profile_id = username_of(row.url)

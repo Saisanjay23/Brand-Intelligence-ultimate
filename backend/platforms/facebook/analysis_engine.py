@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterator, Optional
 
 from backend.shared.models.row import Row
+from backend.platforms.scan_options import captures_screenshot
 from backend.shared.text import (MONTHS, epoch_to_dt, find_ints,
                                is_place, iter_dicts, iter_kv, name_score,
                                parse_count)
@@ -866,7 +867,7 @@ class Scraper:
         self.session = FacebookSession(
             args,
             cookies,
-            load_images=bool(self.evidence),
+            load_images=captures_screenshot(args),
             session_id=session_id,
             proxy=proxy,
         )
@@ -1225,9 +1226,20 @@ class Scraper:
 
     # ───────────────────────────── per URL ────────────────────────────── #
 
-    async def process(self, raw_url: str, target: str, feed: str) -> Row:
+    async def process(
+        self, raw_url: str, target: str, feed: str, known: Optional[dict] = None,
+    ) -> Row:
         """One profile URL, start to finish -- the whole engine's core
         loop, the counterpart to discovery_engine.py's Discovery.sweep().
+
+        Every field but one is still derived from this visit alone,
+        regardless of `known` (whatever discovery already read for this
+        URL, see analysis/runner.py's `seed_by_url`) -- they all come from
+        the SAME main-timeline visit a status/screenshot/last-post read
+        needs anyway, so skipping them would save nothing. `location` is
+        the exception: it lives behind the two About-tab visits at step 6
+        below, a real extra cost, so when discovery already has one those
+        visits are skipped rather than re-confirming it.
 
         WHAT IT RETURNS: a scored `Row` (shared/models/row.py), status OK/
         PARTIAL/GONE/ERROR/CHECKPOINT/LOGIN_REQUIRED, every field this
@@ -1259,6 +1271,9 @@ class Scraper:
         url = normalize_url(raw_url)
         row = Row(url=url, target=target, original_feed=feed)
         row.profile_id = profile_id(url)
+        if known and known.get("location"):
+            row.location = known["location"]
+            row.mark("location", "discovery")
 
         page = await self.ctx.new_page()
         h = Harvest()
@@ -1346,19 +1361,23 @@ class Scraper:
 
             # The main profile page rarely carries a location. Facebook Pages
             # put their city/country on the About tab instead, so this visit
-            # happens unconditionally: accuracy on a field the report actually
-            # promises beats saving one page load. Join/creation date is
-            # deliberately NOT read here (or anywhere in this engine, see
-            # ADR/product decision): Facebook does not expose it to an
-            # ordinary session at all, not in the rendered tab and not in
-            # any payload, so attempting it never succeeded and wasn't
-            # worth the two extra page loads either way.
-            await self.pause(0.4)
-            for sk in ("about_profile_transparency", "about"):
-                await self.visit(page, tab_url(url, sk), h, sk)
-                await self.pause(0.3)
+            # happens unconditionally when location isn't already known:
+            # accuracy on a field the report actually promises beats saving
+            # one page load. When discovery already read one for this URL
+            # (row.location pre-filled from `known`, above), it's treated as
+            # already accurate and these two visits are skipped instead.
+            # Join/creation date is deliberately NOT read here (or anywhere
+            # in this engine, see ADR/product decision): Facebook does not
+            # expose it to an ordinary session at all, not in the rendered
+            # tab and not in any payload, so attempting it never succeeded
+            # and wasn't worth the two extra page loads either way.
+            if not row.location:
+                await self.pause(0.4)
+                for sk in ("about_profile_transparency", "about"):
+                    await self.visit(page, tab_url(url, sk), h, sk)
+                    await self.pause(0.3)
 
-            read_location(row, h.scoped(pid))
+                read_location(row, h.scoped(pid))
 
             row.status = "OK" if row.profile_name else "PARTIAL"
             return row
@@ -1370,10 +1389,10 @@ class Scraper:
 
     # ─────────────────────────── orchestration ────────────────────────── #
 
-    async def one(self, u: str, tgt: str, feed: str) -> Row:
+    async def one(self, u: str, tgt: str, feed: str, known: Optional[dict] = None) -> Row:
         """process() with a failed profile turned into a reportable row."""
         try:
-            return await self.process(u, tgt, feed)
+            return await self.process(u, tgt, feed, known)
         except Exception as e:
             row = Row(url=normalize_url(u), target=tgt, original_feed=feed)
             row.profile_id = profile_id(row.url)

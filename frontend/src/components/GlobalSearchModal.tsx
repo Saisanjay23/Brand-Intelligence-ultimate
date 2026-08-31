@@ -27,8 +27,6 @@ export function GlobalSearchModal({
     const matchesKeywords = [
       ...(c.name_keywords || []),
       ...(c.domain_keywords || []),
-      ...(c.asset_name_individual_keywords || []),
-      ...(c.asset_name_domain_keywords || []),
     ].some((kw) => kw.toLowerCase().includes(q));
     return matchesName || matchesId || matchesDomain || matchesKeywords;
   });

@@ -35,7 +35,7 @@ class Settings(BaseSettings):
 
     # storage, one database, not one-per-platform (see docs/adr/0004)
     mongo_uri: str = "mongodb://localhost:27017"
-    mongo_db_name: str = "brand_intel"
+    mongo_db_name: str = "brand_intelligence"
 
     # paths
     log_path: Path = ROOT / "logs"

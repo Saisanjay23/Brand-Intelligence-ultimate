@@ -41,8 +41,6 @@ def _to_out(doc: dict) -> dict:
         # searches itself, i.e. the exact pre-groups behaviour, with nothing
         # to migrate. See shared/keywords.py::groups_for_client.
         "keyword_groups": _keywords.groups_for_client(doc),
-        "asset_name_individual_keywords": doc.get("asset_name_individual_keywords", []),
-        "asset_name_domain_keywords": doc.get("asset_name_domain_keywords", []),
         # per-platform discovery cap, keyed by platform id, scoped
         # separately to individual-keyword vs domain-keyword sweeps, a
         # platform absent from either map (or mapped to 0) means "scrape
@@ -103,12 +101,6 @@ async def upsert(
     platform_limits_domain: Optional[dict[str, int]] = None,
     platform_tab_limits: Optional[dict[str, dict[str, object]]] = None,
     cron: Optional[str] = None,
-    # `None`, not `[]`: a mutable default is created once at import and
-    # shared by every call that omits the argument, so anything that ever
-    # mutated it in place would leak between clients. Matches how the two
-    # keyword arguments above already declare theirs.
-    asset_name_individual_keywords: Optional[list[str]] = None,
-    asset_name_domain_keywords: Optional[list[str]] = None,
     keyword_groups: Optional[dict] = None,
 ) -> dict:
     """`cron` is optional, a client with keywords but no cron only ever
@@ -143,8 +135,6 @@ async def upsert(
                 "platform_limits_domain": platform_limits_domain or {},
                 "platform_tab_limits": platform_tab_limits or {},
                 "cron": cron,
-                "asset_name_individual_keywords": asset_name_individual_keywords or [],
-                "asset_name_domain_keywords": asset_name_domain_keywords or [],
             },
             # legacy pre-split field, if any, is superseded the moment this
             # client is saved through the current form, _to_out's own

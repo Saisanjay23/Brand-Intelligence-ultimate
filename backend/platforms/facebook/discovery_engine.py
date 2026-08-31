@@ -51,6 +51,8 @@ from typing import Any, Iterator, Optional
 from urllib.parse import parse_qs, quote, urlparse
 
 from backend.shared.extraction import ExtractionResult, run_strategies
+from backend.shared.models.hit import Hit, hit_to_row
+from backend.shared.models.row import Row
 from backend.shared.text import iter_dicts, normalized_host, parse_normalized_url
 from backend.stealth.browser import Session
 
@@ -254,52 +256,12 @@ ENTITY_TYPES = {"User": "profile", "Page": "page", "Group": "group"}
 QUERY_NAME = "SearchCometResultsPaginatedResultsQuery"
 
 
-@dataclass
-class Hit:
-    """One search result. The universal discovery-result shape every other
-    platform's discovery_engine.py also builds, see each platform's
-    `from backend.platforms.facebook.discovery_engine import Hit`."""
-
-    entity_id: str
-    name: str
-    url: str
-    avatar: str = ""
-    has_custom_pic: bool = False
-    verified: bool = False
-    entity_type: str = "profile"  # profile | page | channel | group
-    keyword: str = ""
-    tab: str = ""
-    rank: int = 0
-    source: str = "graphql"  # graphql | id-backfill
-
-    def as_dict(self) -> dict:
-        """WHAT: this Hit's fields as a plain dict. HOW: a flat
-        field-by-field copy, deliberately not `dataclasses.asdict()` --
-        an explicit dict keeps this the one place that has to change if
-        Hit ever gains an internal-only field.
-
-        NOT CURRENTLY CALLED anywhere in this codebase (confirmed via
-        grep across backend/ and every test, 2026-08-22) --
-        discovery_service.py builds its own dict from a Hit's attributes
-        directly instead of going through this method. Left in place
-        rather than deleted only because removing it is a separate,
-        deliberate change (not something to fold into a comment pass);
-        flagged here so whoever next touches this file has the evidence
-        already gathered instead of re-deriving it.
-        """
-        return {
-            "entity_id": self.entity_id,
-            "name": self.name,
-            "url": self.url,
-            "avatar": self.avatar,
-            "has_custom_pic": self.has_custom_pic,
-            "verified": self.verified,
-            "entity_type": self.entity_type,
-            "keyword": self.keyword,
-            "tab": self.tab,
-            "rank": self.rank,
-            "source": self.source,
-        }
+# `Hit` and `hit_to_row` live in shared/models/hit.py, not here -- YouTube's
+# and TikTok's discovery engines use the exact same shape for their own,
+# unrelated sweeps, and importing a type out of Facebook's own file was the
+# wrong home for something three platforms depend on. Facebook itself still
+# uses it constantly below (id-backfill, reconciliation, the DOM fallback)
+# -- only the definition moved, not the usage.
 
 
 @dataclass
@@ -648,7 +610,7 @@ class Sweep:
 
     keyword: str
     tab: str
-    hits: list[Hit] = field(default_factory=list)
+    hits: list[Row] = field(default_factory=list)
     pages: int = 0
     stopped: str = ""  # exhausted | end-of-serp | stalled | cap | error
     complete: bool = False
@@ -1541,7 +1503,7 @@ class Discovery:
                     ("dom:results-page", lambda: dom_search_hits(page, keyword, tab)),
                 ],
             )
-            out.hits = chain.value or []
+            out.hits = [hit_to_row(h) for h in (chain.value or [])]
             out.extraction = chain
             if chain.degraded:
                 out.source = "dom"

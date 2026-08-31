@@ -6,14 +6,17 @@ import {
   ClientsNavIcon,
   LiveResultsNavIcon,
   AdminNavIcon,
-  QuickAnalysisNavIcon,
   BellAlertIcon,
   SearchIcon,
   SunIcon,
   MoonIcon,
 } from "./AppIcons";
 
-export type ViewPage = "home" | "results" | "quick-analysis" | "admin";
+// "analysis" was a standalone top-nav page; removed -- the same
+// paste-URLs-and-scrape tool is reachable from Live Results' own
+// Discovery/Analysis toggle (see LiveResultsView.tsx), so it was a
+// redundant second entry point to the same feature.
+export type ViewPage = "home" | "results" | "admin";
 
 interface Props {
   page: ViewPage;
@@ -87,14 +90,6 @@ export function Header({
         </button>
 
         <button
-          onClick={() => onPage("quick-analysis")}
-          className={`top-nav-btn ${page === "quick-analysis" ? "active" : ""}`}
-        >
-          <QuickAnalysisNavIcon size={16} />
-          <span>Quick Analysis</span>
-        </button>
-
-        <button
           onClick={() => onPage("admin")}
           className={`top-nav-btn ${page === "admin" ? "active" : ""}`}
         >
@@ -118,7 +113,7 @@ export function Header({
         <div
           className="bell-btn"
           onClick={() => onPage("admin")}
-          title={`${activeJobsCount} active background job(s) -- see Admin > Live Activity`}
+          title={`${activeJobsCount} active discovery sweep(s)`}
         >
           <BellAlertIcon size={16} />
           {activeJobsCount > 0 && (

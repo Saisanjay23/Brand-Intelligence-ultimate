@@ -174,6 +174,16 @@ def get(platform_id: str) -> Platform:
     return PLATFORMS[platform_id]
 
 
+def display_name(platform_id: str) -> str:
+    """Human-readable name for job progress/error messages -- "Twitter",
+    not "twitter". Unlike `get()`, never raises: a caller building a
+    message about an id that turns out to be unregistered still gets
+    something printable (a title-cased fallback) rather than a second
+    exception on top of whatever it was already reporting."""
+    plat = PLATFORMS.get(platform_id)
+    return plat.name if plat else platform_id.title()
+
+
 async def session_state(p: Platform) -> str:
     """ready | missing | incomplete.
 

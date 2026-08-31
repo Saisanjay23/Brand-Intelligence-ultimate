@@ -30,6 +30,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from backend.shared.models.row import Row
+from backend.platforms.scan_options import captures_screenshot
 from backend.shared.text import name_score, normalized_host, parse_normalized_url
 from backend.platforms.twitter.discovery_engine import (ABOUT_QUERY,
                                                          RE_CHECKPOINT,
@@ -165,7 +166,7 @@ class Scraper:
         self.session = TwitterSession(
             args,
             cookies,
-            load_images=bool(self.evidence),
+            load_images=captures_screenshot(args),
             session_id=session_id,
             proxy=proxy,
         )
@@ -194,9 +195,24 @@ class Scraper:
 
     # ───────────────────────────── per URL ────────────────────────────── #
 
-    async def process(self, raw_url: str, target: str, feed: str) -> Row:
+    async def process(
+        self, raw_url: str, target: str, feed: str, known: Optional[dict] = None,
+    ) -> Row:
         """One profile URL, start to finish -- the counterpart to
         facebook/analysis_engine.py's Scraper.process().
+
+        `known`, when given (only a profile sent here via "Analyse
+        Validated Profiles" carries one -- see analysis/runner.py's
+        `seed_by_url`), is whatever discovery already read for this same
+        URL. Most fields still come from this visit's own
+        UserByScreenName response regardless -- one page load answers
+        them all in the same round trip a status/screenshot/last-post
+        read needs anyway, so pre-filling from `known` would save nothing
+        and would risk a stale value surviving over a fresher one. The one
+        field this DOES change the behavior of is `location`: when
+        discovery already has one, the separate `read_about_panel()`
+        navigation below (step 5) is skipped entirely rather than paying
+        for a second page load to re-confirm what's already known.
 
         WHAT IT RETURNS: a scored `Row`, status OK/PARTIAL/GONE/ERROR/
         CHECKPOINT/LOGIN_REQUIRED, every field tagged with `row.mark()`.
@@ -214,7 +230,8 @@ class Scraper:
              still has no date, try `replies_tab_last_post()` (an
              all-replies account has a genuinely empty originals
              timeline).
-          5. If still no location: `read_about_panel()`.
+          5. If still no location AND discovery didn't already have one:
+             `read_about_panel()`.
           6. Capture the evidence screenshot.
 
         LINKED TO: called by `one()` below.
@@ -222,6 +239,9 @@ class Scraper:
         url = normalize_url(raw_url)
         row = Row(url=url, target=target, original_feed=feed)
         row.profile_id = handle_of(url)
+        if known and known.get("location"):
+            row.location = known["location"]
+            row.mark("location", "discovery")
 
         page = await self.ctx.new_page()
         found: list[TwitterUser] = []
@@ -630,12 +650,12 @@ class Scraper:
 
     # ─────────────────────────── orchestration ────────────────────────── #
 
-    async def one(self, u: str, tgt: str, feed: str) -> Row:
+    async def one(self, u: str, tgt: str, feed: str, known: Optional[dict] = None) -> Row:
         """process() with a failed profile turned into a reportable ERROR
         row instead of raising -- so one bad URL never crashes the whole
         batch `run()` is driving."""
         try:
-            return await self.process(u, tgt, feed)
+            return await self.process(u, tgt, feed, known)
         except Exception as e:
             row = Row(url=normalize_url(u), target=tgt, original_feed=feed)
             row.profile_id = handle_of(row.url)

@@ -47,8 +47,6 @@ export interface Client {
   // returned by the API -- synthesised from the flat lists above (one
   // childless parent each) for a client saved before this existed.
   keyword_groups?: Record<string, KeywordGroup[]>;
-  asset_name_individual_keywords?: string[];
-  asset_name_domain_keywords?: string[];
   // platform id -> max results to scrape for this client, scoped
   // separately to an individual-keyword (person/executive) sweep vs a
   // domain-keyword (brand) sweep, independent caps, so a noisy brand
@@ -388,27 +386,19 @@ export interface SessionInfo {
   login?: { status: string; message: string; started: string; finished: string };
 }
 
-// GET /health/platforms merges the static registry entry with its rolling
-// health score (backend/services/health_service.py) into one object per platform.
-export interface PlatformHealth {
+// PlatformHealth (GET /health/platforms, a rolling health score) has no
+// backend behind it any more -- that service was deleted along with the
+// old api/controllers layer. GET /discovery/platforms is what actually
+// answers "can this platform run right now" on the rebuilt backend, and
+// PlatformState below is its real shape. Every consumer of platform
+// readiness (usePlatformState, HomeView's platform selector, Live Results'
+// platform rail) reads PlatformState now.
+export interface PlatformState {
   platform: string;
   name: string;
   enabled: boolean;
-  session_state: string;
-  state: "unknown" | "healthy" | "degraded" | "critical";
-  score: number;
-  ok: number;
-  partial: number;
-  bad: number;
-  total: number;
-  last_error: string;
-  last_seen: number;
-  // an inherent caveat about this platform's scraping surface, was
-  // tracked in the backend registry but never actually surfaced anywhere.
-  // Empty when there's none.
-  stability_note?: string;
-  // true when field-scraping during analysis isn't implemented, running
-  // analysis silently produces nothing useful. Surfaced so the UI can warn before, not after.
-  analysis_stub?: boolean;
+  session_state: "ready" | "missing" | "incomplete" | "exhausted";
+  can_discover: boolean;
+  stability_note: string;
 }
 

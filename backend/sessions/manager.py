@@ -112,20 +112,25 @@ def _get_platform(platform_id: str):
 
 
 def _session_in_use(platform_id: str, session_id: str) -> bool:
-    """Is a currently-RUNNING job actually holding this exact session right
-    now, not "was picked at some point", the live answer. `Job` carries
-    `session_id`/`session_platform`, stamped by discovery_service.py /
-    analysis_service.py at the moment session_for_job() hands one out, and
-    naturally clears itself: once the job's status leaves "running" (done,
-    failed, cancelled, including via round_robin_service's own crash
-    recovery, see its module), this stops matching with no explicit
-    "release" call required anywhere."""
-    from backend.services.job_service import job_manager
+    """Is something actually holding this exact session RIGHT NOW -- the
+    live answer, not "was picked at some point". Drives the "currently
+    running" marker in the Sessions panel.
 
-    return any(
-        j.status == "running" and j.session_platform == platform_id and j.session_id == session_id
-        for j in job_manager.jobs.values()
-    )
+    Asks the analysis runner, which registers a session the moment
+    `session_for_job()` hands it one and releases it in a `finally` when
+    that platform's batch ends, so a crashed or cancelled run cannot leave
+    a session marked busy forever.
+
+    Imported lazily and guarded: this is a cosmetic indicator, and a
+    missing/half-built runner must never be able to break the Sessions
+    panel itself. (It did exactly that once -- this used to reach into a
+    job module that had been deleted, and every platform's session status
+    came back as an error.)"""
+    try:
+        from backend.analysis.runner import analysis_runner
+    except Exception:
+        return False
+    return analysis_runner.holds_session(platform_id, session_id)
 
 
 def _required_cookie_expiry(s: dict, required: tuple[str, ...]) -> float:
@@ -449,6 +454,11 @@ async def session_for_job(platform_id: str) -> tuple[object, dict]:
         return plat, {"id": item["id"], "identifier": item["identifier"], "api_key": item["api_key"]}
     item = await get_healthy_session(platform_id)
     if item is None:
+        if plat.can_run_anonymously:
+            # this platform's search/profile pages work logged-out (see
+            # registry.Platform.anonymous_context_path) -- a dead/missing
+            # session pool costs it one field, not the whole platform.
+            return plat, {"id": "", "identifier": "anonymous", "anonymous": True}
         raise ConflictError(f"{platform_id}: no healthy sessions available -- please add more cookies")
     return plat, {"id": item["id"], "identifier": item["identifier"], "cookies": item["cookies"], "proxy": item["proxy"]}
 
@@ -512,15 +522,29 @@ async def mark_session_failed(
             f"(failure #{fails}, cooling off ~{mins:.0f}m)"
         )
         if newly_dead:
-            from backend.services import incident_service as incidents_engine
+            # A session dying is the one operational event worth a durable
+            # record: it is the thing that silently stops scrapes working,
+            # and the pool moves on without it, so nothing else would say
+            # so. Written straight to the incidents collection -- there is
+            # no diagnosis/alert-routing layer any more, and this must
+            # never be able to break the failure-marking above it.
+            from datetime import datetime, timezone
+
+            from backend.database.repositories import incident_repository as incidents_db
             note = f": {detail}" if detail else ""
-            await incidents_engine.record(
-                platform_id, "session", "-- all clients --", "session-failure",
-                "SessionInvalid",
-                f"Session {identifier!r} (id {session_id}) is {reason} and has been taken "
-                f"out of rotation -- the pool moved on to the next available session/key. "
-                f"Delete it or paste fresh credentials to bring it back{note}.",
-            )
+            await incidents_db.record({
+                "platform": platform_id, "kind": "session",
+                "scope": "-- all clients --", "job_id": "session-failure",
+                "error_type": "SessionInvalid", "severity": "critical",
+                "message": (
+                    f"Session {identifier!r} (id {session_id}) is {reason} and has been taken "
+                    f"out of rotation -- the pool moved on to the next available session/key. "
+                    f"Delete it or paste fresh credentials to bring it back{note}."
+                ),
+                "cause": f"The platform rejected this session ({reason}).",
+                "fix": "Re-export cookies or re-authenticate this account under Sessions.",
+                "ts": datetime.now(timezone.utc),
+            })
 
 
 async def mark_session_ok(platform_id: str, session_id: str) -> None:

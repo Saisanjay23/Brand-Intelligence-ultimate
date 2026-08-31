@@ -14,26 +14,32 @@ THE PROBLEM THIS SOLVES
 
     So the two jobs are split:
 
-        PARENT   the real name. Never searched. It is the match target
-                 (name_score / name_exact_run) and the bucket every hit
-                 found by any of its children is filed under.
+        PARENT   the real name. It is the MATCH target (name_score /
+                 name_exact_run), the bucket every hit found by any of its
+                 children is filed under, the only keyword the UI's filter
+                 dropdown offers, and the name the analysis export reports
+                 in its AssetName column. It is ALSO searched, alongside
+                 its children -- see `build_plans`, which sweeps
+                 `[parent, *children]`.
 
         CHILDREN the analyst's permutations. Searched on every platform.
-                 Never scored against, never stored as the hit's keyword.
+                 Never scored against, never stored as the hit's keyword,
+                 never shown as a filter option.
 
     One parent's children all roll up into that one parent, so an analyst
     filtering the results grid by "Gautam Adani" sees everything all twelve
-    permutations turned up, not twelve separate piles.
+    permutations turned up, not twelve separate piles -- and every one of
+    those rows exports under "Gautam Adani", not under the permutation
+    that happened to surface it.
 
 BACK-COMPATIBILITY IS THE LOAD-BEARING PART
     `name_keywords` / `domain_keywords` on the client document stay exactly
     what they always were: a flat list of strings. They now hold the
-    PARENTS. Everything that already reads them keeps working untouched --
-    `discovery_service._is_individual_keyword` (individual-vs-domain
-    classification), `incident_publisher._category_and_asset_name`,
-    `profile_repository.list_profiles`'s keyword_match_type bucket filter,
-    and `scheduler_controller`'s "does this client have keywords at all"
-    check.
+    PARENTS, so everything that already reads them keeps working untouched.
+    (The three service-layer readers this note used to name --
+    `discovery_service`, `incident_publisher`, `scheduler_controller` --
+    were deleted with the old backend; `profile_repository`'s
+    keyword_match_type bucket filter is the surviving one.)
 
     A client saved before groups existed has no `keyword_groups` field at
     all. `groups_from_flat` synthesises one group per existing keyword with
@@ -48,9 +54,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
-# The two keyword categories the whole pipeline is already split by (caps,
-# incident category, asset-name choice). Groups are stored per category so a
-# parent never has to be re-classified at read time.
+# The two keyword categories the whole pipeline is already split by (per-type
+# scrape caps, incident category). Groups are stored per category so a parent
+# never has to be re-classified at read time.
 INDIVIDUAL = "individual"
 DOMAIN = "domain"
 KEYWORD_TYPES = (INDIVIDUAL, DOMAIN)
@@ -60,25 +66,27 @@ KEYWORD_TYPES = (INDIVIDUAL, DOMAIN)
 # why every existing reader must keep working.
 FLAT_FIELD = {INDIVIDUAL: "name_keywords", DOMAIN: "domain_keywords"}
 
-# Which client field holds the asset-name overrides for each type. Those are
-# additional MATCH targets alongside the parent (an analyst may protect
-# "Gautam Adani" but report the asset as "Adani Group"), never search terms.
-ASSET_FIELD = {
-    INDIVIDUAL: "asset_name_individual_keywords",
-    DOMAIN: "asset_name_domain_keywords",
-}
+# NOTE: asset names (`asset_name_individual_keywords` /
+# `asset_name_domain_keywords`) used to sit here as a second set of MATCH
+# targets alongside the parent -- an analyst could protect "Gautam Adani"
+# but have hits also scored against "Adani Group". That whole feature was
+# removed: the PARENT is now the only thing a hit is scored against and the
+# only name it is reported under, which is also what the analysis export's
+# AssetName column carries. One name per bucket, everywhere.
 
 
 @dataclass(frozen=True)
 class MatchTarget:
     """One parent a hit could be filed under, and every string a hit's name
-    is scored against for it (the parent plus that type's asset names).
+    is scored against for it.
 
-    Asset names are included because they are the OTHER name the same
-    entity is publicly known by -- a client protecting the person "Gautam
-    Adani" whose asset name is "Adani Group" wants a profile calling itself
-    "Adani Group Official" to score as a match, and scoring it against the
-    person's name alone would rate it near zero.
+    `terms` is currently always just `(parent,)` -- it used to also carry
+    that type's configured asset names, an alternate public name the same
+    entity was known by, but that feature was removed (see the note by
+    FLAT_FIELD). The tuple shape is kept because `resolve_parent` still
+    needs to pick a parent per hit when one permutation is listed under
+    two different parents, which is a separate concern from how many names
+    each parent is scored under.
     """
 
     parent: str
@@ -238,32 +246,29 @@ def search_terms(groups: dict[str, list[dict]], kw_type: str) -> list[str]:
 
 
 def match_terms_for(client: Optional[dict], parent: str, kw_type: str) -> tuple[str, ...]:
-    """Every string a hit found under `parent` is scored against: the parent
-    itself plus that type's configured asset names. See `MatchTarget`."""
-    client = client or {}
-    assets = client.get(ASSET_FIELD.get(kw_type, "")) or []
-    return tuple(_dedup([parent, *assets]))
+    """Every string a hit found under `parent` is scored against.
+
+    That is now the parent, and only the parent. This used to also return
+    the type's configured asset names; that feature was removed (see the
+    note by FLAT_FIELD). Kept as a function rather than inlined so
+    `MatchTarget` keeps one obvious place to change if a second match name
+    is ever reintroduced. `client`/`kw_type` are unused for the same
+    reason -- the call sites stay stable.
+    """
+    return (parent,)
 
 
 def classify_unknown(client: Optional[dict], keyword: str) -> str:
     """INDIVIDUAL or DOMAIN for a keyword the client's groups don't contain.
 
-    Mirrors `discovery_service._is_individual_keyword` deliberately, and for
-    the same reason that function mirrors
-    `incident_publisher._category_and_asset_name`: a keyword has to
-    classify identically wherever it is classified, or the same ad-hoc
-    search picks one per-type cap during discovery and the opposite
-    incident category at publish time. Kept as a small duplicated rule with
-    an explicit cross-reference rather than an import, exactly as those two
-    already are, since this module must stay free of service-layer imports.
+    Always DOMAIN now. The only signal this ever had was whether the term
+    was one of the client's INDIVIDUAL asset names, and asset names are
+    gone -- so every genuinely unknown ad-hoc term takes what was already
+    the fallback branch. A term the client DOES know is never routed here:
+    `build_plans` matches it against the real groups first, where its type
+    is recorded explicitly.
     """
-    client = client or {}
-    individual = {
-        _clean(k).lower()
-        for k in (client.get(ASSET_FIELD[INDIVIDUAL]) or [])
-        if _clean(k)
-    }
-    return INDIVIDUAL if _clean(keyword).lower() in individual else DOMAIN
+    return DOMAIN
 
 
 def build_plans(
@@ -281,11 +286,9 @@ def build_plans(
     A requested term that matches no parent is still honoured, as its own
     childless plan: an analyst running an ad-hoc one-off search for a term
     that isn't in the client's saved config must not silently sweep
-    nothing. It is classified by `classify_unknown` below, which mirrors
-    `discovery_service._is_individual_keyword` exactly (individual when it
-    is one of the client's individual asset names, domain otherwise) so an
-    ad-hoc keyword picks the same per-type cap and incident category it
-    would have picked before this feature existed.
+    nothing. It is classified by `classify_unknown` below, which is now
+    always DOMAIN -- the individual-asset-name signal it used to consult is
+    gone with that feature.
 
     Deduped by SEARCH TERM: the same permutation listed under two parents
     is one search, not two, since running the same query twice against the
@@ -355,9 +358,10 @@ def resolve_parent(plan: KeywordPlan, name: str, scorer) -> tuple[str, int]:
     first.
 
     Within one target the BEST-scoring term wins but the PARENT is still
-    what is returned -- an asset name is an alternate spelling of the same
-    entity, not a separate bucket to file under, so only the score comes
-    from the asset name.
+    what is returned. With asset names removed each target now has exactly
+    one term (its own parent), so that inner loop is a formality today --
+    kept because the outer loop over multiple TARGETS, which is the case
+    that actually matters, shares it.
 
     `scorer` is injected (rather than importing `shared.text.name_score`
     here) purely so this stays a pure function testable without pulling in

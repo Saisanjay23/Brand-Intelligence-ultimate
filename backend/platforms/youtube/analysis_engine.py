@@ -14,6 +14,7 @@ no-ops kept only to satisfy the same interface as the browser platforms.
 
 from __future__ import annotations
 
+from typing import Optional
 from urllib.parse import unquote, urlparse
 
 from backend.shared.models.row import Row
@@ -136,7 +137,9 @@ class Scraper:
 
     # ───────────────────────────── per URL ────────────────────────────── #
 
-    async def process(self, raw_url: str, target: str, feed: str) -> Row:
+    async def process(
+        self, raw_url: str, target: str, feed: str, known: Optional[dict] = None,
+    ) -> Row:
         """WHAT: one channel URL -> a scored Row. HOW: resolve the URL to a
         channel through whichever lookup its shape allows (trying the
         direct id first and falling back to the handle lookup, so a
@@ -148,6 +151,17 @@ class Scraper:
         genuinely postless, which is a real finding about an impersonator
         account -- rather than left blank, which shared/completeness.py
         would otherwise have to report as a field we failed to read.
+
+        `known` (whatever discovery already read for this URL, see
+        analysis/runner.py's `seed_by_url`) is accepted for interface
+        consistency with the other platforms, but there's nothing to skip
+        here: the `channels.list` call below is the ONLY source for the
+        uploads-playlist id the following `latest_upload()` call needs, so
+        it stays mandatory even when every other field it would return
+        (followers/created/location/pic) is already known. Runner.py's own
+        `_populate` fallback covers those from `known` if this call ever
+        genuinely comes back without one.
+
         LINKED TO: fill() below for the mapping; api.latest_upload is in
         discovery_engine.py::YouTubeAPI."""
         url = normalize_url(raw_url)
@@ -241,7 +255,7 @@ class Scraper:
 
     # ─────────────────────────── orchestration ────────────────────────── #
 
-    async def one(self, u: str, tgt: str, feed: str) -> Row:
+    async def one(self, u: str, tgt: str, feed: str, known: Optional[dict] = None) -> Row:
         """WHAT: process() that never raises -- always a Row. HOW: quota
         exhaustion becomes CHECKPOINT, the status that stops the wave,
         because every further call today would fail identically and burn
@@ -250,7 +264,7 @@ class Scraper:
         by run(); note that check_session() deliberately does NOT treat
         quota as a bad key -- see its docstring."""
         try:
-            return await self.process(u, tgt, feed)
+            return await self.process(u, tgt, feed, known)
         except QuotaExceeded as e:
             row = Row(url=normalize_url(u), target=tgt, original_feed=feed)
             row.status = "CHECKPOINT"  # stops the run, same as a challenge
@@ -277,19 +291,80 @@ class Scraper:
 
     async def run(self, jobs: list[tuple[str, str, str]]) -> list[Row]:
         """WHAT: drives a whole batch of (url, target, feed) jobs. HOW:
-        sequentially with no pacing (the API is quota-bound, not
-        rate-bound), stopping the moment a row comes back CHECKPOINT since
-        the daily quota is gone and every remaining job would fail the
-        same way. Rows gathered before the stop are still returned.
-        LINKED TO: the standalone entry point; the API path drives one()
-        directly through services/analysis_service.py instead."""
+        resolves every job's channel reference up front, then fetches every
+        id-shaped channel through ONE (or few, chunked-50 -- see
+        YouTubeAPI.channels) `channels.list` call instead of one call per
+        channel. `channels.list` costs 1 quota unit regardless of how many
+        ids ride along, so a run of 200 approved channels drops from 200
+        units to ~4 -- previously every channel paid for its own call
+        because `process()` (still used for a single ad-hoc lookup, see
+        one()) always called `api.channels([ref])` with a length-1 list.
+
+        Handle-shaped URLs (@handle, legacy /c/ or /user/) still resolve
+        one at a time: the Data API v3 has no batch handle-lookup endpoint.
+        The per-channel `latest_upload()` call (1 unit each) is likewise
+        unavoidable and unchanged -- see that method's own docstring for
+        why it's already the cheap way to get an activity date.
+
+        Stops the moment a row comes back CHECKPOINT (daily quota gone,
+        every remaining job would fail the same way); rows gathered before
+        the stop are still returned. LINKED TO: the standalone entry
+        point; the API path drives this directly."""
+        from backend.shared.logging import get_logger as _gl
+        log = _gl("platforms.youtube.analysis")
+
+        resolved = [(normalize_url(u), tgt, feed, *channel_ref(normalize_url(u))) for u, tgt, feed in jobs]
+
+        id_refs = list(dict.fromkeys(ref for _, _, _, kind, ref in resolved if kind == "id" and ref))
+        by_id: dict[str, dict] = {}
+        if id_refs:
+            try:
+                by_id = {c.get("id"): c for c in await self.api.channels(id_refs) if c.get("id")}
+            except QuotaExceeded as e:
+                log.warning(f"QUOTA EXHAUSTED before the batch channel lookup -- stopping. {e}")
+                return [
+                    Row(url=url, target=tgt, original_feed=feed, entity_type="channel",
+                        status="CHECKPOINT", notes=str(e))
+                    for url, tgt, feed, _, _ in resolved
+                ]
+
         rows: list[Row] = []
-        for i, (u, tgt, feed) in enumerate(jobs, 1):
-            row = await self.one(u, tgt, feed)
-            rows.append(row)
-            self.report(i, len(jobs), u, row)
-            if row.status == "CHECKPOINT":
-                from backend.shared.logging import get_logger as _gl
-                _gl("platforms.youtube.analysis").warning("QUOTA EXHAUSTED -- stopping.")
+        for i, (url, tgt, feed, kind, ref) in enumerate(resolved, 1):
+            row = Row(url=url, target=tgt, original_feed=feed, entity_type="channel")
+            if not ref:
+                row.status = "ERROR"
+                row.note("could not read a channel reference from the URL")
+                rows.append(row)
+                self.report(i, len(resolved), url, row)
+                continue
+            try:
+                ch = by_id.get(ref) if kind == "id" else None
+                if ch is None:
+                    ch = await self.api.channel_by_handle(ref)
+                if ch is None:
+                    row.status = "GONE"
+                    row.note("no such channel -- may already be taken down")
+                else:
+                    self.fill(row, ch)
+                    uploads = ((ch.get("contentDetails") or {}).get("relatedPlaylists") or {}).get("uploads", "")
+                    if iso := await self.api.latest_upload(uploads):
+                        row.last_post_iso = iso
+                        row.posts_seen = "yes"
+                        row.mark("last_post", "api")
+                    elif (ch.get("statistics") or {}).get("videoCount") == "0":
+                        row.posts_seen = "no"
+                        row.mark("last_post", "api-no-videos")
+                    row.status = "OK" if row.profile_name else "PARTIAL"
+            except QuotaExceeded as e:
+                row.status = "CHECKPOINT"
+                row.note(str(e))
+                rows.append(row)
+                self.report(i, len(resolved), url, row)
+                log.warning("QUOTA EXHAUSTED -- stopping.")
                 break
+            except Exception as e:
+                row.status = "ERROR"
+                row.note(f"{type(e).__name__}: {e}")
+            rows.append(row)
+            self.report(i, len(resolved), url, row)
         return rows

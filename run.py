@@ -5,12 +5,25 @@ Brand Intelligence -- the only file you need to run.
     python run.py                start everything (sets up on first run)
     python run.py --setup        install dependencies, browsers and the UI
     python run.py --check        verify prerequisites, print status, exit
-    python run.py --dev          also run Vite with hot reload on :5173
+    python run.py --dev          serve the UI from Vite instead, hot-reloaded
     python run.py --build        force a UI rebuild first
     python run.py --port 9000    serve somewhere else
 
 First run does the whole install by itself. After that `python run.py` just
 starts the server.
+
+ONE PORT, ONE URL. The API and the UI are the same server: backend/main.py
+mounts the built `frontend/dist` at `/`, so http://127.0.0.1:8000 IS the
+app -- no second process, no separate frontend port to remember. The
+browser is opened for you once the port actually answers.
+
+The build is rebuilt automatically whenever anything under `frontend/src`
+is newer than the last one (see `ui_is_stale`), so editing the UI and
+re-running this never silently serves the previous build.
+
+`--dev` is the exception: there the UI comes from Vite on :5173 (hot
+reload, proxying the API through to this process), and that is the URL
+opened.
 
 ONE WORKER, ON PURPOSE
     Live job state is in memory and the scanners drive real logged-in
@@ -68,6 +81,65 @@ def have(module: str) -> bool:
 
 def missing_packages() -> list[str]:
     return [pip for pip, mod in IMPORT_NAMES.items() if not have(mod)]
+
+
+def ui_is_stale() -> bool:
+    """True when something under frontend/src is newer than the last build.
+
+    Without this, editing the UI and re-running `python run.py` silently
+    serves the PREVIOUS build -- the change appears to have done nothing,
+    which is a genuinely baffling thing to debug. Cheap to check: one mtime
+    walk against dist/index.html.
+    """
+    index = DIST / "index.html"
+    if not index.is_file():
+        return True
+    src = FRONTEND / "src"
+    if not src.is_dir():
+        return False
+    built = index.stat().st_mtime
+    for path in src.rglob("*"):
+        if path.is_file() and path.stat().st_mtime > built:
+            return True
+    # index.html and the config files are sources too, not just src/
+    for name in ("index.html", "vite.config.ts", "package.json"):
+        f = FRONTEND / name
+        if f.is_file() and f.stat().st_mtime > built:
+            return True
+    return False
+
+
+def open_when_ready(url: str, timeout: float = 90.0) -> None:
+    """Open `url` in a browser once something is actually listening there.
+
+    Replaces a fixed `Timer(1.0, ...)`, which raced the server: uvicorn's
+    first bind (plus Mongo ping and session-monitor startup) regularly takes
+    longer than a second, so the browser landed on a connection-refused page
+    and the analyst had to reload by hand. Any HTTP response at all -- 200
+    or 404 -- proves the port is up; only a connection error means keep
+    waiting.
+    """
+    import threading
+    import time
+    import urllib.error
+    import urllib.request
+    import webbrowser
+
+    def wait() -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                urllib.request.urlopen(url, timeout=2)
+                break
+            except urllib.error.HTTPError:
+                break  # it answered, just not with a 200 -- that's up
+            except Exception:
+                time.sleep(0.4)
+        else:
+            return  # never came up; don't open a dead tab
+        webbrowser.open(url)
+
+    threading.Thread(target=wait, daemon=True).start()
 
 
 def mongo_ok() -> tuple[bool, str]:
@@ -129,8 +201,13 @@ def setup(force: bool = False) -> bool:
                 cwd=FRONTEND,
                 why="installing UI dependencies",
             )
-        if force or not DIST.is_dir():
+        # Staleness, not just absence: a dist built before the last UI edit
+        # would otherwise be served as-is, so the edit appears to have done
+        # nothing. See ui_is_stale().
+        if force or ui_is_stale():
             ok &= run([npm(), "run", "build"], cwd=FRONTEND, why="building the UI")
+        else:
+            say(OK, "UI already built and up to date")
     elif not FRONTEND.is_dir():
         say(WARN, "frontend directory not found", "running in backend-only API mode; the UI will not be served")
     else:
@@ -220,9 +297,12 @@ def main() -> None:
     if a.check:
         sys.exit(0 if check() else 1)
 
-    # first run, or a missing piece: install without being asked
-    if missing_packages() or (FRONTEND.is_dir() and not DIST.is_dir()) or a.build:
-        print("Brand Intelligence -- first-run setup\n")
+    # first run, or a missing piece: install without being asked.
+    # `--dev` serves the UI from Vite, so a stale dist doesn't matter there
+    # and rebuilding it would just cost startup time for nothing.
+    needs_ui_build = FRONTEND.is_dir() and not a.dev and ui_is_stale()
+    if missing_packages() or needs_ui_build or a.build:
+        print("Brand Intelligence -- setup\n")
         setup(force=a.build)
         print()
 
@@ -241,13 +321,19 @@ def main() -> None:
 
     try:
         import uvicorn
-        import webbrowser
-        from threading import Timer
 
-        url = f"http://127.0.0.1:{a.port}"
-        print(f"\n  Brand Intelligence -> {url}\n")
-        
-        Timer(1.0, lambda: webbrowser.open(url)).start()
+        api = f"http://127.0.0.1:{a.port}"
+        # In --dev the UI is served by Vite (with hot reload) and proxies the
+        # API through to this port, so the analyst wants :5173 -- opening the
+        # API port there would serve the last BUILD instead, silently
+        # bypassing the very hot-reload dev mode exists for.
+        url = "http://127.0.0.1:5173" if a.dev else api
+        print(f"\n  Brand Intelligence -> {url}")
+        if a.dev:
+            print(f"  API                -> {api}")
+        print(f"  API docs           -> {api}/docs\n")
+
+        open_when_ready(url)
 
         uvicorn.run(
             "backend.main:app",

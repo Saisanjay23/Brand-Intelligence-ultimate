@@ -22,8 +22,6 @@ export const clientsApi = {
 
     name_keywords?: string[];
     domain_keywords?: string[];
-    asset_name_individual_keywords?: string[];
-    asset_name_domain_keywords?: string[];
     platform_limits_individual?: Record<string, number>;
     platform_limits_domain?: Record<string, number>;
     // { [platform]: { [tab]: { [keywordType]: number } } }, e.g.
@@ -44,8 +42,6 @@ export const clientsApi = {
       name_keywords: [],
       domain_keywords: [],
       keyword_groups: {},
-      asset_name_individual_keywords: [],
-      asset_name_domain_keywords: [],
       platform_limits_individual: {},
       platform_limits_domain: {},
       platform_tab_limits: {},

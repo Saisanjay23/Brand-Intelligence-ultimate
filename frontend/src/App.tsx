@@ -1,19 +1,15 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Toaster } from "react-hot-toast";
 import { clientsApi } from "./api/clientsApi";
-import { jobsApi } from "./api/jobsApi";
-import type { Client, Job } from "./api/types";
+import type { Client } from "./api/types";
 import type { ViewPage } from "./components/Header";
 import { AppLayout } from "./layouts/AppLayout";
 import { AdminPanel } from "./pages/AdminPanel";
 import { HomeView } from "./pages/HomeView";
 import { LiveResultsView } from "./pages/LiveResultsView";
-import { QuickAnalysisView } from "./pages/QuickAnalysisView";
-import { useJobPolling } from "./hooks/useJobPolling";
+import { useDiscoveryJobPoll } from "./hooks/useDiscoveryJobPoll";
 import { usePlatformState } from "./hooks/usePlatformState";
 import { loadRecentClients, rememberClient, forgetClient, type RecentClient } from "./services/recentClients";
-
-const ACTIVE_JOB_STATUSES = new Set(["queued", "running"]);
 
 export default function App() {
   const [page, setPage] = useState<ViewPage>("home");
@@ -25,12 +21,32 @@ export default function App() {
   const [clientId, setClientId] = useState("");
   const [clientName, setClientName] = useState("");
   const [error, setError] = useState("");
+  // Bumped whenever a discovery job finishes, to force Live Results to
+  // reload its cards.
+  const [refreshKey, setRefreshKey] = useState(0);
+  // Set when "Analyse Validated Profiles" (or Home's "Analyse" action)
+  // starts a job -- handed to LiveResultsView, which switches its own
+  // Discovery/Analysis toggle to Analysis and passes it into the embedded
+  // AnalysisView so the analyst lands on the job already being watched
+  // instead of an empty paste box. There is no standalone Analysis page
+  // any more (removed -- Live Results' own toggle was a redundant second
+  // entry point to the same tool).
+  const [resumeAnalysisJobId, setResumeAnalysisJobId] = useState<string | null>(null);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
     localStorage.setItem("theme", theme);
   }, [theme]);
 
+  // Client CRUD (create/edit/delete/list) has no backend behind it any
+  // more -- the rebuilt backend only exposes discovery/analysis/sessions,
+  // no /clients. Kept anyway (as the user asked) as the old UI's per-brand
+  // scoping mental model: it renders, and the recent-clients list still
+  // works (that's local/localStorage, see recentClients.ts), but the
+  // "Saved Clients" list from the server will come back empty and any
+  // save/delete will fail with a clear error toast rather than crash --
+  // that's the accepted tradeoff of restoring the old frontend without
+  // also restoring the old client_routes.py/controllers/dto/engine layer.
   const refreshAllClients = useCallback(() => {
     clientsApi.listClients().then((res) => setAllClients(res.items)).catch(() => {});
   }, []);
@@ -48,7 +64,7 @@ export default function App() {
     }
   }, []);
 
-  // Platform health and session pools, kept live by one poller and
+  // Platform readiness and session pools, kept live by one poller and
   // refreshed the instant any panel changes a session, see the hook for
   // why these two have to move together.
   const {
@@ -86,90 +102,14 @@ export default function App() {
     [clientId, refreshAllClients],
   );
 
-  // A finished sweep is the other moment session state changes on its own:
-  // a job that hit a login wall has just quarantined the session it was
-  // holding. Refreshing on finish shows that immediately rather than on
-  // whichever poll happens to come next.
-  const discoveryJobs = useJobPolling(refreshPlatformState);
-  const analysisJobs = useJobPolling(refreshPlatformState);
-
-  // Adopt jobs this browser session did not start.
-  //
-  // Watching a job is what turns on the live view: the results grid only
-  // polls for new rows while `discoveryRunning`/`analysisRunning` is true
-  // (ResultsGrid's "live preview polling" effect), and the progress and log
-  // panels read from the same place. Until now the ONLY thing that ever
-  // called watch() was the Clients page handing back the jobs it had just
-  // launched, so an analysis queued any other way was completely
-  // invisible here:
-  //
-  //   - validating a profile queues one server-side (profile_service.py
-  //     patch_profile / bulk_patch_profiles), which is the common case
-  //   - the round-robin engine queues them continuously
-  //   - the scheduler's catch-up sweep queues them
-  //
-  // For all of those the grid sat still while rows were being written
-  // behind it, and only caught up when something else happened to reload
-  // it, switching tabs and back, which changes `load`'s identity. Asking
-  // the server what is actually running for this client closes that gap at
-  // its source, and the log/progress panels light up for background work
-  // for the first time as a side effect.
-  //
-  // Refs, not effect dependencies, for the already-watched check: the hook
-  // returns a fresh `jobs` object every render, so depending on it would
-  // rebuild this interval constantly. `watch` is stable (useCallback).
-  const watchedDiscovery = useRef(discoveryJobs.jobs);
-  const watchedAnalysis = useRef(analysisJobs.jobs);
-  watchedDiscovery.current = discoveryJobs.jobs;
-  watchedAnalysis.current = analysisJobs.jobs;
-
-  const watchDiscovery = discoveryJobs.watch;
-  const watchAnalysis = analysisJobs.watch;
-
-  useEffect(() => {
-    if (!clientId) return;
-    let cancelled = false;
-
-    const adopt = async () => {
-      try {
-        const { items } = await jobsApi.jobs(clientId, 25);
-        if (cancelled) return;
-        // Only ACTIVE jobs. Re-watching one already being tracked would
-        // reset its event cursor and replay its log; adopting a finished
-        // one would fire a completion toast for something that ended
-        // before anyone was looking.
-        const fresh = items.filter(
-          (j) =>
-            ACTIVE_JOB_STATUSES.has(j.status) &&
-            !watchedDiscovery.current[j.id] &&
-            !watchedAnalysis.current[j.id],
-        );
-        const disc = fresh.filter((j) => j.kind === "discovery");
-        const analysis = fresh.filter((j) => j.kind !== "discovery");
-        if (disc.length) watchDiscovery(disc);
-        if (analysis.length) watchAnalysis(analysis);
-      } catch {
-        // transient, the next tick tries again
-      }
-    };
-
-    void adopt();
-    const tick = setInterval(adopt, 4000);
-    return () => {
-      cancelled = true;
-      clearInterval(tick);
-    };
-  }, [clientId, watchDiscovery, watchAnalysis]);
-
-  const activeJobsCount = useMemo(() => {
-    const isActive = (j: Job) => ACTIVE_JOB_STATUSES.has(j.status);
-    return (
-      Object.values(discoveryJobs.jobs).filter(isActive).length +
-      Object.values(analysisJobs.jobs).filter(isActive).length
-    );
-  }, [discoveryJobs.jobs, analysisJobs.jobs]);
-
-  const readySessionsCount = sessions.filter((s) => s.state === "ready").length;
+  // A finished sweep is the other moment session state changes on its
+  // own -- a job that hit a login wall has just quarantined the session
+  // it was holding. GET /discovery/jobs/{id} is a plain snapshot poll
+  // (no event log, that route group is gone), see the hook.
+  const discoveryPoll = useDiscoveryJobPoll(() => {
+    refreshPlatformState();
+    setRefreshKey((k) => k + 1);
+  });
 
   return (
     <AppLayout
@@ -181,8 +121,8 @@ export default function App() {
       allClients={allClients}
       onClient={onClient}
       onForgetClient={onForgetClient}
-      activeJobsCount={activeJobsCount}
-      readySessionsCount={readySessionsCount}
+      activeJobsCount={discoveryPoll.running ? 1 : 0}
+      readySessionsCount={sessions.filter((s) => s.state === "ready").length}
       platformCount={platforms.length}
       error={error || platformStateError}
       theme={theme}
@@ -195,19 +135,18 @@ export default function App() {
           platforms={platforms}
           onClient={onClient}
           onForgetClient={onForgetClient}
-          busy={discoveryJobs.running}
-          analysisBusy={analysisJobs.running}
-          onStopDiscovery={discoveryJobs.cancelAll}
-          onStopAnalysis={analysisJobs.cancelAll}
-          stoppingDiscovery={discoveryJobs.cancelling}
-          stoppingAnalysis={analysisJobs.cancelling}
-          onJobs={(jobs) => {
+          busy={discoveryPoll.running}
+          onStopDiscovery={discoveryPoll.cancel}
+          stoppingDiscovery={discoveryPoll.cancelling}
+          onDiscoveryStarted={(jobId) => {
             setError("");
-            const disc = jobs.filter((j) => j.kind === "discovery");
-            const analysis = jobs.filter((j) => j.kind !== "discovery");
-            if (disc.length) discoveryJobs.watch(disc);
-            if (analysis.length) analysisJobs.watch(analysis);
-            if (jobs.length) setPage("results");
+            discoveryPoll.watch(jobId);
+            setPage("results");
+          }}
+          onAnalyseStarted={(jobId) => {
+            setError("");
+            setResumeAnalysisJobId(jobId);
+            setPage("results");
           }}
           onError={setError}
         />
@@ -216,36 +155,34 @@ export default function App() {
       {page === "results" && (
         <LiveResultsView
           clientId={clientId}
+          clientName={clientName}
           platforms={platforms}
-          discoveryRunning={discoveryJobs.running}
-          discoveryLog={discoveryJobs.log}
-          discoveryProgress={discoveryJobs.platformProgress}
-          analysisRunning={analysisJobs.running}
-          analysisLog={analysisJobs.log}
-          analysisProgress={analysisJobs.platformProgress}
-          onStopDiscovery={discoveryJobs.cancelAll}
-          onStopAnalysis={analysisJobs.cancelAll}
-          stoppingDiscovery={discoveryJobs.cancelling}
-          stoppingAnalysis={analysisJobs.cancelling}
-          onError={setError}
+          job={discoveryPoll.job}
+          running={discoveryPoll.running}
+          cancelling={discoveryPoll.cancelling}
+          onCancel={discoveryPoll.cancel}
+          refreshKey={refreshKey}
+          resumeAnalysisJobId={resumeAnalysisJobId}
+          onAnalyseStarted={(jobId) => {
+            setError("");
+            setResumeAnalysisJobId(jobId);
+          }}
         />
       )}
 
-      {page === "quick-analysis" && <QuickAnalysisView />}
-
       {page === "admin" && <AdminPanel sessions={sessions} onChanged={refreshPlatformState} />}
-      <Toaster 
-        position="bottom-right" 
-        toastOptions={{ 
-          style: { 
-            background: 'rgba(16, 24, 40, 0.95)', 
-            color: '#fff', 
-            backdropFilter: 'blur(10px)',
-            border: '1px solid var(--border-subtle)',
-            fontSize: '13px',
-            fontFamily: 'var(--font-main)'
-          }
-        }} 
+      <Toaster
+        position="bottom-right"
+        toastOptions={{
+          style: {
+            background: "rgba(16, 24, 40, 0.95)",
+            color: "#fff",
+            backdropFilter: "blur(10px)",
+            border: "1px solid var(--border-subtle)",
+            fontSize: "13px",
+            fontFamily: "var(--font-main)",
+          },
+        }}
       />
     </AppLayout>
   );

@@ -37,7 +37,8 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from backend.shared.logging import get_logger
-from backend.platforms.facebook.discovery_engine import Hit
+from backend.shared.models.hit import Hit, hit_to_row
+from backend.shared.models.row import Row
 
 log = get_logger("youtube.api")
 
@@ -291,7 +292,7 @@ class Sweep:
 
     keyword: str
     tab: str = "channels"
-    hits: list[Hit] = field(default_factory=list)
+    hits: list[Row] = field(default_factory=list)
     pages: int = 0
     stopped: str = ""
     complete: bool = False
@@ -415,7 +416,13 @@ class Discovery:
         except Exception as e:
             out.stopped, out.error = "error", f"{type(e).__name__}: {e}"
         finally:
-            out.hits = list(by_id.values())
+            # search.list's snippet has no statistics/contentDetails part at
+            # all (that's channels.list, a different API resource analysis
+            # calls per approved channel) -- so there is nothing free to
+            # carry forward beyond name/avatar, already on Hit. See
+            # hit_to_row's docstring (facebook/discovery_engine.py) and the
+            # "One Pass or Two" research this redesign is based on.
+            out.hits = [hit_to_row(h) for h in by_id.values()]
             if self.a.max_results:
                 # Same bug class confirmed live on Twitter's identical
                 # pattern: the loop-break check above (`len(by_id) >=

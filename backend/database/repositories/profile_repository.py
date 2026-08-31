@@ -38,10 +38,21 @@ PHASE_DISCOVERY = "discovery"
 PHASE_ANALYSIS = "analysis"
 
 # fields discovery is allowed to write; everything else is analysis territory
+#
+# followers/friends/location/bio/created_at were added alongside the
+# discovery/analysis engine rebuild ("One Pass or Two" research): Twitter's
+# SearchTimeline response and Telegram's plain SearchRequest result already
+# carry these fields, parsed and then discarded before this change (see
+# twitter/discovery_engine.py::user_to_row and
+# telegram/discovery_engine.py::entity_to_row) -- without them here, save()'s
+# field-scoped `$set` (owned = DISCOVERY_FIELDS for a discovery-phase write,
+# below) would silently drop values discovery now legitimately has. They
+# remain in ANALYSIS_FIELDS too: the same document field either phase can
+# populate, whichever ran most recently and actually had a value.
 DISCOVERY_FIELDS = (
     "entity_id", "username", "display_name", "entity_type",
     "discovery_source", "profile_image_url", "has_logo", "verified", "name_score",
-    "name_exact_run",
+    "name_exact_run", "followers", "friends", "location", "bio", "created_at",
 )
 
 # NOTE: `entity_id` is deliberately NOT here. It is the dedup key, and
@@ -338,6 +349,20 @@ async def save(
     bounded by `_COMPLETENESS_PASSES`; this counter bounds the job, so
     only the job's final word on a URL spends from it.
     """
+    # ANALYSIS RESULTS ARE MEMORY-ONLY -- enforced here, at the one write
+    # boundary, rather than left as a convention every future caller has to
+    # remember. Analysis output belongs in shared/analysis_store.py; only
+    # discovery persists (see that module's docstring for the full split
+    # and what memory-only costs). Raising is deliberate: a silent no-op
+    # would look exactly like a successful save to the caller, and the
+    # result would be gone with nothing to explain where.
+    if phase == PHASE_ANALYSIS:
+        raise ValidationError(
+            "analysis results are memory-only and must not be persisted -- "
+            "use backend/shared/analysis_store.py::analysis_store.put(); "
+            "profile_repository.save() accepts discovery writes only"
+        )
+
     coll = db()[PROFILES]
     eid = (entity_id or "").strip()
 

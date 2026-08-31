@@ -1070,9 +1070,9 @@ export function DownloadIcon({ size = 16, color = "currentColor", className, sty
 }
 
 /**
- * Custom Quick Analysis Lightning / Sparkle Nav Icon
+ * Custom Analysis Lightning / Sparkle Nav Icon
  */
-export function QuickAnalysisNavIcon({ size = 16, color = "currentColor", className, style }: IconProps) {
+export function AnalysisNavIcon({ size = 16, color = "currentColor", className, style }: IconProps) {
   return (
     <svg
       width={size}

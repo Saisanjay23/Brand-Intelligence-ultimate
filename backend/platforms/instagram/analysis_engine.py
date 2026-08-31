@@ -67,6 +67,7 @@ from typing import Optional
 from urllib.parse import quote, urlparse
 
 from backend.shared.models.row import Row
+from backend.platforms.scan_options import captures_screenshot
 from backend.shared.text import (MONTHS, name_score,
                                    normalized_host, parse_count,
                                    parse_normalized_url)
@@ -161,7 +162,7 @@ class Scraper:
         self.session = InstagramSession(
             args,
             cookies,
-            load_images=bool(self.evidence),
+            load_images=captures_screenshot(args),
             session_id=session_id,
             proxy=proxy,
         )
@@ -569,9 +570,24 @@ class Scraper:
 
     # ───────────────────────────── per URL ────────────────────────────── #
 
-    async def process(self, raw_url: str, target: str, feed: str) -> Row:
+    async def process(
+        self, raw_url: str, target: str, feed: str, known: Optional[dict] = None,
+    ) -> Row:
         """One profile URL, start to finish -- the counterpart to
         facebook/analysis_engine.py's Scraper.process().
+
+        `known`, when given (only a profile sent here via "Analyse
+        Validated Profiles" carries one -- see analysis/runner.py's
+        `seed_by_url`), pre-fills `row.location`/`row.created_iso` before
+        step 6 below. Every OTHER field still comes from this visit's own
+        `fetch_via_api()`/interception/DOM chain regardless of what
+        discovery had, since they all land in the SAME payload that a
+        status/screenshot/last-post read needs this visit to make anyway
+        -- skipping them would save nothing. Location and join date are
+        different: both come only from the About-this-account panel, a
+        separate click-driven visit (step 6), so pre-filling them from
+        `known` lets that visit be skipped entirely when discovery already
+        has both.
 
         WHAT IT RETURNS: a scored `Row`, status OK/PARTIAL/GONE/ERROR/
         CHECKPOINT/LOGIN_REQUIRED, every field tagged with `row.mark()`.
@@ -600,6 +616,13 @@ class Scraper:
         url = normalize_url(raw_url)
         row = Row(url=url, target=target, original_feed=feed)
         row.profile_id = username_of(url)
+        if known:
+            if known.get("location"):
+                row.location = known["location"]
+                row.mark("location", "discovery")
+            if known.get("created_at"):
+                row.created_iso = known["created_at"]
+                row.mark("created", "discovery")
 
         # Try the direct API call first (see fetch_via_api's docstring),
         # independent of the page visit below, so it costs nothing extra
@@ -942,12 +965,12 @@ class Scraper:
 
     # ─────────────────────────── orchestration ────────────────────────── #
 
-    async def one(self, u: str, tgt: str, feed: str) -> Row:
+    async def one(self, u: str, tgt: str, feed: str, known: Optional[dict] = None) -> Row:
         """process() with a failed profile turned into a reportable ERROR
         row instead of raising -- so one bad URL never crashes the whole
         batch `run()`/`run_parallel()` is driving."""
         try:
-            return await self.process(u, tgt, feed)
+            return await self.process(u, tgt, feed, known)
         except Exception as e:
             row = Row(url=normalize_url(u), target=tgt, original_feed=feed)
             row.profile_id = username_of(row.url)

@@ -27,6 +27,31 @@ class ScanOptions:
     keep_going: bool = False  # continue past a checkpoint
 
 
+def captures_screenshot(args) -> bool:
+    """Will this run take an evidence screenshot at all?
+
+    True for BOTH ways of capturing one: persisted to GridFS (`evidence`)
+    or held in memory (`ephemeral_screenshot`). Every browser platform's
+    Scraper uses this to decide whether images may load, and it must cover
+    both -- the stealth session blocks images by default (see
+    stealth/browser.py), so a capture taken with them blocked is a
+    screenshot of black boxes, which is worthless as evidence of what a
+    profile actually looked like.
+
+    This checked `evidence` alone until the analysis tool moved to
+    memory-only results: it passes `evidence=None` precisely so nothing
+    reaches GridFS, and every screenshot it took came back with the avatar
+    and page imagery blacked out.
+
+    Reads via getattr because adapters are documented as taking a
+    "ScanOptions-shaped object", not necessarily a ScanOptions.
+    """
+    return bool(
+        getattr(args, "evidence", None)
+        or getattr(args, "ephemeral_screenshot", False)
+    )
+
+
 @dataclass
 class DiscoveryOptions:
     """Separate from ScanOptions because the two phases tune against

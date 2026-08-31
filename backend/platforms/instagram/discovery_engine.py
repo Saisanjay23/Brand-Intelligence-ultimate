@@ -25,9 +25,9 @@ from typing import Any, Iterator, Optional
 from urllib.parse import quote
 
 from backend.shared.extraction import ExtractionResult, run_strategies
+from backend.shared.models.row import Row
 from backend.shared.text import iter_dicts
 from backend.stealth.browser import Session
-from backend.platforms.facebook.discovery_engine import Hit
 
 # Session / login state
 
@@ -182,6 +182,38 @@ class InstagramUser:
         return bool(self.avatar) and not any(
             h in self.avatar for h in DEFAULT_PIC_HINTS
         )
+
+
+def user_to_row(u: "InstagramUser", keyword: str, *, source: str = "api") -> Row:
+    """An `InstagramUser` -> the shared `Row` record `Sweep.hits` now
+    carries. `user_from_node()` is a GENERIC node parser -- the same
+    function reads a search-result node here and a full profile-info node
+    in analysis_engine.py's `fetch_via_api()` -- so this carries forward
+    whatever the search response actually populated: usually just name/
+    avatar/verified today (the mobile-search and web-topsearch endpoints
+    are thinner than the profile-info payload), but never less than that,
+    and richer if a future search response happens to embed more.
+
+    Deliberately does NOT call the profile-info endpoint here to backfill
+    followers/bio/location during discovery -- that's the trap the "One
+    Pass or Two" research flagged: it's a per-profile cost, and discovery
+    routinely surfaces far more candidates than an analyst approves.
+    That fetch stays scoped to analysis's existing per-approved-candidate
+    flow. `row.target` is seeded from the raw search term (`keyword`); a
+    caller that resolves keyword-plan parents should overwrite it.
+    """
+    row = Row(
+        url=u.url, target=keyword, entity_type="profile",
+        profile_id=u.entity_id or u.username, profile_name=u.full_name or u.username,
+        profile_pic_url=u.avatar, has_custom_pic=u.has_custom_pic, verified=u.verified,
+        followers=u.followers, friends=u.following, bio=u.biography, location=u.city_name,
+    )
+    for f in ("profile_name", "profile_pic_url", "verified"):
+        row.mark(f, f"discovery-search:{source}")
+    for f in ("followers", "friends", "bio", "location"):
+        if getattr(row, f) not in (None, ""):
+            row.mark(f, f"discovery-search:{source}")
+    return row
 
 
 def _count(node: Any, *keys: str) -> Optional[int]:
@@ -521,7 +553,7 @@ class Sweep:
 
     keyword: str
     tab: str = "people"
-    hits: list[Hit] = field(default_factory=list)
+    hits: list[Row] = field(default_factory=list)
     users: list[InstagramUser] = field(default_factory=list)
     pages: int = 0
     stopped: str = ""
@@ -676,20 +708,8 @@ class Discovery:
                 out.stopped = "mobile-api-failed-web-recovered"
 
             out.hits = [
-                Hit(
-                    entity_id=u.entity_id or u.username,
-                    name=u.full_name or u.username,
-                    url=u.url,
-                    avatar=u.avatar,
-                    has_custom_pic=u.has_custom_pic,
-                    verified=u.verified,
-                    entity_type="profile",
-                    keyword=keyword,
-                    tab=tab,
-                    rank=i,
-                    source=out.source,
-                )
-                for i, u in enumerate(out.users)
+                user_to_row(u, keyword, source=out.source)
+                for u in out.users
                 if u.url
             ]
             if self.a.max_results:

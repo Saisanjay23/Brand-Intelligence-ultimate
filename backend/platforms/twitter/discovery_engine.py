@@ -30,9 +30,9 @@ from typing import Any, Iterator, Optional
 from urllib.parse import quote
 
 from backend.shared.extraction import ExtractionResult, run_strategies
+from backend.shared.models.row import Row
 from backend.shared.text import iter_dicts
 from backend.stealth.browser import Session
-from backend.platforms.facebook.discovery_engine import Hit
 
 # Session / login state
 
@@ -176,6 +176,41 @@ class TwitterUser:
         """Is `avatar` a real upload, not X's own default egg avatar (see
         RE_DEFAULT_PIC above)."""
         return bool(self.avatar) and not RE_DEFAULT_PIC.search(self.avatar)
+
+
+def user_to_row(u: "TwitterUser", keyword: str, *, source: str = "graphql") -> Row:
+    """A `TwitterUser` -> the shared `Row` record `Sweep.hits` now carries.
+
+    `_user_from_result()` above already parses followers/following/bio/
+    location/verified/avatar/name/join-date straight out of the
+    SearchTimeline response -- the exact same fields and the exact same
+    parser `analysis_engine.py` uses for its own UserByScreenName visit
+    (see this module's docstring: "produced here first and re-used by
+    analysis_engine.py"). Carrying them onto `Row` here means analysis no
+    longer has to re-derive any of them; it only has to fetch
+    `last_post_iso` (needs the tweets-timeline query, which only fires on
+    a real profile visit) and, when `location` is still blank, the
+    `/about` panel. See the "One Pass or Two" research this is based on.
+
+    `row.target` is seeded from the raw search term (`keyword`); a caller
+    that resolves keyword-plan parents should overwrite it before scoring.
+    """
+    row = Row(
+        url=u.url, target=keyword, entity_type="profile",
+        profile_id=u.entity_id, profile_name=u.name,
+        profile_pic_url=u.avatar, has_custom_pic=u.has_custom_pic,
+        verified=u.verified, followers=u.followers, friends=u.following,
+        bio=u.description, location=u.location, created_iso=u.created_iso,
+    )
+    always = ("profile_name", "profile_pic_url", "verified")
+    # the DOM fallback (see dom_users below) carries none of the extra
+    # fields -- only mark what this particular extraction tier actually
+    # populated, so a caller can tell "known from search" apart from
+    # "never captured" instead of trusting a blank value's absence alone.
+    rich = () if source == "dom" else ("followers", "friends", "bio", "location", "created_iso")
+    for f in always + rich:
+        row.mark(f, f"discovery-search:{source}")
+    return row
 
 
 # DOM fallback
@@ -589,7 +624,7 @@ class Sweep:
 
     keyword: str
     tab: str = "people"
-    hits: list[Hit] = field(default_factory=list)
+    hits: list[Row] = field(default_factory=list)
     users: list[TwitterUser] = field(default_factory=list)
     pages: int = 0
     stopped: str = ""
@@ -598,7 +633,7 @@ class Sweep:
     error: str = ""
     # which extraction method actually produced `users`, "graphql" normally,
     # "dom" when the network payload yielded nothing and the rendered feed
-    # had to stand in. Carried onto each Hit so a card can say where it came
+    # had to stand in. Carried onto each Row so a card can say where it came
     # from rather than implying every field was equally well sourced.
     source: str = "graphql"
     # the full blame trail (see shared/extraction.py) when any strategy
@@ -780,20 +815,8 @@ class Discovery:
                 out.source = "dom"
 
             out.hits = [
-                Hit(
-                    entity_id=u.entity_id,
-                    name=u.name,
-                    url=u.url,
-                    avatar=u.avatar,
-                    has_custom_pic=u.has_custom_pic,
-                    verified=u.verified,
-                    entity_type="profile",
-                    keyword=keyword,
-                    tab=tab,
-                    rank=i,
-                    source=out.source,
-                )
-                for i, u in enumerate(out.users)
+                user_to_row(u, keyword, source=out.source)
+                for u in out.users
                 if u.url
             ]
             if self.a.max_results:

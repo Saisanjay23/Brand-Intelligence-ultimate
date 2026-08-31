@@ -67,9 +67,9 @@ from urllib.parse import quote
 from backend.config.settings import settings
 from backend.shared.extraction import ExtractionResult, run_strategies
 from backend.shared.logging import get_logger
+from backend.shared.models.row import Row
 from backend.shared.text import iter_dicts
 from backend.stealth.browser import Session
-from backend.platforms.facebook.discovery_engine import Hit
 
 log = get_logger("tiktok")
 
@@ -204,6 +204,36 @@ class TikTokUser:
         rather than serving a known stock URL, so presence IS the signal.
         That is why this platform needs no RE_DEFAULT_PIC equivalent."""
         return bool(self.avatar)
+
+
+def user_to_row(u: "TikTokUser", keyword: str, *, source: str = "search") -> Row:
+    """A `TikTokUser` -> the shared `Row` record `Sweep.hits` now carries.
+
+    `user_from_node()` already parses follower_count/bio/verified/avatar
+    straight out of TikTok's own search response -- the same fields
+    `analysis_engine.py::Scraper.fill` copies onto a Row after a second
+    visit. Carrying them here means analysis no longer starts from a blank
+    Row for a field this sweep already read. `heart_count` (total likes
+    across every video, TikTok's own reach figure) rides along as
+    `friends` for lack of a more specific slot -- TikTok has no
+    following-count analogue worth a field of its own.
+
+    `row.target` is seeded from the raw search term (`keyword`); a caller
+    that resolves keyword-plan parents should overwrite it before scoring.
+    """
+    row = Row(
+        url=u.url, target=keyword, entity_type="profile",
+        profile_id=u.entity_id or u.username, profile_name=u.nickname or u.username,
+        profile_pic_url=u.avatar, has_custom_pic=u.has_custom_pic,
+        verified=u.verified, followers=u.follower_count, friends=u.heart_count,
+        bio=u.bio,
+    )
+    for f in ("profile_name", "profile_pic_url", "verified"):
+        row.mark(f, f"discovery-search:{source}")
+    for f in ("followers", "friends", "bio"):
+        if getattr(row, f) not in (None, ""):
+            row.mark(f, f"discovery-search:{source}")
+    return row
 
 
 def _avatar_url(*candidates: Any) -> str:
@@ -1051,7 +1081,7 @@ class Sweep:
 
     keyword: str
     tab: str = "people"
-    hits: list[Hit] = field(default_factory=list)
+    hits: list[Row] = field(default_factory=list)
     users: list[TikTokUser] = field(default_factory=list)
     pages: int = 0
     stopped: str = ""  # exhausted | stalled | cap:* | error
@@ -1115,8 +1145,8 @@ class Discovery:
         The viewer's own handle is removed: every rendered TikTok page
         embeds the logged-in account, and without that filter the
         session's own profile was collected as an impersonator of every
-        keyword on every sweep (see viewer_username). LINKED TO: Hit is
-        facebook/discovery_engine.py's shared dataclass; iter_users and
+        keyword on every sweep (see viewer_username). LINKED TO:
+        `user_to_row` builds the shared Row; iter_users and
         parse_lines above do the payload work."""
         out = Sweep(keyword=keyword, tab=tab)
         started = time.time()
@@ -1256,26 +1286,17 @@ class Discovery:
             users = [u for u in users if u.username.lower() != viewer]
             out.users = sorted(users, key=lambda u: u.match_kind != "account")
 
+            # "search:account" == TikTok returned this as a name match for
+            # the keyword; "search:author" == it merely posted a video the
+            # keyword matched. Stored as the profile's discovery_source so
+            # the difference survives into triage instead of being
+            # flattened away.
             out.hits = [
-                Hit(
-                    entity_id=u.entity_id or u.username,
-                    name=u.nickname or u.username,
-                    url=u.url,
-                    avatar=u.avatar,
-                    has_custom_pic=u.has_custom_pic,
-                    verified=u.verified,
-                    entity_type="profile",
-                    keyword=keyword,
-                    tab=tab,
-                    rank=i,
-                    # "search:account" == TikTok returned this as a name
-                    # match for the keyword; "search:author" == it merely
-                    # posted a video the keyword matched. Stored as the
-                    # profile's discovery_source so the difference survives
-                    # into triage instead of being flattened away.
+                user_to_row(
+                    u, keyword,
                     source=out.source if out.source == "dom" else f"search:{u.match_kind}",
                 )
-                for i, u in enumerate(out.users)
+                for u in out.users
                 if u.url
             ]
             # TikTok's Users tab, which this Top-tab sweep structurally
@@ -1321,20 +1342,11 @@ class Discovery:
         names = {u.username.lower() for u in found}
         out.users = found + [u for u in out.users if u.username.lower() not in names]
         out.hits = [
-            Hit(
-                entity_id=u.entity_id or u.username,
-                name=u.nickname or u.username,
-                url=u.url,
-                avatar=u.avatar,
-                has_custom_pic=u.has_custom_pic,
-                verified=u.verified,
-                entity_type="profile",
-                keyword=out.keyword,
-                tab=out.tab,
-                rank=i,
+            user_to_row(
+                u, out.keyword,
                 source=out.source if out.source == "dom" else f"search:{u.match_kind}",
             )
-            for i, u in enumerate(out.users)
+            for u in out.users
             if u.url
         ]
 

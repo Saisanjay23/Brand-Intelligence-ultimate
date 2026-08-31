@@ -39,7 +39,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from backend.shared.logging import get_logger
-from backend.platforms.facebook.discovery_engine import Hit
+from backend.shared.models.row import Row
 
 log = get_logger("telegram")
 
@@ -150,6 +150,35 @@ class TelegramEntity:
         if self.username:
             return f"https://t.me/{self.username}"
         return f"https://t.me/c/{self.entity_id}" if self.entity_id else ""
+
+
+def entity_to_row(e: "TelegramEntity", keyword: str) -> Row:
+    """A `TelegramEntity` -> the shared `Row` record `Sweep.hits` now
+    carries. `entity_from()` above already reads title/members/creation
+    date/verified-scam-restricted-fake-premium/photo straight off the
+    plain `contacts.SearchRequest` result object -- the same fields, and
+    the same avatar bytes (already downloaded via
+    `download_profile_photo()`), analysis would otherwise fetch again from
+    scratch. Only `about` and last-message date genuinely need the
+    heavier `GetFullChannelRequest`/`GetFullUserRequest` + `get_messages()`
+    calls analysis still makes. See the "One Pass or Two" research this is
+    based on. `row.target` is seeded from the raw search term (`keyword`);
+    a caller that resolves keyword-plan parents should overwrite it."""
+    row = Row(
+        url=e.url, target=keyword, entity_type=e.kind,
+        profile_id=e.entity_id, profile_name=e.title,
+        profile_pic_url=e.avatar, has_custom_pic=e.has_photo,
+        verified=e.verified, followers=e.members, created_iso=e.created_iso,
+    )
+    for f in ("profile_name", "profile_pic_url", "has_custom_pic", "verified", "followers", "created_iso"):
+        row.mark(f, "discovery-search:mtproto")
+    if e.scam:
+        row.note("Telegram flags this account as scam")
+    if e.fake:
+        row.note("Telegram flags this account as fake")
+    if e.restricted:
+        row.note("Telegram flags this account as restricted")
+    return row
 
 
 def _iso(value: Any) -> str:
@@ -319,7 +348,11 @@ class Telegram:
         return out
 
     async def resolve(self, username: str) -> Optional[TelegramEntity]:
-        """@name -> entity, with the detail that needs a second call filled in."""
+        """@name -> entity, with the detail that needs a second call filled
+        in. Used only by the analysis pass, which is independent of
+        discovery by design: everything here is re-read over MTProto for
+        this run, including the profile photo, rather than reusing
+        anything a discovery sweep may already have fetched."""
         try:
             obj = await self.client.get_entity(username)
         except (UsernameInvalidError, UsernameNotOccupiedError, ValueError):
@@ -395,7 +428,7 @@ class Sweep:
 
     keyword: str
     tab: str = "all"
-    hits: list[Hit] = field(default_factory=list)
+    hits: list[Row] = field(default_factory=list)
     pages: int = 0
     stopped: str = ""
     complete: bool = False
@@ -485,22 +518,7 @@ class Discovery:
             await self._ensure_connected()
             found = await self.tg.search(keyword, SEARCH_LIMIT)
             out.pages = 1
-            out.hits = [
-                Hit(
-                    entity_id=e.entity_id or e.username,
-                    name=e.title,
-                    url=e.url,
-                    avatar=e.avatar,
-                    has_custom_pic=e.has_photo,
-                    entity_type=e.kind,
-                    keyword=keyword,
-                    tab=e.kind,
-                    rank=i,
-                    source="mtproto",
-                )
-                for i, e in enumerate(found)
-                if e.url
-            ]
+            out.hits = [entity_to_row(e, keyword) for e in found if e.url]
             if self.a.max_results:
                 out.hits = out.hits[: self.a.max_results]
             out.stopped, out.complete = "exhausted", True

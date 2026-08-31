@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
+from typing import Optional
+
 from backend.shared.models.row import Row
 from backend.shared.text import (name_score, normalized_host,
                                    parse_normalized_url)
@@ -115,7 +117,9 @@ class Scraper:
 
     # ───────────────────────────── per URL ────────────────────────────── #
 
-    async def process(self, raw_url: str, target: str, feed: str) -> Row:
+    async def process(
+        self, raw_url: str, target: str, feed: str, known: Optional[dict] = None,
+    ) -> Row:
         """WHAT: one t.me URL -> a scored Row. HOW: normalize the URL, pull
         the @username out of it, resolve that username to an entity over
         MTProto, then hand the entity to fill() for the field-by-field
@@ -123,6 +127,18 @@ class Scraper:
         (ERROR -- a private t.me/joinchat link carries no resolvable
         identity, so retrying cannot help), no such entity (GONE -- the
         terminal state, the account is deleted or banned), or a reading.
+
+        `known` (whatever discovery already read for this URL, see
+        analysis/runner.py's `seed_by_url`) is accepted for interface
+        consistency with the other platforms' `one()`/`process()`, but
+        unlike Twitter's About-panel there is nothing here to skip:
+        `resolve()` below is ONE MTProto call that returns every field this
+        engine reads in one shot (members, created date, avatar, last post,
+        verified/scam flags) -- there is no separate per-field fetch a
+        known value could let this profile skip. Runner.py's own
+        `_populate` fallback already covers "discovery had it, this call
+        somehow didn't" for whichever fields apply.
+
         LINKED TO: called by one() below, which wraps it in the error
         handling; resolve() is discovery_engine.py::Telegram.resolve."""
         url = normalize_url(raw_url)
@@ -195,17 +211,15 @@ class Scraper:
 
     # ─────────────────────────── orchestration ────────────────────────── #
 
-    async def one(self, u: str, tgt: str, feed: str) -> Row:
+    async def one(self, u: str, tgt: str, feed: str, known: Optional[dict] = None) -> Row:
         """WHAT: process() that never raises -- always a Row, whatever
         happened. HOW: FloodWait becomes CHECKPOINT, which is the status
-        the run loop and services/analysis_service.py both treat as "stop
-        the wave, the account is at risk", the same handling a browser
-        platform's login challenge gets. Anything else becomes ERROR with
-        the exception on the row, so one unreachable channel cannot end a
-        job. LINKED TO: called by run(); the CHECKPOINT contract is read
-        in analysis_service.py, which burns the session on it."""
+        the run loop treats as "stop the wave, the account is at risk",
+        the same handling a browser platform's login challenge gets.
+        Anything else becomes ERROR with the exception on the row, so one
+        unreachable channel cannot end a job."""
         try:
-            return await self.process(u, tgt, feed)
+            return await self.process(u, tgt, feed, known)
         except FloodWait as e:
             row = Row(url=normalize_url(u), target=tgt, original_feed=feed)
             row.profile_id = username_of(row.url)

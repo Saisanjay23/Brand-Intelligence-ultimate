@@ -1,10 +1,8 @@
 import { useCallback, useEffect, useMemo, useState, Fragment } from "react";
 import { toast } from "react-hot-toast";
-import { analysisApi } from "../api/analysisApi";
 import { clientsApi } from "../api/clientsApi";
 import { discoveryApi } from "../api/discoveryApi";
-import { jobsApi } from "../api/jobsApi";
-import type { Client, Job, KeywordGroup, PlatformHealth } from "../api/types";
+import type { Client, KeywordGroup, PlatformState } from "../api/types";
 import {
   mergeGeneratedChildren,
   parseBulkKeywordGroups,
@@ -13,6 +11,8 @@ import {
 import { PlatformIcon } from "../components/PlatformIcon";
 import { GlobalSearchModal } from "../components/GlobalSearchModal";
 import { confirmAction } from "../utils/confirmAction";
+import { saveClientKeywords } from "../services/clientKeywords";
+import { listSavedClients, saveClientLocally, deleteClientLocally } from "../services/savedClients";
 import {
   DiscoverIcon,
   AnalyseIcon,
@@ -36,7 +36,7 @@ import {
   LayersIcon,
 } from "../components/AppIcons";
 
-type KeywordTab = "names" | "domain" | "assetNames";
+type KeywordTab = "names" | "domain";
 type Mode = "select" | "create";
 type WorkspaceTab = "overview" | "keywords" | "limits" | "settings";
 
@@ -46,16 +46,24 @@ type FacebookTabLimits = Record<FacebookTab, { individual: string; domain: strin
 interface Props {
   clientId: string;
   clientName: string;
-  platforms: PlatformHealth[];
+  platforms: PlatformState[];
   onClient: (clientId: string, name: string) => void;
   onForgetClient: (clientId: string) => void;
   busy: boolean;
-  analysisBusy: boolean;
   onStopDiscovery?: () => void;
-  onStopAnalysis?: () => void;
   stoppingDiscovery?: boolean;
-  stoppingAnalysis?: boolean;
-  onJobs: (jobs: Job[]) => void;
+  // Discovery still runs as a trackable job (see useDiscoveryJobPoll) --
+  // this just hands the new job's id to whoever's watching it (App.tsx),
+  // no jobsApi.job()/event-log fetch first, the poller reads its own
+  // snapshot.
+  onDiscoveryStarted: (jobId: string) => void;
+  // "Run Analysis" no longer re-scrapes a client's own profile rows in
+  // place (there is no such concept any more -- analysis is independent,
+  // memory-only, URL-driven). It analyses this client's currently
+  // VALIDATED discovery profiles instead (same action as Live Results'
+  // "Analyse Validated Profiles"), which starts an ordinary analysis job
+  // this hands off to the Analysis tab to watch.
+  onAnalyseStarted: (jobId: string) => void;
   onError: (m: string) => void;
 }
 
@@ -81,12 +89,19 @@ function dedupeKeywordsCaseInsensitive(keywords: string[]): string[] {
 function ChipInput({
   chips,
   onAdd,
+  onAddMany,
   onRemove,
   placeholder,
   disabled,
 }: {
   chips: string[];
   onAdd: (v: string) => void;
+  // Adding several at once (paste, bulk import) needs ONE state update
+  // carrying the whole batch, not N calls to onAdd -- see addMany's own
+  // comment for why. Optional so a caller with nothing better falls back
+  // to looping onAdd (still correct for a caller whose onAdd doesn't close
+  // over a stale array, just not what this component's own two callers do).
+  onAddMany?: (values: string[]) => void;
   onRemove: (i: number) => void;
   placeholder: string;
   disabled?: boolean;
@@ -107,21 +122,38 @@ function ChipInput({
     }
   };
 
-  const commitBulk = () => {
-    let dupCount = 0;
-    const items = splitKeywordList(bulkText);
+  // Dedupes the whole batch in ONE pass against `chips` (this render's
+  // value, read once) and against each other, then commits it in ONE call.
+  // NOT "call onAdd() once per item in a loop": every real onAdd()
+  // implementation here is `(v) => onChange([...chips, v])`, closing over
+  // the SAME `chips` from this render -- N synchronous calls each compute
+  // "current chips + one new item" from that identical stale array, and
+  // since React batches these into one re-render, only the LAST call's
+  // result survives. A paste of 4 terms silently kept just the last one.
+  const addMany = (items: string[]) => {
     const seen = new Set(chips.map((c) => c.toLowerCase()));
+    const fresh: string[] = [];
+    let dupCount = 0;
     for (const kw of items) {
-      if (seen.has(kw.toLowerCase())) {
+      const key = kw.toLowerCase();
+      if (seen.has(key)) {
         dupCount++;
       } else {
-        seen.add(kw.toLowerCase());
-        onAdd(kw);
+        seen.add(key);
+        fresh.push(kw);
       }
+    }
+    if (fresh.length) {
+      if (onAddMany) onAddMany(fresh);
+      else fresh.forEach(onAdd);
     }
     if (dupCount > 0) {
       toast(`⚠️ Skipped ${dupCount} duplicate keyword${dupCount === 1 ? "" : "s"}`);
     }
+  };
+
+  const commitBulk = () => {
+    addMany(splitKeywordList(bulkText));
     setBulkText("");
     setBulkOpen(false);
   };
@@ -150,20 +182,7 @@ function ChipInput({
             const text = e.clipboardData.getData("text");
             if (/[,\n]/.test(text)) {
               e.preventDefault();
-              const items = splitKeywordList(text);
-              const seen = new Set(chips.map((c) => c.toLowerCase()));
-              let dupCount = 0;
-              for (const kw of items) {
-                if (seen.has(kw.toLowerCase())) {
-                  dupCount++;
-                } else {
-                  seen.add(kw.toLowerCase());
-                  onAdd(kw);
-                }
-              }
-              if (dupCount > 0) {
-                toast(`⚠️ Skipped ${dupCount} duplicate keyword${dupCount === 1 ? "" : "s"}`);
-              }
+              addMany(splitKeywordList(text));
             }
           }}
           onBlur={commit}
@@ -215,288 +234,245 @@ function ChipInput({
   );
 }
 
-/** Domain Asset Names input: a platform picker + text input that stores
- *  entries as `"platform::AssetName"`. Chips render with a platform badge.
- *  "All Platforms" stores without a prefix (legacy-compatible). */
-function DomainAssetPlatformInput({
-  chips,
-  onAdd,
-  onRemove,
-  platforms,
-  disabled,
-}: {
-  chips: string[];
-  onAdd: (v: string) => void;
-  onRemove: (i: number) => void;
-  platforms: PlatformHealth[];
-  disabled?: boolean;
-}) {
-  const [input, setInput] = useState("");
-  const [selectedPlatform, setSelectedPlatform] = useState("");
-  const [bulkOpen, setBulkOpen] = useState(false);
-  const [bulkText, setBulkText] = useState("");
 
-  const platformNames: Record<string, string> = useMemo(() => {
-    const map: Record<string, string> = {};
-    for (const p of platforms) map[p.platform] = p.name;
-    return map;
-  }, [platforms]);
+// ── Rule-based keyword generator ──────────────────────────────────
+// Instead of picking individual permutations from a 100+ item flat list,
+// the analyst checks RULE CATEGORIES ("Prefix Impersonation", "Scam Lures",
+// etc.) and the system generates all matching terms at once. The output
+// format (parent → children[]) is identical to what the old modal produced,
+// so mergeGeneratedChildren and the backend need zero changes.
 
-  const encode = (name: string): string => {
-    if (!selectedPlatform) return name; // all platforms
-    return `${selectedPlatform}::${name}`;
-  };
-
-  const isDuplicate = (encoded: string): boolean =>
-    chips.some((c) => c.toLowerCase() === encoded.toLowerCase());
-
-  const commit = () => {
-    const trimmed = input.trim();
-    if (trimmed) {
-      const encoded = encode(trimmed);
-      if (isDuplicate(encoded)) {
-        toast(`⚠️ "${trimmed}" already exists for this platform`, { id: `dup-da-${encoded.toLowerCase()}` });
-      } else {
-        onAdd(encoded);
-      }
-      setInput("");
-    }
-  };
-
-  const commitBulk = () => {
-    let dupCount = 0;
-    const items = splitKeywordList(bulkText);
-    const seen = new Set(chips.map((c) => c.toLowerCase()));
-    for (const kw of items) {
-      const encoded = encode(kw);
-      if (seen.has(encoded.toLowerCase())) {
-        dupCount++;
-      } else {
-        seen.add(encoded.toLowerCase());
-        onAdd(encoded);
-      }
-    }
-    if (dupCount > 0) {
-      toast(`⚠️ Skipped ${dupCount} duplicate${dupCount === 1 ? "" : "s"}`);
-    }
-    setBulkText("");
-    setBulkOpen(false);
-  };
-
-  return (
-    <div>
-      <div className="chips-input-container" style={{ minHeight: "60px", alignItems: "center", alignContent: "flex-start" }}>
-        {chips.map((raw, i) => {
-          const { platform, name } = parseDomainAssetEntry(raw);
-          return (
-            <span key={i} className="kw-chip" style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
-              {platform && (
-                <span style={{
-                  background: "var(--purple)", color: "#fff",
-                  borderRadius: "3px", padding: "1px 5px", fontSize: "9.5px",
-                  fontWeight: 600, letterSpacing: "0.3px", textTransform: "uppercase",
-                  lineHeight: "14px", flexShrink: 0,
-                }}>
-                  {platformNames[platform] || platform}
-                </span>
-              )}
-              {name}
-              <span className="remove-chip" onClick={() => onRemove(i)}>✕</span>
-            </span>
-          );
-        })}
-        
-        <div style={{ display: "flex", flex: 1, minWidth: "250px", alignItems: "center" }}>
-          <select
-            value={selectedPlatform}
-            onChange={(e) => setSelectedPlatform(e.target.value)}
-            disabled={disabled}
-            style={{
-              background: "transparent", color: selectedPlatform ? "var(--purple)" : "var(--text-dim)",
-              border: "none", outline: "none", fontSize: "13px", fontWeight: selectedPlatform ? 600 : 400,
-              cursor: "pointer", padding: "4px 2px", marginRight: "6px", fontFamily: "inherit"
-            }}
-            title="Select platform to tag this asset name with"
-          >
-            <option style={{ background: "var(--bg-surface)", color: "var(--text-main)", fontWeight: "normal" }} value="">
-              [All Platforms]
-            </option>
-            {platforms.map((p) => (
-              <option style={{ background: "var(--bg-surface)", color: "var(--text-main)", fontWeight: "normal" }} key={p.platform} value={p.platform}>
-                [{p.name}]
-              </option>
-            ))}
-          </select>
-          <input
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" || e.key === ",") {
-                e.preventDefault();
-                commit();
-              }
-            }}
-            onPaste={(e) => {
-              const text = e.clipboardData.getData("text");
-              if (/[,\n]/.test(text)) {
-                e.preventDefault();
-                const items = splitKeywordList(text);
-                const seen = new Set(chips.map((c) => c.toLowerCase()));
-                let dupCount = 0;
-                for (const kw of items) {
-                  const encoded = encode(kw);
-                  if (seen.has(encoded.toLowerCase())) {
-                    dupCount++;
-                  } else {
-                    seen.add(encoded.toLowerCase());
-                    onAdd(encoded);
-                  }
-                }
-                if (dupCount > 0) {
-                  toast(`⚠️ Skipped ${dupCount} duplicate${dupCount === 1 ? "" : "s"}`);
-                }
-              }
-            }}
-            onBlur={commit}
-            placeholder="Type asset name here…"
-            className="chip-input"
-            disabled={disabled}
-            style={{ flex: 1, minWidth: "150px" }}
-          />
-        </div>
-      </div>
-
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "6px" }}>
-        <div className="kw-count-badge" style={{ margin: 0 }}>
-          <strong>{chips.length}</strong> asset name{chips.length === 1 ? "" : "s"} configured
-        </div>
-        <button
-          type="button"
-          className="bulk-kw-toggle"
-          onClick={() => setBulkOpen((v) => !v)}
-          disabled={disabled}
-        >
-          {bulkOpen ? "▾ Close bulk paste" : (
-            <span style={{ display: "inline-flex", alignItems: "center", gap: "5px" }}>
-              <CloneIcon size={12} /> Bulk import
-            </span>
-          )}
-        </button>
-      </div>
-      {bulkOpen && (
-        <div className="bulk-kw-panel">
-          <div style={{ fontSize: "11px", color: "var(--text-dim)", marginBottom: "4px" }}>
-            Asset names will be tagged with the platform selected above ({selectedPlatform ? (platformNames[selectedPlatform] || selectedPlatform) : "All Platforms"}).
-          </div>
-          <textarea
-            value={bulkText}
-            onChange={(e) => setBulkText(e.target.value)}
-            placeholder={"one per line, or comma-separated — e.g.\nAcme Group\nAcme Holdings, Acme Brand"}
-            rows={3}
-            disabled={disabled}
-          />
-          <div style={{ display: "flex", justifyContent: "flex-end", marginTop: "4px" }}>
-            <button
-              type="button"
-              className="btn-cyber-primary"
-              style={{ width: "auto", padding: "6px 14px", fontSize: "11.5px", marginTop: 0 }}
-              onClick={commitBulk}
-              disabled={disabled || !bulkText.trim()}
-            >
-              Add Asset Names
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
-  );
+interface GenerationRule {
+  id: string;
+  label: string;
+  description: string;
+  appliesTo: "names" | "domain" | "both";
+  prefixes: string[];
+  suffixes: string[];
 }
 
-function KeywordGeneratorModal({
+const GENERATION_RULES: GenerationRule[] = [
+  {
+    id: "prefix_impersonation",
+    label: "Prefix Impersonation",
+    description: "official_, real_, the_real_",
+    appliesTo: "both",
+    prefixes: ["official_", "real_", "the_real_"],
+    suffixes: [],
+  },
+  {
+    id: "suffix_impersonation",
+    label: "Suffix Impersonation",
+    description: "_official, _real, _vip, _direct",
+    appliesTo: "both",
+    prefixes: [],
+    suffixes: ["_official", "_real", "_vip", "_direct"],
+  },
+  {
+    id: "fan_parody",
+    label: "Fan / Parody Pages",
+    description: "_fanpage, _fan, _parody, _tribute",
+    appliesTo: "names",
+    prefixes: [],
+    suffixes: ["_fanpage", "_fan", "_parody", "_tribute"],
+  },
+  {
+    id: "support_lures",
+    label: "Customer Support Lures",
+    description: "support_, help_ / _support, _helpdesk, _service",
+    appliesTo: "domain",
+    prefixes: ["support_", "help_"],
+    suffixes: ["_support", "_helpdesk", "_service"],
+  },
+  {
+    id: "scam_crypto",
+    label: "Scam / Crypto / Giveaway Lures",
+    description: "_crypto, _giveaway, _investment, _fund, _promo",
+    appliesTo: "both",
+    prefixes: [],
+    suffixes: ["_crypto", "_giveaway", "_investment", "_fund", "_promo"],
+  },
+  {
+    id: "hiring_jobs",
+    label: "Hiring / Job Lures",
+    description: "_careers, _jobs, _recruitment, _hiring",
+    appliesTo: "domain",
+    prefixes: [],
+    suffixes: ["_careers", "_jobs", "_recruitment", "_hiring"],
+  },
+  {
+    id: "app_service",
+    label: "App / Service Impersonation",
+    description: "_app, _pro, _finance, _pay",
+    appliesTo: "domain",
+    prefixes: [],
+    suffixes: ["_app", "_pro", "_finance", "_pay"],
+  },
+];
+
+interface CustomRule {
+  prefix: string;
+  suffix: string;
+}
+
+// How many preview terms to show per rule before collapsing.
+const RULE_PREVIEW_CAP = 4;
+
+function RuleBasedGeneratorModal({
   nameKeywords,
   domainKeywords,
+  existingNameGroups,
+  existingDomainGroups,
   onAddKeywords,
   onClose,
 }: {
   nameKeywords: string[];
   domainKeywords: string[];
-  // Keyed by the PARENT each variation was generated from -> the variations
-  // to attach to it as children.
+  existingNameGroups: KeywordGroup[];
+  existingDomainGroups: KeywordGroup[];
   onAddKeywords: (type: "names" | "domain", byParent: Record<string, string[]>) => void;
   onClose: () => void;
 }) {
-  const [selectedSuggestions, setSelectedSuggestions] = useState<Set<string>>(new Set());
+  const [enabledRules, setEnabledRules] = useState<Set<string>>(new Set());
+  const [scopeNames, setScopeNames] = useState(true);
+  const [scopeDomain, setScopeDomain] = useState(true);
+  const [customRules, setCustomRules] = useState<CustomRule[]>([]);
+  const [customPrefixInput, setCustomPrefixInput] = useState("");
+  const [customSuffixInput, setCustomSuffixInput] = useState("");
 
-  const suggestions = useMemo(() => {
-    // Every variation remembers the `parent` it was derived from, because
-    // that is where it has to be FILED. A generated permutation is a search
-    // term, never a thing to match against: "official_gautam_adani" is not
-    // a name any real profile is called, so adding it as its own parent
-    // (which this modal used to do) meant hits found through it were scored
-    // and grouped under the permutation instead of under "Gautam Adani".
-    // See backend/shared/keywords.py -- children are searched, parents are
-    // matched -- and the regression documented in
-    // tests_unit/test_keyword_groups.py::TestScoringUsesTheParentNotTheSearchTerm.
-    const list: { type: "names" | "domain"; parent: string; kw: string; pattern: string }[] = [];
-    const namePrefixes = ["official_", "real_", "the_real_"];
-    const nameSuffixes = ["_official", "_real", "_vip", "_direct", "_fanpage", "_investment", "_crypto"];
-    const domainPrefixes = ["official_", "support_", "help_"];
-    const domainSuffixes = ["_support", "_helpdesk", "_careers", "_jobs", "_fund", "_finance", "_promo", "_giveaway", "_official", "_app", "_service"];
-
-    nameKeywords.forEach((name) => {
-      const clean = name.toLowerCase().replace(/\s+/g, "_");
-      namePrefixes.forEach((pre) => list.push({ type: "names", parent: name, kw: `${pre}${clean}`, pattern: "Prefix Impersonation" }));
-      nameSuffixes.forEach((suf) => list.push({ type: "names", parent: name, kw: `${clean}${suf}`, pattern: "Suffix Impersonation" }));
-    });
-
-    domainKeywords.forEach((dom) => {
-      const clean = dom.toLowerCase().replace(/\s+/g, "_");
-      domainPrefixes.forEach((pre) => list.push({ type: "domain", parent: dom, kw: `${pre}${clean}`, pattern: "Customer Support Lure" }));
-      domainSuffixes.forEach((suf) => list.push({ type: "domain", parent: dom, kw: `${clean}${suf}`, pattern: "Scam / Giveaway / Job Lure" }));
-    });
-
-    return list;
-  }, [nameKeywords, domainKeywords]);
-
-  // Selection is keyed by type+parent+term, not by the term alone: the same
-  // permutation can legitimately be generated for two different parents
-  // (an individual "Adani" and a domain "Adani" both yield
-  // "official_adani"), and keying on the bare term would tie those two
-  // checkboxes together and file the variation under both.
-  const idOf = (s: { type: string; parent: string; kw: string }) => `${s.type}:${s.parent}:${s.kw}`;
-
-  const toggleSelect = (id: string) => {
-    setSelectedSuggestions((prev) => {
+  const toggleRule = (id: string) => {
+    setEnabledRules((prev) => {
       const next = new Set(prev);
       next.has(id) ? next.delete(id) : next.add(id);
       return next;
     });
   };
 
-  const selectAll = () => {
-    if (selectedSuggestions.size === suggestions.length) {
-      setSelectedSuggestions(new Set());
+  const selectAllRules = () => {
+    const applicableRules = GENERATION_RULES.filter((r) => {
+      if (r.appliesTo === "names") return scopeNames && nameKeywords.length > 0;
+      if (r.appliesTo === "domain") return scopeDomain && domainKeywords.length > 0;
+      return (scopeNames && nameKeywords.length > 0) || (scopeDomain && domainKeywords.length > 0);
+    });
+    if (enabledRules.size === applicableRules.length && customRules.length === 0) {
+      setEnabledRules(new Set());
     } else {
-      setSelectedSuggestions(new Set(suggestions.map(idOf)));
+      setEnabledRules(new Set(applicableRules.map((r) => r.id)));
     }
   };
 
+  const addCustomRule = () => {
+    const p = customPrefixInput.trim();
+    const s = customSuffixInput.trim();
+    if (!p && !s) return;
+    // Ensure they end/start with underscore for readability
+    const prefix = p ? (p.endsWith("_") ? p : p + "_") : "";
+    const suffix = s ? (s.startsWith("_") ? s : "_" + s) : "";
+    setCustomRules((prev) => [...prev, { prefix, suffix }]);
+    setCustomPrefixInput("");
+    setCustomSuffixInput("");
+  };
+
+  const removeCustomRule = (idx: number) => {
+    setCustomRules((prev) => prev.filter((_, i) => i !== idx));
+  };
+
+  // Build the set of all existing children for fast duplicate detection.
+  const existingChildrenByParent = useMemo(() => {
+    const map: Record<string, Set<string>> = {};
+    for (const g of existingNameGroups) {
+      map[g.parent] = new Set(g.children.map((c) => c.toLowerCase()));
+    }
+    for (const g of existingDomainGroups) {
+      map[g.parent] = new Set(g.children.map((c) => c.toLowerCase()));
+    }
+    return map;
+  }, [existingNameGroups, existingDomainGroups]);
+
+  // Compute all generated terms grouped by type and parent, plus duplicate counts.
+  const generated = useMemo(() => {
+    const nameResults: Record<string, string[]> = {};
+    const domainResults: Record<string, string[]> = {};
+    let newCount = 0;
+    let dupCount = 0;
+
+    const perRulePreview: Record<string, { terms: string[]; total: number }> = {};
+
+    const applyRule = (
+      rule: { prefixes: string[]; suffixes: string[] },
+      ruleId: string,
+      keywords: string[],
+      kwType: "names" | "domain",
+    ) => {
+      const bucket = kwType === "names" ? nameResults : domainResults;
+      const preview = perRulePreview[ruleId] || { terms: [], total: 0 };
+      perRulePreview[ruleId] = preview;
+
+      for (const kw of keywords) {
+        const clean = kw.toLowerCase().replace(/\s+/g, "_");
+        const existingSet = existingChildrenByParent[kw] || new Set<string>();
+        if (!bucket[kw]) bucket[kw] = [];
+
+        const generated: string[] = [];
+        for (const pre of rule.prefixes) generated.push(`${pre}${clean}`);
+        for (const suf of rule.suffixes) generated.push(`${clean}${suf}`);
+
+        for (const term of generated) {
+          const key = term.toLowerCase();
+          if (existingSet.has(key) || bucket[kw].some((t) => t.toLowerCase() === key)) {
+            dupCount++;
+          } else {
+            bucket[kw].push(term);
+            newCount++;
+            preview.total++;
+            if (preview.terms.length < RULE_PREVIEW_CAP) preview.terms.push(term);
+          }
+        }
+      }
+    };
+
+    // Apply built-in rules
+    for (const rule of GENERATION_RULES) {
+      if (!enabledRules.has(rule.id)) continue;
+      if ((rule.appliesTo === "names" || rule.appliesTo === "both") && scopeNames) {
+        applyRule(rule, rule.id, nameKeywords, "names");
+      }
+      if ((rule.appliesTo === "domain" || rule.appliesTo === "both") && scopeDomain) {
+        applyRule(rule, rule.id, domainKeywords, "domain");
+      }
+    }
+
+    // Apply custom rules
+    for (let ci = 0; ci < customRules.length; ci++) {
+      const cr = customRules[ci];
+      const customRuleObj = {
+        prefixes: cr.prefix ? [cr.prefix] : [],
+        suffixes: cr.suffix ? [cr.suffix] : [],
+      };
+      const ruleId = `custom_${ci}`;
+      if (scopeNames && nameKeywords.length) {
+        applyRule(customRuleObj, ruleId, nameKeywords, "names");
+      }
+      if (scopeDomain && domainKeywords.length) {
+        applyRule(customRuleObj, ruleId, domainKeywords, "domain");
+      }
+    }
+
+    return { nameResults, domainResults, newCount, dupCount, perRulePreview };
+  }, [enabledRules, scopeNames, scopeDomain, nameKeywords, domainKeywords, customRules, existingChildrenByParent]);
+
   const handleApply = () => {
-    // Grouped by parent so each variation is added as a CHILD of the name
-    // it was built from, which is what makes it a search term that still
-    // scores and files against the real name.
-    const names: Record<string, string[]> = {};
-    const domains: Record<string, string[]> = {};
-    suggestions.forEach((s) => {
-      if (!selectedSuggestions.has(idOf(s))) return;
-      const bucket = s.type === "names" ? names : domains;
-      (bucket[s.parent] ||= []).push(s.kw);
-    });
-    if (Object.keys(names).length) onAddKeywords("names", names);
-    if (Object.keys(domains).length) onAddKeywords("domain", domains);
-    toast.success(`Added ${selectedSuggestions.size} search variations!`, { icon: "✨" });
+    if (Object.keys(generated.nameResults).length) {
+      onAddKeywords("names", generated.nameResults);
+    }
+    if (Object.keys(generated.domainResults).length) {
+      onAddKeywords("domain", generated.domainResults);
+    }
+    toast.success(`Added ${generated.newCount} search variation${generated.newCount === 1 ? "" : "s"}!`, { icon: "✨" });
     onClose();
   };
+
+  const hasKeywords = nameKeywords.length > 0 || domainKeywords.length > 0;
 
   return (
     <div
@@ -518,107 +494,353 @@ function KeywordGeneratorModal({
       <div
         onClick={(e) => e.stopPropagation()}
         className="dashboard-card-box"
-        style={{ width: "min(620px, 100%)", background: "var(--bg-card)" }}
+        style={{ width: "min(680px, 100%)", background: "var(--bg-card)", maxHeight: "85vh", display: "flex", flexDirection: "column" }}
       >
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px", borderBottom: "1px solid var(--border-subtle)", paddingBottom: "10px" }}>
+        {/* Header */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px", borderBottom: "1px solid var(--border-subtle)", paddingBottom: "10px", flexShrink: 0 }}>
           <div style={{ fontSize: "15px", fontWeight: 700, display: "flex", alignItems: "center", gap: "8px" }}>
             <SparklesIcon size={16} color="var(--cyan)" />
-            <span>Threat Actor Keyword Generator</span>
+            <span>Keyword Rule Generator</span>
           </div>
           <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-muted)", fontSize: "16px", cursor: "pointer" }}>✕</button>
         </div>
 
-        <div style={{ fontSize: "12px", color: "var(--text-dim)", marginBottom: "12px" }}>
-          Automatically generates common impersonation, scam, fake support, and typo-squatting variations from your configured names and domains.
+        <div style={{ fontSize: "12px", color: "var(--text-dim)", marginBottom: "14px", lineHeight: 1.5, flexShrink: 0 }}>
+          Select generation rules below to auto-generate impersonation, scam, and
+          fake-support keyword variations. Each generated term is filed as a{" "}
+          <strong style={{ color: "var(--cyan)" }}>search term</strong> under its parent keyword.
         </div>
 
-        {!suggestions.length ? (
+        {!hasKeywords ? (
           <div style={{ textAlign: "center", padding: "24px", color: "var(--text-dim)" }}>
             Please add at least one Individual Name or Domain Keyword first.
           </div>
         ) : (
           <>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
-              <span style={{ fontSize: "11px", color: "var(--text-dim)" }}>
-                Generated <strong>{suggestions.length}</strong> variations
-              </span>
+            {/* Scope toggles */}
+            <div style={{ display: "flex", gap: "10px", marginBottom: "14px", flexShrink: 0 }}>
+              <label
+                className="rule-scope-toggle"
+                style={{
+                  display: "inline-flex", alignItems: "center", gap: "6px",
+                  padding: "6px 12px", borderRadius: "8px", cursor: nameKeywords.length ? "pointer" : "not-allowed",
+                  fontSize: "12px", fontWeight: 600,
+                  background: scopeNames && nameKeywords.length ? "rgba(136, 56, 221, 0.15)" : "transparent",
+                  border: `1px solid ${scopeNames && nameKeywords.length ? "rgba(136, 56, 221, 0.4)" : "var(--border-subtle)"}`,
+                  color: scopeNames && nameKeywords.length ? "var(--cyan)" : "var(--text-dim)",
+                  opacity: nameKeywords.length ? 1 : 0.5,
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={scopeNames && nameKeywords.length > 0}
+                  onChange={() => nameKeywords.length && setScopeNames((v) => !v)}
+                  disabled={!nameKeywords.length}
+                  style={{ accentColor: "var(--cyan)" }}
+                />
+                <UserIcon size={13} /> Individual Names ({nameKeywords.length})
+              </label>
+              <label
+                className="rule-scope-toggle"
+                style={{
+                  display: "inline-flex", alignItems: "center", gap: "6px",
+                  padding: "6px 12px", borderRadius: "8px", cursor: domainKeywords.length ? "pointer" : "not-allowed",
+                  fontSize: "12px", fontWeight: 600,
+                  background: scopeDomain && domainKeywords.length ? "rgba(119, 39, 205, 0.15)" : "transparent",
+                  border: `1px solid ${scopeDomain && domainKeywords.length ? "rgba(119, 39, 205, 0.4)" : "var(--border-subtle)"}`,
+                  color: scopeDomain && domainKeywords.length ? "var(--purple)" : "var(--text-dim)",
+                  opacity: domainKeywords.length ? 1 : 0.5,
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={scopeDomain && domainKeywords.length > 0}
+                  onChange={() => domainKeywords.length && setScopeDomain((v) => !v)}
+                  disabled={!domainKeywords.length}
+                  style={{ accentColor: "var(--purple)" }}
+                />
+                <TagIcon size={13} /> Domain Keywords ({domainKeywords.length})
+              </label>
+
               <button
                 type="button"
-                onClick={selectAll}
-                style={{ background: "none", border: "none", color: "var(--cyan)", fontSize: "11px", cursor: "pointer", textDecoration: "underline" }}
+                onClick={selectAllRules}
+                style={{ marginLeft: "auto", background: "none", border: "none", color: "var(--cyan)", fontSize: "11px", cursor: "pointer", textDecoration: "underline" }}
               >
-                {selectedSuggestions.size === suggestions.length ? "Deselect All" : "Select All"}
+                {enabledRules.size > 0 ? "Deselect All Rules" : "Select All Rules"}
               </button>
             </div>
-            <div style={{ maxHeight: "260px", overflowY: "auto", border: "1px solid var(--border-subtle)", borderRadius: "8px", padding: "6px" }}>
-              {suggestions.map((s) => (
-                <label
-                  key={idOf(s)}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    padding: "6px 10px",
-                    borderRadius: "6px",
-                    cursor: "pointer",
-                    background: selectedSuggestions.has(idOf(s)) ? "rgba(0, 229, 255, 0.08)" : "transparent",
-                  }}
-                >
-                  <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                    <input
-                      type="checkbox"
-                      checked={selectedSuggestions.has(idOf(s))}
-                      onChange={() => toggleSelect(idOf(s))}
-                    />
-                    <span style={{ fontSize: "12px", fontFamily: "var(--font-mono)", color: "var(--text-main)" }}>{s.kw}</span>
-                    {/* Which parent this will be filed under -- the whole
-                        point of the change, so it should be visible before
-                        the analyst commits to it. */}
-                    <span style={{ fontSize: "10px", color: "var(--text-dim)" }}>→ {s.parent}</span>
+
+            {/* Rules list -- scrollable */}
+            <div style={{ overflowY: "auto", flex: 1, minHeight: 0, border: "1px solid var(--border-subtle)", borderRadius: "10px", padding: "6px" }}>
+              {GENERATION_RULES.map((rule) => {
+                const disabled =
+                  (rule.appliesTo === "names" && (!scopeNames || !nameKeywords.length)) ||
+                  (rule.appliesTo === "domain" && (!scopeDomain || !domainKeywords.length)) ||
+                  (rule.appliesTo === "both" && ((!scopeNames || !nameKeywords.length) && (!scopeDomain || !domainKeywords.length)));
+
+                const checked = enabledRules.has(rule.id);
+                const preview = generated.perRulePreview[rule.id];
+
+                const appliesToLabel =
+                  rule.appliesTo === "names" ? "Individual" :
+                  rule.appliesTo === "domain" ? "Domain" : "Both";
+                const appliesToColor =
+                  rule.appliesTo === "names" ? "var(--cyan)" :
+                  rule.appliesTo === "domain" ? "var(--purple)" : "var(--text-dim)";
+
+                return (
+                  <div
+                    key={rule.id}
+                    style={{
+                      padding: "10px 12px",
+                      borderRadius: "8px",
+                      marginBottom: "4px",
+                      background: checked ? "rgba(136, 56, 221, 0.08)" : "transparent",
+                      border: checked ? "1px solid rgba(136, 56, 221, 0.2)" : "1px solid transparent",
+                      opacity: disabled ? 0.45 : 1,
+                      transition: "all 0.15s ease",
+                    }}
+                  >
+                    <label
+                      style={{
+                        display: "flex",
+                        alignItems: "flex-start",
+                        gap: "10px",
+                        cursor: disabled ? "not-allowed" : "pointer",
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() => !disabled && toggleRule(rule.id)}
+                        disabled={disabled}
+                        style={{ marginTop: "2px", accentColor: "var(--cyan)" }}
+                      />
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "3px" }}>
+                          <span style={{ fontSize: "13px", fontWeight: 600, color: "var(--text-main)" }}>{rule.label}</span>
+                          <span style={{
+                            fontSize: "9.5px", fontWeight: 600, color: appliesToColor,
+                            background: "rgba(255,255,255,0.05)", padding: "1px 7px",
+                            borderRadius: "20px", textTransform: "uppercase", letterSpacing: "0.3px",
+                          }}>
+                            {appliesToLabel}
+                          </span>
+                        </div>
+                        <div style={{ fontSize: "11px", color: "var(--text-dim)", fontFamily: "var(--font-mono, monospace)" }}>
+                          {rule.description}
+                        </div>
+                        {/* Live preview of generated terms */}
+                        {checked && preview && preview.total > 0 && (
+                          <div style={{
+                            marginTop: "6px", fontSize: "11px", color: "var(--cyan)",
+                            display: "flex", flexWrap: "wrap", gap: "4px", alignItems: "center",
+                          }}>
+                            <span style={{ color: "var(--text-dim)", marginRight: "2px" }}>→ {preview.total} terms:</span>
+                            {preview.terms.map((t, i) => (
+                              <span
+                                key={i}
+                                style={{
+                                  background: "rgba(136, 56, 221, 0.12)", padding: "1px 6px",
+                                  borderRadius: "4px", fontSize: "10.5px", fontFamily: "var(--font-mono, monospace)",
+                                  color: "var(--text-main)",
+                                }}
+                              >
+                                {t}
+                              </span>
+                            ))}
+                            {preview.total > RULE_PREVIEW_CAP && (
+                              <span style={{ color: "var(--text-dim)", fontSize: "10px" }}>
+                                +{preview.total - RULE_PREVIEW_CAP} more
+                              </span>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    </label>
                   </div>
-                  <span style={{ fontSize: "10px", color: "var(--text-dim)", background: "var(--bg-inner)", padding: "2px 6px", borderRadius: "4px", display: "inline-flex", alignItems: "center", gap: "4px" }}>
-                    {s.type === "names" ? <UserIcon size={12} color="var(--cyan)" /> : <TagIcon size={12} color="var(--purple)" />}
-                    {s.pattern}
-                  </span>
-                </label>
-              ))}
+                );
+              })}
+
+              {/* Custom rules already added */}
+              {customRules.map((cr, ci) => {
+                const ruleId = `custom_${ci}`;
+                const preview = generated.perRulePreview[ruleId];
+                const label = [cr.prefix && `${cr.prefix}…`, cr.suffix && `…${cr.suffix}`].filter(Boolean).join(" / ");
+                return (
+                  <div
+                    key={ruleId}
+                    style={{
+                      padding: "10px 12px",
+                      borderRadius: "8px",
+                      marginBottom: "4px",
+                      background: "rgba(0, 229, 255, 0.06)",
+                      border: "1px solid rgba(0, 229, 255, 0.15)",
+                    }}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                      <ZapIcon size={14} color="var(--cyan)" />
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "2px" }}>
+                          <span style={{ fontSize: "13px", fontWeight: 600, color: "var(--text-main)" }}>Custom: {label}</span>
+                          <span style={{
+                            fontSize: "9.5px", fontWeight: 600, color: "var(--text-dim)",
+                            background: "rgba(255,255,255,0.05)", padding: "1px 7px",
+                            borderRadius: "20px", textTransform: "uppercase", letterSpacing: "0.3px",
+                          }}>
+                            Both
+                          </span>
+                        </div>
+                        {preview && preview.total > 0 && (
+                          <div style={{ fontSize: "11px", color: "var(--cyan)", display: "flex", flexWrap: "wrap", gap: "4px", alignItems: "center" }}>
+                            <span style={{ color: "var(--text-dim)", marginRight: "2px" }}>→ {preview.total} terms:</span>
+                            {preview.terms.map((t, i) => (
+                              <span
+                                key={i}
+                                style={{
+                                  background: "rgba(136, 56, 221, 0.12)", padding: "1px 6px",
+                                  borderRadius: "4px", fontSize: "10.5px", fontFamily: "var(--font-mono, monospace)",
+                                  color: "var(--text-main)",
+                                }}
+                              >
+                                {t}
+                              </span>
+                            ))}
+                            {preview.total > RULE_PREVIEW_CAP && (
+                              <span style={{ color: "var(--text-dim)", fontSize: "10px" }}>+{preview.total - RULE_PREVIEW_CAP} more</span>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => removeCustomRule(ci)}
+                        style={{ background: "transparent", border: "none", color: "var(--danger, #e95053)", cursor: "pointer", fontSize: "13px", padding: "2px 6px", flexShrink: 0 }}
+                        title="Remove custom rule"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+
+              {/* Custom rule input */}
+              <div
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: "8px",
+                  border: "1px dashed var(--border-subtle)",
+                  marginTop: "4px",
+                }}
+              >
+                <div style={{ fontSize: "12px", fontWeight: 600, color: "var(--text-dim)", marginBottom: "8px", display: "flex", alignItems: "center", gap: "6px" }}>
+                  <PlusIcon size={13} /> Add Custom Rule
+                </div>
+                <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                  <div style={{ flex: 1 }}>
+                    <label style={{ fontSize: "10px", color: "var(--text-dim)", display: "block", marginBottom: "2px" }}>Prefix</label>
+                    <input
+                      value={customPrefixInput}
+                      onChange={(e) => setCustomPrefixInput(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addCustomRule(); } }}
+                      placeholder="e.g. hq_"
+                      style={{
+                        width: "100%", background: "rgba(255,255,255,0.04)", border: "1px solid var(--border-subtle)",
+                        borderRadius: "6px", padding: "5px 8px", color: "var(--text-main)", fontSize: "12px",
+                        fontFamily: "var(--font-mono, monospace)", outline: "none",
+                      }}
+                    />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <label style={{ fontSize: "10px", color: "var(--text-dim)", display: "block", marginBottom: "2px" }}>Suffix</label>
+                    <input
+                      value={customSuffixInput}
+                      onChange={(e) => setCustomSuffixInput(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addCustomRule(); } }}
+                      placeholder="e.g. _global"
+                      style={{
+                        width: "100%", background: "rgba(255,255,255,0.04)", border: "1px solid var(--border-subtle)",
+                        borderRadius: "6px", padding: "5px 8px", color: "var(--text-main)", fontSize: "12px",
+                        fontFamily: "var(--font-mono, monospace)", outline: "none",
+                      }}
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    onClick={addCustomRule}
+                    disabled={!customPrefixInput.trim() && !customSuffixInput.trim()}
+                    style={{
+                      background: "rgba(136, 56, 221, 0.15)", border: "1px solid rgba(136, 56, 221, 0.3)",
+                      color: "var(--cyan)", padding: "6px 12px", borderRadius: "6px", fontSize: "11px",
+                      fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap", marginTop: "14px",
+                      opacity: (!customPrefixInput.trim() && !customSuffixInput.trim()) ? 0.5 : 1,
+                    }}
+                  >
+                    + Add
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Summary bar */}
+            <div style={{
+              display: "flex", justifyContent: "space-between", alignItems: "center",
+              marginTop: "14px", paddingTop: "10px", borderTop: "1px solid var(--border-subtle)", flexShrink: 0,
+            }}>
+              <div style={{ fontSize: "12px", color: "var(--text-dim)" }}>
+                {generated.newCount > 0 ? (
+                  <>
+                    <strong style={{ color: "var(--cyan)" }}>{generated.newCount}</strong> new search term{generated.newCount === 1 ? "" : "s"} from{" "}
+                    <strong>{(scopeNames ? nameKeywords.length : 0) + (scopeDomain ? domainKeywords.length : 0)}</strong> keyword{((scopeNames ? nameKeywords.length : 0) + (scopeDomain ? domainKeywords.length : 0)) === 1 ? "" : "s"}
+                    {generated.dupCount > 0 && (
+                      <span style={{ color: "var(--text-muted)", marginLeft: "6px" }}>
+                        ({generated.dupCount} duplicate{generated.dupCount === 1 ? "" : "s"} skipped)
+                      </span>
+                    )}
+                  </>
+                ) : enabledRules.size > 0 || customRules.length > 0 ? (
+                  <span>All generated terms already exist as search terms.</span>
+                ) : (
+                  <span>Select rules above to generate search terms.</span>
+                )}
+              </div>
+            </div>
+
+            {/* Action buttons */}
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: "10px", marginTop: "12px", flexShrink: 0 }}>
+              <button type="button" onClick={onClose} className="action-btn" style={{ fontSize: "12px" }}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleApply}
+                disabled={!generated.newCount}
+                className="btn-cyber-primary"
+                style={{ width: "auto", padding: "7px 18px", fontSize: "12px", marginTop: 0, display: "inline-flex", alignItems: "center", gap: "6px" }}
+              >
+                <SparklesIcon size={14} /> Apply {generated.newCount} Keyword{generated.newCount === 1 ? "" : "s"}
+              </button>
             </div>
           </>
         )}
-
-        <div style={{ display: "flex", justifyContent: "flex-end", gap: "10px", marginTop: "16px" }}>
-          <button type="button" onClick={onClose} className="action-btn" style={{ fontSize: "12px" }}>
-            Cancel
-          </button>
-          <button
-            type="button"
-            onClick={handleApply}
-            disabled={!selectedSuggestions.size}
-            className="btn-cyber-primary"
-            style={{ width: "auto", padding: "7px 18px", fontSize: "12px", marginTop: 0, display: "inline-flex", alignItems: "center", gap: "6px" }}
-          >
-            <PlusIcon size={14} /> Add {selectedSuggestions.size} Selected Keywords
-          </button>
-        </div>
       </div>
     </div>
   );
 }
 
-// Parent/child keyword editor.
+// Parent/child keyword editor -- SPREADSHEET / DATA GRID layout.
 //
 // The distinction it exists to express (see backend/shared/keywords.py):
-//   PARENT   the real name being protected. NEVER searched. It is what
-//            discovered profiles are scored against and the bucket they are
-//            filed under, so filtering results by it shows everything all of
-//            its children turned up.
+//   PARENT   the real name being protected. It is what discovered profiles
+//            are scored against and the bucket they are filed under.
 //   CHILDREN the analyst's own permutations. These ARE what gets searched on
 //            every platform, and are never scored against.
 //
-// A parent with no children searches itself, which is what every client did
-// before this existed -- so an analyst who adds a parent and stops is in
-// exactly the old behaviour, not a broken half-state. The row says so
-// explicitly rather than leaving that to be guessed.
+// The grid layout is Excel-like: analysts can enter Main Keyword and its
+// Permutations in the bottom row, Tab between them, press Enter to commit,
+// or paste single/multi-line lists (e.g. "Name: perm1, perm2").
 function KeywordGroupEditor({
   groups,
   onChange,
@@ -635,8 +857,7 @@ function KeywordGroupEditor({
   disabled?: boolean;
 }) {
   const [parentInput, setParentInput] = useState("");
-  const [bulkOpen, setBulkOpen] = useState(false);
-  const [bulkText, setBulkText] = useState("");
+  const [childInput, setChildInput] = useState("");
 
   const applyBulkText = (raw: string) => {
     const parsed = parseBulkKeywordGroups(raw);
@@ -651,27 +872,58 @@ function KeywordGroupEditor({
     }
   };
 
-  const addParent = () => {
-    const trimmed = parentInput.trim().replace(/^,+|,+$/g, "");
-    if (!trimmed) return;
-    if (/[,\n]/.test(trimmed) || trimmed.includes(":") || trimmed.includes("->")) {
-      applyBulkText(trimmed);
-      setParentInput("");
-      return;
-    }
-    if (groups.some((g) => g.parent.toLowerCase() === trimmed.toLowerCase())) {
-      toast(`⚠️ "${trimmed}" already exists`, { id: `dup-parent-${trimmed.toLowerCase()}` });
-      setParentInput("");
-      return;
-    }
-    onChange([...groups, { parent: trimmed, children: [] }]);
-    setParentInput("");
-  };
+  const handleAddRow = () => {
+    const pTrimmed = parentInput.trim().replace(/^,+|,+$/g, "");
+    const cTrimmed = childInput.trim();
 
-  const commitBulk = () => {
-    applyBulkText(bulkText);
-    setBulkText("");
-    setBulkOpen(false);
+    if (!pTrimmed && !cTrimmed) return;
+
+    // If input contains bulk separator or multiple lines, apply bulk parser
+    if (/[,\n]/.test(pTrimmed) || pTrimmed.includes(":") || pTrimmed.includes("->") || pTrimmed.includes("=>")) {
+      applyBulkText(pTrimmed);
+      setParentInput("");
+      setChildInput("");
+      return;
+    }
+
+    if (!pTrimmed) {
+      toast.error("Please enter a main keyword first");
+      return;
+    }
+
+    // Parse children from childInput (comma-separated or semicolon-separated)
+    const newChildren = cTrimmed
+      ? cTrimmed.split(/[,;\n]+/).map((s) => s.trim()).filter(Boolean)
+      : [];
+
+    // Check if parent already exists (case-insensitive)
+    const existingIdx = groups.findIndex((g) => g.parent.toLowerCase() === pTrimmed.toLowerCase());
+    if (existingIdx >= 0) {
+      if (newChildren.length > 0) {
+        const existing = groups[existingIdx];
+        const seen = new Set(existing.children.map((c) => c.toLowerCase()));
+        seen.add(existing.parent.toLowerCase());
+        const fresh = newChildren.filter((c) => !seen.has(c.toLowerCase()));
+        if (fresh.length > 0) {
+          const updated = [...groups];
+          updated[existingIdx] = { ...existing, children: [...existing.children, ...fresh] };
+          onChange(updated);
+          toast.success(`Added ${fresh.length} variation(s) to "${existing.parent}"`);
+        } else {
+          toast(`⚠️ All variations already exist for "${existing.parent}"`);
+        }
+      } else {
+        toast(`⚠️ "${pTrimmed}" already exists`, { id: `dup-parent-${pTrimmed.toLowerCase()}` });
+      }
+      setParentInput("");
+      setChildInput("");
+      return;
+    }
+
+    // Add new group
+    onChange([...groups, { parent: pTrimmed, children: newChildren }]);
+    setParentInput("");
+    setChildInput("");
   };
 
   const removeParent = (idx: number) =>
@@ -686,149 +938,254 @@ function KeywordGroupEditor({
 
   return (
     <div>
-      <div style={{ fontSize: "12px", color: "var(--text-dim)", marginBottom: "10px", lineHeight: 1.5 }}>
-        The <strong style={{ color: accent }}>parent</strong> is the primary target name — it is searched directly
-        and serves as the anchor results are matched against and grouped under. Its{" "}
-        <strong style={{ color: accent }}>search terms</strong> are the additional permutations and variations also
-        searched on every platform.
-      </div>
-
-      <div className="chips-input-container" style={{ marginBottom: "6px" }}>
-        <input
-          value={parentInput}
-          onChange={(e) => setParentInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" || e.key === ",") {
-              e.preventDefault();
-              addParent();
-            }
-          }}
-          onPaste={(e) => {
-            const text = e.clipboardData.getData("text");
-            if (/[,\n]/.test(text) || text.includes(":") || text.includes("->")) {
-              e.preventDefault();
-              applyBulkText(text);
-              setParentInput("");
-            }
-          }}
-          onBlur={addParent}
-          placeholder={parentPlaceholder}
-          disabled={disabled}
-          style={{ flex: 1, minWidth: "220px", background: "transparent", border: "none", outline: "none", color: "var(--text-main)", fontSize: "13px" }}
-        />
-      </div>
-
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
-        <div className="kw-count-badge" style={{ margin: 0 }}>
-          <strong>{groups.length}</strong> configured · <strong style={{ color: accent }}>{totalSearchTerms}</strong> search{totalSearchTerms === 1 ? "" : "es"} per platform
-        </div>
-        <button
-          type="button"
-          className="bulk-kw-toggle"
-          onClick={() => setBulkOpen((v) => !v)}
-          disabled={disabled}
-        >
-          {bulkOpen ? "▾ Close bulk paste" : (
-            <span style={{ display: "inline-flex", alignItems: "center", gap: "5px" }}>
-              <CloneIcon size={12} /> Bulk import
-            </span>
-          )}
-        </button>
-      </div>
-
-      {bulkOpen && (
-        <div className="bulk-kw-panel" style={{ marginBottom: "14px" }}>
-          <textarea
-            value={bulkText}
-            onChange={(e) => setBulkText(e.target.value)}
-            placeholder={"one per line, or comma-separated -- e.g.\ngautam adani\nkaran adani, jeet adani\n\nOptional search terms:\nAdani Group: adani_group, official_adani"}
-            rows={4}
-            disabled={disabled}
-          />
-          <div style={{ display: "flex", justifyContent: "flex-end", marginTop: "4px" }}>
-            <button
-              type="button"
-              className="btn-cyber-primary"
-              style={{ width: "auto", padding: "6px 14px", fontSize: "11.5px", marginTop: 0 }}
-              onClick={commitBulk}
-              disabled={disabled || !bulkText.trim()}
-            >
-              Add Keywords
-            </button>
-          </div>
-        </div>
-      )}
-
-      {!groups.length ? (
-        <div style={{ padding: "18px", textAlign: "center", fontSize: "12px", color: "var(--text-dim)", border: "1px dashed var(--border-subtle)", borderRadius: "10px" }}>
-          No names configured yet. Add one above to get started.
-        </div>
-      ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-          {groups.map((g, idx) => (
-            <div
-              key={`${g.parent}-${idx}`}
-              style={{
-                border: "1px solid var(--border-subtle)",
-                borderLeft: `3px solid ${accent}`,
-                borderRadius: "10px",
-                padding: "10px 12px",
-                background: "var(--bg-inner, rgba(255,255,255,0.02))",
-              }}
-            >
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", marginBottom: "8px" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: "8px", minWidth: 0 }}>
-                  <span style={{ fontSize: "13px", fontWeight: 700, color: "var(--text-main)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+      {/* ── SPREADSHEET GRID ── */}
+      <div style={{
+        border: "1px solid var(--border-subtle)",
+        borderRadius: "10px",
+        overflow: "hidden",
+        background: "var(--bg-card)",
+      }}>
+        <table style={{
+          width: "100%",
+          borderCollapse: "collapse",
+          tableLayout: "fixed",
+        }}>
+          <thead>
+            <tr style={{
+              background: "rgba(255,255,255,0.03)",
+              borderBottom: "1px solid var(--border-subtle)",
+            }}>
+              <th style={{
+                width: "220px",
+                padding: "8px 12px",
+                fontSize: "11px",
+                fontWeight: 700,
+                color: accent,
+                textAlign: "left",
+                textTransform: "uppercase",
+                letterSpacing: "0.5px",
+                borderRight: "1px solid var(--border-subtle)",
+              }}>
+                Main Keyword
+              </th>
+              <th style={{
+                padding: "8px 12px",
+                fontSize: "11px",
+                fontWeight: 700,
+                color: "var(--text-dim)",
+                textAlign: "left",
+                textTransform: "uppercase",
+                letterSpacing: "0.5px",
+              }}>
+                Search Permutations
+              </th>
+              <th style={{ width: "44px", padding: "8px 4px" }} />
+            </tr>
+          </thead>
+          <tbody>
+            {groups.map((g, idx) => (
+              <tr
+                key={`${g.parent}-${idx}`}
+                style={{
+                  borderBottom: "1px solid var(--border-subtle)",
+                  background: "transparent",
+                  transition: "background 0.1s ease",
+                }}
+                onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = "rgba(255,255,255,0.02)"; }}
+                onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = "transparent"; }}
+              >
+                {/* Parent cell */}
+                <td style={{
+                  padding: "8px 12px",
+                  verticalAlign: "top",
+                  borderRight: "1px solid var(--border-subtle)",
+                }}>
+                  <div style={{
+                    fontSize: "13px",
+                    fontWeight: 600,
+                    color: "var(--text-main)",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                    lineHeight: "28px",
+                  }}>
                     {g.parent}
-                  </span>
-                  <span style={{ fontSize: "10px", fontWeight: 600, color: accent, background: "rgba(255,255,255,0.05)", padding: "2px 7px", borderRadius: "20px", whiteSpace: "nowrap" }}>
+                  </div>
+                  <div style={{
+                    fontSize: "10px",
+                    color: accent,
+                    fontWeight: 500,
+                    marginTop: "2px",
+                    opacity: 0.85,
+                  }}>
                     {g.children.length
-                      ? `${g.children.length + 1} search terms (${g.children.length} variation${g.children.length === 1 ? "" : "s"})`
+                      ? `${g.children.length + 1} searches (${g.children.length} permutation${g.children.length === 1 ? "" : "s"})`
                       : "searches itself"}
-                  </span>
+                  </div>
+                </td>
+
+                {/* Children/permutations cell */}
+                <td style={{ padding: "6px 10px", verticalAlign: "top" }}>
+                  <ChipInput
+                    chips={g.children}
+                    onAdd={(v) => setChildren(idx, [...g.children, v])}
+                    onAddMany={(vs) => setChildren(idx, [...g.children, ...vs])}
+                    onRemove={(i) => setChildren(idx, g.children.filter((_, j) => j !== i))}
+                    placeholder={childPlaceholder}
+                    disabled={disabled}
+                  />
+                </td>
+
+                {/* Delete cell */}
+                <td style={{ padding: "8px 4px", verticalAlign: "top", textAlign: "center" }}>
+                  <button
+                    type="button"
+                    onClick={() => removeParent(idx)}
+                    disabled={disabled}
+                    title="Remove this keyword and all its permutations"
+                    style={{
+                      background: "transparent",
+                      border: "none",
+                      color: "var(--danger, #e95053)",
+                      cursor: "pointer",
+                      fontSize: "13px",
+                      padding: "4px",
+                      opacity: 0.6,
+                      transition: "opacity 0.15s",
+                      lineHeight: "28px",
+                    }}
+                    onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.opacity = "1"; }}
+                    onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.opacity = "0.6"; }}
+                  >
+                    <TrashIcon size={14} />
+                  </button>
+                </td>
+              </tr>
+            ))}
+
+            {/* Add-new row -- dual inputs for Main Keyword & Permutations */}
+            <tr style={{ background: "rgba(255,255,255,0.015)" }}>
+              {/* Main Keyword Input */}
+              <td style={{
+                padding: "8px 12px",
+                borderRight: "1px solid var(--border-subtle)",
+                verticalAlign: "middle",
+              }}>
+                <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                  <PlusIcon size={13} color={accent} style={{ flexShrink: 0, opacity: 0.7 }} />
+                  <input
+                    value={parentInput}
+                    onChange={(e) => setParentInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        handleAddRow();
+                      }
+                    }}
+                    onPaste={(e) => {
+                      const text = e.clipboardData.getData("text");
+                      if (/[,\n]/.test(text) || text.includes(":") || text.includes("->")) {
+                        e.preventDefault();
+                        applyBulkText(text);
+                        setParentInput("");
+                        setChildInput("");
+                      }
+                    }}
+                    placeholder={parentPlaceholder}
+                    disabled={disabled}
+                    style={{
+                      flex: 1,
+                      minWidth: 0,
+                      background: "transparent",
+                      border: "none",
+                      outline: "none",
+                      color: "var(--text-main)",
+                      fontSize: "12.5px",
+                      padding: "4px 0",
+                    }}
+                  />
                 </div>
+              </td>
+
+              {/* Permutations Input */}
+              <td style={{ padding: "8px 10px", verticalAlign: "middle" }}>
+                <input
+                  value={childInput}
+                  onChange={(e) => setChildInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      handleAddRow();
+                    }
+                  }}
+                  onPaste={(e) => {
+                    const text = e.clipboardData.getData("text");
+                    if (text.includes(":") || text.includes("->") || text.includes("\n")) {
+                      e.preventDefault();
+                      applyBulkText(text);
+                      setParentInput("");
+                      setChildInput("");
+                    }
+                  }}
+                  placeholder="Permutations (e.g. official_name, real_name) -- press Enter to add"
+                  disabled={disabled}
+                  style={{
+                    width: "100%",
+                    background: "rgba(255,255,255,0.03)",
+                    border: "1px dashed var(--border-subtle)",
+                    borderRadius: "6px",
+                    outline: "none",
+                    color: "var(--text-main)",
+                    fontSize: "12px",
+                    padding: "5px 8px",
+                  }}
+                />
+              </td>
+
+              {/* Add Action Button */}
+              <td style={{ padding: "8px 4px", verticalAlign: "middle", textAlign: "center" }}>
                 <button
                   type="button"
-                  onClick={() => removeParent(idx)}
-                  disabled={disabled}
-                  title="Remove this name and all its search terms"
-                  style={{ background: "transparent", border: "none", color: "var(--danger, #e95053)", cursor: "pointer", fontSize: "13px", padding: "2px 4px", flexShrink: 0 }}
+                  onClick={handleAddRow}
+                  disabled={disabled || (!parentInput.trim() && !childInput.trim())}
+                  title="Add keyword"
+                  style={{
+                    background: (parentInput.trim() || childInput.trim()) ? "rgba(136, 56, 221, 0.25)" : "transparent",
+                    border: `1px solid ${(parentInput.trim() || childInput.trim()) ? "rgba(136, 56, 221, 0.5)" : "transparent"}`,
+                    color: (parentInput.trim() || childInput.trim()) ? "var(--cyan)" : "var(--text-muted)",
+                    borderRadius: "6px",
+                    cursor: (parentInput.trim() || childInput.trim()) ? "pointer" : "default",
+                    fontSize: "12px",
+                    padding: "4px 6px",
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    opacity: (parentInput.trim() || childInput.trim()) ? 1 : 0.4,
+                    transition: "all 0.15s ease",
+                  }}
                 >
-                  ✕
+                  <PlusIcon size={14} />
                 </button>
-              </div>
-              <ChipInput
-                chips={g.children}
-                onAdd={(v) => setChildren(idx, [...g.children, v])}
-                onRemove={(i) => setChildren(idx, g.children.filter((_, j) => j !== i))}
-                placeholder={childPlaceholder}
-                disabled={disabled}
-              />
-            </div>
-          ))}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      {/* Footer count */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "8px" }}>
+        <div className="kw-count-badge" style={{ margin: 0 }}>
+          <strong>{groups.length}</strong> keyword{groups.length === 1 ? "" : "s"} · <strong style={{ color: accent }}>{totalSearchTerms}</strong> search{totalSearchTerms === 1 ? "" : "es"} per platform
         </div>
-      )}
+        <div style={{ fontSize: "10px", color: "var(--text-dim)" }}>
+          Tip: Enter main keyword & permutations in the bottom row, or paste <code style={{ background: "rgba(255,255,255,0.06)", padding: "1px 4px", borderRadius: "3px" }}>Name: perm1, perm2</code>
+        </div>
+      </div>
     </div>
   );
 }
 
 
-
-/** Parse a stored domain asset-name entry. Entries with a `platform::`
- *  prefix return `{ platform, name }`; legacy entries (no prefix) return
- *  `{ platform: "", name: raw }` meaning "all platforms". */
-function parseDomainAssetEntry(raw: string): { platform: string; name: string } {
-  const idx = raw.indexOf("::");
-  if (idx >= 0) return { platform: raw.slice(0, idx).trim(), name: raw.slice(idx + 2).trim() };
-  return { platform: "", name: raw.trim() };
-}
-
-/** Render a human-friendly label for a stored domain asset-name chip. */
-function domainAssetChipLabel(raw: string, platformNames: Record<string, string>): string {
-  const { platform, name } = parseDomainAssetEntry(raw);
-  if (!platform) return name;
-  return `${name} (${platformNames[platform] || platform})`;
-}
 
 function KeywordTabs({
   activeTab,
@@ -839,12 +1196,6 @@ function KeywordTabs({
   domainGroups,
   onNameGroups,
   onDomainGroups,
-  assetNameIndividualKw,
-  assetNameDomainKw,
-  onAddAssetIndividual,
-  onRemoveAssetIndividual,
-  onAddAssetDomain,
-  onRemoveAssetDomain,
   platforms,
   disabled,
 }: {
@@ -859,13 +1210,7 @@ function KeywordTabs({
   domainGroups: KeywordGroup[];
   onNameGroups: (next: KeywordGroup[]) => void;
   onDomainGroups: (next: KeywordGroup[]) => void;
-  assetNameIndividualKw: string[];
-  assetNameDomainKw: string[];
-  onAddAssetIndividual: (kw: string) => void;
-  onRemoveAssetIndividual: (i: number) => void;
-  onAddAssetDomain: (kw: string) => void;
-  onRemoveAssetDomain: (i: number) => void;
-  platforms: PlatformHealth[];
+  platforms: PlatformState[];
   disabled?: boolean;
 }) {
   const [genOpen, setGenOpen] = useState(false);
@@ -883,13 +1228,6 @@ function KeywordTabs({
             <TagIcon size={14} style={{ marginRight: "6px" }} />
             Domain Keywords
             {domainKeywords.length > 0 && <span className="kw-tab-count">{domainKeywords.length}</span>}
-          </button>
-          <button className={`kw-tab-btn ${activeTab === "assetNames" ? "active" : ""}`} onClick={() => onTab("assetNames")}>
-            <LayersIcon size={14} style={{ marginRight: "6px" }} />
-            Asset Names
-            {(assetNameIndividualKw.length + assetNameDomainKw.length) > 0 && (
-              <span className="kw-tab-count">{assetNameIndividualKw.length + assetNameDomainKw.length}</span>
-            )}
           </button>
         </div>
 
@@ -938,42 +1276,13 @@ function KeywordTabs({
         />
       </div>
 
-      <div style={{ display: activeTab === "assetNames" ? "block" : "none" }}>
-        <div style={{ fontSize: "12px", color: "var(--text-dim)", marginBottom: "10px" }}>
-          Target asset name overrides mapped for the Analysis & Incident Reporting views.
-        </div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" }}>
-          <div>
-            <label className="field-label" style={{ marginBottom: "6px", display: "flex", alignItems: "center", gap: "6px" }}>
-              <UserIcon size={13} color="var(--cyan)" /> Individual Asset Names
-            </label>
-            <ChipInput
-              chips={assetNameIndividualKw}
-              onAdd={onAddAssetIndividual}
-              onRemove={onRemoveAssetIndividual}
-              placeholder="Asset name for individuals…"
-              disabled={disabled}
-            />
-          </div>
-          <div>
-            <label className="field-label" style={{ marginBottom: "6px", display: "flex", alignItems: "center", gap: "6px" }}>
-              <GlobeIcon size={13} color="var(--purple)" /> Domain Asset Names
-            </label>
-            <DomainAssetPlatformInput
-              chips={assetNameDomainKw}
-              onAdd={onAddAssetDomain}
-              onRemove={onRemoveAssetDomain}
-              platforms={platforms}
-              disabled={disabled}
-            />
-          </div>
-        </div>
-      </div>
 
       {genOpen && (
-        <KeywordGeneratorModal
+        <RuleBasedGeneratorModal
           nameKeywords={nameKeywords}
           domainKeywords={domainKeywords}
+          existingNameGroups={nameGroups}
+          existingDomainGroups={domainGroups}
           onAddKeywords={(type, byParent) => {
             // Attach the variations as CHILDREN of the parents they were
             // generated from, never as new parents (see
@@ -998,7 +1307,7 @@ function PlatformLimitsEditor({
   onFacebookTabChange,
   disabled,
 }: {
-  platforms: PlatformHealth[];
+  platforms: PlatformState[];
   individualLimits: Record<string, string>;
   domainLimits: Record<string, string>;
   onIndividualChange: (platform: string, value: string) => void;
@@ -1194,12 +1503,10 @@ export function HomeView({
   onClient,
   onForgetClient,
   busy,
-  analysisBusy,
   onStopDiscovery,
-  onStopAnalysis,
   stoppingDiscovery = false,
-  stoppingAnalysis = false,
-  onJobs,
+  onDiscoveryStarted,
+  onAnalyseStarted,
   onError,
 }: Props) {
   const [clients, setClients] = useState<Client[]>([]);
@@ -1238,8 +1545,6 @@ export function HomeView({
   const nameKeywords = useMemo(() => nameGroups.map((g) => g.parent), [nameGroups]);
   const domainKeywords = useMemo(() => domainGroups.map((g) => g.parent), [domainGroups]);
 
-  const [assetNameIndividualKw, setAssetNameIndividualKw] = useState<string[]>([]);
-  const [assetNameDomainKw, setAssetNameDomainKw] = useState<string[]>([]);
   const [platformLimitsIndividual, setPlatformLimitsIndividual] = useState<Record<string, string>>({});
   const [platformLimitsDomain, setPlatformLimitsDomain] = useState<Record<string, string>>({});
   const [facebookTabLimits, setFacebookTabLimits] = useState<FacebookTabLimits>({
@@ -1265,10 +1570,23 @@ export function HomeView({
     setLoadingClients(true);
     clientsApi
       .listClients()
-      .then((res) => setClients(res.items))
-      .catch((e) => onError((e as Error).message))
+      // GET /clients has no backend on the rebuilt API -- this always
+      // 404s in that configuration, which is expected (see saveConfig's
+      // local-only fallback). Locally-saved clients (savedClients.ts) are
+      // what actually populates the directory today; merged in regardless
+      // of whether the API call above succeeded, so a real future backend
+      // and this browser's own saved list both show up rather than one
+      // silently hiding the other.
+      .then((res) => res.items)
+      .catch(() => [] as Client[])
+      .then((serverClients) => {
+        const local = listSavedClients();
+        const byId = new Map(serverClients.map((c) => [c.client_id, c]));
+        for (const c of local) if (!byId.has(c.client_id)) byId.set(c.client_id, c);
+        setClients([...byId.values()]);
+      })
       .finally(() => setLoadingClients(false));
-  }, [onError]);
+  }, []);
 
   useEffect(() => {
     refreshClients();
@@ -1280,8 +1598,6 @@ export function HomeView({
     setDomainInput(c.domain || "");
     setNameGroups(groupsOf(c, "individual", c.name_keywords || []));
     setDomainGroups(groupsOf(c, "domain", c.domain_keywords || []));
-    setAssetNameIndividualKw(c.asset_name_individual_keywords || []);
-    setAssetNameDomainKw(c.asset_name_domain_keywords || []);
     setPlatformLimitsIndividual(
       Object.fromEntries(Object.entries(c.platform_limits_individual || {}).map(([k, v]) => [k, String(v)])),
     );
@@ -1314,8 +1630,6 @@ export function HomeView({
     setDomainInput(EMPTY_FORM.domain);
     setNameGroups([]);
     setDomainGroups([]);
-    setAssetNameIndividualKw([]);
-    setAssetNameDomainKw([]);
     setPlatformLimitsIndividual({});
     setPlatformLimitsDomain({});
     setFacebookTabLimits({
@@ -1385,8 +1699,6 @@ export function HomeView({
     setDomainInput(c.domain || "");
     setNameGroups(groupsOf(c, "individual", c.name_keywords || []));
     setDomainGroups(groupsOf(c, "domain", c.domain_keywords || []));
-    setAssetNameIndividualKw([...(c.asset_name_individual_keywords || [])]);
-    setAssetNameDomainKw([...(c.asset_name_domain_keywords || [])]);
     setPlatformLimitsIndividual(
       Object.fromEntries(Object.entries(c.platform_limits_individual || {}).map(([k, v]) => [k, String(v)])),
     );
@@ -1400,17 +1712,18 @@ export function HomeView({
   const activeDomainCount = activeClient?.domain_keywords?.length || 0;
   const activeKeywordCount = activeIndividualCount + activeDomainCount;
 
-  // Which keyword category a discovery sweep should cover. "" is BOTH --
-  // the default, and what every sweep did before this control existed.
-  // The full keyword list is still sent either way; the server scopes it
-  // by each keyword's own resolved category (see
-  // backend/services/discovery_service.py), so this and the per-category
-  // caps can never disagree about what "individual" means.
   // Which keyword categories a discovery sweep covers. A SET with the same
   // semantics as `sweepPlatforms` above: EMPTY means all of them, which is
-  // the default and what every sweep did before this existed. Selecting
-  // both categories is the same thing as selecting neither, so it collapses
-  // back to empty (see toggleKeywordType).
+  // the default and what every sweep did before this control existed.
+  // Selecting both categories is the same thing as selecting neither, so
+  // it collapses back to empty (see toggleKeywordType). Narrowing this
+  // actually excludes the other type's keywords from the request now --
+  // handleSearch sends individual_keywords/domain_keywords as two separate
+  // lists (see POST /discovery/jobs), each swept under its own cap
+  // (platform_limits_individual/_domain, platform_tab_limits) -- there is
+  // no server-side category resolution to fall back on any more; discovery/
+  // discovery_service.py, which used to do that, was deleted in the lean
+  // backend rebuild.
   const [sweepKeywordTypes, setSweepKeywordTypes] = useState<Set<KeywordScope>>(new Set());
 
   // The scope persists across client switches (the platform chips do too),
@@ -1455,7 +1768,7 @@ export function HomeView({
         }
         if (Object.keys(perType).length) fbTabLimits[tab] = perType;
       }
-      const client = await clientsApi.upsertClient({
+      const upsertBody: Parameters<typeof clientsApi.upsertClient>[0] = {
         client_id: id,
         name,
         domain: domainInput.trim(),
@@ -1465,20 +1778,45 @@ export function HomeView({
         name_keywords: nameKeywords,
         domain_keywords: domainKeywords,
         keyword_groups: { individual: nameGroups, domain: domainGroups },
-        asset_name_individual_keywords: assetNameIndividualKw,
-        asset_name_domain_keywords: assetNameDomainKw,
         platform_limits_individual: parsedLimitsIndividual,
         platform_limits_domain: parsedLimitsDomain,
         platform_tab_limits: Object.keys(fbTabLimits).length ? { facebook: fbTabLimits } : {},
         cron: cron.trim() || null,
-      });
+      };
+      let client: Client;
+      let persisted = true;
+      try {
+        client = await clientsApi.upsertClient(upsertBody);
+      } catch {
+        // POST /clients has no backend on the rebuilt API (only
+        // /discovery, /analysis, /sessions survive) -- fall back to a
+        // browser-local client so the actual point of this form (giving
+        // Discover something with a group id + keywords to sweep with)
+        // still works. Persisted to localStorage (savedClients.ts), not
+        // just this render's state, so it survives a page reload instead
+        // of vanishing the moment "Clients Directory" refetches.
+        persisted = false;
+        client = { ...upsertBody, domain: upsertBody.domain || "" } as Client;
+        saveClientLocally(client);
+        // GET /clients will keep coming back empty (no backend), so the
+        // sidebar list would otherwise never reflect what's actually
+        // usable right now -- merge this local client into it directly.
+        setClients((prev) => [client, ...prev.filter((c) => c.client_id !== client.client_id)]);
+      }
       setActiveClient(client);
+      // The "Individual + Domain" filter on Live Results reads this back
+      // to classify each profile's own keywords[] -- see clientKeywords.ts.
+      saveClientKeywords(client.client_id, nameKeywords, domainKeywords);
       setMode("select");
       setEditing(false);
       onClient(client.client_id, client.name);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
-      toast.success(`Client "${client.name}" saved!`, { icon: "💾" });
+      if (persisted) {
+        toast.success(`Client "${client.name}" saved!`, { icon: "💾" });
+      } else {
+        toast(`"${client.name}" is local-only for this session -- no /clients backend to persist it to.`, { icon: "⚠️" });
+      }
       refreshClients();
       return client;
     } catch (e) {
@@ -1495,7 +1833,8 @@ export function HomeView({
       onError("This client has no keywords yet — head to the Keywords tab to add executive names or brand keywords.");
       return;
     }
-    // The server rejects this too (discovery_service raises rather than
+    // The server rejects this too (POST /discovery/jobs requires at least
+    // one non-empty individual_keywords/domain_keywords entry rather than
     // sweeping nothing and reporting success), but catching it here means
     // the analyst finds out on click instead of via a failed job.
     if (sweepKeywordScope === "individual" && !activeIndividualCount) {
@@ -1507,17 +1846,26 @@ export function HomeView({
       return;
     }
     try {
-      const { job_id } = await discoveryApi.discover({
-        client_id: activeClient.client_id,
-        keywords: dedupeKeywordsCaseInsensitive([
-          ...(activeClient.name_keywords || []),
-          ...(activeClient.domain_keywords || []),
-        ]),
-        ...platformScope(sweepPlatforms),
-        ...(sweepKeywordScope ? { keyword_type: sweepKeywordScope } : {}),
+      const scope = platformScope(sweepPlatforms);
+      // sweepKeywordScope narrows which TYPE actually gets swept -- sending
+      // an empty list for the excluded type rather than filtering after the
+      // fact, so the caps below (platform_limits_individual/_domain) only
+      // ever apply to keywords that are genuinely part of this sweep.
+      const res = await discoveryApi.startDiscovery({
+        group_id: activeClient.client_id,
+        individual_keywords: sweepKeywordScope === "domain"
+          ? [] : dedupeKeywordsCaseInsensitive(activeClient.name_keywords || []),
+        domain_keywords: sweepKeywordScope === "individual"
+          ? [] : dedupeKeywordsCaseInsensitive(activeClient.domain_keywords || []),
+        platforms: scope.platforms || (scope.platform ? [scope.platform] : undefined),
+        platform_limits_individual: activeClient.platform_limits_individual,
+        platform_limits_domain: activeClient.platform_limits_domain,
+        platform_tab_limits: activeClient.platform_tab_limits,
       });
-      const job = await jobsApi.job(job_id);
-      onJobs([job]);
+      if (res.skipped.length) {
+        onError(`Skipped: ${res.skipped.map((s) => `${s.value} (${s.reason})`).join(", ")}`);
+      }
+      onDiscoveryStarted(res.job_id);
     } catch (e) {
       onError((e as Error).message);
     }
@@ -1538,22 +1886,22 @@ export function HomeView({
 
   const handleRunAnalysis = async () => {
     if (!activeClient) return;
-    const scope = analysisPlatformName ? `on ${analysisPlatformName}` : "across every ready platform";
+    const scope = analysisPlatformName ? `on ${analysisPlatformName}` : "across every platform";
     if (
       !(await confirmAction(
-        `Re-run analysis for every validated profile of "${activeClient.name || activeClient.client_id}" ${scope}, including ones already analysed? This re-scrapes each one again.`,
+        `Analyse every currently validated profile of "${activeClient.name || activeClient.client_id}" ${scope}? This re-scrapes each one again -- results are memory-only, shown on the Analysis tab.`,
       ))
     ) {
       return;
     }
     try {
-      const { job_id } = await analysisApi.analyse({
-        client_id: activeClient.client_id,
-        force: true,
-        ...platformScope(analysisPlatforms),
+      const platformFilter = analysisPlatforms.size === 1 ? [...analysisPlatforms][0] : undefined;
+      const res = await discoveryApi.analyseValidated({
+        group_id: activeClient.client_id,
+        platform: platformFilter,
+        domain: activeClient.domain,
       });
-      const job = await jobsApi.job(job_id);
-      onJobs([job]);
+      onAnalyseStarted(res.job_id);
     } catch (e) {
       onError((e as Error).message);
     }
@@ -1566,21 +1914,28 @@ export function HomeView({
     );
     if (!confirmed) return;
     setDeleting(true);
+    const deletedId = activeClient.client_id;
+    let persisted = true;
     try {
-      const deletedId = activeClient.client_id;
       await clientsApi.deleteClient(deletedId);
-      onForgetClient(deletedId);
-      setActiveClient(null);
-      setEditing(false);
-      clearForm();
-      onClient("", "");
-      refreshClients();
-      toast.success(`Client "${deletedId}" deleted.`, { icon: "🗑️" });
-    } catch (e) {
-      onError((e as Error).message);
-    } finally {
-      setDeleting(false);
+    } catch {
+      // DELETE /clients/{id} has no backend either -- remove it from this
+      // browser's local list regardless, so the UI doesn't get stuck.
+      // Any discovery profiles already saved server-side under this
+      // group_id are untouched (no route exposes deleting them).
+      persisted = false;
     }
+    deleteClientLocally(deletedId);
+    setClients((prev) => prev.filter((c) => c.client_id !== deletedId));
+    onForgetClient(deletedId);
+    setActiveClient(null);
+    setEditing(false);
+    clearForm();
+    onClient("", "");
+    setDeleting(false);
+    toast(persisted ? `Client "${deletedId}" deleted.` : `Removed "${deletedId}" locally -- no /clients backend to delete it from.`, {
+      icon: persisted ? "🗑️" : "⚠️",
+    });
   };
 
   const filteredClients = useMemo(() => {
@@ -1799,12 +2154,6 @@ export function HomeView({
                   domainGroups={domainGroups}
                   onNameGroups={setNameGroups}
                   onDomainGroups={setDomainGroups}
-                  assetNameIndividualKw={assetNameIndividualKw}
-                  assetNameDomainKw={assetNameDomainKw}
-                  onAddAssetIndividual={(v) => setAssetNameIndividualKw((prev) => (prev.some((k) => k.toLowerCase() === v.toLowerCase()) ? prev : [...prev, v]))}
-                  onRemoveAssetIndividual={(i) => setAssetNameIndividualKw((prev) => prev.filter((_, idx) => idx !== i))}
-                  onAddAssetDomain={(v) => setAssetNameDomainKw((prev) => (prev.some((k) => k.toLowerCase() === v.toLowerCase()) ? prev : [...prev, v]))}
-                  onRemoveAssetDomain={(i) => setAssetNameDomainKw((prev) => prev.filter((_, idx) => idx !== i))}
                   platforms={platforms}
                   disabled={busy}
                 />
@@ -1984,7 +2333,7 @@ export function HomeView({
                       const dotClass =
                         p.session_state === "ready"
                           ? "ready"
-                          : p.session_state === "login_required"
+                          : p.session_state === "incomplete"
                           ? "warn"
                           : "error";
                       return (
@@ -2098,11 +2447,7 @@ export function HomeView({
                         type="button"
                         className="runner-btn-secondary"
                         onClick={handleRunAnalysis}
-                        title={
-                          analysisBusy
-                            ? "Queue another analysis run -- it starts when the running one finishes"
-                            : "Re-run analysis now"
-                        }
+                        title="Analyse this client's currently validated profiles now -- results are memory-only, shown on the Analysis tab"
                       >
                         <AnalyseIcon size={17} color="#00F0FF" />
                         <span>
@@ -2111,22 +2456,10 @@ export function HomeView({
                             : "Analyse"}
                         </span>
                       </button>
-                      {analysisBusy && onStopAnalysis && (
-                        <button
-                          type="button"
-                          className="runner-btn-stop"
-                          onClick={onStopAnalysis}
-                          disabled={stoppingAnalysis}
-                          title="Abort the analysis run that is running now"
-                        >
-                          <StopIcon size={17} color="#fff" />
-                          <span>{stoppingAnalysis ? "Stopping..." : "Stop Analysis"}</span>
-                        </button>
-                      )}
                     </div>
                   </div>
 
-                  {(busy || analysisBusy) && (
+                  {busy && (
                     <div className="runner-queue-hint">
                       A run is already in flight for this client (it may be the
                       scheduler&rsquo;s). Starting another queues it behind the
@@ -2183,12 +2516,6 @@ export function HomeView({
                   domainGroups={domainGroups}
                   onNameGroups={setNameGroups}
                   onDomainGroups={setDomainGroups}
-                  assetNameIndividualKw={assetNameIndividualKw}
-                  assetNameDomainKw={assetNameDomainKw}
-                  onAddAssetIndividual={(v) => setAssetNameIndividualKw((prev) => (prev.some((k) => k.toLowerCase() === v.toLowerCase()) ? prev : [...prev, v]))}
-                  onRemoveAssetIndividual={(i) => setAssetNameIndividualKw((prev) => prev.filter((_, idx) => idx !== i))}
-                  onAddAssetDomain={(v) => setAssetNameDomainKw((prev) => (prev.some((k) => k.toLowerCase() === v.toLowerCase()) ? prev : [...prev, v]))}
-                  onRemoveAssetDomain={(i) => setAssetNameDomainKw((prev) => prev.filter((_, idx) => idx !== i))}
                   platforms={platforms}
                   disabled={busy}
                 />

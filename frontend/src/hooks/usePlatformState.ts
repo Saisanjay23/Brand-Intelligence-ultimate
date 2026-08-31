@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { healthApi } from "../api/healthApi";
+import { discoveryApi } from "../api/discoveryApi";
 import { sessionsApi } from "../api/sessionsApi";
-import type { PlatformHealth, SessionInfo } from "../api/types";
+import type { PlatformState, SessionInfo } from "../api/types";
 
 // Everything that answers "can this platform actually run right now":
-// /health/platforms (its `session_state` is what the Live Results platform
-// rail renders) and /sessions (the pools themselves, which drive the Sessions
-// panel and the header's ready count).
+// /discovery/platforms (its `session_state` is what the platform checkboxes
+// on the Discovery page render) and /sessions (the pools themselves, which
+// drive the Sessions panel and the header's ready count).
 //
 // These two used to be fetched independently and only once each: platform
 // health at mount and never again, sessions only when the Sessions panel
@@ -32,8 +32,8 @@ const POLL_MS = 8000;
 // Two in a row (~16s of silence) is worth telling someone about.
 const FAILURES_BEFORE_ERROR = 2;
 
-interface PlatformState {
-  platforms: PlatformHealth[];
+interface PlatformStateResult {
+  platforms: PlatformState[];
   sessions: SessionInfo[];
   refresh: () => Promise<void>;
   error: string;
@@ -47,8 +47,8 @@ function keepIfUnchanged<T>(previous: T[], next: T[]): T[] {
   return JSON.stringify(previous) === JSON.stringify(next) ? previous : next;
 }
 
-export function usePlatformState(): PlatformState {
-  const [platforms, setPlatforms] = useState<PlatformHealth[]>([]);
+export function usePlatformState(): PlatformStateResult {
+  const [platforms, setPlatforms] = useState<PlatformState[]>([]);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [error, setError] = useState("");
 
@@ -63,7 +63,7 @@ export function usePlatformState(): PlatformState {
     inFlight.current = true;
     try {
       const [health, pools] = await Promise.all([
-        healthApi.platformsHealth(),
+        discoveryApi.platforms(),
         sessionsApi.allSessionStatus(),
       ]);
       if (!mounted.current) return;
