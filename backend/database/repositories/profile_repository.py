@@ -940,9 +940,8 @@ def compute_risk_score(
 
 
 def compute_priority(
-    has_logo: bool, has_name_match: bool,
-    logo_match: Optional[bool] = None, username_match: Optional[bool] = None,
-    validated: bool = False,
+    has_logo: bool, risk_score: int,
+    logo_match: Optional[bool] = None, validated: bool = False,
 ) -> str:
     """High/Medium/Low off the same resolved signals the score uses, an
     undone logo match has to be able to drop the priority too, or the two
@@ -951,16 +950,27 @@ def compute_priority(
     Deliberately still High on a logo alone, even where `compute_score`
     returns its floor of 2 for want of a name match: priority is defined as
     photo-driven "regardless of score" (see shared/models/row.py::Row
-    .priority, which this must stay identical to, test_scoring.py asserts
-    exactly that parity). So an undone username match floors the score
-    while leaving priority High, and that is the intended reading, not a
-    contradiction.
+    .priority, which this must stay identical to).
+
+    Takes the ALREADY-COMPUTED `risk_score` for the non-logo branch,
+    deliberately -- not `has_name_match` re-derived on its own, which is
+    what this function used to take. `Row.priority` (the fresh-scrape
+    version this one must match) falls back to `score >= 5` when there's
+    no logo match, and that score already folds in activity/location, not
+    just "was the name a match." The old signature skipped that gate
+    entirely: approving a dormant, name-matched-only profile with no logo
+    stamped it High even though a fresh scrape of the identical facts,
+    lacking the activity signal, would score it below 5 and call it Low --
+    the two disagreeing about the same profile is exactly what this
+    function exists to prevent. Callers already compute `risk_score` via
+    `compute_risk_score` right before calling this; pass that value straight
+    through rather than recomputing from a narrower set of signals.
     """
     from backend.shared.models.scoring import resolve_match
 
     if resolve_match(has_logo, logo_match, validated):
         return "High"
-    return "High" if resolve_match(has_name_match, username_match, validated) else "Low"
+    return "High" if risk_score >= 5 else "Low"
 
 
 async def patch(doc_id: str, fields: dict) -> dict:
@@ -998,8 +1008,8 @@ async def patch(doc_id: str, fields: dict) -> dict:
             merged.get("logo_match"), merged.get("username_match"), validated,
         )
         safe["priority"] = compute_priority(
-            merged.get("has_logo", False), merged.get("has_name_match", False),
-            merged.get("logo_match"), merged.get("username_match"), validated,
+            merged.get("has_logo", False), safe["risk_score"],
+            merged.get("logo_match"), validated,
         )
 
     for field_name, source_key in PROVENANCE_KEYS.items():

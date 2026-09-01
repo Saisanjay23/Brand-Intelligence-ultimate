@@ -188,16 +188,29 @@ class Harvest:
         would depend on the payload having no space after the colon, which is
         true of Facebook's compact JSON today and would silently return
         nothing the day it stops being true.
+
+        Case-INSENSITIVE on purpose: the only caller who passes a mixed-case
+        needle is `entity_id_for`'s vanity slug (a bare numeric id has no
+        case to get wrong), and there is no guarantee the caller's own
+        casing matches whatever case the payload happens to render that
+        vanity in. Comparing case-sensitively made this method return
+        NOTHING for any capitalized vanity URL -- confirmed live against
+        facebook.com/AdaniOnline, where the payload's own "AdaniOnline"
+        never matched a lowercased "adanionline" needle, silently forcing
+        every such profile down to the much weaker DOM id-resolution
+        fallback. Safe for the numeric-id caller too, since lowercasing a
+        string of digits is a no-op.
         """
+        needle = needle.lower()
         for t in self.raw:
-            if needle in t:
+            if needle in t.lower():
                 try:
                     yield json.loads(t)
                 except (json.JSONDecodeError, ValueError):
                     continue
         for blob in self.gql:
             try:
-                if needle in json.dumps(blob):
+                if needle in json.dumps(blob).lower():
                     yield blob
             except (TypeError, ValueError):
                 continue

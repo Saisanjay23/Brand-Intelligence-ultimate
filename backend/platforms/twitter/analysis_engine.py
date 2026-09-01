@@ -404,6 +404,19 @@ class Scraper:
                         if about.last_username_change_iso:
                             seen += f", last {about.last_username_change_iso}"
                         row.note(seen)
+            else:
+                # The About panel is the ONLY source this engine has for a
+                # rename count -- skipping the visit here because a location
+                # was already available (from this visit's own payload, OR
+                # from a `known` discovery record pre-seeding it, see
+                # process()'s own docstring) ALSO means this row's rename
+                # history was never checked. That used to be silent: an
+                # analyst reviewing a possible recycled-identity case had no
+                # way to tell "checked, zero changes" from "never checked"
+                # apart from re-running the analysis without a known
+                # location to force the visit. Noted instead, so the gap is
+                # visible on the row itself.
+                row.note("rename-count not checked (location already known)")
 
             await self.screenshot(page, row)
             row.status = "OK" if row.profile_name else "PARTIAL"

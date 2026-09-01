@@ -34,6 +34,7 @@ import {
   SettingsGearIcon,
   AlertTriangleIcon,
   LayersIcon,
+  ClockIcon,
 } from "../components/AppIcons";
 
 type KeywordTab = "names" | "domain";
@@ -1565,6 +1566,16 @@ export function HomeView({
   // no scope is sent -- so the previous behaviour is the empty case.
   const [sweepPlatforms, setSweepPlatforms] = useState<Set<string>>(new Set());
   const [analysisPlatforms, setAnalysisPlatforms] = useState<Set<string>>(new Set());
+  // Per-sweep time safety net, minutes as typed -- blank means "use the
+  // server default" (currently 15 min, see backend/config/settings.py's
+  // discovery_max_seconds). This only ever matters for a keyword that is
+  // STILL finding new results when the clock runs out; one that already
+  // reached a real end (Facebook's own has_next=false, etc.) stops on its
+  // own well before any of this, confirmed live -- see that setting's own
+  // comment. Not persisted per-client on purpose: unlike the result caps
+  // above it, this is a "how patient am I today" dial, not part of a
+  // client's saved scraping profile.
+  const [sweepMaxMinutes, setSweepMaxMinutes] = useState("");
 
   const refreshClients = useCallback(() => {
     setLoadingClients(true);
@@ -1861,6 +1872,7 @@ export function HomeView({
         platform_limits_individual: activeClient.platform_limits_individual,
         platform_limits_domain: activeClient.platform_limits_domain,
         platform_tab_limits: activeClient.platform_tab_limits,
+        max_seconds: sweepMaxMinutes.trim() ? Number(sweepMaxMinutes) * 60 : undefined,
       });
       if (res.skipped.length) {
         onError(`Skipped: ${res.skipped.map((s) => `${s.value} (${s.reason})`).join(", ")}`);
@@ -2391,6 +2403,36 @@ export function HomeView({
                         </button>
                       );
                     })}
+                  </div>
+
+                  {/* Per-sweep time safety net -- only bites a keyword that
+                      is still finding new results when the clock runs out;
+                      one that already reached a real end stops on its own
+                      well before this. Blank = server default (15 min). */}
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px", marginTop: "10px" }}>
+                    <label
+                      htmlFor="sweep-max-minutes"
+                      style={{ fontSize: "12px", color: "var(--text-dim)", display: "flex", alignItems: "center", gap: "6px" }}
+                      title="Per-sweep safety cap -- only matters for a keyword still finding new results when time runs out. One that already finished stops immediately regardless of this."
+                    >
+                      <ClockIcon size={13} color="var(--text-dim)" />
+                      Sweep time budget (minutes)
+                    </label>
+                    <input
+                      id="sweep-max-minutes"
+                      type="number"
+                      min={1}
+                      step={1}
+                      placeholder="15 (default)"
+                      value={sweepMaxMinutes}
+                      onChange={(e) => setSweepMaxMinutes(e.target.value)}
+                      style={{
+                        width: "110px", padding: "6px 10px", fontSize: "12px",
+                        background: "var(--bg-input, rgba(255,255,255,0.04))",
+                        border: "1px solid var(--border-subtle, rgba(255,255,255,0.12))",
+                        borderRadius: "6px", color: "var(--text-main)",
+                      }}
+                    />
                   </div>
 
                   {/* Discover/Analyse stay available while something is

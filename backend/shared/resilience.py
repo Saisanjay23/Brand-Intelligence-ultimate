@@ -70,10 +70,10 @@ def classify_failure(err: BaseException | str) -> Optional[str]:
     text = str(err).lower()
     if any(tok in text for tok in _CHECKPOINT_TOKENS):
         return "checkpointed"
-    if any(tok in text for tok in _RATE_LIMIT_TOKENS):
-        return "rate_limited"
     if any(tok in text for tok in _AUTH_TOKENS):
         return "expired"
+    if any(tok in text for tok in _RATE_LIMIT_TOKENS):
+        return "rate_limited"
     return None
 
 

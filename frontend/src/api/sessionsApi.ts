@@ -6,6 +6,29 @@
 import { json, post, url } from "./httpClient";
 import type { SessionInfo } from "./types";
 
+/** What POST /sessions/proxy/test reports back. `ok` false means traffic did
+ * NOT actually egress through the proxy -- see `warnings`, which is ordered
+ * most-severe first and is written to be shown verbatim. */
+export interface ProxyTestResult {
+  ok: boolean;
+  exit_ip?: string | null;
+  direct_ip?: string | null;
+  country?: string | null;
+  country_code?: string | null;
+  city?: string | null;
+  timezone?: string | null;
+  isp?: string | null;
+  org?: string | null;
+  /** true = hosting range (loud), false = residential/mobile (quiet), null = unknown */
+  is_datacenter?: boolean | null;
+  is_known_proxy?: boolean | null;
+  is_mobile?: boolean | null;
+  latency_ms?: number;
+  intel_source?: string | null;
+  warnings?: string[];
+  error?: string;
+}
+
 export const sessionsApi = {
   // Every platform's pool in one request. Preferred over fanning
   // sessionStatus out across the platform list: it's one round trip instead
@@ -53,6 +76,16 @@ export const sessionsApi = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ proxy }),
     }).then(json<SessionInfo>),
+  // Checks a proxy BEFORE it is attached to anything: the backend starts a
+  // throwaway browser through it (and one without it, to compare) and
+  // reports the address the world actually sees. Slow by API standards --
+  // it is launching real browsers -- so callers should show a spinner.
+  testProxy: (proxy: { server: string; username?: string; password?: string }) =>
+    fetch(url(`/sessions/proxy/test`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ proxy }),
+    }).then(json<ProxyTestResult>),
   // Backend has no separate DELETE-proxy route, clearing is PUT with
   // proxy: null (see backend/controllers/session_controller.py::set_proxy).
   clearSessionProxy: (platform: string, sessionId: string) =>

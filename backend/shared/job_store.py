@@ -66,7 +66,7 @@ class JobStore(Generic[J]):
         """Register a newly-created job, evicting first so the table never
         grows past `max_jobs` even under a burst of creations."""
         async with self._lock:
-            self._evict_locked()
+            self._evict_locked(reserve=1)
             self._jobs[job.id] = job
 
     async def get(self, job_id: str) -> Optional[J]:
@@ -95,14 +95,19 @@ class JobStore(Generic[J]):
         if self._jobs.pop(job_id, None) is not None and self._on_evict is not None:
             self._on_evict(job_id)
 
-    def _evict_locked(self) -> None:
+    def _evict_locked(self, *, reserve: int = 0) -> None:
         """Expired jobs first (free to lose), then oldest-first once still
         over the ceiling. Insertion order isn't relied on for age -- this
         reads each job's own `created_at`, so eviction stays correct even
-        if a caller ever re-inserts an existing id."""
+        if a caller ever re-inserts an existing id.
+
+        `reserve` leaves room for a job `put()` is about to insert right
+        after this call -- without it, evicting down to exactly `max_jobs`
+        and then inserting leaves the table at `max_jobs + 1` until the
+        NEXT `put()`, one permanently-late eviction behind the ceiling."""
         for jid in [j for j, job in self._jobs.items() if self.age_seconds(job) >= self.ttl_seconds]:
             self._drop_locked(jid)
-        while len(self._jobs) > self.max_jobs:
+        while len(self._jobs) > self.max_jobs - reserve:
             oldest = min(self._jobs, key=lambda j: self._jobs[j].created_at)
             self._drop_locked(oldest)
 

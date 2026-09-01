@@ -354,10 +354,19 @@ export function AnalysisView({ resumeJobId }: Props = {}) {
     toast.success("Workspace reset");
   };
 
-  // Filtered rows for the table
+  // Filtered rows for the table -- grouped one platform after another (in
+  // the same order the Platform Status Chips above the table show them),
+  // rather than interleaved in whatever order each platform's scrape
+  // happened to finish an item in. Array.prototype.sort is stable, so
+  // items within one platform keep their original relative order.
   const filteredItems = useMemo(() => {
     if (!jobData?.items) return [];
-    return jobData.items.filter((it) => {
+    const platformOrder = Object.keys(jobData.platform_progress || {});
+    const orderIndex = (p: string) => {
+      const i = platformOrder.indexOf(p);
+      return i === -1 ? platformOrder.length : i;
+    };
+    const filtered = jobData.items.filter((it) => {
       // Platform filter
       if (platformFilter !== "all" && it.platform !== platformFilter) return false;
 
@@ -377,7 +386,8 @@ export function AnalysisView({ resumeJobId }: Props = {}) {
 
       return true;
     });
-  }, [jobData?.items, platformFilter, riskFilter, searchQuery]);
+    return filtered.sort((a, b) => orderIndex(a.platform) - orderIndex(b.platform));
+  }, [jobData?.items, jobData?.platform_progress, platformFilter, riskFilter, searchQuery]);
 
   // Export handlers
   const handleExport = async (fmt: "xlsx" | "csv" | "json" | "tsv") => {

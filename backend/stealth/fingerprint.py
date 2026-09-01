@@ -245,8 +245,13 @@ VIEWPORTS = [
     {"width": 1280, "height": 800},
 ]
 
-# Stable hardware characteristics keyed by session seed so cloud/VPS server
-# deployments don't leak uncharacteristically low vCPU or memory statistics.
+# Hardware specs are NO LONGER spoofed -- these pools are kept only so
+# get_identity() below keeps returning the keys some callers still read, and
+# nothing consumes them for spoofing any more. An init script cannot reach
+# Web Worker scope, so overriding these produced a main-thread-vs-worker
+# contradiction (measured: main hc=8/dm=8 against worker hc=12/dm=32) that is
+# far more identifying than any honest core count. See
+# navigator_spoofing.py's note where the overrides used to live.
 HARDWARE_CONCURRENCY = [8, 12, 16]
 DEVICE_MEMORY = [8, 16]
 
@@ -261,9 +266,21 @@ LAUNCH_ARGS = [
     "--no-first-run",
     "--disable-component-update",
     "--no-default-browser-check",
-    "--disable-site-isolation-trials",
-    "--disable-features=IsolateOrigins,site-per-process",
-    # keep WebRTC from advertising local addresses
+    # keep WebRTC from advertising local addresses.
+    #
+    # ONE --disable-features flag, deliberately. Chromium does NOT merge
+    # repeated --disable-features=; the last occurrence wins and every
+    # earlier one is silently discarded. This list used to carry a second
+    # one (`IsolateOrigins,site-per-process`) ABOVE this line, so it was
+    # never actually in effect -- verified by inspecting the list directly.
+    #
+    # It was not merged in when that was found, it was dropped, along with
+    # the `--disable-site-isolation-trials` that accompanied it. Real
+    # Chrome ships with site isolation ON; a browser that has it off is
+    # itself an automation tell, and turning it off now would ADD a signal
+    # rather than remove one. Since the flag was already inert, removing it
+    # cannot change how any engine behaves -- the browser has been running
+    # with site isolation enabled all along.
     "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
     "--disable-features=WebRtcHideLocalIpsWithMdns",
 ]

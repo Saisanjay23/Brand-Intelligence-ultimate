@@ -17,7 +17,7 @@ realistic media devices and power/network telemetry.
 from __future__ import annotations
 
 
-def build_init_js(hardware_concurrency: int = 8, device_memory: int = 8) -> str:
+def build_init_js() -> str:
     """Builds a robust initialization script with native function masking and multi-tier shielding."""
     return f"""
 (() => {{
@@ -29,15 +29,27 @@ def build_init_js(hardware_concurrency: int = 8, device_memory: int = 8) -> str:
             }});
         }};
 
-        try {{
-            delete Object.getPrototypeOf(navigator).webdriver;
-            delete navigator.webdriver;
-        }} catch (e) {{}}
-
-        Object.defineProperty(navigator, 'webdriver', {{
-            get: maskFunction(() => undefined, 'webdriver'),
-            configurable: true
-        }});
+        // navigator.webdriver is deliberately NOT touched here.
+        //
+        // This used to delete the property and redefine it to return
+        // undefined. That is what a real browser never looks like: Chrome
+        // defines `webdriver` as an accessor on Navigator.PROTOTYPE that
+        // returns the boolean false, so `typeof navigator.webdriver` is
+        // "boolean" and `'webdriver' in navigator` is true. Deleting it
+        // makes the typeof "undefined", which no genuine Chrome produces --
+        // the concealment was itself the signal. rebrowser-bot-detector
+        // flagged exactly this and said so plainly: "This property
+        // shouldn't be undefined. You might have it deleted manually."
+        //
+        // `--disable-blink-features=AutomationControlled` (fingerprint.py's
+        // LAUNCH_ARGS) already makes Chrome report the honest, correct
+        // false. Measured with the flag on and this override removed:
+        //   value=false  type=boolean  inNavigator=true
+        //   onProto=true onInstance=false
+        // which is indistinguishable from an ordinary install. Adding JS on
+        // top of a browser that is already correct could only make it wrong,
+        // so nothing goes here -- see browser.py's docstring on why less
+        // patching survives longer.
 
         Object.defineProperty(document, 'visibilityState', {{
             get: maskFunction(() => 'visible', 'visibilityState'),
@@ -49,15 +61,37 @@ def build_init_js(hardware_concurrency: int = 8, device_memory: int = 8) -> str:
             configurable: true
         }});
 
-        Object.defineProperty(navigator, 'hardwareConcurrency', {{
-            get: maskFunction(() => {hardware_concurrency}, 'hardwareConcurrency'),
-            configurable: true
-        }});
-
-        Object.defineProperty(navigator, 'deviceMemory', {{
-            get: maskFunction(() => {device_memory}, 'deviceMemory'),
-            configurable: true
-        }});
+        // EVERY navigator override below targets Navigator.PROTOTYPE, never
+        // the `navigator` instance. In a real browser navigator carries no
+        // own properties at all -- Object.getOwnPropertyNames(navigator)
+        // returns [] and every field resolves through the prototype chain.
+        // Defining on the instance leaves fingerprints that are trivial to
+        // enumerate: this used to report
+        //   ['hardwareConcurrency', 'deviceMemory', 'getBattery']
+        // which rebrowser-bot-detector flags directly ("should return empty
+        // array") -- three names that say "someone patched this" without any
+        // need to inspect their values.
+        // hardwareConcurrency and deviceMemory are deliberately NOT spoofed.
+        //
+        // They used to be, seeded per session, to stop a low-spec VPS from
+        // advertising 2 vCPU. That backfired, measurably: `add_init_script`
+        // runs in the page's main world ONLY -- it does not reach Web Worker
+        // scope -- so a worker kept reporting the machine's real hardware
+        // while the main thread reported the spoof. Measured here:
+        //     main thread  hc=8   dm=8    (spoofed)
+        //     web worker   hc=12  dm=32   (real)
+        // Any script can spawn a worker and compare those in a few lines,
+        // and a self-contradicting browser is a far louder signal than a
+        // modest core count -- plenty of real users are on 4-core laptops,
+        // none are on a machine that reports two different CPUs at once.
+        // deviceandbrowserinfo.com flags exactly this as
+        // `hasInconsistentWorkerValues`.
+        //
+        // Spoofing consistently is not an option: the worker global cannot
+        // be patched from an init script. So the honest values ship, which
+        // are also usually the better ones. If a deployment host genuinely
+        // has implausible specs, fix the HOST -- that is an ops decision,
+        // not something to paper over per-session.
 
         if (!window.chrome || !window.chrome.runtime) {{
             window.chrome = window.chrome || {{}};
@@ -99,11 +133,11 @@ def build_init_js(hardware_concurrency: int = 8, device_memory: int = 8) -> str:
                 arr.refresh = () => {{}};
                 return arr;
             }};
-            Object.defineProperty(navigator, 'plugins', {{
+            Object.defineProperty(Navigator.prototype, 'plugins', {{
                 get: maskFunction(() => makePluginArray(), 'plugins'),
                 configurable: true
             }});
-            Object.defineProperty(navigator, 'mimeTypes', {{
+            Object.defineProperty(Navigator.prototype, 'mimeTypes', {{
                 get: maskFunction(() => {{
                     const arr = [{{
                         description: "Portable Document Format",
@@ -220,7 +254,7 @@ def build_init_js(hardware_concurrency: int = 8, device_memory: int = 8) -> str:
         // --- 4. Battery & Broadband Network Information APIs ---
         try {{
             if (!navigator.connection) {{
-                Object.defineProperty(navigator, 'connection', {{
+                Object.defineProperty(Navigator.prototype, 'connection', {{
                     get: maskFunction(() => ({{
                         effectiveType: '4g',
                         rtt: 50,
@@ -232,7 +266,7 @@ def build_init_js(hardware_concurrency: int = 8, device_memory: int = 8) -> str:
                 }});
             }}
             if (!navigator.getBattery) {{
-                Object.defineProperty(navigator, 'getBattery', {{
+                Object.defineProperty(Navigator.prototype, 'getBattery', {{
                     value: maskFunction(() => Promise.resolve({{
                         charging: true,
                         chargingTime: 0,
@@ -305,4 +339,7 @@ def build_init_js(hardware_concurrency: int = 8, device_memory: int = 8) -> str:
 """
 
 
-INIT_JS = build_init_js(8, 8)
+# Module-level convenience build. Nothing imports it today (browser.py calls
+# build_init_js() directly), but it is cheap and keeps the module importable
+# as a script for eyeballing the generated JS.
+INIT_JS = build_init_js()

@@ -83,4 +83,8 @@ class DiscoveryOptions:
     # INCOMPLETE rather than pretending the results ran out.
     max_results: int = 0  # 0 = no cap
     max_pages: int = 0  # 0 = no cap
-    max_seconds: float = 300  # per sweep; 0 = no cap
+    # Mirrors settings.discovery_max_seconds -- this dataclass default is
+    # only what a caller gets that never passes max_seconds at all (the
+    # live path, discovery/runner.py, always sets one explicitly from
+    # settings). See that setting's own comment for why 900, not 300.
+    max_seconds: float = 900  # per sweep; 0 = no cap

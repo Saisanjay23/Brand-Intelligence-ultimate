@@ -386,6 +386,7 @@ class DiscoveryRunner:
         discoverer = None
         held: Optional[tuple[str, str]] = None
         anon_cm = None
+        session_item: Optional[dict] = None
         try:
             plat_obj, session_item = await sessions_engine.session_for_job(platform_id)
             held = self._store.hold_session(platform_id, session_item.get("id", ""))
@@ -419,7 +420,10 @@ class DiscoveryRunner:
                 discoverer = plat_obj.discoverer()(options, session.ctx)
 
             incomplete = 0
+            stop_platform = False
             for keyword, kw_type in job.keyword_plan:
+                if stop_platform:
+                    break
                 for tab in tabs:
                     if job.cancel.is_set():
                         break
@@ -457,7 +461,40 @@ class DiscoveryRunner:
                     if not getattr(sweep, "complete", True):
                         incomplete += 1
                     prog.keywords_done += 1
-                if job.cancel.is_set():
+
+                    stop_reason = ""
+                    if getattr(sweep, "stopped", "") == "flood-wait":
+                        stop_reason = "flood-wait"
+                    else:
+                        # A sweep that caught its own session-shaped problem
+                        # (TikTok's CAPTCHA/checkpoint, an auth failure a
+                        # platform detected mid-page rather than as a raised
+                        # exception) reports it via `error`/`stopped`
+                        # instead of raising -- the `except Exception`
+                        # branch above never sees it, so nothing would ever
+                        # tell `sessions/manager.py` this session is bad.
+                        session_reason = classify_failure(
+                            getattr(sweep, "error", "") or getattr(sweep, "stopped", "")
+                        )
+                        if session_reason:
+                            await sessions_engine.mark_session_failed(
+                                platform_id, session_item.get("id", ""), session_reason,
+                                detail=getattr(sweep, "error", "") or getattr(sweep, "stopped", ""),
+                            )
+                            stop_reason = session_reason
+                    if stop_reason:
+                        # Stop only THIS platform's remaining keywords --
+                        # job.cancel is shared across every platform running
+                        # concurrently in this job, so setting it would
+                        # wrongly cancel the others too. Firing the next
+                        # keyword immediately at a session that just told us
+                        # it's rate-limited/checkpointed/expired would only
+                        # make things worse.
+                        log.warning(f"[{platform_id}] {stop_reason} -- stopping remaining keywords this run")
+                        prog.note = f"stopped early: session {stop_reason}"
+                        stop_platform = True
+                        break
+                if job.cancel.is_set() or stop_platform:
                     break
 
             if incomplete:
@@ -471,6 +508,15 @@ class DiscoveryRunner:
             log.error(f"discovery job {job.id}: {platform_id} failed -- {prog.note}")
         finally:
             self._store.release_session(held)
+            # The other half of get_healthy_session's cross-runner claim
+            # (see sessions/manager.py) -- `held` only guards this SAME
+            # runner's own JobStore-level "in use" tracking, which can't
+            # see a job on the OTHER runner (discovery vs analysis) holding
+            # the same session; this is the real exclusion that must be
+            # released regardless, or the session looks permanently
+            # claimed to every future job on either runner.
+            if session_item is not None:
+                sessions_engine.release_claim(platform_id, session_item.get("id", ""))
             # Telegram holds a lock on its local session file until its
             # discoverer is closed; a missed stop() here is what makes the
             # NEXT Telegram run fail with "database is locked".

@@ -293,6 +293,7 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
   const [analysing, setAnalysing] = useState<"all" | "selected" | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [copyingAll, setCopyingAll] = useState(false);
 
   const [keywordFilter, setKeywordFilter] = useState("");
   const [keywordMatchType, setKeywordMatchType] = useState<"" | "individual" | "domain">("");
@@ -316,6 +317,22 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
     };
     document.addEventListener("mousedown", onClick);
     return () => document.removeEventListener("mousedown", onClick);
+  }, []);
+
+  // New/Old is a pure computed split of `pendingItems` by age (see
+  // isProfileNew) -- it's already correct the instant this component
+  // mounts or re-renders, no explicit "move" step needed. But nothing
+  // forces a re-render purely from the clock ticking: if an analyst opens
+  // this grid and leaves the tab sitting untouched (no filter change, no
+  // refresh) for longer than 24h, a profile that crosses the boundary
+  // stays visually stuck under New until *something* else triggers a
+  // re-render. This tick exists only to be that trigger -- every minute is
+  // plenty for a 24h-granularity split, cheap, and needs no server round
+  // trip since pendingItems itself doesn't change.
+  const [, forceTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => forceTick((n) => n + 1), 60_000);
+    return () => clearInterval(id);
   }, []);
 
   // Debounce search -> server param, matching the old app's search box.
@@ -361,15 +378,39 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
     }
   }, [groupId, platform, keywordFilter, search, pageSize, offset]);
 
+  // Imperative use only (e.g. after a bulk delete) -- NOT an effect
+  // dependency anywhere, see the two load effects below for why: bundling
+  // both loads behind one identity is what made a page-change also look
+  // like "the dataset changed" and clear the selection.
   const reloadAll = useCallback(() => {
     void loadPending();
     void loadValidated();
   }, [loadPending, loadValidated]);
 
+  // Each list reloads on its own actual dependencies -- notably,
+  // loadValidated depends on `offset` (real server-side pagination), so a
+  // combined "reload everything" effect keyed on both callbacks' identity
+  // used to re-run on every page change too. That's what was clearing a
+  // page-1 selection the instant an analyst clicked to page 2: this effect
+  // doesn't touch `selected` at all, so paging within the same filtered
+  // set now leaves it alone.
+  useEffect(() => {
+    void loadPending();
+  }, [loadPending, refreshKey]);
+
+  useEffect(() => {
+    void loadValidated();
+  }, [loadValidated, refreshKey]);
+
+  // Selection IS reset here, but only on what actually changes the
+  // dataset being browsed -- a different client/platform/keyword/search,
+  // switching tabs, or a fresh sweep landing (refreshKey). Deliberately
+  // excludes `offset`/`pageSize`: paging forward/back is still the same
+  // dataset, just a different slice of it.
   useEffect(() => {
     setSelected(new Set());
-    reloadAll();
-  }, [reloadAll, refreshKey]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groupId, platform, keywordFilter, search, tab, refreshKey]);
 
   // Individual/Domain classification: no server-side data for this any
   // more -- read back whatever HomeView's saveConfig last remembered for
@@ -578,6 +619,35 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
     setCopyMenuOpen(false);
   };
 
+  // Validated-tab-only pair, next to Analyse All Validated/Analyse
+  // Selected -- same "all vs. selected" split, but for the clipboard
+  // instead of a job. "Selected" reuses what's already loaded (selection
+  // only ever covers rows on screen); "All" means every validated profile
+  // matching the current filters, not just the current page, so it fetches
+  // fresh rather than reusing `validatedPage` (which is paginated to
+  // `pageSize`) -- same PENDING_FETCH_CAP-style ceiling loadPending()
+  // already uses for its own "all pending rows" fetch.
+  const handleCopyAllValidated = async () => {
+    setCopyingAll(true);
+    try {
+      const res = await discoveryApi.listProfiles({
+        group_id: groupId, platform: platform || undefined, status: "validated",
+        keyword: keywordFilter || undefined, search: search || undefined,
+        limit: PENDING_FETCH_CAP,
+      });
+      await copyUrls(res.items.map((p) => p.url), "validated");
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setCopyingAll(false);
+    }
+  };
+
+  const handleCopySelectedValidated = () => {
+    const rows = (validatedPage?.items || []).filter((p) => selected.has(p.id));
+    copyUrls(rows.map((p) => p.url), "selected");
+  };
+
   const handleExport = async (fmt: "xlsx" | "csv" | "json") => {
     const rows = scopedRows();
     if (!rows.length) {
@@ -659,6 +729,26 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
 
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
   const currentPage = Math.floor(offset / pageSize) + 1;
+
+  // Arrow-key paging -- lets an analyst walk through a long list without
+  // reaching for the mouse each time. Ignored while focus is in a text
+  // field/select/textarea so it never hijacks normal typing (the search
+  // box, a keyword filter, an editable cell). Same bounds as the Prev/Next
+  // buttons themselves, so this is a no-op on the first/last page.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      if (e.key === "ArrowRight" && currentPage < pageCount) {
+        setOffset(offset + pageSize);
+      } else if (e.key === "ArrowLeft" && offset > 0) {
+        setOffset(Math.max(0, offset - pageSize));
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [offset, pageSize, currentPage, pageCount]);
   // No per-card validate on the Validated tab -- it's already validated;
   // that tab's actions are the selection-scoped Copy/Export/Analyse ones.
   const onValidateHandler = tab === "validated" ? undefined : onValidateOne;
@@ -898,6 +988,22 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
           >
             <ZapIcon size={14} /> {analysing === "selected" ? "Starting…" : "Analyse Selected"}
           </button>
+          <button
+            className="btn-cyber-primary"
+            style={{ width: "auto", margin: 0, padding: "10px 18px" }}
+            disabled={copyingAll || !total}
+            onClick={handleCopyAllValidated}
+          >
+            <CloneIcon size={14} /> {copyingAll ? "Copying…" : "Copy All"}
+          </button>
+          <button
+            className="btn-cyber-primary"
+            style={{ width: "auto", margin: 0, padding: "10px 18px" }}
+            disabled={!selected.size}
+            onClick={handleCopySelectedValidated}
+          >
+            <CloneIcon size={14} /> Copy Selected
+          </button>
         </div>
       )}
 
@@ -931,11 +1037,11 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
           </label>
           {total > pageSize && (
             <>
-              <button disabled={offset === 0} onClick={() => setOffset(0)} className="btn-cyber-primary" style={{ width: "auto", padding: "6px 10px", marginTop: 0 }}>⏮</button>
-              <button disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - pageSize))} className="btn-cyber-primary" style={{ width: "auto", padding: "6px 12px", marginTop: 0 }}>← Prev</button>
+              <button disabled={offset === 0} onClick={() => setOffset(0)} className="btn-cyber-primary" style={{ width: "auto", padding: "6px 10px", marginTop: 0 }} title="First page">⏮</button>
+              <button disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - pageSize))} className="btn-cyber-primary" style={{ width: "auto", padding: "6px 12px", marginTop: 0 }} title="Previous page (← arrow key)">← Prev</button>
               <span style={{ fontSize: "12px", color: "var(--text-dim)" }}>Page {currentPage} of {pageCount} · {total} total</span>
-              <button disabled={currentPage >= pageCount} onClick={() => setOffset(offset + pageSize)} className="btn-cyber-primary" style={{ width: "auto", padding: "6px 12px", marginTop: 0 }}>Next →</button>
-              <button disabled={currentPage >= pageCount} onClick={() => setOffset((pageCount - 1) * pageSize)} className="btn-cyber-primary" style={{ width: "auto", padding: "6px 10px", marginTop: 0 }}>⏭</button>
+              <button disabled={currentPage >= pageCount} onClick={() => setOffset(offset + pageSize)} className="btn-cyber-primary" style={{ width: "auto", padding: "6px 12px", marginTop: 0 }} title="Next page (→ arrow key)">Next →</button>
+              <button disabled={currentPage >= pageCount} onClick={() => setOffset((pageCount - 1) * pageSize)} className="btn-cyber-primary" style={{ width: "auto", padding: "6px 10px", marginTop: 0 }} title="Last page">⏭</button>
             </>
           )}
         </div>

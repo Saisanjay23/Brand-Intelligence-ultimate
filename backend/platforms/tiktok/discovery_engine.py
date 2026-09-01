@@ -345,23 +345,37 @@ def iter_users(blob: Any) -> Iterator[TikTokUser]:
 
     def take(u: Optional[TikTokUser], bucket: list[TikTokUser]) -> None:
         """Add a parsed user to its bucket unless that handle was already
-        taken. Dedup is global across both buckets, so an account that is
-        BOTH a name match and a video author stays in `accounts` -- the
-        stronger classification wins because accounts are walked first."""
+        taken."""
         if u and u.username.lower() not in seen:
             seen.add(u.username.lower())
             bucket.append(u)
 
+    # TWO PASSES over the tree, not one -- account nodes and author nodes
+    # are NOT grouped together in TikTok's own JSON, they're interleaved in
+    # whatever order the search response happens to render them. A single
+    # walk that dedupes into `seen` as it goes only gives "accounts win"
+    # when an account's own user_info node HAPPENS to come before that same
+    # user's video-author node in the raw tree -- if a video by the real
+    # account is listed before the account's own card (routine: TikTok's
+    # results are ranked, not grouped by node type), `take()` claims that
+    # username into `authors` first, and the account-card node reached
+    # later is silently dropped as "already seen." A single walk cannot
+    # fix this by reordering the check -- the account card genuinely
+    # hasn't been read yet at that point in the tree. Walking for accounts
+    # ONLY, in full, before authors are ever considered is what actually
+    # guarantees "the stronger classification wins" regardless of raw
+    # JSON order.
     for d in iter_dicts(blob):
-        # the user-card block: {"user_list": [{"user_info": {...}}, ...]}
         info = d.get("user_info")
         if isinstance(info, dict) and (info.get("unique_id") or info.get("uniqueId")):
             u = user_from_node(info)
             if u:
                 u.match_kind = "account"
             take(u, accounts)
-            continue
 
+    for d in iter_dicts(blob):
+        if isinstance(d.get("user_info"), dict):
+            continue  # already handled as a possible account node above
         nested = d.get("user")
         if isinstance(nested, dict) and (nested.get("uniqueId") or nested.get("unique_id")):
             stats = d.get("stats") if isinstance(d.get("stats"), dict) else d.get("statsV2")
@@ -1184,12 +1198,32 @@ class Discovery:
             # Blocked region? Stop here and NAME it. Everything below would
             # otherwise run its full time budget against a notice page and
             # report a stall (see RE_GEOBLOCK).
-            if geoblocked(page.url, await _body_text(page)):
+            body = await _body_text(page)
+            if geoblocked(page.url, body):
                 out.stopped, out.complete = "geoblocked", False
                 out.error = (
                     "TikTok is blocked for this IP -- the request was redirected to "
                     f"{page.url}. Route this platform through a proxy in a region "
                     "where TikTok is available."
+                )
+                log.warning(f"tiktok/people {keyword!r}: {out.error}")
+                out.seconds = time.time() - started
+                return out
+
+            # A CAPTCHA/slide-verify challenge instead of results -- same
+            # signal analysis_engine.py::Scraper.process() already checks
+            # for (RE_CHECKPOINT / "/captcha" in the URL), just missing
+            # here. Without this, a checkpointed session's search page
+            # renders no results and the sweep below eventually gives up
+            # via the ordinary "stalled" path, which looks identical to a
+            # slow page and never tells `sessions/manager.py` the session
+            # itself is the problem -- so the same checkpointed session
+            # keeps getting handed out to the next job.
+            if RE_CHECKPOINT.search(body) or "/captcha" in page.url:
+                out.stopped, out.complete = "checkpoint", False
+                out.error = (
+                    "TikTok served a CAPTCHA/verification challenge instead of "
+                    "search results -- this session is checkpointed."
                 )
                 log.warning(f"tiktok/people {keyword!r}: {out.error}")
                 out.seconds = time.time() - started
@@ -1255,7 +1289,20 @@ class Discovery:
                 else:
                     stalls += 1
                     if stalls >= self.a.patience:
-                        out.stopped, out.complete = "stalled", False
+                        # A CAPTCHA can also appear mid-scroll (bot
+                        # detection tripping after several requests), not
+                        # just on the initial load -- check once more
+                        # before writing this off as an ordinary stall.
+                        stall_body = await _body_text(page)
+                        if RE_CHECKPOINT.search(stall_body) or "/captcha" in page.url:
+                            out.stopped, out.complete = "checkpoint", False
+                            out.error = (
+                                "TikTok served a CAPTCHA/verification challenge mid-sweep -- "
+                                "this session is checkpointed."
+                            )
+                            log.warning(f"tiktok/people {keyword!r}: {out.error}")
+                        else:
+                            out.stopped, out.complete = "stalled", False
                         break
                     await page.wait_for_timeout(600)
 

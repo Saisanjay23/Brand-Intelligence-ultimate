@@ -361,7 +361,20 @@ class Scraper:
                     row.mark("last_post", "search")
 
             await self.screenshot(page, row)
-            row.status = "OK" if row.profile_name or row.profile_id else "PARTIAL"
+            # NOT `or row.profile_id` -- profile_id is derived from the URL
+            # at the very top of this method and is unconditionally
+            # non-empty by this point (a blank one already returned ERROR
+            # earlier), so `or row.profile_id` made this condition always
+            # True regardless of whether anything was actually read.
+            # Concrete case this let through as "OK": the DOM fallback tier
+            # runs when `dom.get("followers") or dom.get("nickname")` is
+            # truthy (line 341) -- if only `followers` came back and
+            # `nickname` didn't, `fill_from_dom` leaves `row.profile_name`
+            # blank (it's only ever set from `dom.get("nickname")`), a
+            # genuinely weak read missing the one field this whole tool is
+            # about (the name to compare against the keyword) -- and this
+            # line still stamped it "OK", hiding that from the analyst.
+            row.status = "OK" if row.profile_name else "PARTIAL"
             return row
         finally:
             try:

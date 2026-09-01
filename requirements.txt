@@ -3,6 +3,13 @@
 
 # browser automation (Facebook, X, Instagram)
 playwright>=1.40
+# API-compatible Playwright fork that strips driver-level automation signals
+# (CDP announcement, worker-scope CDP, timing-resolution tell). Measured
+# against deviceandbrowserinfo.com: vanilla playwright -> isBot TRUE,
+# patchright -> isBot FALSE. backend/stealth/browser.py prefers it and falls
+# back to playwright when absent, so this is a strong recommendation rather
+# than a hard requirement.
+patchright>=1.40
 
 # API + service
 fastapi>=0.110

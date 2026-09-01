@@ -438,6 +438,7 @@ class AnalysisRunner:
 
         scraper = None
         held: Optional[tuple[str, str]] = None
+        session_item: Optional[dict] = None
         try:
             plat, session_item = await sessions_engine.session_for_job(platform_id)
             held = self._store.hold_session(platform_id, session_item.get("id", ""))
@@ -464,7 +465,20 @@ class AnalysisRunner:
                     "check credentials under Sessions")
             await sessions_engine.mark_session_ok(platform_id, session_item.get("id", ""))
 
+            if platform_id == "youtube":
+                # YouTube's channels.list costs 1 quota unit per call
+                # regardless of how many ids ride along (up to 50) --
+                # Scraper.run() already batches on that, but nothing called
+                # it: this loop's generic per-item path called scraper.one()
+                # once per item, i.e. once per channel, so a run of 200
+                # approved channels paid 200 quota units for what a single
+                # batched call (well, ~4, at 50/call) could answer. See
+                # Scraper.run()'s own docstring for the full accounting.
+                await self._scrape_youtube_batch(job, platform_id, items, scraper, session_item, progress)
+                return
+
             i = 0
+            session_died = False
             while i < len(items):
                 if job.cancel.is_set():
                     break
@@ -483,7 +497,14 @@ class AnalysisRunner:
                 )
                 if any(fatal):
                     # the session itself died -- stop this platform rather
-                    # than burning every remaining URL against it
+                    # than burning every remaining URL against it. Chunks
+                    # after this one were never even started, so unlike a
+                    # plain cancel (below) they must not be left at
+                    # "pending" -- that would report a terminal `done` job
+                    # with URLs that were silently never visited and no
+                    # explanation on any of them. Marked in the block below,
+                    # once the loop has actually stopped.
+                    session_died = True
                     break
                 if i < len(items):
                     try:
@@ -491,7 +512,16 @@ class AnalysisRunner:
                     except Exception:
                         pass
 
-            progress["status"] = "done"
+            if session_died:
+                detail = "session failed mid-run -- see the earlier failed item(s) on this platform for why"
+                for it in items:
+                    if it.status in ("pending", "running"):
+                        self._fail_item(job, it, detail)
+                        job.completed += 1
+                        progress["completed"] += 1
+                progress["status"] = "failed"
+            else:
+                progress["status"] = "done"
         except Exception as e:
             progress["status"] = "failed"
             detail = f"{type(e).__name__}: {e}"
@@ -508,11 +538,72 @@ class AnalysisRunner:
             # cancel must never leave a session showing as busy forever in
             # the Sessions panel.
             self._store.release_session(held)
+            # The other half of get_healthy_session's cross-runner claim
+            # (see sessions/manager.py) -- `held` only guards THIS runner's
+            # own JobStore, which can't see a discovery job holding the
+            # same session; this is the real exclusion and must be released
+            # regardless of which path got here.
+            if session_item is not None:
+                sessions_engine.release_claim(platform_id, session_item.get("id", ""))
             if scraper is not None:
                 try:
                     await scraper.stop()
                 except Exception:
                     pass
+
+    async def _scrape_youtube_batch(
+        self, job: AnalysisJob, platform_id: str, items: list[AnalysisItem],
+        scraper: Any, session_item: dict, progress: dict,
+    ) -> None:
+        """YouTube-only replacement for the generic per-item chunk loop in
+        `_scrape_platform`: one call to `Scraper.run()` (internally batched
+        50 channel ids per `channels.list` call, 1 quota unit each) instead
+        of one `scraper.one()` -> one `channels.list` call per item. Called
+        instead of, never alongside, the generic loop -- see the
+        `platform_id == "youtube"` branch above.
+
+        Mirrors `_scrape_one`'s per-item bookkeeping (status, `_populate`,
+        `job.completed`/`progress["completed"]`) but for a whole batch at
+        once, since there's no per-item concurrency here to stagger."""
+        for it in items:
+            it.status = "running"
+
+        jobs = [(it.url, job.target_name, job.official_feed) for it in items]
+        try:
+            rows = await scraper.run(jobs)
+        except Exception as e:
+            detail = f"{type(e).__name__}: {e}"
+            log.error(f"analysis job {job.id}: youtube batch failed -- {detail}")
+            for it in items:
+                self._fail_item(job, it, detail)
+                job.completed += 1
+                progress["completed"] += 1
+            progress["status"] = "failed"
+            return
+
+        # `run()` stops the moment a row comes back CHECKPOINT (daily quota
+        # exhausted -- every remaining lookup would fail identically), so
+        # `rows` can be shorter than `items`; zip only covers what actually
+        # ran, and the loop after it accounts for whatever's left.
+        quota_hit = False
+        for it, row in zip(items, rows):
+            if row.status == "CHECKPOINT":
+                quota_hit = True
+                await sessions_engine.mark_session_failed(
+                    platform_id, session_item.get("id", ""), "rate_limited",
+                    detail=row.notes or "quota exhausted",
+                )
+            known = job.seed_by_url.get(it.url)
+            await self._populate(job, it, row, known)
+            job.completed += 1
+            progress["completed"] += 1
+
+        for it in items[len(rows):]:
+            self._fail_item(job, it, "youtube quota exhausted mid-batch -- not attempted")
+            job.completed += 1
+            progress["completed"] += 1
+
+        progress["status"] = "failed" if quota_hit else "done"
 
     async def _scrape_one(
         self, job: AnalysisJob, it: AnalysisItem, scraper: Any,
@@ -703,7 +794,13 @@ class AnalysisRunner:
             "Risk Score": it.risk_score,
             "priority": it.priority,
             "Date": to_ddmmyyyy(it.analysed_at),
-            "Comments": it.comments or "",
+            # Always blank, never auto-filled from `it.comments` (the
+            # engine's own scrape notes / error text, still visible on the
+            # item itself and in its error badge) -- this column is the
+            # analyst's own free-text field, and pre-seeding it with
+            # scraper notes meant real analyst comments were mixed in with
+            # (or overwritten by) machine-generated text on every re-export.
+            "Comments": "",
         }
 
     async def stats(self) -> dict:

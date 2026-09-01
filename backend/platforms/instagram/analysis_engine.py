@@ -250,10 +250,30 @@ class Scraper:
           break;
         }
       }
-      const img = document.querySelector(
-        `header img[alt*="profile picture" i], header img[alt*="profile photo" i], header img`
-      );
-      const verified = !!document.querySelector('header svg[aria-label*="Verified" i], svg[aria-label*="Verified" i]');
+      // Exact alt match first ("<username>'s profile picture/photo", what
+      // this function's own docstring promises), scoped to `header` --
+      // `username` is passed in for exactly this. Falls back to a looser
+      // substring match ONLY if the exact one misses (a different phrasing
+      // Instagram might render), but that fallback stays header-scoped too:
+      // it never drops to "any image in the header" the way this used to,
+      // which could return an unrelated icon/decoration image sitting
+      // beside the real avatar inside the same <header> element.
+      const headerImgs = Array.from(document.querySelectorAll('header img[alt]'));
+      const wantedAlts = username
+        ? [`${username}'s profile picture`, `${username}'s profile photo`]
+        : [];
+      let avatarEl = headerImgs.find(el => wantedAlts.includes(el.getAttribute('alt') || ''));
+      if (!avatarEl) {
+        avatarEl = headerImgs.find(el => /profile (picture|photo)/i.test(el.getAttribute('alt') || ''));
+      }
+      const img = avatarEl || null;
+      // header-scoped ONLY -- the unscoped second alternative this used to
+      // carry (`svg[aria-label*="Verified" i]` with no `header` prefix)
+      // made the header-scoped clause dead: a comma-joined CSS selector
+      // matches either side, so ANY verified badge anywhere on the page
+      // (a suggested-accounts rail, a related-profile carousel) satisfied
+      // the match and got attributed to the profile being scored.
+      const verified = !!document.querySelector('header svg[aria-label*="Verified" i]');
       const bodyText = document.body.innerText || "";
       return {
         name, posts, followers, following,

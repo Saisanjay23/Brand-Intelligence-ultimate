@@ -13,6 +13,7 @@
 // backstop on whatever this parses to.
 import { useState } from "react";
 import { sessionsApi } from "../api/sessionsApi";
+import type { ProxyTestResult } from "../api/sessionsApi";
 import type { SessionInfo, SessionItem } from "../api/types";
 import { PlatformIcon } from "../components/PlatformIcon";
 import {
@@ -65,9 +66,20 @@ export function ProxyPanel({ sessions, onChanged }: Props) {
   const [rawInput, setRawInput] = useState<string>("");
   const [timezoneId, setTimezoneId] = useState<string>("");
   const [showFormats, setShowFormats] = useState(false);
+  // Result of the pre-save probe, and whether one is in flight. Kept beside
+  // the editor state because it is only ever meaningful for the string
+  // currently in `rawInput` -- see clearProbe.
+  const [probe, setProbe] = useState<ProxyTestResult | null>(null);
+  const [probing, setProbing] = useState(false);
 
   const parsed: ParsedProxy | null = editing ? parseProxyString(rawInput) : null;
   const showParseError = editing && rawInput.trim().length > 0 && !parsed;
+
+  // A probe result outlives the string it describes unless something drops
+  // it. Showing "✓ residential" under a proxy the analyst has since edited
+  // would be worse than showing nothing, so every path that changes the
+  // input clears it.
+  const clearProbe = () => setProbe(null);
 
   const openEditor = (platform: string, sessionId: string) => {
     const key = `${platform}:${sessionId}`;
@@ -75,12 +87,14 @@ export function ProxyPanel({ sessions, onChanged }: Props) {
     setRawInput("");
     setTimezoneId("");
     setError("");
+    clearProbe();
   };
 
   const closeEditor = () => {
     setEditing("");
     setRawInput("");
     setTimezoneId("");
+    clearProbe();
   };
 
   const run = async (key: string, fn: () => Promise<unknown>) => {
@@ -93,6 +107,22 @@ export function ProxyPanel({ sessions, onChanged }: Props) {
       setError((e as Error).message);
     } finally {
       setBusyId("");
+    }
+  };
+
+  const testProxy = async () => {
+    if (!parsed) return;
+    setProbing(true);
+    setProbe(null);
+    setError("");
+    try {
+      setProbe(await sessionsApi.testProxy({
+        server: parsed.server, username: parsed.username, password: parsed.password,
+      }));
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setProbing(false);
     }
   };
 
@@ -361,7 +391,7 @@ export function ProxyPanel({ sessions, onChanged }: Props) {
                         <input
                           autoFocus
                           value={rawInput}
-                          onChange={(e) => setRawInput(e.target.value)}
+                          onChange={(e) => { setRawInput(e.target.value); clearProbe(); }}
                           placeholder="paste any proxy string -- host:port, user:pass@host:port, socks5://host:port, ..."
                           style={{
                             width: "100%", background: "var(--bg-app, #101828)", border: "1px solid var(--border-color, #344054)",
@@ -381,6 +411,20 @@ export function ProxyPanel({ sessions, onChanged }: Props) {
                               outline: "none", boxSizing: "border-box",
                             }}
                           />
+                          <button
+                            onClick={() => testProxy()}
+                            disabled={!parsed || probing}
+                            title="Route a throwaway browser through this proxy and report the address the world actually sees"
+                            style={{
+                              padding: "7px 14px", borderRadius: "7px", fontSize: "12px", fontWeight: 600,
+                              background: "transparent",
+                              border: "1px solid var(--border-subtle, rgba(255,255,255,0.18))",
+                              color: parsed ? "var(--text-primary, #fff)" : "var(--text-dim, #98A2B3)",
+                              cursor: parsed && !probing ? "pointer" : "not-allowed", whiteSpace: "nowrap",
+                            }}
+                          >
+                            {probing ? "Testing…" : "Test"}
+                          </button>
                           <button
                             onClick={() => saveProxy(s.platform, item.id)}
                             disabled={!parsed || isBusy}
@@ -405,6 +449,66 @@ export function ProxyPanel({ sessions, onChanged }: Props) {
                             </span>
                           )}
                         </div>
+
+                        {/* Live probe result. Deliberately verbose: a proxy
+                            that "saves fine" can still be sending traffic
+                            out on the real IP (Chromium's SOCKS fallback) or
+                            be a datacenter range, and neither is visible
+                            from the parsed string alone. */}
+                        {probe && (
+                          <div
+                            style={{
+                              marginTop: "8px", padding: "9px 11px", borderRadius: "8px", fontSize: "11.5px",
+                              background: probe.ok ? "rgba(18,183,106,0.08)" : "rgba(240,68,56,0.10)",
+                              border: `1px solid ${probe.ok ? "rgba(18,183,106,0.35)" : "rgba(240,68,56,0.40)"}`,
+                            }}
+                          >
+                            <div style={{ fontWeight: 700, color: probe.ok ? "var(--success, #12B76A)" : "var(--danger, #F04438)" }}>
+                              {probe.ok ? "✓ Traffic is exiting through this proxy" : "✕ Not usable"}
+                            </div>
+                            {probe.exit_ip && (
+                              <div style={{ marginTop: "4px", color: "var(--text-dim, #98A2B3)" }}>
+                                exit <strong style={{ color: "var(--text-primary,#fff)" }}>{probe.exit_ip}</strong>
+                                {probe.city || probe.country ? ` · ${[probe.city, probe.country].filter(Boolean).join(", ")}` : ""}
+                                {probe.timezone ? ` · ${probe.timezone}` : ""}
+                                {typeof probe.latency_ms === "number" ? ` · ${probe.latency_ms}ms` : ""}
+                              </div>
+                            )}
+                            {probe.org && (
+                              <div style={{ color: "var(--text-dim, #98A2B3)" }}>{probe.org}</div>
+                            )}
+                            {probe.is_datacenter !== null && probe.is_datacenter !== undefined && (
+                              <div style={{ marginTop: "3px", fontWeight: 600,
+                                            color: probe.is_datacenter ? "var(--warning, #F79009)" : "var(--success, #12B76A)" }}>
+                                {probe.is_datacenter
+                                  ? "⚠ datacenter range — the loudest network-layer signal"
+                                  : probe.is_mobile ? "✓ mobile carrier range — the quietest kind"
+                                  : "✓ residential range"}
+                              </div>
+                            )}
+                            {probe.timezone && (
+                              <button
+                                onClick={() => setTimezoneId(probe.timezone as string)}
+                                style={{
+                                  marginTop: "6px", padding: "3px 8px", borderRadius: "6px", fontSize: "10.5px",
+                                  background: "transparent", border: "1px solid var(--border-subtle, rgba(255,255,255,0.18))",
+                                  color: "var(--text-primary,#fff)", cursor: "pointer",
+                                }}
+                                title="Match the browser timezone to where this proxy actually exits"
+                              >
+                                use {probe.timezone} as this session's timezone
+                              </button>
+                            )}
+                            {(probe.warnings || []).map((w: string, i: number) => (
+                              <div key={i} style={{ marginTop: "5px", color: "var(--warning, #F79009)", lineHeight: 1.45 }}>
+                                {w}
+                              </div>
+                            ))}
+                            {probe.error && (
+                              <div style={{ marginTop: "5px", color: "var(--danger, #F04438)" }}>{probe.error}</div>
+                            )}
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>

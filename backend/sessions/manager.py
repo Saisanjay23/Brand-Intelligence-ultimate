@@ -391,12 +391,39 @@ def _pick_least_recently_used(available: list[dict]) -> Optional[dict]:
     return sorted(available, key=lambda s: s["last_used"])[0]
 
 
+# Guards the read-pick-write below against two callers picking the SAME
+# session before either has written anything back. `_is_available()` reads
+# only `status`/`rate_limited_until` -- claiming a session doesn't change
+# either of those, so a lock around the read+pick alone wouldn't stop a
+# second caller from immediately re-picking the one just claimed; `_claimed`
+# is the actual exclusion signal, consulted (and updated) while still
+# holding the lock.
+#
+# Deliberately NOT `backend/shared/job_store.py`'s existing hold-tracking:
+# each of discovery_runner/analysis_runner owns its OWN JobStore instance
+# with its OWN `_sessions_in_use` set, so a discovery job and an analysis
+# job (or two discovery jobs) can't see each other's holds there -- this is
+# the one module every caller of session_for_job actually shares, so it's
+# the only place a cross-runner claim can live. Confirmed live/reproducible
+# before this fix: two concurrent jobs on the same platform could both be
+# handed the same account's cookies and open two browser contexts on one
+# IP at once -- this codebase's own health-monitor comments call exactly
+# that scenario the single most reliable way to earn a checkpoint.
+_claim_lock = asyncio.Lock()
+_claimed: set[tuple[str, str]] = set()
+
+
 async def get_healthy_session(platform_id: str) -> Optional[dict]:
-    items = await sessions_db.list_pool(platform_id)
-    available = [s for s in items if _is_available(s, _now())]
-    chosen = _pick_least_recently_used(available)
-    if chosen is None:
-        return None
+    async with _claim_lock:
+        items = await sessions_db.list_pool(platform_id)
+        available = [
+            s for s in items
+            if _is_available(s, _now()) and (platform_id, s["id"]) not in _claimed
+        ]
+        chosen = _pick_least_recently_used(available)
+        if chosen is None:
+            return None
+        _claimed.add((platform_id, chosen["id"]))
     now = _now()
     await sessions_db.update_item(platform_id, chosen["id"], status="ready", rate_limited_until=0.0, last_used=now)
     # a real, durable count of how many times this session has actually
@@ -408,6 +435,18 @@ async def get_healthy_session(platform_id: str) -> Optional[dict]:
         "ready", 0.0, now, use_count,
     )
     return chosen
+
+
+def release_claim(platform_id: str, session_id: str) -> None:
+    """The other half of `get_healthy_session`'s claim -- callers MUST call
+    this once they're done with the session (in a `finally`, alongside
+    their own JobStore `release_session`), or it looks permanently in-use
+    to every other job. A no-op for a blank id (anonymous/no-session
+    platforms never claimed anything to begin with), matching JobStore's
+    own `hold_session`/`release_session` convention so callers don't need
+    an extra branch."""
+    if session_id:
+        _claimed.discard((platform_id, session_id))
 
 
 async def session_for_job(platform_id: str) -> tuple[object, dict]:
@@ -805,6 +844,18 @@ def _validate_proxy(proxy: dict) -> dict:
         out["username"] = username
     if password := str(proxy.get("password") or "").strip():
         out["password"] = password
+
+    # Refused rather than warned about, because this combination fails
+    # DANGEROUSLY: Chromium has no SOCKS username/password auth, so it drops
+    # the credentials, the proxy refuses, and the browser silently falls
+    # back to a DIRECT connection. The session would report healthy and be
+    # proxied in the UI while every request left on the host's real IP --
+    # the exact opposite of what assigning a proxy is for. Storing it would
+    # be storing a false sense of safety.
+    from backend.stealth.proxy import socks_auth_warning
+
+    if warn := socks_auth_warning(out):
+        raise ValidationError(warn)
     if tz := str(proxy.get("timezone_id") or "").strip():
         # not validated against the IANA database here, resolve_timezone_id
         # (stealth/timezone.py) just hands whatever string this is straight

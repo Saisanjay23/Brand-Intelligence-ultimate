@@ -96,7 +96,18 @@ class Settings(BaseSettings):
     # unconditionally (MTProto allows one connection at a time).
     analysis_concurrency: int = 2
     discovery_concurrency: int = 2
-    discovery_max_seconds: float = 300
+    # 15 min, not 5: live-timed against a genuinely broad keyword ("nasa")
+    # on Facebook, People and Pages were STILL finding ~1 new result/sec at
+    # the old 300s ceiling, no sign of slowing -- that config was cutting
+    # off well before those tabs would ever have reached a real end. A
+    # keyword that already finishes fast is unaffected either way: the
+    # sweep loop breaks the instant the platform reports no more results
+    # (see facebook/discovery_engine.py's `state.has_next` check, which
+    # fires every scroll regardless of this ceiling) -- confirmed live,
+    # Facebook's Groups tab exhausted in 119s against a 420s test ceiling.
+    # This is a safety backstop for the keywords that DON'T have a fast
+    # natural end, not a target duration for the ones that do.
+    discovery_max_seconds: float = 900
     headless: bool = True
 
     # webhook callbacks (job completion push-back to the caller)

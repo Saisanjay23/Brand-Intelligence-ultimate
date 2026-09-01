@@ -342,6 +342,17 @@ class Telegram:
                         photo_bytes = await self.client.download_profile_photo(obj, file=bytes)
                         if photo_bytes:
                             ent.avatar = f"data:image/jpeg;base64,{base64.b64encode(photo_bytes).decode('utf-8')}"
+                    except FloodWaitError as e:
+                        # NOT the generic except below -- every other RPC in
+                        # this file converts this to the module's own
+                        # FloodWait and lets it propagate so the run stops;
+                        # swallowing it here at debug level let a flood
+                        # triggered by a photo download go completely
+                        # unnoticed, and every remaining photo download in
+                        # this same search() call (and every resolve() call
+                        # after it) would re-hit the same limit with no
+                        # backoff, silently.
+                        raise FloodWait(int(getattr(e, "seconds", 0))) from e
                     except Exception as e:
                         log.debug(f"could not download photo for {ent.username or ent.entity_id}: {e}")
                 out.append(ent)
@@ -371,6 +382,14 @@ class Telegram:
                 photo_bytes = await self.client.download_profile_photo(obj, file=bytes)
                 if photo_bytes:
                     ent.avatar = f"data:image/jpeg;base64,{base64.b64encode(photo_bytes).decode('utf-8')}"
+            except FloodWaitError as e:
+                # See search()'s identical fix -- this used to be silently
+                # swallowed by the generic except below, so a flood-wait
+                # hit here came back as an ordinary OK/PARTIAL row instead
+                # of CHECKPOINT, and Scraper.run() never stopped the batch,
+                # driving the account deeper into the limit on every
+                # subsequent resolve() call.
+                raise FloodWait(int(getattr(e, "seconds", 0))) from e
             except Exception as e:
                 log.debug(f"could not download photo for @{username}: {e}")
 
@@ -480,9 +499,28 @@ class Discovery:
                 return
             tg = Telegram(self.a)
             await tg.start()
-            if not await tg.check_session():
+            try:
+                if not await tg.check_session():
+                    raise NotAuthorised("telegram session rejected -- not authenticated")
+            except Exception:
+                # Not just the explicit "not authenticated" case above --
+                # ANY exception past this point must not leave `tg`
+                # connected with nothing able to reach it. `self.tg` is
+                # only assigned below, after check_session() succeeds, so
+                # Discovery.stop() (which only acts `if self.tg is not
+                # None`) can never find and close a connection that died
+                # here. check_session()'s own docstring says it
+                # deliberately lets non-auth exceptions (a FloodWaitError
+                # from get_me(), a transient RPC/network error) propagate
+                # rather than returning False for them -- so this is not a
+                # rare edge case, it's the documented normal behavior for
+                # that path. Without this, the session file stays locked
+                # and the NEXT sweep for this account reproduces the exact
+                # "database is locked" bug `stop()`'s own docstring below
+                # says was already fixed -- just from a connect path that
+                # fix didn't cover.
                 await tg.stop()
-                raise NotAuthorised("telegram session rejected -- not authenticated")
+                raise
             self.tg = tg
 
     async def stop(self) -> None:

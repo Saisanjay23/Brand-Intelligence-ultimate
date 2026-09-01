@@ -116,6 +116,15 @@ class FacebookSession(Session):
     whenever a discovery or analysis job needs a live Facebook browser
     context."""
 
+    # Fetch images for real against Meta. Measured: a Facebook profile visit
+    # requests 74 images from scontent.*.fna.fbcdn.net / static.xx.fbcdn.net,
+    # 29% of all its traffic, and stubbing them locally means Meta's own CDN
+    # logs show a logged-in session that pulled the page and every script but
+    # never one image byte. See Session.ALWAYS_LOAD_IMAGES for the full
+    # measurement, including why the speed argument against this is wrong
+    # (+0.1s per visit).
+    ALWAYS_LOAD_IMAGES = True
+
     async def check_session(self) -> bool:  # type: ignore[override]
         """WHAT: are these cookies still logged in? HOW: visits /me (an
         authenticated-only destination) and asks the shared

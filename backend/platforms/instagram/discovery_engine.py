@@ -64,6 +64,13 @@ class InstagramSession(Session):
     (backend/sessions/manager.py) whenever a job needs a live Instagram
     browser context."""
 
+    # Same reasoning as FacebookSession -- same company, same CDN, same
+    # server-side signal. Measured: an Instagram profile visit requests 33
+    # images from instagram.*.fna.fbcdn.net, 23% of its traffic, none of
+    # which reached Meta while they were being stubbed. See
+    # Session.ALWAYS_LOAD_IMAGES.
+    ALWAYS_LOAD_IMAGES = True
+
     async def check_session(self) -> bool:  # type: ignore[override]
         """WHAT: are these cookies still logged in? HOW: visits the
         authenticated-only /accounts/edit/ page and asks
@@ -465,6 +472,36 @@ MOBILE_SEARCH_API = "https://i.instagram.com/api/v1/users/search/?q={q}&count={c
 # which it no longer does for a logged-in view of someone else's profile
 # (verified live; see analysis_engine.py's module docstring).
 PROFILE_INFO_API = "https://i.instagram.com/api/v1/users/web_profile_info/?username={u}"
+# This MUST stay an Instagram APP user-agent. It is not a stylistic choice
+# and it is not stale -- re-verified live 2026-09-01 against
+# /api/v1/users/search/?q=nasa, which answered 200 with 30 users on this
+# exact string. Three rules were measured, all of them traps:
+#
+#   1. A BROWSER user-agent is rejected outright. Both desktop Chrome and
+#      mobile Chrome return HTTP 400 {"message":"useragent mismatch"} on
+#      i.instagram.com AND www.instagram.com. Anyone "modernising" this
+#      constant to a current Chrome UA silently kills Instagram discovery --
+#      the sweep would report 0 results as a clean success.
+#
+#   2. The x-ig-app-id sent alongside it must be the WEB id
+#      (936619743392459), NOT the Instagram Android id (567067343352427).
+#      Pairing this app UA with the "matching" Android app id returns
+#      {"message":"challenge_required"} -- i.e. it asks the ACCOUNT to pass
+#      a challenge, which is the one outcome worth avoiding. The mismatched-
+#      looking pair is the one that works.
+#
+#   3. This call cannot be moved to an in-page fetch(). Doing so was
+#      investigated to give it Chrome's TLS/HTTP2 fingerprint instead of the
+#      Node stack ctx.request uses (the JA3 and ALPN genuinely do differ --
+#      ctx.request does not even negotiate h2). It is architecturally
+#      impossible: User-Agent is a forbidden header for fetch(), so an
+#      in-page call cannot send an app UA and lands straight on rule 1. The
+#      TLS difference is real but demonstrably NOT gating this endpoint,
+#      which returns 200 over ctx.request today. ctx.request is the correct
+#      tool here.
+#
+# Bumping the version string is safe (275.0.0.27.98 also returns 200) but
+# buys nothing measured; the old build is not what would break this.
 MOBILE_UA = "Instagram 219.0.0.12.117 Android (29/10; 480dpi; 1080x2151; OnePlus; GM1913; OnePlus7Pro; qcom; en_US; 314660328)"
 
 # Fallback page budget, used only when the caller configured no `max_pages`
@@ -688,24 +725,39 @@ class Discovery:
                 out.stopped = "cap:pages"
                 out.complete = False
 
-            # Private mobile API first (richer), rendered search page second.
-            # The DOM pass only runs when the API produced nothing at all,
-            # a 403, or a payload whose shape we no longer recognise, so a
-            # healthy sweep never pays for a browser page.
-            chain = await run_strategies(
-                f"instagram/search[{keyword!r}]",
-                [
-                    ("api:mobile-topsearch", lambda: list(by_name.values())),
-                    ("api:web-topsearch", lambda: web_search_users(self.ctx, keyword, self.a.timeout)),
-                ],
-            )
-            out.users = chain.value or []
-            out.extraction = chain
-            if chain.degraded:
-                out.source = "web-api"
-                # the mobile leg failed, so whatever `stopped` recorded about
-                # it (http-403) no longer describes the sweep's outcome
-                out.stopped = "mobile-api-failed-web-recovered"
+            if not by_name and out.stopped == "exhausted":
+                # The mobile API paged all the way to its own "no more
+                # results" signal and genuinely found nobody -- a common,
+                # valid outcome for a keyword with zero real Instagram
+                # matches, NOT an extraction failure. Routing this through
+                # run_strategies() would misreport it as "every strategy
+                # failed" (an ERROR-level log for a normal empty search)
+                # and pay for a pointless web-topsearch fallback call on
+                # every such keyword. Only a mobile pass that did NOT
+                # cleanly complete (http-403, cap:pages, an exception)
+                # falls through to the web fallback below.
+                out.users = []
+            else:
+                # Private mobile API first (richer), rendered search page
+                # second. The DOM pass only runs when the API produced
+                # nothing at all, a 403, or a payload whose shape we no
+                # longer recognise, so a healthy sweep never pays for a
+                # browser page.
+                chain = await run_strategies(
+                    f"instagram/search[{keyword!r}]",
+                    [
+                        ("api:mobile-topsearch", lambda: list(by_name.values())),
+                        ("api:web-topsearch", lambda: web_search_users(self.ctx, keyword, self.a.timeout)),
+                    ],
+                )
+                out.users = chain.value or []
+                out.extraction = chain
+                if chain.degraded:
+                    out.source = "web-api"
+                    # the mobile leg failed, so whatever `stopped` recorded
+                    # about it (http-403) no longer describes the sweep's
+                    # outcome
+                    out.stopped = "mobile-api-failed-web-recovered"
 
             out.hits = [
                 user_to_row(u, keyword, source=out.source)
