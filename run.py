@@ -282,7 +282,9 @@ def main() -> None:
         "--dev", action="store_true", help="also run Vite with hot reload on :5173"
     )
     ap.add_argument(
-        "--reload", action="store_true", help="restart the API when code changes"
+        "--reload", action="store_true",
+        help="restart the API when code changes "
+             "(WINDOWS: breaks all browser scraping -- see the warning it prints)",
     )
     ap.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8000)))
     a = ap.parse_args()
@@ -332,6 +334,26 @@ def main() -> None:
         if a.dev:
             print(f"  API                -> {api}")
         print(f"  API docs           -> {api}/docs\n")
+
+        # --reload on Windows runs the app in a supervised child whose event
+        # loop cannot spawn subprocesses, and Playwright needs one for its
+        # driver. The result is not a crash: the API serves happily and every
+        # browser platform fails with an empty "NotImplementedError" while
+        # YouTube and Telegram keep working, so it reads as a platform bug.
+        # Warned about at the point the flag is actually typed.
+        if a.reload and sys.platform == "win32":
+            print(
+                "  WARNING: --reload breaks browser scraping on Windows.\n"
+                "           Facebook, Instagram, Twitter and TikTok will all fail with\n"
+                "           an empty 'NotImplementedError'; YouTube/Telegram still work,\n"
+                "           so it looks like a platform bug rather than this flag.\n"
+                "           Use plain `python run.py` (add --dev for frontend hot-reload,\n"
+                "           which is unaffected).\n",
+                # flushed: stdout is block-buffered when this is not a tty
+                # (nohup, a service wrapper, CI), and a warning that only
+                # appears after the process dies is not a warning.
+                flush=True,
+            )
 
         open_when_ready(url)
 

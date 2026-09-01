@@ -35,8 +35,35 @@ AUTH: none. This is an internal service; put it behind your own gateway.
 
 from __future__ import annotations
 
+import asyncio
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+# Windows: force the Proactor event loop before anything creates one.
+#
+# Every browser-driven platform launches Playwright/patchright, which spawns
+# a Node driver as a SUBPROCESS. Windows' SelectorEventLoop cannot spawn
+# subprocesses at all -- it raises a bare `NotImplementedError` with no
+# message -- and some server setups (notably `uvicorn --reload`, which runs
+# the app in a supervised child process) leave that policy installed.
+#
+# The failure is silent and extremely misleading: the API stays up, jobs are
+# accepted, sessions verify, and then EVERY browser platform fails with an
+# empty `NotImplementedError:` while YouTube (a plain HTTPS API) and
+# Telegram (MTProto) keep working -- so it reads as "Facebook/Instagram/
+# Twitter are broken" rather than "the event loop cannot start a browser".
+# Diagnosed exactly that way: identical code succeeded under `python run.py`
+# and failed under `python run.py --dev --reload`.
+#
+# Setting the policy here rather than in run.py is deliberate: under
+# --reload the app is imported by a CHILD process that never executes
+# run.py, so a policy set there would not apply to the process that actually
+# launches browsers.
+if sys.platform == "win32":
+    _policy = asyncio.get_event_loop_policy()
+    if not isinstance(_policy, asyncio.WindowsProactorEventLoopPolicy):
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -62,6 +89,34 @@ log = get_logger("main")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Can this process actually start a browser?
+    #
+    # Playwright/patchright spawns its driver as a subprocess, which a
+    # Windows SelectorEventLoop cannot do. The policy set at import time
+    # (top of this file) fixes the common cases, but it CANNOT fix a loop
+    # that was already created before this module was imported -- which is
+    # exactly what `uvicorn --reload` does on Windows.
+    #
+    # Checked and shouted about here because the alternative is the failure
+    # mode this actually produced in practice: the API comes up, sessions
+    # verify, YouTube and Telegram jobs succeed, and every browser platform
+    # returns a bare `NotImplementedError:` with no message -- which reads
+    # as "Facebook and Instagram are broken" and sends you looking in
+    # entirely the wrong place. One loud line at startup is worth more than
+    # any amount of debugging later.
+    if sys.platform == "win32":
+        loop = asyncio.get_running_loop()
+        if not isinstance(loop, asyncio.ProactorEventLoop):
+            log.error(
+                "EVENT LOOP CANNOT LAUNCH BROWSERS: this process is running on "
+                f"{type(loop).__name__}, which on Windows cannot spawn subprocesses. "
+                "Playwright needs one, so EVERY browser platform (Facebook, Instagram, "
+                "Twitter, TikTok) will fail with an empty 'NotImplementedError'. "
+                "YouTube and Telegram will keep working, which makes this look like a "
+                "per-platform bug. Cause is almost always `--reload`: restart without it "
+                "(`python run.py`). Frontend hot-reload via `--dev` alone is unaffected."
+            )
+
     # Mongo backs the session pool (the credentials scrapes log in with)
     # and discovery's results. Analysis needs neither -- it runs from
     # memory -- but it still needs a session to scrape with, so a
