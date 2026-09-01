@@ -15,6 +15,7 @@ import { DiscoveryProfileGrid } from "../components/DiscoveryProfileGrid";
 import { PlatformIcon } from "../components/PlatformIcon";
 import { DiscoverIcon, AnalyseIcon, StopIcon, AlertTriangleIcon } from "../components/AppIcons";
 import { AnalysisView } from "./AnalysisView";
+import { formatElapsed, useLiveTimer } from "../utils/timeFormat";
 
 interface Props {
   clientId: string;
@@ -63,9 +64,304 @@ function StatusDot({ status }: { status: PlatformSweepState["status"] }) {
 // KEYWORD (not sweep-unit) is in flight right now -- the API doesn't
 // expose that directly, this derives it from what it does expose.
 function currentKeywordOf(job: DiscoveryJobState, p: PlatformSweepState): string | undefined {
+  if (p.current_keyword) return p.current_keyword;
   if (p.status !== "running" || !job.keywords.length) return undefined;
   const tabsForPlatform = p.keywords_total / job.keywords.length || 1;
   return job.keywords[Math.floor(p.keywords_done / tabsForPlatform)];
+}
+
+function PlatformInFlightItem({
+  p,
+  job,
+  running,
+}: {
+  p: PlatformSweepState;
+  job: DiscoveryJobState;
+  running: boolean;
+}) {
+  const kw = p.current_keyword || currentKeywordOf(job, p);
+  const tab = p.current_tab ? p.current_tab.toUpperCase() : undefined;
+  const isRunning = p.status === "running";
+  const itemElapsed = useLiveTimer(p.item_started_at_ts, isRunning);
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: "8px",
+        fontSize: "12px",
+        background: isRunning ? "rgba(0, 229, 255, 0.08)" : "var(--bg-surface)",
+        padding: "6px 14px",
+        borderRadius: "16px",
+        border: `1px solid ${isRunning ? "rgba(0, 229, 255, 0.4)" : "var(--border-color)"}`,
+        boxShadow: isRunning ? "0 0 10px rgba(0, 229, 255, 0.15)" : "none",
+        flexWrap: "wrap",
+      }}
+    >
+      <PlatformIcon platform={p.platform} size={15} />
+      <span style={{ fontWeight: 600, color: "var(--text-main)" }}>{p.display_name}:</span>
+      <span style={{ color: STATUS_COLOR[p.status], fontWeight: 700, display: "inline-flex", alignItems: "center", gap: "4px" }}>
+        <StatusDot status={p.status} /> {p.keywords_done}/{p.keywords_total}
+      </span>
+      {kw && (
+        <span style={{ fontSize: "11.5px", color: "var(--cyan)", fontWeight: 600, background: "rgba(0, 229, 255, 0.1)", padding: "1px 7px", borderRadius: "10px" }}>
+          "{kw}"
+        </span>
+      )}
+      {tab && isRunning && (
+        <span
+          style={{
+            fontSize: "10px",
+            fontWeight: 800,
+            color: "#fff",
+            background: "linear-gradient(135deg, var(--cyan), var(--purple))",
+            padding: "1px 6px",
+            borderRadius: "4px",
+            letterSpacing: "0.5px",
+          }}
+        >
+          {tab}
+        </span>
+      )}
+      {isRunning && itemElapsed > 0 && (
+        <span style={{ fontFamily: "var(--font-mono)", fontSize: "11px", color: "var(--cyan-bright, #00f0ff)", fontWeight: 700 }}>
+          ⏱️ {itemElapsed.toFixed(1)}s in flight
+        </span>
+      )}
+      {p.note && <span style={{ fontSize: "11px", color: "var(--text-dim)", marginLeft: "4px" }}>{p.note}</span>}
+    </div>
+  );
+}
+
+function DiscoveryBannerBox({
+  job,
+  running,
+  cancelling,
+  onCancel,
+}: {
+  job: DiscoveryJobState;
+  running: boolean;
+  cancelling: boolean;
+  onCancel: () => void;
+}) {
+  const [showHistory, setShowHistory] = useState(false);
+  const totalDone = (job.platforms || []).reduce((acc, p) => acc + p.keywords_done, 0);
+  const totalUnits = (job.platforms || []).reduce((acc, p) => acc + p.keywords_total, 0);
+  const pct = totalUnits > 0 ? Math.min(100, Math.round((totalDone / totalUnits) * 100)) : 0;
+
+  const elapsedSec = useLiveTimer(job.started_at_ts, running, job.elapsed_seconds);
+  const history = job.history || [];
+
+  return (
+    <div
+      className="dashboard-card-box"
+      style={{
+        marginTop: "16px",
+        borderLeft: "4px solid var(--cyan)",
+        background: "rgba(0, 229, 255, 0.04)",
+        padding: "16px 20px",
+        transition: "all 0.3s ease",
+      }}
+    >
+      {/* Top Header Row with Timers, ETA, & Progress */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "10px", flexWrap: "wrap", gap: "10px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+          <DiscoverIcon size={18} color="var(--cyan)" />
+          <span style={{ fontWeight: 700, color: "var(--text-main)", fontSize: "14px" }}>
+            {running ? "Live Discovery Sweep Progress" : "Recent Discovery Status"}
+          </span>
+          {running ? (
+            <span className="rail-pill" style={{ background: "var(--cyan)", color: "#000", fontWeight: 700, animation: "pulse 1.5s infinite" }}>
+              RUNNING
+            </span>
+          ) : (
+            <span className="rail-pill" style={{ background: "rgba(54,181,160,0.2)", color: "var(--success)", fontWeight: 700 }}>
+              {job.status.toUpperCase()}
+            </span>
+          )}
+          {running && (
+            <button
+              type="button"
+              onClick={onCancel}
+              disabled={cancelling}
+              style={{
+                background: "linear-gradient(135deg, rgba(239,68,68,0.25), rgba(220,38,38,0.35))",
+                color: "#ff6b6b", border: "1px solid rgba(239,68,68,0.5)", padding: "3px 10px",
+                borderRadius: "12px", fontSize: "11px", fontWeight: 700,
+                cursor: cancelling ? "progress" : "pointer", opacity: cancelling ? 0.6 : 1,
+                display: "inline-flex", alignItems: "center", gap: "5px",
+              }}
+            >
+              <StopIcon size={11} color="#ff6b6b" /> {cancelling ? "Stopping..." : "Stop Sweep"}
+            </button>
+          )}
+        </div>
+
+        {/* Real-time Telemetry Metrics Pill Bar */}
+        <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", fontFamily: "var(--font-mono)", fontSize: "12px" }}>
+          <span
+            style={{
+              background: "rgba(0, 229, 255, 0.1)",
+              border: "1px solid rgba(0, 229, 255, 0.25)",
+              color: "var(--cyan)",
+              padding: "3px 9px",
+              borderRadius: "6px",
+              fontWeight: 700,
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "4px",
+            }}
+          >
+            ⏱️ {formatElapsed(elapsedSec)}
+          </span>
+
+          {running && job.estimated_remaining_seconds !== undefined && job.estimated_remaining_seconds !== null && (
+            <span
+              style={{
+                background: "rgba(124, 92, 255, 0.12)",
+                border: "1px solid rgba(124, 92, 255, 0.3)",
+                color: "var(--purple, #a78bfa)",
+                padding: "3px 9px",
+                borderRadius: "6px",
+                fontWeight: 600,
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "4px",
+              }}
+              title="Estimated time remaining based on active sweep speeds"
+            >
+              ⏳ Est: ~{formatElapsed(job.estimated_remaining_seconds)}
+            </span>
+          )}
+
+          <span style={{ fontWeight: 700, color: "var(--text-main)" }}>
+            {totalDone} / {totalUnits || "?"} Sweeps ({pct}%)
+          </span>
+
+          {job.found > 0 && (
+            <span
+              style={{
+                background: "rgba(18, 183, 106, 0.15)",
+                color: "var(--success, #12b76a)",
+                border: "1px solid rgba(18, 183, 106, 0.35)",
+                padding: "3px 9px",
+                borderRadius: "6px",
+                fontWeight: 700,
+              }}
+            >
+              🎯 {job.found} Found {job.new > 0 ? `(+${job.new} new)` : ""}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Progress Bar */}
+      <div style={{ height: "8px", background: "var(--bg-inner)", borderRadius: "4px", overflow: "hidden", marginBottom: "10px" }}>
+        <div
+          style={{
+            height: "100%", width: `${pct}%`,
+            background: "linear-gradient(90deg, var(--cyan), var(--purple))",
+            boxShadow: running ? "0 0 10px rgba(0, 229, 255, 0.5)" : "none",
+            transition: "width 0.4s ease",
+          }}
+        />
+      </div>
+
+      {job.message && (
+        <div style={{ fontSize: "12px", color: "var(--text-dim)", marginBottom: "10px" }}>
+          {job.message}
+        </div>
+      )}
+
+      {/* Active Platform & Keyword In-Flight Chips */}
+      <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
+        {job.platforms.map((p) => (
+          <PlatformInFlightItem key={p.platform} p={p} job={job} running={running} />
+        ))}
+      </div>
+
+      {/* Collapsible Completed Sweeps Timings & Audit Log */}
+      {history.length > 0 && (
+        <div style={{ marginTop: "12px", borderTop: "1px solid rgba(255, 255, 255, 0.08)", paddingTop: "8px" }}>
+          <button
+            type="button"
+            onClick={() => setShowHistory((v) => !v)}
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "var(--cyan)",
+              fontSize: "11.5px",
+              fontWeight: 600,
+              cursor: "pointer",
+              padding: "2px 0",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "6px",
+            }}
+          >
+            <span>{showHistory ? "▾ Hide Completed Sweeps Log" : `▸ Show Completed Sweeps Timings (${history.length} completed)`}</span>
+          </button>
+
+          {showHistory && (
+            <div
+              style={{
+                marginTop: "8px",
+                maxHeight: "180px",
+                overflowY: "auto",
+                background: "rgba(0, 0, 0, 0.25)",
+                border: "1px solid rgba(255, 255, 255, 0.06)",
+                borderRadius: "8px",
+                padding: "8px 12px",
+                display: "flex",
+                flexDirection: "column",
+                gap: "5px",
+                fontFamily: "var(--font-mono)",
+                fontSize: "11px",
+              }}
+            >
+              {[...history].reverse().map((h, i) => (
+                <div
+                  key={i}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "8px",
+                    color: "var(--text-dim)",
+                    padding: "3px 0",
+                    borderBottom: i !== history.length - 1 ? "1px solid rgba(255, 255, 255, 0.03)" : "none",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <span style={{ color: "var(--success)" }}>✅</span>
+                  <span style={{ color: "var(--text-muted)", fontSize: "10px" }}>{h.timestamp}</span>
+                  <PlatformIcon platform={h.platform} size={12} />
+                  <span style={{ fontWeight: 600, color: "var(--text-main)" }}>{h.display_name}</span>
+                  <span style={{ color: "var(--cyan)" }}>"{h.keyword}"</span>
+                  <span
+                    style={{
+                      fontSize: "9.5px",
+                      background: "rgba(255, 255, 255, 0.08)",
+                      padding: "1px 5px",
+                      borderRadius: "3px",
+                      textTransform: "uppercase",
+                      color: "#fff",
+                    }}
+                  >
+                    [{h.tab}]
+                  </span>
+                  <span style={{ color: "var(--purple, #a78bfa)", fontWeight: 700 }}>⏱️ {h.duration_seconds.toFixed(1)}s</span>
+                  <span style={{ marginLeft: "auto", color: h.hits_found > 0 ? "var(--success)" : "var(--text-muted)" }}>
+                    {h.hits_found} found {h.hits_new > 0 ? `(+${h.hits_new} new)` : ""}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 // Small per-tile progress row -- same recipe as the original
@@ -132,8 +428,6 @@ export function LiveResultsView({
   }
 
   const jobPlatformById = new Map((job?.platforms || []).map((p) => [p.platform, p]));
-  const totalDone = (job?.platforms || []).reduce((acc, p) => acc + p.keywords_done, 0);
-  const totalUnits = (job?.platforms || []).reduce((acc, p) => acc + p.keywords_total, 0);
 
   return (
     <div style={{ animation: "fadeUp 0.4s ease" }}>
@@ -190,78 +484,14 @@ export function LiveResultsView({
         })}
       </div>
 
-      {/* "Recent Discovery Status" -- same box as the original app's, kept
-          on screen after the job finishes (not just while running), so
-          the analyst can see what the last sweep actually did. */}
+      {/* "Recent Discovery Status" Banner Box */}
       {job && (
-        <div
-          className="dashboard-card-box"
-          style={{ marginTop: "16px", borderLeft: "4px solid var(--cyan)", background: "rgba(0, 229, 255, 0.04)", padding: "16px 20px" }}
-        >
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "8px", flexWrap: "wrap", gap: "8px" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-              <DiscoverIcon size={18} color="var(--cyan)" />
-              <span style={{ fontWeight: 700, color: "var(--text-main)", fontSize: "14px" }}>
-                {running ? "Live Discovery Sweep Progress" : "Recent Discovery Status"}
-              </span>
-              {running ? (
-                <span className="rail-pill" style={{ background: "var(--cyan)", color: "#000", fontWeight: 700, animation: "pulse 1.5s infinite" }}>RUNNING</span>
-              ) : (
-                <span className="rail-pill" style={{ background: "rgba(54,181,160,0.2)", color: "var(--success)", fontWeight: 700 }}>{job.status.toUpperCase()}</span>
-              )}
-              {running && (
-                <button
-                  type="button"
-                  onClick={onCancel}
-                  disabled={cancelling}
-                  style={{
-                    background: "linear-gradient(135deg, rgba(239,68,68,0.25), rgba(220,38,38,0.35))",
-                    color: "#ff6b6b", border: "1px solid rgba(239,68,68,0.5)", padding: "3px 10px",
-                    borderRadius: "12px", fontSize: "11px", fontWeight: 700,
-                    cursor: cancelling ? "progress" : "pointer", opacity: cancelling ? 0.6 : 1,
-                    display: "inline-flex", alignItems: "center", gap: "5px",
-                  }}
-                >
-                  <StopIcon size={11} color="#ff6b6b" /> {cancelling ? "Stopping..." : "Stop Sweep"}
-                </button>
-              )}
-            </div>
-            <div style={{ fontFamily: "var(--font-mono)", fontSize: "13px", fontWeight: 700, color: "var(--cyan)" }}>
-              {totalDone} / {totalUnits || "?"} Sweeps Completed
-            </div>
-          </div>
-          <div style={{ height: "8px", background: "var(--bg-inner)", borderRadius: "4px", overflow: "hidden" }}>
-            <div
-              style={{
-                height: "100%", width: `${Math.min(100, Math.round((totalDone / (totalUnits || 1)) * 100))}%`,
-                background: "linear-gradient(90deg, var(--cyan), var(--purple))", transition: "width 0.4s ease",
-              }}
-            />
-          </div>
-          {job.message && <div style={{ fontSize: "12px", color: "var(--text-dim)", marginTop: "8px" }}>{job.message}</div>}
-          <div style={{ display: "flex", gap: "10px", marginTop: "12px", flexWrap: "wrap" }}>
-            {job.platforms.map((p) => {
-              const kw = currentKeywordOf(job, p);
-              return (
-                <div
-                  key={p.platform}
-                  style={{
-                    display: "flex", alignItems: "center", gap: "6px", fontSize: "12px",
-                    background: "var(--bg-surface)", padding: "5px 12px", borderRadius: "16px", border: "1px solid var(--border-color)",
-                  }}
-                >
-                  <PlatformIcon platform={p.platform} size={15} />
-                  <span style={{ fontWeight: 600, textTransform: "capitalize", color: "var(--text-main)" }}>{p.display_name}:</span>
-                  <span style={{ color: STATUS_COLOR[p.status], fontWeight: 700, display: "inline-flex", alignItems: "center", gap: "4px" }}>
-                    <StatusDot status={p.status} /> {p.keywords_done}/{p.keywords_total}
-                  </span>
-                  {kw && <span style={{ fontSize: "11px", color: "var(--cyan)", marginLeft: "4px" }}>"{kw}"</span>}
-                  {p.note && <span style={{ fontSize: "11px", color: "var(--text-dim)", marginLeft: "4px" }}>{p.note}</span>}
-                </div>
-              );
-            })}
-          </div>
-        </div>
+        <DiscoveryBannerBox
+          job={job}
+          running={running}
+          cancelling={cancelling}
+          onCancel={onCancel}
+        />
       )}
 
       {phase === "discovery" && (

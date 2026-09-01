@@ -15,6 +15,7 @@ import {
 } from "../components/AppIcons";
 import { PlatformIcon } from "../components/PlatformIcon";
 import { download, downloadBlob, rowsToCsv, rowsToTsv } from "../utils/download";
+import { formatElapsed, formatSeconds, useLiveTimer } from "../utils/timeFormat";
 
 const SAMPLE_URLS = [
   "https://www.facebook.com/zuck",
@@ -161,6 +162,225 @@ const getPriorityFromRisk = (score: number) => {
   if (score >= 5) return "High";
   return "Low";
 };
+
+function AnalysisProgressBanner({
+  jobData,
+  loading,
+}: {
+  jobData: AnalysisJobResponse;
+  loading: boolean;
+}) {
+  const elapsedSec = useLiveTimer(jobData.started_at_ts, loading, jobData.elapsed_seconds);
+  const pct = Math.min(100, Math.round((jobData.completed / (jobData.total || 1)) * 100));
+  const avgSpeed = jobData.completed > 0 ? (elapsedSec / jobData.completed).toFixed(1) : undefined;
+
+  return (
+    <div
+      style={{
+        background: "var(--bg-card, #1D2939)",
+        border: "1px solid var(--border-color, #344054)",
+        borderRadius: "12px",
+        padding: "20px",
+        marginBottom: "24px",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "12px", flexWrap: "wrap", gap: "10px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+          <div
+            style={{
+              width: "10px",
+              height: "10px",
+              borderRadius: "50%",
+              background:
+                jobData.status === "running"
+                  ? "var(--cyan, #00F0FF)"
+                  : jobData.status === "done"
+                  ? "var(--success, #12B76A)"
+                  : "var(--danger, #E95053)",
+              boxShadow: jobData.status === "running" ? "0 0 10px var(--cyan, #00F0FF)" : "none",
+            }}
+          />
+          <span style={{ fontSize: "14px", fontWeight: 700, color: "var(--text-main, #fff)" }}>
+            Analysis Progress: {jobData.completed} / {jobData.total} Finished
+          </span>
+          <span
+            style={{
+              fontSize: "11px",
+              color: "var(--text-muted, #98a2b3)",
+              background: "var(--bg-surface-3, #344054)",
+              padding: "2px 8px",
+              borderRadius: "4px",
+              textTransform: "uppercase",
+              fontWeight: 600,
+            }}
+          >
+            {jobData.status}
+          </span>
+        </div>
+
+        {/* Real-time Telemetry Metrics Pill Bar */}
+        <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", fontFamily: "var(--font-mono)", fontSize: "12px" }}>
+          <span
+            style={{
+              background: "rgba(0, 229, 255, 0.1)",
+              border: "1px solid rgba(0, 229, 255, 0.25)",
+              color: "var(--cyan, #00F0FF)",
+              padding: "3px 9px",
+              borderRadius: "6px",
+              fontWeight: 700,
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "4px",
+            }}
+          >
+            ⏱️ {formatElapsed(elapsedSec)}
+          </span>
+
+          {loading && jobData.estimated_remaining_seconds !== undefined && jobData.estimated_remaining_seconds !== null && (
+            <span
+              style={{
+                background: "rgba(124, 92, 255, 0.12)",
+                border: "1px solid rgba(124, 92, 255, 0.3)",
+                color: "var(--purple, #a78bfa)",
+                padding: "3px 9px",
+                borderRadius: "6px",
+                fontWeight: 600,
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "4px",
+              }}
+              title="Estimated time remaining based on scraping speed"
+            >
+              ⏳ Est: ~{formatElapsed(jobData.estimated_remaining_seconds)}
+            </span>
+          )}
+
+          {avgSpeed && (
+            <span style={{ color: "var(--text-dim, #98a2b3)", fontSize: "11.5px" }}>
+              ⚡ {avgSpeed}s / item avg
+            </span>
+          )}
+
+          <div style={{ fontSize: "13px", fontWeight: 700, color: "var(--text-main, #fff)" }}>
+            {pct}%
+          </div>
+        </div>
+      </div>
+
+      {/* Progress Bar */}
+      <div
+        style={{
+          width: "100%",
+          height: "6px",
+          background: "var(--bg-primary, #080F1E)",
+          borderRadius: "3px",
+          overflow: "hidden",
+          marginBottom: "16px",
+        }}
+      >
+        <div
+          style={{
+            width: `${pct}%`,
+            height: "100%",
+            background: "linear-gradient(90deg, var(--cyan, #00F0FF), var(--primary-color, #8838DD))",
+            boxShadow: loading ? "0 0 10px rgba(0, 240, 255, 0.5)" : "none",
+            transition: "width 0.3s ease",
+          }}
+        />
+      </div>
+
+      {/* Platform Status Chips */}
+      <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", marginBottom: "12px" }}>
+        {Object.entries(jobData.platform_progress || {}).map(([plat, prog]) => (
+          <div
+            key={plat}
+            style={{
+              background: "var(--bg-surface-3, #344054)",
+              border: "1px solid var(--border-color, #475467)",
+              borderRadius: "8px",
+              padding: "6px 12px",
+              fontSize: "12px",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "8px",
+            }}
+          >
+            <PlatformIcon platform={plat} size={16} />
+            <span style={{ fontWeight: 600, color: "var(--text-main, #fff)" }}>{prog.display_name}:</span>
+            <span style={{ color: "var(--text-dim, #98a2b3)" }}>
+              {prog.completed}/{prog.total}
+            </span>
+            <span
+              style={{
+                fontSize: "10px",
+                fontWeight: 700,
+                textTransform: "uppercase",
+                color:
+                  prog.status === "done"
+                    ? "var(--success, #12B76A)"
+                    : prog.status === "running"
+                    ? "var(--cyan, #00F0FF)"
+                    : prog.status === "failed"
+                    ? "var(--danger, #E95053)"
+                    : "var(--text-muted)",
+              }}
+            >
+              {prog.status}
+            </span>
+          </div>
+        ))}
+      </div>
+
+      {/* Live per-URL status & timings */}
+      <div style={{ display: "flex", flexDirection: "column", gap: "5px", maxHeight: "200px", overflowY: "auto" }}>
+        {jobData.items.map((it) => (
+          <div
+            key={it.id}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "8px",
+              fontSize: "12px",
+              padding: "5px 10px",
+              borderRadius: "6px",
+              background: it.status === "running" ? "rgba(0, 240, 255, 0.08)" : "rgba(0, 0, 0, 0.15)",
+              border: it.status === "running" ? "1px solid rgba(0, 240, 255, 0.3)" : "1px solid transparent",
+            }}
+          >
+            <PlatformIcon platform={it.platform} size={13} />
+            <span
+              style={{
+                fontSize: "10px",
+                fontWeight: 700,
+                textTransform: "uppercase",
+                width: "56px",
+                flexShrink: 0,
+                color:
+                  it.status === "done"
+                    ? "var(--success, #12B76A)"
+                    : it.status === "running"
+                    ? "var(--cyan, #00F0FF)"
+                    : it.status === "error"
+                    ? "var(--danger, #E95053)"
+                    : "var(--text-muted)",
+              }}
+            >
+              {it.status === "running" ? "⏳ live" : it.status}
+            </span>
+            <span style={{ color: "var(--text-dim, #98a2b3)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }} title={it.url}>
+              {it.url}
+            </span>
+            {it.duration_seconds !== undefined && it.duration_seconds !== null && it.status !== "pending" && (
+              <span style={{ fontFamily: "var(--font-mono)", fontSize: "11px", color: "var(--purple, #a78bfa)", fontWeight: 700, flexShrink: 0 }}>
+                ⏱️ {it.duration_seconds.toFixed(1)}s
+              </span>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 interface Props {
   // Set by HomeView's "Analyse" action or Live Results' "Analyse
@@ -840,153 +1060,10 @@ export function AnalysisView({ resumeJobId }: Props = {}) {
 
       {/* ─── Live Execution Progress Card ─── */}
       {jobData && (
-        <div
-          style={{
-            background: "var(--bg-card, #1D2939)",
-            border: "1px solid var(--border-color, #344054)",
-            borderRadius: "12px",
-            padding: "20px",
-            marginBottom: "24px",
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "12px", flexWrap: "wrap", gap: "10px" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-              <div
-                style={{
-                  width: "10px",
-                  height: "10px",
-                  borderRadius: "50%",
-                  background:
-                    jobData.status === "running"
-                      ? "var(--cyan, #00F0FF)"
-                      : jobData.status === "done"
-                      ? "var(--success, #12B76A)"
-                      : "var(--danger, #E95053)",
-                  boxShadow: jobData.status === "running" ? "0 0 10px var(--cyan, #00F0FF)" : "none",
-                }}
-              />
-              <span style={{ fontSize: "14px", fontWeight: 700, color: "var(--text-main, #fff)" }}>
-                Analysis Progress: {jobData.completed} / {jobData.total} Finished
-              </span>
-              <span
-                style={{
-                  fontSize: "11px",
-                  color: "var(--text-muted, #98a2b3)",
-                  background: "var(--bg-surface-3, #344054)",
-                  padding: "2px 8px",
-                  borderRadius: "4px",
-                  textTransform: "uppercase",
-                  fontWeight: 600,
-                }}
-              >
-                {jobData.status}
-              </span>
-            </div>
-
-            <div style={{ fontSize: "13px", fontWeight: 600, color: "var(--text-main, #fff)" }}>
-              {Math.round((jobData.completed / (jobData.total || 1)) * 100)}%
-            </div>
-          </div>
-
-          {/* Progress Bar */}
-          <div
-            style={{
-              width: "100%",
-              height: "6px",
-              background: "var(--bg-primary, #080F1E)",
-              borderRadius: "3px",
-              overflow: "hidden",
-              marginBottom: "16px",
-            }}
-          >
-            <div
-              style={{
-                width: `${Math.min(100, Math.round((jobData.completed / (jobData.total || 1)) * 100))}%`,
-                height: "100%",
-                background: "linear-gradient(90deg, var(--cyan, #00F0FF), var(--primary-color, #8838DD))",
-                transition: "width 0.3s ease",
-              }}
-            />
-          </div>
-
-          {/* Platform Status Chips */}
-          <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
-            {Object.entries(jobData.platform_progress || {}).map(([plat, prog]) => (
-              <div
-                key={plat}
-                style={{
-                  background: "var(--bg-surface-3, #344054)",
-                  border: "1px solid var(--border-color, #475467)",
-                  borderRadius: "8px",
-                  padding: "6px 12px",
-                  fontSize: "12px",
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: "8px",
-                }}
-              >
-                <PlatformIcon platform={plat} size={16} />
-                <span style={{ fontWeight: 600, color: "var(--text-main, #fff)" }}>{prog.display_name}:</span>
-                <span style={{ color: "var(--text-dim, #98a2b3)" }}>
-                  {prog.completed}/{prog.total}
-                </span>
-                <span
-                  style={{
-                    fontSize: "10px",
-                    fontWeight: 700,
-                    textTransform: "uppercase",
-                    color:
-                      prog.status === "done"
-                        ? "var(--success, #12B76A)"
-                        : prog.status === "running"
-                        ? "var(--cyan, #00F0FF)"
-                        : prog.status === "failed"
-                        ? "var(--danger, #E95053)"
-                        : "var(--text-muted)",
-                  }}
-                >
-                  {prog.status}
-                </span>
-              </div>
-            ))}
-          </div>
-
-          {/* Live per-URL status -- concurrency is 1 per platform, so at
-              most one item is "running" for a given platform at a time;
-              this shows exactly which one, not just an aggregate count.
-              The full scraped data (editable, exportable) is in the table
-              below once a URL finishes -- this is just "what's happening
-              right now", not a second copy of the results. */}
-          <div style={{ marginTop: "12px", display: "flex", flexDirection: "column", gap: "4px" }}>
-            {jobData.items.map((it) => (
-              <div
-                key={it.id}
-                style={{
-                  display: "flex", alignItems: "center", gap: "8px", fontSize: "12px",
-                  padding: "4px 8px", borderRadius: "6px",
-                  background: it.status === "running" ? "rgba(0, 240, 255, 0.06)" : "transparent",
-                }}
-              >
-                <PlatformIcon platform={it.platform} size={13} />
-                <span
-                  style={{
-                    fontSize: "10px", fontWeight: 700, textTransform: "uppercase", width: "56px", flexShrink: 0,
-                    color:
-                      it.status === "done" ? "var(--success, #12B76A)"
-                      : it.status === "running" ? "var(--cyan, #00F0FF)"
-                      : it.status === "error" ? "var(--danger, #E95053)"
-                      : "var(--text-muted)",
-                  }}
-                >
-                  {it.status === "running" ? "⏳ live" : it.status}
-                </span>
-                <span style={{ color: "var(--text-dim, #98a2b3)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={it.url}>
-                  {it.url}
-                </span>
-              </div>
-            ))}
-          </div>
-        </div>
+        <AnalysisProgressBanner
+          jobData={jobData}
+          loading={loading}
+        />
       )}
 
       {/* ─── Dual-Format Results & Export Section ─── */}

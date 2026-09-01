@@ -154,6 +154,23 @@ class PlatformSweepState(BaseModel):
     found: int = Field(..., description="Profiles written for this platform.")
     new: int = Field(..., description="Of `found`, how many were not already known.")
     note: str = ""
+    current_keyword: Optional[str] = ""
+    current_tab: Optional[str] = ""
+    current_step: Optional[str] = ""
+    item_started_at_ts: Optional[float] = None
+    started_at_ts: Optional[float] = None
+    finished_at_ts: Optional[float] = None
+
+
+class CompletedSweepTelemetry(BaseModel):
+    platform: str
+    display_name: str
+    keyword: str
+    tab: str
+    duration_seconds: float
+    hits_found: int
+    hits_new: int
+    timestamp: str
 
 
 class DiscoveryJobState(BaseModel):
@@ -168,7 +185,12 @@ class DiscoveryJobState(BaseModel):
     new: int
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
+    started_at_ts: Optional[float] = None
+    finished_at_ts: Optional[float] = None
+    elapsed_seconds: Optional[float] = None
+    estimated_remaining_seconds: Optional[float] = None
     platforms: list[PlatformSweepState]
+    history: list[CompletedSweepTelemetry] = Field(default_factory=list)
 
 
 class StartDiscoveryAccepted(JobAccepted):

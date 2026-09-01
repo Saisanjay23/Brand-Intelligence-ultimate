@@ -98,6 +98,22 @@ _PLATFORM_CONCURRENCY: dict[str, int] = {
     # just slow this platform down, it can cost every URL queued behind the
     # burst. 3 is a modest step up from serial with far less of that risk.
     "telegram": 3,
+    # Meta is the one place where concurrency is a BEHAVIOURAL tell rather
+    # than just a load question. Every visit rides one logged-in account, and
+    # a person opens one profile at a time -- two profile pages beginning
+    # ~1s apart, over and over, from a single account, is not a shape human
+    # browsing produces, and it is visible to Meta without inspecting the
+    # browser at all.
+    #
+    # Measured before this change: at concurrency 2 with the (also broken)
+    # pacing scale, the effective rate was ~109 profile visits/minute per
+    # platform. A person reading profiles manages a few per minute.
+    #
+    # This is a deliberate throughput trade, and it is the honest one: the
+    # fingerprint work is finished and measured clean, so rate is what is
+    # left to give away. Other platforms are unaffected.
+    "facebook": 1,
+    "instagram": 1,
 }
 _DEFAULT_CONCURRENCY = 2
 
@@ -194,6 +210,8 @@ class AnalysisItem:
 
     incident_row: dict[str, Any] = field(default_factory=dict)
     legacy_row: dict[str, Any] = field(default_factory=dict)
+    duration_seconds: Optional[float] = None
+    started_at_ts: Optional[float] = None
 
     def to_dict(self) -> dict:
         return {
@@ -201,6 +219,8 @@ class AnalysisItem:
             "platform_name": registry.display_name(self.platform),
             "entity_id": self.entity_id, "status": self.status,
             "error": self.error, "analysed_at": self.analysed_at,
+            "duration_seconds": self.duration_seconds,
+            "started_at_ts": self.started_at_ts,
             "profile_name": self.profile_name, "followers": self.followers,
             "location": self.location, "bio": self.bio,
             "last_post_date": self.last_post_date,
@@ -241,6 +261,8 @@ class AnalysisJob:
     platform_progress: dict[str, dict[str, Any]] = field(default_factory=dict)
     task: Optional[Any] = None
     cancel: asyncio.Event = field(default_factory=asyncio.Event)
+    started_at_ts: Optional[float] = None
+    finished_at_ts: Optional[float] = None
     # url -> whatever discovery already knows about that profile (see
     # POST /discovery/profiles/analyse -> _seed_from_doc). Not part of
     # to_dict()/the frontend contract -- it's an input to scraping, not a
@@ -249,11 +271,29 @@ class AnalysisJob:
     seed_by_url: dict[str, dict] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
+        now = time.time()
+        elapsed = (self.finished_at_ts or now) - self.started_at_ts if self.started_at_ts else 0.0
+
+        completed_items = [i for i in self.items if i.status in ("done", "error") and i.duration_seconds]
+        remaining = max(0, self.total - self.completed)
+        est_remaining_sec: Optional[float] = None
+        if self.status == RUNNING and self.started_at_ts and self.total > 0:
+            if completed_items:
+                avg_dur = sum(i.duration_seconds for i in completed_items) / len(completed_items)
+                concurrency = max(1, sum(1 for p in self.platform_progress.values() if p.get("status") == "running"))
+                est_remaining_sec = round((avg_dur * remaining) / concurrency, 1)
+            else:
+                est_remaining_sec = round(6.0 * remaining, 1)
+
         return {
             "id": self.id, "status": self.status,
             "target_name": self.target_name, "official_feed": self.official_feed,
             "total": self.total, "completed": self.completed,
             "message": self.message,
+            "started_at_ts": self.started_at_ts,
+            "finished_at_ts": self.finished_at_ts,
+            "elapsed_seconds": round(elapsed, 1),
+            "estimated_remaining_seconds": est_remaining_sec,
             "platform_progress": self.platform_progress,
             "items": [i.to_dict() for i in self.items],
         }
@@ -372,6 +412,7 @@ class AnalysisRunner:
 
     async def _run(self, job: AnalysisJob) -> None:
         job.status = RUNNING
+        job.started_at_ts = time.time()
         try:
             by_platform: dict[str, list[AnalysisItem]] = {}
             for it in job.items:
@@ -412,26 +453,23 @@ class AnalysisRunner:
             job.status = FAILED
             job.message = f"{type(e).__name__}: {e}"
             log.error(f"analysis job {job.id} failed: {job.message}")
+        finally:
+            job.finished_at_ts = time.time()
 
     async def _scrape_platform(
         self, job: AnalysisJob, platform_id: str, items: list[AnalysisItem],
     ) -> None:
         progress = job.platform_progress[platform_id]
         progress["status"] = "running"
+        progress["current_url"] = ""
+        progress["current_step"] = "Connecting session..."
+        progress["item_started_at_ts"] = time.time()
 
         concurrency = _PLATFORM_CONCURRENCY.get(platform_id, _DEFAULT_CONCURRENCY)
         options = ScanOptions(
-            # No evidence directory: a screenshot must NOT go to GridFS here.
-            # `ephemeral_screenshot` is what puts the PNG on the Row as raw
-            # bytes instead, which is the whole memory-only contract.
             evidence=None,
             ephemeral_screenshot=True,
             delay=settings.analysis_delay_sec,
-            # Not read by the chunk loop below (that's driven by the same
-            # `concurrency` local directly) -- set here only so a platform
-            # engine that inspects `self.a.concurrency` (e.g. facebook/
-            # analysis_engine.py's own unused run()/run_parallel() split)
-            # sees the real value rather than a stale 1.
             concurrency=concurrency,
             headful=not settings.headless,
         )
@@ -466,14 +504,6 @@ class AnalysisRunner:
             await sessions_engine.mark_session_ok(platform_id, session_item.get("id", ""))
 
             if platform_id == "youtube":
-                # YouTube's channels.list costs 1 quota unit per call
-                # regardless of how many ids ride along (up to 50) --
-                # Scraper.run() already batches on that, but nothing called
-                # it: this loop's generic per-item path called scraper.one()
-                # once per item, i.e. once per channel, so a run of 200
-                # approved channels paid 200 quota units for what a single
-                # batched call (well, ~4, at 50/call) could answer. See
-                # Scraper.run()'s own docstring for the full accounting.
                 await self._scrape_youtube_batch(job, platform_id, items, scraper, session_item, progress)
                 return
 
@@ -484,26 +514,11 @@ class AnalysisRunner:
                     break
                 chunk = items[i:i + concurrency]
                 i += len(chunk)
-                # Every item in the chunk visits its own page/makes its own
-                # call concurrently, on the ONE session/browser context this
-                # platform is holding for the whole run -- a context is
-                # built to carry several pages at once, so this isn't
-                # opening extra sessions, just overlapping requests on the
-                # one already held. `_scrape_one` never raises (see its own
-                # try/except), so no return_exceptions needed here.
                 fatal = await asyncio.gather(
                     *(self._scrape_one(job, it, scraper, platform_id, session_item, stagger=idx)
                       for idx, it in enumerate(chunk))
                 )
                 if any(fatal):
-                    # the session itself died -- stop this platform rather
-                    # than burning every remaining URL against it. Chunks
-                    # after this one were never even started, so unlike a
-                    # plain cancel (below) they must not be left at
-                    # "pending" -- that would report a terminal `done` job
-                    # with URLs that were silently never visited and no
-                    # explanation on any of them. Marked in the block below,
-                    # once the loop has actually stopped.
                     session_died = True
                     break
                 if i < len(items):
@@ -526,23 +541,16 @@ class AnalysisRunner:
             progress["status"] = "failed"
             detail = f"{type(e).__name__}: {e}"
             log.error(f"analysis job {job.id}: {platform_id} failed -- {detail}")
-            # every URL for this platform is unread; say so on each item
-            # rather than leaving them stuck at "pending" with no reason
             for it in items:
                 if it.status in ("pending", "running"):
                     self._fail_item(job, it, detail)
                     job.completed += 1
                     progress["completed"] += 1
         finally:
-            # Released here, not at the end of the happy path: a crash or a
-            # cancel must never leave a session showing as busy forever in
-            # the Sessions panel.
+            progress["current_url"] = ""
+            progress["current_step"] = ""
+            progress["item_started_at_ts"] = None
             self._store.release_session(held)
-            # The other half of get_healthy_session's cross-runner claim
-            # (see sessions/manager.py) -- `held` only guards THIS runner's
-            # own JobStore, which can't see a discovery job holding the
-            # same session; this is the real exclusion and must be released
-            # regardless of which path got here.
             if session_item is not None:
                 sessions_engine.release_claim(platform_id, session_item.get("id", ""))
             if scraper is not None:
@@ -555,38 +563,34 @@ class AnalysisRunner:
         self, job: AnalysisJob, platform_id: str, items: list[AnalysisItem],
         scraper: Any, session_item: dict, progress: dict,
     ) -> None:
-        """YouTube-only replacement for the generic per-item chunk loop in
-        `_scrape_platform`: one call to `Scraper.run()` (internally batched
-        50 channel ids per `channels.list` call, 1 quota unit each) instead
-        of one `scraper.one()` -> one `channels.list` call per item. Called
-        instead of, never alongside, the generic loop -- see the
-        `platform_id == "youtube"` branch above.
-
-        Mirrors `_scrape_one`'s per-item bookkeeping (status, `_populate`,
-        `job.completed`/`progress["completed"]`) but for a whole batch at
-        once, since there's no per-item concurrency here to stagger."""
         for it in items:
             it.status = "running"
+            it.started_at_ts = time.time()
+
+        progress["current_step"] = f"Batch resolving {len(items)} channels..."
+        progress["item_started_at_ts"] = time.time()
 
         jobs = [(it.url, job.target_name, job.official_feed) for it in items]
+        t0 = time.time()
         try:
             rows = await scraper.run(jobs)
         except Exception as e:
+            dur = time.time() - t0
             detail = f"{type(e).__name__}: {e}"
             log.error(f"analysis job {job.id}: youtube batch failed -- {detail}")
             for it in items:
+                it.duration_seconds = round(dur / max(1, len(items)), 2)
                 self._fail_item(job, it, detail)
                 job.completed += 1
                 progress["completed"] += 1
             progress["status"] = "failed"
             return
 
-        # `run()` stops the moment a row comes back CHECKPOINT (daily quota
-        # exhausted -- every remaining lookup would fail identically), so
-        # `rows` can be shorter than `items`; zip only covers what actually
-        # ran, and the loop after it accounts for whatever's left.
+        dur = time.time() - t0
+        per_item_dur = round(dur / max(1, len(rows)), 2)
         quota_hit = False
         for it, row in zip(items, rows):
+            it.duration_seconds = per_item_dur
             if row.status == "CHECKPOINT":
                 quota_hit = True
                 await sessions_engine.mark_session_failed(
@@ -599,6 +603,7 @@ class AnalysisRunner:
             progress["completed"] += 1
 
         for it in items[len(rows):]:
+            it.duration_seconds = 0.0
             self._fail_item(job, it, "youtube quota exhausted mid-batch -- not attempted")
             job.completed += 1
             progress["completed"] += 1
@@ -609,28 +614,23 @@ class AnalysisRunner:
         self, job: AnalysisJob, it: AnalysisItem, scraper: Any,
         platform_id: str, session_item: dict, stagger: int = 0,
     ) -> bool:
-        """One profile, run as part of a `_scrape_platform` chunk. Never
-        raises -- every failure is recorded on `it` and swallowed, the same
-        contract the old serial loop had, so `asyncio.gather` over a chunk
-        never needs `return_exceptions`. Returns True when the failure was
-        session-fatal (session marked failed): the caller stops starting
-        further chunks when ANY item in a chunk comes back True, mirroring
-        the old loop's `break` on the same condition.
-
-        `stagger` (this item's position within its chunk) delays the start
-        by that many seconds, so a chunk of 2-8 concurrent visits doesn't
-        all hit the platform in the exact same instant -- the same reason
-        facebook/analysis_engine.py's (currently unused) `run_parallel`
-        already staggers its own tabs."""
         if stagger:
             await asyncio.sleep(stagger * 1.0)
         it.status = "running"
+        it.started_at_ts = time.time()
+        prog = job.platform_progress.get(platform_id, {})
+        prog["current_url"] = it.url
+        prog["current_step"] = "Extracting profile & screenshots..."
+        prog["item_started_at_ts"] = time.time()
         fatal = False
+        t0 = time.time()
         try:
             known = job.seed_by_url.get(it.url)
             row = await scraper.one(it.url, job.target_name, job.official_feed, known=known)
+            it.duration_seconds = round(time.time() - t0, 2)
             await self._populate(job, it, row, known)
         except Exception as e:
+            it.duration_seconds = round(time.time() - t0, 2)
             self._fail_item(job, it, f"{type(e).__name__}: {e}")
             if reason := classify_failure(e):
                 await sessions_engine.mark_session_failed(
@@ -638,7 +638,8 @@ class AnalysisRunner:
                 fatal = True
         finally:
             job.completed += 1
-            job.platform_progress[platform_id]["completed"] += 1
+            if platform_id in job.platform_progress:
+                job.platform_progress[platform_id]["completed"] += 1
         return fatal
 
     # -------------------------------------------------------------- mapping

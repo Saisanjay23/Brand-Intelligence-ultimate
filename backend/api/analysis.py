@@ -115,6 +115,8 @@ class AnalysedProfile(BaseModel):
     legacy_row: dict[str, Any] = Field(
         default_factory=dict, description="Raw-analysis column layout.",
     )
+    duration_seconds: Optional[float] = None
+    started_at_ts: Optional[float] = None
 
 
 class PlatformProgress(BaseModel):
@@ -122,6 +124,9 @@ class PlatformProgress(BaseModel):
     total: int
     completed: int
     display_name: str
+    current_url: Optional[str] = ""
+    current_step: Optional[str] = ""
+    item_started_at_ts: Optional[float] = None
 
 
 class AnalysisJobState(BaseModel):
@@ -132,6 +137,10 @@ class AnalysisJobState(BaseModel):
     total: int
     completed: int
     message: str = ""
+    started_at_ts: Optional[float] = None
+    finished_at_ts: Optional[float] = None
+    elapsed_seconds: Optional[float] = None
+    estimated_remaining_seconds: Optional[float] = None
     platform_progress: dict[str, PlatformProgress]
     items: list[AnalysedProfile]
 
@@ -182,11 +191,18 @@ async def get_job(job_id: str = Path(..., description="From POST /analysis/jobs"
         job_id=d["id"], status=JobStatus(d["status"]),
         target_name=d["target_name"], official_feed=d["official_feed"],
         total=d["total"], completed=d["completed"], message=d["message"],
+        started_at_ts=d.get("started_at_ts"),
+        finished_at_ts=d.get("finished_at_ts"),
+        elapsed_seconds=d.get("elapsed_seconds"),
+        estimated_remaining_seconds=d.get("estimated_remaining_seconds"),
         platform_progress={
             k: PlatformProgress(
-                status=v["status"], total=v["total"], completed=v["completed"],
-                display_name=v["displayName"],
-            ) for k, v in d["platform_progress"].items()
+                status=v.get("status", "pending"), total=v.get("total", 0), completed=v.get("completed", 0),
+                display_name=v.get("display_name") or v.get("displayName", k),
+                current_url=v.get("current_url", ""),
+                current_step=v.get("current_step", ""),
+                item_started_at_ts=v.get("item_started_at_ts"),
+            ) for k, v in d.get("platform_progress", {}).items()
         },
         items=[AnalysedProfile(**i) for i in d["items"]],
     )

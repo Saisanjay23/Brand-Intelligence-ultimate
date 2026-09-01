@@ -22,6 +22,8 @@ export interface AnalysisItemData {
   status: "pending" | "running" | "done" | "error";
   error?: string;
   analysed_at?: string;
+  duration_seconds?: number | null;
+  started_at_ts?: number | null;
   profile_name?: string;
   followers?: number | null;
   location?: string;
@@ -37,9 +39,6 @@ export interface AnalysisItemData {
   verified?: boolean | null;
   comments?: string;
   has_screenshot?: boolean;
-  // The two export layouts, built server-side from what was actually
-  // scraped (backend/analysis/runner.py::_build_rows) so the sheet and the
-  // table can never disagree about a value.
   incident_row: Record<string, any>;
   legacy_row: Record<string, any>;
 }
@@ -49,6 +48,9 @@ export interface PlatformProgressData {
   total: number;
   completed: number;
   display_name: string;
+  current_url?: string;
+  current_step?: string;
+  item_started_at_ts?: number | null;
 }
 
 export interface AnalysisJobResponse {
@@ -59,6 +61,10 @@ export interface AnalysisJobResponse {
   total: number;
   completed: number;
   message?: string;
+  started_at_ts?: number | null;
+  finished_at_ts?: number | null;
+  elapsed_seconds?: number | null;
+  estimated_remaining_seconds?: number | null;
   platform_progress: Record<string, PlatformProgressData>;
   items: AnalysisItemData[];
 }

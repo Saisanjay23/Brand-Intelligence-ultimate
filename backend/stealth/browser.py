@@ -59,7 +59,7 @@ except ImportError:
         sys.exit("pip install patchright  (or: pip install playwright && playwright install chromium)")
 
 from backend.shared.logging import get_logger
-from backend.stealth.human import Human
+from backend.stealth.human import BASE, Human
 from backend.stealth.fingerprint import (
     LAUNCH_ARGS,
     chrome_binary,
@@ -279,10 +279,22 @@ class Session:
                     pass
 
     async def pause(self, mult: float = 1.0):
-        """Between-profile pacing, jittered and fatigued."""
-        scale = (
-            getattr(self.o, "delay", 0) / 6.0 if getattr(self.o, "delay", 0) else 1.0
-        )
+        """Between-profile pacing, jittered and fatigued.
+
+        `options.delay` is the MEDIAN gap in seconds, and now actually is
+        one. It used to be divided by a bare 6.0, which silently made the
+        setting mean 44% of its face value -- measured over 4000 draws with
+        the shipped `analysis_delay_sec = 2.5`, the real median gap was
+        1.10s, not 2.5s. Scaling against `BASE["between_profiles"]` instead
+        makes the configured number the number you get, so anyone tuning
+        pacing for stealth is tuning the thing they think they are.
+
+        (Jitter, fatigue and circadian multipliers still apply on top -- see
+        human.py. Those shape the distribution; they do not move the median
+        far, which is the point.)
+        """
+        configured = getattr(self.o, "delay", 0) or 0
+        scale = (configured / BASE["between_profiles"]) if configured else 1.0
         await self.human.pause("between_profiles", scale * mult)
         # Every platform's per-profile pause funnels through here, so this is
         # the one place that needs to fire for should_rest()/maybe_rest() to

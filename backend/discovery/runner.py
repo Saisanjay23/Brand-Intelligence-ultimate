@@ -139,6 +139,32 @@ def row_to_fields(row: Row, keyword: str) -> dict:
 
 
 @dataclass
+class CompletedSweep:
+    """Telemetry record for one completed keyword sweep."""
+
+    platform: str
+    display_name: str
+    keyword: str
+    tab: str
+    duration_seconds: float
+    hits_found: int
+    hits_new: int
+    timestamp: str
+
+    def to_dict(self) -> dict:
+        return {
+            "platform": self.platform,
+            "display_name": self.display_name,
+            "keyword": self.keyword,
+            "tab": self.tab,
+            "duration_seconds": round(self.duration_seconds, 2),
+            "hits_found": self.hits_found,
+            "hits_new": self.hits_new,
+            "timestamp": self.timestamp,
+        }
+
+
+@dataclass
 class PlatformSweep:
     """How one platform's part of a job went."""
 
@@ -150,6 +176,13 @@ class PlatformSweep:
     found: int = 0
     new: int = 0
     note: str = ""
+    # Real-time Telemetry
+    current_keyword: str = ""
+    current_tab: str = ""
+    current_step: str = ""
+    item_started_at_ts: Optional[float] = None
+    started_at_ts: Optional[float] = None
+    finished_at_ts: Optional[float] = None
 
     def to_dict(self) -> dict:
         return {
@@ -157,6 +190,12 @@ class PlatformSweep:
             "status": self.status, "keywords_total": self.keywords_total,
             "keywords_done": self.keywords_done, "found": self.found,
             "new": self.new, "note": self.note,
+            "current_keyword": self.current_keyword,
+            "current_tab": self.current_tab,
+            "current_step": self.current_step,
+            "item_started_at_ts": self.item_started_at_ts,
+            "started_at_ts": self.started_at_ts,
+            "finished_at_ts": self.finished_at_ts,
         }
 
 
@@ -178,6 +217,9 @@ class DiscoveryJob:
     cancel: asyncio.Event = field(default_factory=asyncio.Event)
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
+    started_at_ts: Optional[float] = None
+    finished_at_ts: Optional[float] = None
+    history: list[CompletedSweep] = field(default_factory=list)
 
     @property
     def keywords(self) -> list[str]:
@@ -192,13 +234,33 @@ class DiscoveryJob:
         return sum(p.keywords_done for p in self.platforms.values())
 
     def to_dict(self) -> dict:
+        now = time.time()
+        elapsed = (self.finished_at_ts or now) - self.started_at_ts if self.started_at_ts else 0.0
+
+        # Calculate dynamic ETA based on rolling average duration per sweep across completed items
+        remaining_units = max(0, self.total - self.completed)
+        est_remaining_sec: Optional[float] = None
+        if self.status == RUNNING and self.started_at_ts and self.total > 0:
+            if self.history and self.completed > 0:
+                durations = [h.duration_seconds for h in self.history]
+                avg_duration = sum(durations) / len(durations)
+                active_platforms_count = max(1, sum(1 for p in self.platforms.values() if p.status == "running" or p.keywords_done < p.keywords_total))
+                est_remaining_sec = round((avg_duration * remaining_units) / active_platforms_count, 1)
+            else:
+                active_platforms_count = max(1, sum(1 for p in self.platforms.values() if p.status != "skipped"))
+                est_remaining_sec = round((8.0 * remaining_units) / active_platforms_count, 1)
+
         return {
             "job_id": self.id, "group_id": self.group_id, "status": self.status,
             "keywords": self.keywords, "message": self.message,
             "total": self.total, "completed": self.completed,
             "found": self.found, "new": self.new,
             "started_at": self.started_at, "finished_at": self.finished_at,
+            "started_at_ts": self.started_at_ts, "finished_at_ts": self.finished_at_ts,
+            "elapsed_seconds": round(elapsed, 1),
+            "estimated_remaining_seconds": est_remaining_sec,
             "platforms": [p.to_dict() for p in self.platforms.values()],
+            "history": [h.to_dict() for h in self.history[-30:]],
         }
 
 
@@ -310,6 +372,7 @@ class DiscoveryRunner:
     ) -> None:
         job.status = RUNNING
         job.started_at = datetime.now(timezone.utc).isoformat()
+        job.started_at_ts = time.time()
         try:
             # Every ready platform swept CONCURRENTLY. Each is a fully
             # separate account, browser context and proxy on a fully
@@ -354,6 +417,7 @@ class DiscoveryRunner:
             log.error(f"discovery job {job.id} failed: {job.message}")
         finally:
             job.finished_at = datetime.now(timezone.utc).isoformat()
+            job.finished_at_ts = time.time()
 
     async def _sweep_platform(
         self, job: DiscoveryJob, platform_id: str,
@@ -363,6 +427,7 @@ class DiscoveryRunner:
     ) -> None:
         prog = job.platforms[platform_id]
         prog.status = "running"
+        prog.started_at_ts = time.time()
         plat = registry.get(platform_id)
         tabs = PLATFORM_TABS.get(platform_id, ["people"])
         platform_limits = {"individual": platform_limits_individual, "domain": platform_limits_domain}
@@ -427,6 +492,11 @@ class DiscoveryRunner:
                 for tab in tabs:
                     if job.cancel.is_set():
                         break
+                    prog.current_keyword = keyword
+                    prog.current_tab = tab
+                    prog.current_step = f"Searching {tab.upper()} tab..."
+                    prog.item_started_at_ts = time.time()
+                    t0 = time.time()
                     options.max_results = _resolve_cap(
                         platform_id, tab, kw_type, max_results,
                         platform_limits, platform_tab_limits,
@@ -434,8 +504,19 @@ class DiscoveryRunner:
                     try:
                         sweep = await discoverer.sweep(keyword, tab)
                     except Exception as e:
+                        dur = time.time() - t0
                         log.error(f"[{platform_id}] {keyword!r}/{tab}: {type(e).__name__}: {e}")
                         prog.keywords_done += 1
+                        job.history.append(CompletedSweep(
+                            platform=platform_id,
+                            display_name=prog.display_name,
+                            keyword=keyword,
+                            tab=tab,
+                            duration_seconds=dur,
+                            hits_found=0,
+                            hits_new=0,
+                            timestamp=datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                        ))
                         if reason := classify_failure(e):
                             await sessions_engine.mark_session_failed(
                                 platform_id, session_item.get("id", ""), reason, detail=str(e))
@@ -445,7 +526,10 @@ class DiscoveryRunner:
                         incomplete += 1
                         continue
 
+                    dur = time.time() - t0
                     hits = [h for h in (sweep.hits or []) if h.url]
+                    saved_count = 0
+                    new_count = 0
                     if hits:
                         # Saved per completed sweep, not batched at the end,
                         # so a caller polling this job (or reading /profiles)
@@ -454,6 +538,8 @@ class DiscoveryRunner:
                             job.group_id, platform_id, profiles_db.PHASE_DISCOVERY,
                             [row_to_fields(h, keyword) for h in hits],
                         )
+                        saved_count = saved
+                        new_count = new
                         prog.found += saved
                         prog.new += new
                         job.found += saved
@@ -461,6 +547,16 @@ class DiscoveryRunner:
                     if not getattr(sweep, "complete", True):
                         incomplete += 1
                     prog.keywords_done += 1
+                    job.history.append(CompletedSweep(
+                        platform=platform_id,
+                        display_name=prog.display_name,
+                        keyword=keyword,
+                        tab=tab,
+                        duration_seconds=dur,
+                        hits_found=saved_count,
+                        hits_new=new_count,
+                        timestamp=datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                    ))
 
                     stop_reason = ""
                     if getattr(sweep, "stopped", "") == "flood-wait":
@@ -507,6 +603,11 @@ class DiscoveryRunner:
             prog.note = f"{type(e).__name__}: {e}"
             log.error(f"discovery job {job.id}: {platform_id} failed -- {prog.note}")
         finally:
+            prog.current_keyword = ""
+            prog.current_tab = ""
+            prog.current_step = ""
+            prog.item_started_at_ts = None
+            prog.finished_at_ts = time.time()
             self._store.release_session(held)
             # The other half of get_healthy_session's cross-runner claim
             # (see sessions/manager.py) -- `held` only guards this SAME

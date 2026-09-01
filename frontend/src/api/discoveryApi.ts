@@ -44,6 +44,17 @@ export interface StartDiscoveryAccepted {
   skipped: SkippedInput[];
 }
 
+export interface CompletedSweepTelemetry {
+  platform: string;
+  display_name: string;
+  keyword: string;
+  tab: string;
+  duration_seconds: number;
+  hits_found: number;
+  hits_new: number;
+  timestamp: string;
+}
+
 export interface PlatformSweepState {
   platform: string;
   display_name: string;
@@ -53,6 +64,12 @@ export interface PlatformSweepState {
   found: number;
   new: number;
   note: string;
+  current_keyword?: string;
+  current_tab?: string;
+  current_step?: string;
+  item_started_at_ts?: number | null;
+  started_at_ts?: number | null;
+  finished_at_ts?: number | null;
 }
 
 export interface DiscoveryJobState {
@@ -67,7 +84,12 @@ export interface DiscoveryJobState {
   new: number;
   started_at: string | null;
   finished_at: string | null;
+  started_at_ts?: number | null;
+  finished_at_ts?: number | null;
+  elapsed_seconds?: number | null;
+  estimated_remaining_seconds?: number | null;
   platforms: PlatformSweepState[];
+  history?: CompletedSweepTelemetry[];
 }
 
 export interface DiscoveredProfile {
