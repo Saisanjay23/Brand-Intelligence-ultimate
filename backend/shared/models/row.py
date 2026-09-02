@@ -25,6 +25,13 @@ class Row:
     status: str = "PENDING"
     entity_type: str = "profile"
     profile_id: str = ""
+    # The PUBLIC handle (@name), as distinct from `profile_id`, which is the
+    # platform's internal id. Discovery persists this as the `username`
+    # column; before it existed every row stored the id there instead and
+    # the UI rendered "@50840430092" for a profile whose handle is
+    # "@defnce.app". Platforms whose search payload names the handle set it
+    # here; the rest fall back to shared/text.py::handle_from_url.
+    username: str = ""
     profile_name: str = ""
     created_iso: str = ""
     followers: Optional[int] = None

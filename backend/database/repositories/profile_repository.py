@@ -573,7 +573,15 @@ def _build_query(
     if status:
         q["status"] = status
     if keyword:
-        q["keywords"] = keyword
+        # Into `clauses`, NOT `q["keywords"]` -- the keyword-category filter
+        # below writes the same key, and a second assignment would silently
+        # drop this one (see the note on `$or` in this docstring; the same
+        # trap, a different key). That combination is reachable straight
+        # from the UI, which has both a keyword dropdown and an
+        # Individual/Domain dropdown: picking a keyword AND a category
+        # returned MORE rows than the keyword alone, because the keyword
+        # filter had been thrown away.
+        clauses.append({"keywords": keyword})
     if entity_type:
         q["entity_type"] = entity_type
     if priority:
@@ -600,7 +608,7 @@ def _build_query(
         wanted = list(client_keywords.get(bucket) or [])
         # an empty configured list can never match anything, express that
         # as an impossible clause rather than letting it degrade to "all"
-        q["keywords"] = {"$in": wanted} if wanted else {"$in": [None]}
+        clauses.append({"keywords": {"$in": wanted} if wanted else {"$in": [None]}})
     if data_quality:
         # The analyst-facing "Data Quality" filter. "complete" is the exact
         # complement of "incomplete" ($nor of the same clause), so the two

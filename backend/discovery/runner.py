@@ -41,7 +41,7 @@ from backend.shared.job_store import JobStore
 from backend.shared.logging import get_logger
 from backend.shared.models.row import Row
 from backend.shared.resilience import classify_failure
-from backend.shared.text import name_score
+from backend.shared.text import handle_from_url, name_score
 
 log = get_logger("discovery.runner")
 
@@ -117,7 +117,10 @@ def row_to_fields(row: Row, keyword: str) -> dict:
         "url": row.url,
         "entity_id": row.profile_id,
         "keyword": keyword,
-        "username": row.profile_id,
+        # The handle, NOT `profile_id` -- see Row.username. Falls back to the
+        # URL and then to the id, so a platform that publishes neither still
+        # stores something rather than a blank.
+        "username": row.username or handle_from_url(row.url) or row.profile_id,
         "display_name": row.profile_name,
         "entity_type": row.entity_type,
         "discovery_source": src,

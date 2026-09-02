@@ -63,12 +63,37 @@ def find_ints(text: str, keys) -> list[int]:
     return out
 
 
+# A dotted thousands group, the way most non-English locales render a
+# follower count: "1.234.567". Every group after the first is exactly three
+# digits and there is no K/M/B suffix, so an English "1.2K" can never match
+# this and the two readings never collide.
+_DOTTED_THOUSANDS = re.compile(r"^\d{1,3}(?:\.\d{3})+$")
+
+
 def parse_count(raw: str):
+    r"""(value, is_exact) for a scraped count, or (None, False) if it is not
+    one. TOTAL: never raises, whatever the page put in front of it.
+
+    The `float()` here used to be unguarded, and every caller feeds it raw
+    scraped text -- Facebook's own RE_FOLLOWERS/RE_CHIP capture `[\d.,\s]+`,
+    and TikTok passes DOM strings through untouched. So a page rendering
+    "1.234.567 followers" (German, Spanish, Portuguese, Indonesian, ... --
+    Facebook serves that to a large share of locales) raised an uncaught
+    ValueError and took the whole visit down. Now such a count is READ
+    rather than merely survived; anything genuinely unparseable ("1.2.3")
+    returns None, which every caller already handles.
+    """
     s = re.sub(r"[\s,]", "", raw.strip())
+    if _DOTTED_THOUSANDS.match(s):
+        return int(s.replace(".", "")), True
     m = re.match(r"^([\d.]+)([KMB])?$", s, re.I)
     if not m:
         return None, False
-    val, suf = float(m.group(1)), (m.group(2) or "").upper()
+    try:
+        val = float(m.group(1))
+    except ValueError:
+        return None, False
+    suf = (m.group(2) or "").upper()
     mult = {"": 1, "K": 1_000, "M": 1_000_000, "B": 1_000_000_000}[suf]
     return int(val * mult), (suf == "" and "." not in m.group(1))
 
@@ -131,6 +156,55 @@ def parse_normalized_url(url: str, extra_schemes: tuple[str, ...] = ()) -> Optio
 
 def normalized_host(parsed: ParseResult) -> str:
     return parsed.netloc.lower().split(":")[0]
+
+
+# Path segments that introduce an id or a page type rather than being a
+# handle themselves -- `facebook.com/profile.php?id=N`, `t.me/c/<internal
+# id>`, `youtube.com/channel/UC...`, `facebook.com/groups/<id>`. For these
+# the URL simply does not carry a handle and callers fall back to the id.
+_NON_HANDLE_SEGMENTS = frozenset({
+    "profile.php", "people", "pages", "groups", "channel", "c", "watch",
+    "video", "reel", "reels", "p", "story", "stories", "hashtag", "explore",
+    "search", "share",
+})
+
+
+def handle_from_url(url: str) -> str:
+    """The public handle a profile URL carries, or "" when it carries none.
+
+        https://www.instagram.com/defnce.app/     -> "defnce.app"
+        https://x.com/CyfirmaDev                  -> "CyfirmaDev"
+        https://www.tiktok.com/@someone           -> "someone"
+        https://www.youtube.com/user/LegacyName   -> "LegacyName"
+        https://www.facebook.com/llaudreyisabelcc -> "llaudreyisabelcc"
+        https://www.facebook.com/profile.php?id=6 -> ""   (id, not a handle)
+        https://t.me/c/8925111777                 -> ""   (internal id)
+        https://www.youtube.com/channel/UCabc     -> ""   (channel id)
+
+    WHY THIS EXISTS. Discovery stores a `username` per profile, but `Row`
+    only ever carried `profile_id` -- so every platform's rows were saved
+    with the numeric/opaque id in the username field, and the UI rendered
+    a real handle as "@50840430092". Platforms whose search payload names
+    the handle now set `Row.username` directly; this recovers it for the
+    ones that don't (Facebook and YouTube go through `Hit`, which has no
+    handle field at all) from the URL we already store.
+    """
+    parsed = parse_normalized_url(url)
+    if parsed is None:
+        return ""
+    segments = [seg for seg in parsed.path.split("/") if seg]
+    if not segments:
+        return ""
+    first = segments[0]
+    # `youtube.com/@handle`, `tiktok.com/@handle`
+    if first.startswith("@"):
+        return first[1:].strip()
+    # `youtube.com/user/<legacy handle>` -- the handle is the NEXT segment
+    if first.lower() == "user":
+        return segments[1].strip() if len(segments) > 1 else ""
+    if first.lower() in _NON_HANDLE_SEGMENTS:
+        return ""
+    return first.strip()
 
 
 def is_place(v: str) -> bool:

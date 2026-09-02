@@ -223,7 +223,8 @@ def user_to_row(u: "TikTokUser", keyword: str, *, source: str = "search") -> Row
     """
     row = Row(
         url=u.url, target=keyword, entity_type="profile",
-        profile_id=u.entity_id or u.username, profile_name=u.nickname or u.username,
+        profile_id=u.entity_id or u.username, username=u.username,
+        profile_name=u.nickname or u.username,
         profile_pic_url=u.avatar, has_custom_pic=u.has_custom_pic,
         verified=u.verified, followers=u.follower_count, friends=u.heart_count,
         bio=u.bio,

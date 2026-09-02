@@ -211,7 +211,8 @@ def user_to_row(u: "InstagramUser", keyword: str, *, source: str = "api") -> Row
     """
     row = Row(
         url=u.url, target=keyword, entity_type="profile",
-        profile_id=u.entity_id or u.username, profile_name=u.full_name or u.username,
+        profile_id=u.entity_id or u.username, username=u.username,
+        profile_name=u.full_name or u.username,
         profile_pic_url=u.avatar, has_custom_pic=u.has_custom_pic, verified=u.verified,
         followers=u.followers, friends=u.following, bio=u.biography, location=u.city_name,
     )

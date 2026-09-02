@@ -665,8 +665,6 @@ class AnalysisRunner:
         it.profile_image_url = row.profile_pic_url
         it.verified = row.verified
         it.comments = row.notes
-        it.risk_score = row.risk
-        it.priority = row.priority
 
         # Belt-and-suspenders: an engine that hasn't been taught to read
         # `known` yet (or one that genuinely couldn't confirm a field on
@@ -677,11 +675,11 @@ class AnalysisRunner:
             if known.get("main_keyword"):
                 it.main_keyword = known["main_keyword"]
             if not it.profile_name and known.get("display_name"):
-                it.profile_name = known["display_name"]
+                it.profile_name = row.profile_name = known["display_name"]
             if it.followers is None and known.get("followers") is not None:
                 it.followers = known["followers"]
             if not it.location and known.get("location"):
-                it.location = known["location"]
+                it.location = row.location = known["location"]
             if not it.bio and known.get("bio"):
                 it.bio = known["bio"]
             if not it.created_date and known.get("created_at"):
@@ -691,9 +689,9 @@ class AnalysisRunner:
             if it.verified is None and known.get("verified") is not None:
                 it.verified = known["verified"]
             if it.has_logo is None and known.get("has_logo") is not None:
-                it.has_logo = known["has_logo"]
+                it.has_logo = row.has_custom_pic = known["has_logo"]
             if not it.name_score and known.get("name_score"):
-                it.name_score = known["name_score"]
+                it.name_score = row.name_score = known["name_score"]
                 # has_name_match was derived from THIS visit's score (see
                 # Row.name_yes), which is 0 whenever the job carries no
                 # target name to score against -- the usual case, since
@@ -704,6 +702,21 @@ class AnalysisRunner:
                 # and what compute_incident_risk_score reads. Re-derive the
                 # verdict from the score actually being used.
                 it.has_name_match = it.name_score >= NAME_THRESHOLD
+
+        # LAST, and deliberately after the `known` merge above. Risk and
+        # priority are DERIVED from name/logo/location/activity, so reading
+        # them before those fields were restored scored the row on what this
+        # one visit happened to see rather than on everything known about it.
+        # Analysis usually carries no target name (neither the analysis form
+        # nor "Analyse Validated" sends one), so `row.name_score` is 0 on
+        # arrival and `Row.name_yes` reads "No" -- which pinned a confirmed
+        # impersonation carrying the brand's logo, name, location and a
+        # recent post at 2, the "no name match" FLOOR, when the rubric scores
+        # it 9. The restores above are mirrored onto `row` rather than
+        # recomputing the rubric here, so scoring.py stays the only place
+        # the cascade exists.
+        it.risk_score = row.risk
+        it.priority = row.priority
 
         if row.screenshot_bytes:
             async with self._lock:

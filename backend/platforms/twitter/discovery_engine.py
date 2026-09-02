@@ -197,7 +197,7 @@ def user_to_row(u: "TwitterUser", keyword: str, *, source: str = "graphql") -> R
     """
     row = Row(
         url=u.url, target=keyword, entity_type="profile",
-        profile_id=u.entity_id, profile_name=u.name,
+        profile_id=u.entity_id, username=u.handle, profile_name=u.name,
         profile_pic_url=u.avatar, has_custom_pic=u.has_custom_pic,
         verified=u.verified, followers=u.followers, friends=u.following,
         bio=u.description, location=u.location, created_iso=u.created_iso,

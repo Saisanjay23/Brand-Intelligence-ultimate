@@ -166,7 +166,7 @@ def entity_to_row(e: "TelegramEntity", keyword: str) -> Row:
     a caller that resolves keyword-plan parents should overwrite it."""
     row = Row(
         url=e.url, target=keyword, entity_type=e.kind,
-        profile_id=e.entity_id, profile_name=e.title,
+        profile_id=e.entity_id, username=e.username, profile_name=e.title,
         profile_pic_url=e.avatar, has_custom_pic=e.has_photo,
         verified=e.verified, followers=e.members, created_iso=e.created_iso,
     )

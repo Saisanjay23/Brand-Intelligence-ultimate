@@ -23,6 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from backend.shared.models.row import Row
+from backend.shared.text import handle_from_url
 
 
 @dataclass
@@ -61,8 +62,12 @@ def hit_to_row(hit: Hit) -> Row:
     permutation -> the real brand/person name) should overwrite it before
     persisting or scoring.
     """
+    # `Hit` has no handle field -- Facebook's and YouTube's search payloads
+    # do not publish one separately from the URL -- so recover it from the
+    # URL, which is the same place the platform itself puts it.
     row = Row(url=hit.url, target=hit.keyword, entity_type=hit.entity_type,
-              profile_id=hit.entity_id, profile_name=hit.name,
+              profile_id=hit.entity_id, username=handle_from_url(hit.url),
+              profile_name=hit.name,
               profile_pic_url=hit.avatar, has_custom_pic=hit.has_custom_pic,
               verified=hit.verified)
     for f in ("profile_name", "profile_pic_url", "verified"):
