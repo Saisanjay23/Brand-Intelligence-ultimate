@@ -5,8 +5,8 @@ import react from "@vitejs/plugin-react";
 // Relative paths so the bundle can be served from any origin (see
 // src/api/httpClient.ts's API_BASE) -- this dev proxy is local convenience
 // only, not what makes the app work. /discovery, /analysis, /sessions,
-// /health are real backend routers on the rebuilt backend
-// (backend/api/{discovery,analysis,sessions,health}.py). /clients, /jobs,
+// /health and /media are real backend routers on the rebuilt backend
+// (backend/api/{discovery,analysis,sessions,health,media}.py). /clients, /jobs,
 // /scheduler are NOT -- the old frontend pages that call them (Clients,
 // Scheduler) were restored for their UI/layout, but that backend layer
 // (client_routes.py/job_routes.py/scheduler_routes.py + controllers/dto)
@@ -17,7 +17,7 @@ import react from "@vitejs/plugin-react";
 const BACKEND = "http://127.0.0.1:8000";
 const proxy = Object.fromEntries(
   [
-    "/discovery", "/analysis", "/sessions", "/health",
+    "/discovery", "/analysis", "/sessions", "/health", "/media",
     "/clients", "/jobs", "/scheduler",
     "/docs", "/redoc", "/openapi.json",
   ].map((path) => [path, { target: BACKEND, changeOrigin: true }]),

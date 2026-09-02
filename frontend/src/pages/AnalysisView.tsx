@@ -14,6 +14,7 @@ import {
   VerifiedBadgeIcon,
 } from "../components/AppIcons";
 import { PlatformIcon } from "../components/PlatformIcon";
+import { avatarSrc } from "../utils/avatar";
 import { download, downloadBlob, rowsToCsv, rowsToTsv } from "../utils/download";
 import { formatElapsed, formatSeconds, useLiveTimer } from "../utils/timeFormat";
 
@@ -1398,7 +1399,7 @@ export function AnalysisView({ resumeJobId }: Props = {}) {
                               <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                                 {it.profile_image_url ? (
                                   <img
-                                    src={it.profile_image_url}
+                                    src={avatarSrc(it.profile_image_url)}
                                     alt=""
                                     style={{ width: "26px", height: "26px", borderRadius: "50%", objectFit: "cover", flexShrink: 0 }}
                                     onError={(e) => {

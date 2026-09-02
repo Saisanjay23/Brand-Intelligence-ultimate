@@ -28,6 +28,7 @@ import { discoveryApi } from "../api/discoveryApi";
 import type { DiscoveredProfile } from "../api/discoveryApi";
 import { getClientKeywords } from "../services/clientKeywords";
 import { listSavedClients } from "../services/savedClients";
+import { avatarSrc } from "../utils/avatar";
 import { confirmAction } from "../utils/confirmAction";
 import { download, rowsToCsv } from "../utils/download";
 import { PlatformIcon } from "./PlatformIcon";
@@ -115,7 +116,7 @@ function Avatar({ p }: { p: DiscoveredProfile }) {
   }
   return (
     <img
-      src={p.profile_image_url}
+      src={avatarSrc(p.profile_image_url)}
       alt=""
       referrerPolicy="no-referrer"
       style={{ width: "100%", height: "100%", objectFit: "cover" }}

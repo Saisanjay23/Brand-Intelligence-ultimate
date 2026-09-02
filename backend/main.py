@@ -10,7 +10,9 @@ from, and every route declares a real response schema):
     /analysis    URLs in      -> scraped + scored profiles, in memory only
     /sessions    the platform credentials both of the above scrape with
 
-Plus /health for liveness/readiness probes.
+Plus /health for liveness/readiness probes, and /media/avatar, which
+re-serves a profile picture from this origin when the platform's own CDN
+refuses to be embedded cross-origin (see backend/api/media.py).
 
 It also SERVES THE UI: the built `frontend/dist` is mounted at `/` when it
 exists, so one process on one port is the whole tool (see the mount at the
@@ -73,6 +75,8 @@ from fastapi.staticfiles import StaticFiles
 from backend.api.analysis import router as analysis_router
 from backend.api.discovery import router as discovery_router
 from backend.api.health import router as health_router
+from backend.api.media import close as media_close
+from backend.api.media import router as media_router
 from backend.api.sessions import router as sessions_router
 from backend.config.settings import settings
 from backend.database.connection import close as mongo_close
@@ -136,6 +140,7 @@ async def lifespan(app: FastAPI):
         )
     yield
     sessions_engine.stop_monitor()
+    await media_close()
     await mongo_close()
 
 
@@ -155,6 +160,9 @@ app = FastAPI(
         {"name": "sessions", "description":
             "The per-platform credentials discovery and analysis scrape with. "
             "Nothing can be scraped for a platform with no usable session."},
+        {"name": "media", "description":
+            "Re-serves a profile picture from this origin, for CDNs whose "
+            "response headers stop a browser embedding them directly."},
         {"name": "health", "description": "Liveness and readiness probes."},
     ],
 )
@@ -180,6 +188,9 @@ app.include_router(health_router)
 app.include_router(discovery_router)
 app.include_router(analysis_router)
 app.include_router(sessions_router)
+# Serves remote avatars from this origin -- see backend/api/media.py for why
+# Instagram's CDN cannot be embedded directly.
+app.include_router(media_router)
 
 
 # ------------------------------------------------------------------- the UI
