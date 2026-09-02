@@ -128,6 +128,18 @@ export interface DiscoveredProfilePage {
   total: number;
   limit: number;
   offset: number;
+  // Totals for the WHOLE filtered set, not this page -- so the New/Old tab
+  // badges can state the true size of a tab that isn't open. Counted with
+  // the `age` filter itself dropped, so both numbers are always the real
+  // ones regardless of which tab is being viewed.
+  counts?: {
+    ages?: { new?: number; old?: number };
+    // Per-keyword totals across the WHOLE filtered set. The dropdown used to
+    // tally the rows it happened to have loaded, which with server-side
+    // paging would have meant one page -- a keyword only present further in
+    // would not have appeared in the list at all.
+    keywords?: Record<string, number>;
+  };
 }
 
 export interface ListProfilesQuery {
@@ -136,6 +148,13 @@ export interface ListProfilesQuery {
   status?: ProfileStatus;
   keyword?: string;
   search?: string;
+  // "new" = first seen within the last 24h, "old" = everything else.
+  // Server-side, so the New/Old split survives pagination: it used to be
+  // computed in the browser over one capped fetch, which silently hid every
+  // pending profile past the cap from both tabs.
+  age?: "new" | "old";
+  match_level?: "high" | "medium" | "low";
+  entity_type?: string;
   limit?: number;
   offset?: number;
 }
@@ -185,6 +204,9 @@ export const discoveryApi = {
     if (q.status) p.set("status", q.status);
     if (q.keyword) p.set("keyword", q.keyword);
     if (q.search) p.set("search", q.search);
+    if (q.age) p.set("age", q.age);
+    if (q.match_level) p.set("match_level", q.match_level);
+    if (q.entity_type) p.set("entity_type", q.entity_type);
     if (q.limit) p.set("limit", String(q.limit));
     if (q.offset) p.set("offset", String(q.offset));
     return fetch(url(`/discovery/profiles?${p}`)).then(json<DiscoveredProfilePage>);

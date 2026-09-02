@@ -34,7 +34,7 @@ them. Any stable string works.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Path, Query, Response, status
 from pydantic import BaseModel, Field
@@ -243,11 +243,31 @@ class DiscoveredProfile(BaseModel):
     last_seen: Optional[str] = None
 
 
+class ProfileCounts(BaseModel):
+    """Totals for the whole filtered set, not just this page -- so a tab
+    badge can state the real size of a tab the caller is not looking at."""
+
+    ages: dict[str, int] = Field(
+        default_factory=dict,
+        description="Pending rows by age bucket: `new` (first seen within the "
+                    "last 24h) and `old`. Counted with the `age` filter itself "
+                    "dropped, so both are the true totals.",
+    )
+    keywords: dict[str, int] = Field(
+        default_factory=dict,
+        description="Matching rows per keyword, across the whole filtered set "
+                    "rather than the current page. Counted with the `keyword` "
+                    "filter itself dropped, so picking one keyword doesn't "
+                    "collapse the list to that keyword alone.",
+    )
+
+
 class DiscoveredProfilePage(BaseModel):
     items: list[DiscoveredProfile]
     total: int = Field(..., description="Matching rows in total, not just this page.")
     limit: int
     offset: int
+    counts: ProfileCounts = Field(default_factory=ProfileCounts)
 
 
 def _to_profile(doc: dict) -> DiscoveredProfile:
@@ -378,21 +398,43 @@ async def list_profiles(
                     "POST /discovery/profiles/analyse also reads from.",
     ),
     keyword: Optional[str] = Query(None, description="Only profiles found under this keyword."),
+    match_level: Optional[Literal["high", "medium", "low"]] = Query(
+        None,
+        description="Name-match band. `high` is a true contiguous letter-run of "
+                    "the keyword inside the profile name (name_exact_run), NOT a "
+                    "score threshold -- a reordered name scores 100 but is not a "
+                    "High match. `medium`/`low` band on name_score around 50.",
+    ),
+    entity_type: Optional[str] = Query(
+        None, max_length=40,
+        description="profile | page | group | channel.",
+    ),
+    age: Optional[Literal["new", "old"]] = Query(
+        None,
+        description="Split by how recently the profile was first discovered: "
+                    "`new` = first seen within the last 24h, `old` = everything "
+                    "else (a profile with no first_seen counts as old). Applied "
+                    "server-side so the split survives pagination.",
+    ),
     search: Optional[str] = Query(None, max_length=200, description="Substring match on name/username/url."),
     limit: int = Query(DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
     offset: int = Query(0, ge=0),
 ) -> DiscoveredProfilePage:
     """Durable results, readable while the job that produced them is still
     running. Ordering is stable, so `limit`/`offset` paging is safe."""
-    docs, total, _ = await profiles_db.find(
+    docs, total, counts = await profiles_db.find(
         group_id, platform=platform.value if platform else None,
         status=_TO_DB_STATUS[status_.value] if status_ else None,
         phase=profiles_db.PHASE_DISCOVERY,
         keyword=keyword, search=search, limit=limit, offset=offset,
-        include_held=True,
+        include_held=True, age=age, match_level=match_level,
+        entity_type=entity_type,
     )
     return DiscoveredProfilePage(
         items=[_to_profile(d) for d in docs], total=total, limit=limit, offset=offset,
+        counts=ProfileCounts(
+            ages=counts.get("ages") or {}, keywords=counts.get("keywords") or {},
+        ),
     )
 
 

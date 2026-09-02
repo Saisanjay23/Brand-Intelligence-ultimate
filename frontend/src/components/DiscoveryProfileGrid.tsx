@@ -52,12 +52,15 @@ const PAGE_SIZE_OPTIONS = [25, 50, 100, 200] as const;
 // instead. Medium still does.
 const MATCH_MEDIUM_THRESHOLD = 50;
 const NEW_WINDOW_MS = 24 * 60 * 60 * 1000;
-// How many pending rows the New/Old split is computed over -- the
-// backend's own hard ceiling per request (backend/shared/pagination.py's
-// MAX_LIMIT). A client with more pending rows than this at once will see
-// New/Old counts capped here rather than a true total; Validated has no
-// such cap, it pages the normal server-side way.
-const PENDING_FETCH_CAP = 1000;
+// Ceiling for the one remaining bulk read (Copy All Validated), matching
+// the backend's own hard limit per request (backend/shared/pagination.py's
+// MAX_LIMIT). Every LISTING is server-paged and no longer goes through this:
+// New/Old used to be one capped fetch split in the browser, which on a
+// client with 1635 pending rows left 635 of them unreachable in either tab
+// while the badges still presented the visible 1000 as the whole set. The
+// age split is a server filter now (`age=new|old`), so the tabs page like
+// Validated always has and the badges come from server-side counts.
+const BULK_FETCH_CAP = 1000;
 
 // High Match is gated on `name_exact_run` (a real contiguous letter-run of
 // the keyword inside the name -- see backend/shared/text.py::
@@ -301,6 +304,10 @@ function ProfileTable({
 export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseStarted }: Props) {
   const [tab, setTab] = useState<Tab>("new");
   const [pendingItems, setPendingItems] = useState<DiscoveredProfile[] | null>(null);
+  // True totals for both age tabs, from the server, independent of which one
+  // is open and of how the current page happens to be filled.
+  const [ageCounts, setAgeCounts] = useState<{ new: number; old: number }>({ new: 0, old: 0 });
+  const [keywordCounts, setKeywordCounts] = useState<Record<string, number>>({});
   const [loadingPending, setLoadingPending] = useState(false);
   const [validatedPage, setValidatedPage] = useState<{ items: DiscoveredProfile[]; total: number } | null>(null);
   const [loadingValidated, setLoadingValidated] = useState(false);
@@ -370,15 +377,22 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
       const res = await discoveryApi.listProfiles({
         group_id: groupId, platform: platform || undefined, status: "pending",
         keyword: keywordFilter || undefined, search: search || undefined,
-        limit: PENDING_FETCH_CAP,
+        match_level: matchLevel || undefined, entity_type: entityType || undefined,
+        // On the Validated tab this call exists only to keep the New/Old
+        // badges truthful, so it asks for one row and reads `counts`.
+        age: tab === "validated" ? undefined : tab,
+        limit: tab === "validated" ? 1 : pageSize,
+        offset: tab === "validated" ? 0 : offset,
       });
-      setPendingItems(res.items);
+      setPendingItems(tab === "validated" ? [] : res.items);
+      setAgeCounts({ new: res.counts?.ages?.new ?? 0, old: res.counts?.ages?.old ?? 0 });
+      setKeywordCounts(res.counts?.keywords ?? {});
     } catch (e) {
       toast.error((e as Error).message);
     } finally {
       setLoadingPending(false);
     }
-  }, [groupId, platform, keywordFilter, search]);
+  }, [groupId, platform, keywordFilter, search, matchLevel, entityType, tab, pageSize, offset]);
 
   const loadValidated = useCallback(async () => {
     setLoadingValidated(true);
@@ -451,28 +465,23 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
     return true;
   };
 
-  const newItems = (pendingItems || []).filter(isProfileNew).filter(clientFilter);
-  const oldItems = (pendingItems || []).filter((p) => !isProfileNew(p)).filter(clientFilter);
+  // All three tabs are now server-paged: `pendingItems` IS the current page
+  // of the active age tab, not a capped fetch to be split and sliced here.
   const validatedItemsAll = (validatedPage?.items || []).filter(clientFilter);
+  const displayed = tab === "validated" ? validatedItemsAll : (pendingItems || []).filter(clientFilter);
 
-  // New/Old paginate client-side over the already-fetched+filtered set;
-  // Validated keeps true server pagination.
-  const displayed =
-    tab === "new" ? newItems.slice(offset, offset + pageSize)
-    : tab === "old" ? oldItems.slice(offset, offset + pageSize)
-    : validatedItemsAll;
-
-  const total = tab === "new" ? newItems.length : tab === "old" ? oldItems.length : (validatedPage?.total || 0);
+  const total =
+    tab === "new" ? ageCounts.new
+    : tab === "old" ? ageCounts.old
+    : (validatedPage?.total || 0);
   const loading = tab === "validated" ? loadingValidated : loadingPending;
 
-  // Keyword dropdown options, counted from whatever's actually loaded right
-  // now (no aggregate-across-all-pages endpoint exists) -- an honest
-  // approximation, not a true global count.
-  const keywordCounts = new Map<string, number>();
-  for (const p of [...(pendingItems || []), ...(validatedPage?.items || [])]) {
-    for (const kw of p.keywords) keywordCounts.set(kw, (keywordCounts.get(kw) || 0) + 1);
-  }
-  const keywordOptions = [...keywordCounts.entries()].sort((a, b) => b[1] - a[1]);
+  // Keyword dropdown options, counted SERVER-side over the whole filtered
+  // set. This used to tally whatever rows happened to be loaded, which was
+  // already only an approximation and, now that every tab is server-paged,
+  // would have been a tally of the 25 rows on screen -- a keyword that first
+  // appears on page 2 would not have been offered at all.
+  const keywordOptions = Object.entries(keywordCounts).sort((a, b) => b[1] - a[1]);
 
   const toggle = (id: string) =>
     setSelected((prev) => {
@@ -509,8 +518,10 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
       }
       if (res.updated.length) toast.success(`${res.updated.length} validated -- moved to Validated Profiles`);
       // Refreshes the Validated tab's contents/count with what just moved
-      // there. Not awaited: it must never delay the instant removal above.
+      // there, and the New/Old badges the rows just left. Neither is
+      // awaited: they must never delay the instant removal above.
       void loadValidated();
+      void loadPending();
     } catch (e) {
       // Never reached the server -- none of it actually validated, so all
       // of it goes back.
@@ -643,15 +654,15 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
   // only ever covers rows on screen); "All" means every validated profile
   // matching the current filters, not just the current page, so it fetches
   // fresh rather than reusing `validatedPage` (which is paginated to
-  // `pageSize`) -- same PENDING_FETCH_CAP-style ceiling loadPending()
-  // already uses for its own "all pending rows" fetch.
+  // `pageSize`) -- bounded by BULK_FETCH_CAP, the backend's own per-request
+  // ceiling.
   const handleCopyAllValidated = async () => {
     setCopyingAll(true);
     try {
       const res = await discoveryApi.listProfiles({
         group_id: groupId, platform: platform || undefined, status: "validated",
         keyword: keywordFilter || undefined, search: search || undefined,
-        limit: PENDING_FETCH_CAP,
+        limit: BULK_FETCH_CAP,
       });
       await copyUrls(res.items.map((p) => p.url), "validated");
     } catch (e) {
@@ -780,8 +791,8 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
           re-evaluated live every time this loads. */}
       <div className="status-summary-row" style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
         {([
-          ["new", "🆕 New Profiles", "var(--cyan-bright, var(--cyan))", newItems.length],
-          ["old", "🕓 Old Profiles", "var(--purple)", oldItems.length],
+          ["new", "🆕 New Profiles", "var(--cyan-bright, var(--cyan))", ageCounts.new],
+          ["old", "🕓 Old Profiles", "var(--purple)", ageCounts.old],
           ["validated", "✅ Validated Profiles", "var(--success, #12B76A)", validatedPage?.total || 0],
         ] as const).map(([t, label, color, count]) => (
           <button

@@ -1,4 +1,4 @@
-"""Regressions for four accuracy bugs, each of which was silent -- every one
+"""Regressions for six accuracy bugs, each of which was silent -- every one
 of them produced a confident, plausible-looking wrong answer rather than an
 error, which is why none had been noticed.
 
@@ -12,6 +12,13 @@ error, which is why none had been noticed.
        recent post scored 2, the "no name match" FLOOR, instead of 9.
     4. A follower count rendered "1.234.567" (the format Facebook serves to
        a large share of locales) raised an uncaught ValueError.
+    5. The New/Old split was computed in the browser over one capped fetch,
+       so on a client with 1635 pending profiles 635 of them were unreachable
+       in either tab while the badges presented the visible 1000 as the whole
+       set.
+    6. The server's "High Match" meant `name_score >= 80` while the grid's
+       meant `name_exact_run` -- two different answers to the same question,
+       disagreeing on 31 of 1653 live rows.
 """
 
 from __future__ import annotations
@@ -21,11 +28,11 @@ import asyncio
 import pytest
 
 from backend.analysis.runner import AnalysisItem, AnalysisJob, AnalysisRunner
-from backend.database.repositories.profile_repository import _build_query
+from backend.database.repositories.profile_repository import _build_query, _without
 from backend.discovery.runner import row_to_fields
 from backend.shared.models.hit import Hit, hit_to_row
 from backend.shared.models.row import Row
-from backend.shared.models.scoring import compute_score
+from backend.shared.models.scoring import MEDIUM_MATCH_THRESHOLD, compute_score
 from backend.shared.text import handle_from_url, parse_count
 
 
@@ -185,3 +192,71 @@ class TestParseCountNeverRaises:
     @pytest.mark.parametrize("raw", ["...", ".", "..2", "1.2.3", "1.2.3K", "", "abc"])
     def test_unparseable_input_returns_none_rather_than_raising(self, raw):
         assert parse_count(raw) == (None, False)
+
+
+class TestAgeFilterPartitions:
+    """New/Old is a server filter, so the split survives pagination."""
+
+    def test_the_two_buckets_are_exclusive_and_exhaustive(self):
+        """Every row lands in exactly one bucket -- no row can hide between
+        them, which is the whole point of moving this off the client."""
+        new_q = _build_query("c1", status="pending", age="new")
+        old_q = _build_query("c1", status="pending", age="old")
+        new_clause = next(c for c in new_q["$and"] if "first_seen" in c)
+        old_clause = next(c for c in old_q["$and"] if "$or" in c)
+        assert "$gte" in new_clause["first_seen"]
+        # "old" must also claim rows with NO first_seen, matching the
+        # frontend's isProfileNew, which reads a missing timestamp as not-new
+        branches = old_clause["$or"]
+        assert {"first_seen": None} in branches
+        assert {"first_seen": {"$exists": False}} in branches
+
+    def test_no_age_filter_leaves_first_seen_alone(self):
+        q = _build_query("c1", status="pending")
+        assert not any("first_seen" in c for c in q.get("$and", []))
+
+
+class TestMatchLevelMatchesTheCardBadge:
+    """The server's bands must be the grid's bands (matchLevelOf), which gate
+    High on a contiguous letter-run and NOT on a score threshold."""
+
+    @staticmethod
+    def _clause(level):
+        q = _build_query("c1", match_level=level)
+        return next(c for c in q["$and"] if "name_exact_run" in c)
+
+    def test_high_is_the_exact_run_not_a_score(self):
+        assert self._clause("high") == {"name_exact_run": True}
+
+    def test_medium_excludes_high_and_bands_on_the_score(self):
+        c = self._clause("medium")
+        assert c["name_exact_run"] == {"$ne": True}
+        assert c["name_score"]["$gte"] == MEDIUM_MATCH_THRESHOLD
+
+    def test_low_excludes_high_and_takes_missing_scores(self):
+        """matchLevelOf returns "low" for a null score, so the query must
+        too -- otherwise those rows belong to no band at all."""
+        c = self._clause("low")
+        assert c["name_exact_run"] == {"$ne": True}
+        assert {"name_score": None} in c["$or"]
+        assert {"name_score": {"$exists": False}} in c["$or"]
+
+
+class TestFacetsDropOnlyTheirOwnFilter:
+    """A facet count answers "how many for each value of THIS field, with the
+    other filters still applied", so it must drop its own filter wherever it
+    lives -- including out of `$and`, where the keyword filter now sits."""
+
+    KEYWORDS = {"name_keywords": ["Adani"], "domain_keywords": []}
+
+    def test_keyword_facet_drops_the_keyword_filter(self):
+        q = _build_query("c1", keyword="Adani", platform="facebook", status="pending")
+        stripped = _without(q, "keywords")
+        assert not any("keywords" in c for c in stripped.get("$and", []))
+        assert "keywords" not in stripped
+
+    def test_but_keeps_every_other_filter(self):
+        q = _build_query("c1", keyword="Adani", platform="facebook", status="pending")
+        stripped = _without(q, "keywords")
+        assert stripped["platform"] == "facebook"
+        assert stripped["status"] == "pending"

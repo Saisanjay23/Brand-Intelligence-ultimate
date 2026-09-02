@@ -27,7 +27,7 @@ from pymongo.errors import DuplicateKeyError
 from backend.config.settings import settings
 from backend.shared.errors import ConflictError, NotFoundError, ValidationError
 from backend.shared.logging import get_logger
-from backend.shared.models.scoring import MEDIUM_MATCH_THRESHOLD, NAME_THRESHOLD
+from backend.shared.models.scoring import MEDIUM_MATCH_THRESHOLD
 from backend.database.connection import db
 
 log = get_logger("repositories.profile_repository")
@@ -282,6 +282,54 @@ def _stamp_utc_for_api(doc: dict) -> dict:
         if isinstance(v, datetime) and v.tzinfo is None:
             doc[f] = v.replace(tzinfo=timezone.utc)
     return doc
+
+
+# How long a freshly discovered profile counts as "new". The discovery grid
+# splits pending profiles into New/Old on exactly this boundary, and it is
+# applied HERE rather than in the browser so the split survives pagination:
+# the grid used to fetch one capped page of pending rows and divide it
+# client-side, which on a client with 1635 pending profiles left 635 of them
+# unreachable in either tab while the badges still presented the visible
+# 1000 as the whole set.
+NEW_WINDOW_HOURS = 24
+
+
+def _new_cutoff() -> datetime:
+    return datetime.now(timezone.utc) - timedelta(hours=NEW_WINDOW_HOURS)
+
+
+def _age_clause(age: str) -> dict:
+    """A profile is "old" when its first_seen is outside the window OR it has
+    none at all -- matching the frontend's isProfileNew, which reads a
+    missing timestamp as not-new rather than as brand new."""
+    cutoff = _new_cutoff()
+    if age == "new":
+        return {"first_seen": {"$gte": cutoff}}
+    return {"$or": [
+        {"first_seen": {"$lt": cutoff}},
+        {"first_seen": None},
+        {"first_seen": {"$exists": False}},
+    ]}
+
+
+def _without(query: dict, field: str) -> dict:
+    """`query` with every constraint on `field` removed, whether it sits at
+    the top level or inside `$and`.
+
+    Each facet count below answers "how many rows would each value of THIS
+    field give me, with the other filters still applied", so it has to drop
+    its own filter first. A plain `dict.pop(field)` only reaches the
+    top-level form -- and the keyword filter moved into `$and` (it shares
+    the `keywords` key with the keyword-category filter, and one plain
+    assignment silently overwrote the other), which would have left the
+    keyword facet counting only the keyword already selected.
+    """
+    out = {k: v for k, v in query.items() if k != field}
+    if rest := [c for c in out.get("$and", []) if field not in c]:
+        out["$and"] = rest
+    else:
+        out.pop("$and", None)
+    return out
 
 
 def _oid(doc_id: str) -> ObjectId:
@@ -539,6 +587,7 @@ def _build_query(
     match_level: Optional[str] = None, keyword_match_type: Optional[str] = None,
     search: Optional[str] = None, client_keywords: Optional[dict] = None,
     published: Optional[bool] = None, data_quality: Optional[str] = None,
+    age: Optional[str] = None,
 ) -> dict[str, Any]:
     """The filter `find()` queries with, factored out so `delete_matching()`
     (the "Delete Platform Data" button) can delete EXACTLY the set of
@@ -589,16 +638,35 @@ def _build_query(
     if published is not None:
         q["published"] = False if published is False else {"$ne": False}
     if match_level:
-        # Match level thresholds mirror the card badge and NAME_THRESHOLD / MEDIUM_MATCH_THRESHOLD:
-        # - High:   name_score >= 80 (NAME_THRESHOLD)
-        # - Medium: 50 <= name_score < 80
-        # - Low:    name_score < 50
+        # EXACTLY the cascade the card badge uses (frontend
+        # DiscoveryProfileGrid.tsx::matchLevelOf), which is deliberately NOT
+        # a plain threshold on name_score:
+        #
+        #   High   -> name_exact_run: the keyword's letters appear inside the
+        #             profile name as one contiguous run.
+        #   Medium -> not High, and name_score >= MEDIUM_MATCH_THRESHOLD.
+        #   Low    -> everything else, a missing/blank score included.
+        #
+        # This used to threshold High at name_score >= NAME_THRESHOLD, which
+        # is the exact mistake shared/text.py and test_matching.py both warn
+        # about: name_score is word-order-insensitive, so "Adani Gautam"
+        # scores 100 against "Gautam Adani" while reading as a different
+        # name. On live data the two definitions disagreed on 31 of 1653
+        # rows -- 29 reordered names the threshold called High and an
+        # analyst asking for High Match wants excluded, and 2 real
+        # contiguous-run matches it dropped. The filter was unreachable from
+        # any route at the time, so nothing had surfaced the divergence.
+        not_high = {"name_exact_run": {"$ne": True}}
         if match_level == "high":
-            q["name_score"] = {"$gte": NAME_THRESHOLD}
+            clauses.append({"name_exact_run": True})
         elif match_level == "medium":
-            q["name_score"] = {"$gte": MEDIUM_MATCH_THRESHOLD, "$lt": NAME_THRESHOLD}
+            clauses.append({**not_high, "name_score": {"$gte": MEDIUM_MATCH_THRESHOLD}})
         else:
-            q["name_score"] = {"$lt": MEDIUM_MATCH_THRESHOLD, "$exists": True, "$ne": None}
+            clauses.append({**not_high, "$or": [
+                {"name_score": {"$lt": MEDIUM_MATCH_THRESHOLD}},
+                {"name_score": None},
+                {"name_score": {"$exists": False}},
+            ]})
     if keyword_match_type and client_keywords is not None:
         # "was this found under one of the client's INDIVIDUAL-name keywords
         # or one of its DOMAIN/brand keywords", the same classification
@@ -617,6 +685,8 @@ def _build_query(
         # both the moment either definition drifted.
         incomplete = _incomplete_clause()
         clauses.append(incomplete if data_quality == "incomplete" else {"$nor": [incomplete]})
+    if age in ("new", "old"):
+        clauses.append(_age_clause(age))
     if search and search.strip():
         rx = {"$regex": re.escape(search.strip()), "$options": "i"}
         clauses.append({"$or": [{"display_name": rx}, {"username": rx}, {"url": rx}]})
@@ -657,6 +727,7 @@ async def find(
     match_level: Optional[str] = None, keyword_match_type: Optional[str] = None,
     search: Optional[str] = None, client_keywords: Optional[dict] = None,
     published: Optional[bool] = None, data_quality: Optional[str] = None,
+    age: Optional[str] = None,
 ) -> tuple[list[dict], int, dict]:
     """`include_held=False` (the default, used by any caller that doesn't
     explicitly ask otherwise, i.e. the SaaS backend's normal poll) hides a
@@ -676,7 +747,7 @@ async def find(
         client_id, platform=platform, status=status, phase=phase, include_held=include_held,
         keyword=keyword, entity_type=entity_type, priority=priority, match_level=match_level,
         keyword_match_type=keyword_match_type, search=search, client_keywords=client_keywords,
-        published=published, data_quality=data_quality,
+        published=published, data_quality=data_quality, age=age,
     )
 
     coll = db()[PROFILES]
@@ -709,22 +780,19 @@ async def find(
         doc["id"] = str(doc.pop("_id"))
         rows.append(_stamp_utc_for_api(doc))
 
-    plat_match = dict(q)
-    plat_match.pop("platform", None)
+    plat_match = _without(q, "platform")
     plat_counts = {}
     async for doc in coll.aggregate([{"$match": plat_match}, {"$group": {"_id": "$platform", "count": {"$sum": 1}}}]):
         if doc.get("_id"):
             plat_counts[str(doc["_id"])] = doc["count"]
 
-    status_match = dict(q)
-    status_match.pop("status", None)
+    status_match = _without(q, "status")
     status_counts = {}
     async for doc in coll.aggregate([{"$match": status_match}, {"$group": {"_id": "$status", "count": {"$sum": 1}}}]):
         if doc.get("_id"):
             status_counts[str(doc["_id"])] = doc["count"]
 
-    keyword_match = dict(q)
-    keyword_match.pop("keywords", None)
+    keyword_match = _without(q, "keywords")
     keyword_counts: dict[str, int] = {}
     async for doc in coll.aggregate([
         {"$match": keyword_match}, {"$unwind": "$keywords"},
@@ -733,7 +801,33 @@ async def find(
         if doc.get("_id"):
             keyword_counts[str(doc["_id"])] = doc["count"]
 
-    counts = {"platforms": plat_counts, "statuses": status_counts, "keywords": keyword_counts}
+    # New/Old totals for the grid's tab badges. Counted over the query with
+    # its OWN age filter dropped, so each badge shows the real size of its
+    # tab rather than the size of whichever tab is open.
+    age_counts = {"new": 0, "old": 0}
+    cutoff = _new_cutoff()
+    async for doc in coll.aggregate([
+        # The same query with NO age filter -- rebuilt rather than stripped,
+        # because the "old" clause is an `$or` and removing every `$or`
+        # would take the phase, publish-hold and search clauses with it.
+        {"$match": _build_query(
+            client_id, platform=platform, status=status, phase=phase,
+            include_held=include_held, keyword=keyword, entity_type=entity_type,
+            priority=priority, match_level=match_level,
+            keyword_match_type=keyword_match_type, search=search,
+            client_keywords=client_keywords, published=published,
+            data_quality=data_quality,
+        )},
+        {"$group": {
+            "_id": {"$cond": [{"$gte": ["$first_seen", cutoff]}, "new", "old"]},
+            "count": {"$sum": 1},
+        }},
+    ]):
+        if doc.get("_id") in age_counts:
+            age_counts[str(doc["_id"])] = doc["count"]
+
+    counts = {"platforms": plat_counts, "statuses": status_counts,
+              "keywords": keyword_counts, "ages": age_counts}
     return rows, total, counts
 
 
