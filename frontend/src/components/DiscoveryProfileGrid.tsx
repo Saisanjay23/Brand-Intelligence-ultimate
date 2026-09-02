@@ -80,6 +80,14 @@ function isProfileNew(p: DiscoveredProfile): boolean {
   return !isNaN(t) && Date.now() - t < NEW_WINDOW_MS;
 }
 
+// Table-row equivalent of the card's badge stack: a validated profile
+// that's still inside its 24h window reads "validated + new", not just
+// "validated".
+function statusLabel(p: DiscoveredProfile): string {
+  if (p.status === "validated") return isProfileNew(p) ? "validated + new" : "validated";
+  return isProfileNew(p) ? "new" : "old";
+}
+
 function exportRow(p: DiscoveredProfile): Record<string, unknown> {
   return {
     Platform: p.platform,
@@ -147,6 +155,21 @@ function ProfileCard({
           >
             {p.status === "validated" ? "validated" : isProfileNew(p) ? "new" : "old"}
           </span>
+          {/* Validating doesn't stop a profile being newly-discovered -- it
+              keeps its "new" badge (next to "validated") until the same 24h
+              window from first_seen runs out, so an analyst can still tell
+              a just-scraped validated profile from an old one. Validating
+              never touches first_seen (it's $setOnInsert in
+              backend/database/repositories/profile_repository.py), and the
+              minute tick below re-renders this once the window lapses. */}
+          {p.status === "validated" && isProfileNew(p) && (
+            <span
+              className="card-badge-top-left"
+              style={{ position: "static", background: "rgba(154,80,233,0.85)", color: "#fff" }}
+            >
+              new
+            </span>
+          )}
         </div>
         {p.name_score != null && (() => {
           const level = matchLevelOf(p);
@@ -243,7 +266,7 @@ function ProfileTable({
                   {p.verified && <VerifiedBadgeIcon size={13} />}
                 </a>
               </td>
-              <td>{p.status === "validated" ? "validated" : isProfileNew(p) ? "new" : "old"}</td>
+              <td>{statusLabel(p)}</td>
               <td>{p.name_score != null ? `${matchLevelOf(p)} (${p.name_score})` : "—"}</td>
               <td>{p.followers != null ? p.followers.toLocaleString() : "—"}</td>
               <td>{p.keywords.join(", ")}</td>
