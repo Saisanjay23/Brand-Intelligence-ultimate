@@ -27,13 +27,19 @@ MEASURED, per platform, against the live CDNs (see the allowlist below):
     youtube    yt3.ggpht.com               CORP: cross-origin  ok
     telegram   (stores data: URIs)         never hits network  ok
 
-Only Instagram needs this today. The allowlist deliberately covers the whole
-Meta CDN family anyway: which host serves a given avatar is Meta's routing
-decision rather than ours (the same picture can come back on `fbcdn.net` or
-`cdninstagram.com`, on a shared host or an ISP-local `*.fna.*` cache node),
-and the header they attach is theirs to change. Proxying a Facebook avatar
-that would have loaded directly costs one extra hop; NOT proxying an
-Instagram one costs a broken card.
+Only Instagram needs this today, and the client does NOT route everything
+through here: it sends known-blocked hosts straight to this route and tries
+every other CDN directly first, falling back here only if that fails (see
+frontend/src/utils/avatar.ts). That ordering matters -- an earlier version
+proxied all of Meta unconditionally and put Facebook's 1300+ working avatars
+behind this one code path, where a single bug in it broke every one of them
+at once.
+
+The allowlist below is therefore wider than the set of hosts that are
+actually blocked: it is the set this route is WILLING to fetch, so that any
+platform which starts sending `same-origin` recovers through the client's
+fallback with no code change. Which header Meta, Google or Twitter attach is
+their decision, not ours.
 
 NOT A GENERAL-PURPOSE PROXY. `url` is matched against a host allowlist
 before a single byte is fetched. Without that check this route would be an
@@ -62,13 +68,23 @@ log = get_logger("media")
 # a substring test would let `notfbcdn.net.attacker.com` through, and a
 # check on the URL text would be fooled by `https://evil.com/?x=.fbcdn.net`.
 # Each entry matches the bare apex too (`fbcdn.net` as well as `*.fbcdn.net`).
-_ALLOWED_HOST_SUFFIXES = (".fbcdn.net", ".cdninstagram.com")
+_ALLOWED_HOST_SUFFIXES = (
+    ".fbcdn.net",           # facebook (scontent.*) and instagram (instagram.*)
+    ".cdninstagram.com",    # instagram, when Meta routes it off the shared CDN
+    ".twimg.com",           # twitter/X -- pbs.twimg.com, abs.twimg.com
+    ".ggpht.com",           # youtube channel avatars -- yt3.ggpht.com
+    ".googleusercontent.com",   # youtube's other avatar host
+    ".licdn.com",           # linkedin
+    ".tiktokcdn.com",       # tiktok
+    ".tiktokcdn-us.com",
+)
 
 # Avatars are thumbnails -- the Instagram ones measured here are 5-9 KB, and
 # the largest `profile_pic_url_hd` variant is well under a megabyte. 8 MB is
 # generous headroom that still refuses to let this endpoint be used to pull
 # arbitrarily large files through the server.
 _MAX_BYTES = 8 * 1024 * 1024
+_CHUNK_BYTES = 64 * 1024
 _TIMEOUT = aiohttp.ClientTimeout(total=15, connect=5)
 
 # A Meta CDN node briefly refusing connections is routine (one of the
@@ -159,11 +175,24 @@ async def avatar(
                 # the URL pointed at something that is not an avatar.
                 return _err(502, "upstream did not return an image")
 
-            # Read one byte past the cap so an oversized body is rejected
-            # rather than silently truncated into a corrupt image.
-            body = await resp.content.read(_MAX_BYTES + 1)
-            if len(body) > _MAX_BYTES:
-                return _err(502, "upstream image too large")
+            # MUST loop. `resp.content.read(n)` returns up to n bytes -- in
+            # practice whatever is in the first chunk off the socket -- NOT n
+            # bytes. Using it directly served a 1-byte "image" for a 110 KB
+            # Facebook avatar: a 200 with a valid image/jpeg content-type and
+            # a truncated, undecodable body, so the browser fired onerror and
+            # the card fell back to its letter circle exactly as if the fetch
+            # had failed. Small avatars (Instagram's are ~6 KB) happened to
+            # arrive in one chunk and hid the bug completely.
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in resp.content.iter_chunked(_CHUNK_BYTES):
+                total += len(chunk)
+                if total > _MAX_BYTES:
+                    return _err(502, "upstream image too large")
+                chunks.append(chunk)
+            body = b"".join(chunks)
+            if not body:
+                return _err(502, "upstream returned an empty image")
     except asyncio.TimeoutError:
         return _err(504, "upstream image fetch timed out")
     except aiohttp.ClientError as e:

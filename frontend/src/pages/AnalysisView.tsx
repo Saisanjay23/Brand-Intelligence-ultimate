@@ -13,8 +13,8 @@ import {
   StopIcon,
   VerifiedBadgeIcon,
 } from "../components/AppIcons";
+import { AvatarImg } from "../components/AvatarImg";
 import { PlatformIcon } from "../components/PlatformIcon";
-import { avatarSrc } from "../utils/avatar";
 import { download, downloadBlob, rowsToCsv, rowsToTsv } from "../utils/download";
 import { formatElapsed, formatSeconds, useLiveTimer } from "../utils/timeFormat";
 
@@ -1397,33 +1397,32 @@ export function AnalysisView({ resumeJobId }: Props = {}) {
                             {/* Profile Info */}
                             <td style={{ padding: "10px 14px", minWidth: "220px" }}>
                               <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                                {it.profile_image_url ? (
-                                  <img
-                                    src={avatarSrc(it.profile_image_url)}
-                                    alt=""
-                                    style={{ width: "26px", height: "26px", borderRadius: "50%", objectFit: "cover", flexShrink: 0 }}
-                                    onError={(e) => {
-                                      (e.target as HTMLElement).style.display = "none";
-                                    }}
-                                  />
-                                ) : (
-                                  <div
-                                    style={{
-                                      width: "26px",
-                                      height: "26px",
-                                      borderRadius: "50%",
-                                      background: "var(--bg-surface-3, #344054)",
-                                      display: "flex",
-                                      alignItems: "center",
-                                      justifyContent: "center",
-                                      fontSize: "11px",
-                                      fontWeight: 700,
-                                      flexShrink: 0,
-                                    }}
-                                  >
-                                    {(it.profile_name || it.entity_id || "?").charAt(0).toUpperCase()}
-                                  </div>
-                                )}
+                                {/* Falls back to the initial-letter circle when there is
+                                    no picture AND when every source for it fails -- it
+                                    used to hide the <img> instead, which left a hole in
+                                    the row. See components/AvatarImg.tsx. */}
+                                <AvatarImg
+                                  src={it.profile_image_url}
+                                  style={{ width: "26px", height: "26px", borderRadius: "50%", objectFit: "cover", flexShrink: 0 }}
+                                  fallback={
+                                    <div
+                                      style={{
+                                        width: "26px",
+                                        height: "26px",
+                                        borderRadius: "50%",
+                                        background: "var(--bg-surface-3, #344054)",
+                                        display: "flex",
+                                        alignItems: "center",
+                                        justifyContent: "center",
+                                        fontSize: "11px",
+                                        fontWeight: 700,
+                                        flexShrink: 0,
+                                      }}
+                                    >
+                                      {(it.profile_name || it.entity_id || "?").charAt(0).toUpperCase()}
+                                    </div>
+                                  }
+                                />
 
                                 <div style={{ minWidth: 0 }}>
                                   <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>

@@ -28,9 +28,9 @@ import { discoveryApi } from "../api/discoveryApi";
 import type { DiscoveredProfile } from "../api/discoveryApi";
 import { getClientKeywords } from "../services/clientKeywords";
 import { listSavedClients } from "../services/savedClients";
-import { avatarSrc } from "../utils/avatar";
 import { confirmAction } from "../utils/confirmAction";
 import { download, rowsToCsv } from "../utils/download";
+import { AvatarImg } from "./AvatarImg";
 import { PlatformIcon } from "./PlatformIcon";
 import { CloneIcon, GlobeIcon, LayersIcon, TargetIcon, TrashIcon, VerifiedBadgeIcon, ZapIcon } from "./AppIcons";
 
@@ -105,22 +105,16 @@ function exportRow(p: DiscoveredProfile): Record<string, unknown> {
 }
 
 function Avatar({ p }: { p: DiscoveredProfile }) {
-  const [failed, setFailed] = useState(false);
   const label = p.display_name || p.username || "?";
-  if (!p.profile_image_url || failed) {
-    return (
-      <span className="profile-avatar-circle" style={{ width: 64, height: 64, fontSize: 26, borderRadius: "50%" }}>
-        {label.charAt(0).toUpperCase()}
-      </span>
-    );
-  }
   return (
-    <img
-      src={avatarSrc(p.profile_image_url)}
-      alt=""
-      referrerPolicy="no-referrer"
+    <AvatarImg
+      src={p.profile_image_url}
       style={{ width: "100%", height: "100%", objectFit: "cover" }}
-      onError={() => setFailed(true)}
+      fallback={
+        <span className="profile-avatar-circle" style={{ width: 64, height: 64, fontSize: 26, borderRadius: "50%" }}>
+          {label.charAt(0).toUpperCase()}
+        </span>
+      }
     />
   );
 }
