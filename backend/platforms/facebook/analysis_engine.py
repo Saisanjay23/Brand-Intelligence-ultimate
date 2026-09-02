@@ -16,6 +16,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Iterator, Optional
 
+from backend.shared.avatars import looks_like_placeholder
 from backend.shared.models.row import Row
 from backend.platforms.scan_options import captures_screenshot
 from backend.shared.text import (MONTHS, epoch_to_dt, find_ints,
@@ -811,8 +812,14 @@ def read_pic(row: Row, h: Harvest) -> None:
         # the tiny `ctp` thumbnail actually requested, this recovers the
         # real uploaded photo instead of a 40-60px snippet thumbnail
         row.profile_pic_url = hd_picture_url(url)
-        row.has_custom_pic = not bool(RE_DEFAULT_PIC.search(url))
-    elif RE_DEFAULT_PIC.search(main):
+        # Matches Facebook's stock assets by their own ASSET ID rather than
+        # by CDN path tag -- see shared/avatars.py. The tag-only rule this
+        # replaces read the grey silhouette as a real upload on 104 of our
+        # rows and the illustrated default GROUP avatar on 63 more, which is
+        # the single most expensive misread in the rubric: a stock image
+        # scored as "using the brand's photo", which alone forces High.
+        row.has_custom_pic = not looks_like_placeholder("facebook", url)
+    elif RE_DEFAULT_PIC.search(main) or looks_like_placeholder("facebook", main):
         row.has_custom_pic = False
 
 

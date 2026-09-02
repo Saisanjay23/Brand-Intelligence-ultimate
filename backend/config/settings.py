@@ -90,10 +90,13 @@ class Settings(BaseSettings):
     # pacing, the single most important knob for staying unremarkable
     request_timeout_sec: int = 45
     analysis_delay_sec: float = 2.5
-    # 2 tabs at once per platform (analysis_service.py::_analyse_platform
-    # staggers and caps this at 3 regardless), a moderate default, not the
-    # 1-at-a-time pace this used to force everywhere. Telegram is exempt
-    # unconditionally (MTProto allows one connection at a time).
+    # Declared but NOT read anywhere, and the file it used to name
+    # (analysis_service.py) no longer exists. Analysis concurrency is
+    # per-platform rather than one global number -- see
+    # _PLATFORM_CONCURRENCY and _PLATFORM_INTER_BATCH_DELAY in
+    # analysis/runner.py, which are what actually decide how many of a
+    # platform's URLs run at once and how long it waits between chunks.
+    # Left declared so a .env that already carries it still loads.
     analysis_concurrency: int = 2
     discovery_concurrency: int = 2
     # 15 min, not 5: live-timed against a genuinely broad keyword ("nasa")

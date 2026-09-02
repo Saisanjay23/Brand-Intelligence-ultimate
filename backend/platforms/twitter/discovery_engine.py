@@ -30,6 +30,7 @@ from typing import Any, Iterator, Optional
 from urllib.parse import quote
 
 from backend.shared.extraction import ExtractionResult, run_strategies
+from backend.shared.avatars import looks_like_placeholder
 from backend.shared.models.row import Row
 from backend.shared.text import iter_dicts
 from backend.stealth.browser import Session
@@ -175,7 +176,7 @@ class TwitterUser:
     def has_custom_pic(self) -> bool:
         """Is `avatar` a real upload, not X's own default egg avatar (see
         RE_DEFAULT_PIC above)."""
-        return bool(self.avatar) and not RE_DEFAULT_PIC.search(self.avatar)
+        return bool(self.avatar) and not looks_like_placeholder("twitter", self.avatar)
 
 
 def user_to_row(u: "TwitterUser", keyword: str, *, source: str = "graphql") -> Row:

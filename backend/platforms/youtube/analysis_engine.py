@@ -14,9 +14,13 @@ no-ops kept only to satisfy the same interface as the browser platforms.
 
 from __future__ import annotations
 
+import asyncio
+import urllib.request
 from typing import Optional
 from urllib.parse import unquote, urlparse
 
+from backend.shared.avatars import (YOUTUBE_GENERATED_PREFIX,
+                                    is_generated_avatar)
 from backend.shared.models.row import Row
 from backend.shared.text import name_score, normalized_host, parse_normalized_url
 from backend.platforms.youtube.discovery_engine import (RE_DEFAULT_PIC,
@@ -187,6 +191,7 @@ class Scraper:
             return row
 
         self.fill(row, ch)
+        await self._confirm_avatar(row)
         uploads = ((ch.get("contentDetails") or {}).get("relatedPlaylists") or {}).get(
             "uploads", ""
         )
@@ -254,6 +259,52 @@ class Scraper:
             row.note(f"{int(videos):,} videos")
 
     # ─────────────────────────── orchestration ────────────────────────── #
+
+    _AVATAR_TIMEOUT = 8
+    _AVATAR_MAX_BYTES = 2 * 1024 * 1024
+
+    @classmethod
+    def _read_avatar(cls, uri: str) -> bytes:
+        """The avatar image itself. urllib in a thread, matching how this
+        platform's API client already does its I/O rather than pulling in an
+        async HTTP client for one call."""
+        req = urllib.request.Request(uri, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=cls._AVATAR_TIMEOUT) as resp:
+            return resp.read(cls._AVATAR_MAX_BYTES)
+
+    async def _confirm_avatar(self, row: Row) -> None:
+        """Settle has_custom_pic from the IMAGE, which for YouTube is the
+        only thing that can settle it.
+
+        YouTube does not serve one shared placeholder the way Facebook,
+        Instagram and X do. It GENERATES a per-channel avatar -- one letter
+        on a solid colour, varying by letter and by colour -- from the same
+        host and the same URL shape as a real upload, so `fill()` above
+        cannot tell the two apart and marked every channel as having a real
+        picture. Measured across 960 stored avatars, 164 were generated.
+
+        Only runs for URLs carrying the generated-avatar prefix (that alone
+        is 60% precise, so shared/avatars.py also requires the image to be
+        two flat colours), which keeps this to a fraction of channels rather
+        than one extra fetch each.
+
+        NON-FATAL by construction: on any failure the row keeps whatever
+        `fill()` decided. A missed placeholder is a far smaller error than a
+        broken analysis run.
+        """
+        uri = row.profile_pic_url
+        if not uri or YOUTUBE_GENERATED_PREFIX not in uri:
+            return
+        try:
+            data = await asyncio.to_thread(self._read_avatar, uri)
+        except Exception:
+            return
+        if not data:
+            return
+        generated = is_generated_avatar("youtube", uri, data)
+        if generated is not None:
+            row.has_custom_pic = not generated
+            row.mark("logo", "api+image")
 
     async def one(self, u: str, tgt: str, feed: str, known: Optional[dict] = None) -> Row:
         """WHAT: process() that never raises -- always a Row. HOW: quota
@@ -346,6 +397,7 @@ class Scraper:
                     row.note("no such channel -- may already be taken down")
                 else:
                     self.fill(row, ch)
+                    await self._confirm_avatar(row)
                     uploads = ((ch.get("contentDetails") or {}).get("relatedPlaylists") or {}).get("uploads", "")
                     if iso := await self.api.latest_upload(uploads):
                         row.last_post_iso = iso

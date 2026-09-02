@@ -71,8 +71,8 @@ from backend.platforms.scan_options import captures_screenshot
 from backend.shared.text import (MONTHS, name_score,
                                    normalized_host, parse_count,
                                    parse_normalized_url)
+from backend.shared.avatars import looks_like_placeholder
 from backend.platforms.instagram.discovery_engine import (ABOUT_PANEL_APPID,
-                                                           DEFAULT_PIC_HINTS,
                                                            MOBILE_UA,
                                                            PROFILE_ENDPOINTS,
                                                            PROFILE_INFO_API,
@@ -935,7 +935,7 @@ class Scraper:
         avatar = dom.get("avatar") or ""
         if avatar:
             row.profile_pic_url = avatar
-            row.has_custom_pic = not any(h in avatar for h in DEFAULT_PIC_HINTS)
+            row.has_custom_pic = not looks_like_placeholder("instagram", avatar)
             row.mark("logo", "dom-header")
 
         if dom.get("verified"):

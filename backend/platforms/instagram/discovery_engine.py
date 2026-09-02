@@ -136,12 +136,12 @@ PROFILE_ENDPOINTS = (
     "api/v1/users/",
 )
 
-# Instagram's anonymous avatar
-DEFAULT_PIC_HINTS = (
-    "44884218_345707102882519_2446069589734326272_n",
-    "anonymousUser",
-    "default_profile",
-)
+# Instagram's anonymous avatar. The list now lives in shared/avatars.py,
+# which carries BOTH the current asset id and the one this tuple used to
+# hold on its own -- Instagram rotated the asset, so checking only the old
+# id silently stopped detecting anything and every account with no picture
+# was recorded as having a real one.
+from backend.shared.avatars import looks_like_placeholder
 
 
 @dataclass
@@ -186,9 +186,7 @@ class InstagramUser:
     def has_custom_pic(self) -> bool:
         """Is `avatar` a real upload, not Instagram's own anonymous-user
         placeholder (see DEFAULT_PIC_HINTS above)."""
-        return bool(self.avatar) and not any(
-            h in self.avatar for h in DEFAULT_PIC_HINTS
-        )
+        return bool(self.avatar) and not looks_like_placeholder("instagram", self.avatar)
 
 
 def user_to_row(u: "InstagramUser", keyword: str, *, source: str = "api") -> Row:

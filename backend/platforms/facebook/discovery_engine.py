@@ -51,6 +51,7 @@ from typing import Any, Iterator, Optional
 from urllib.parse import parse_qs, quote, urlparse
 
 from backend.shared.extraction import ExtractionResult, run_strategies
+from backend.shared.avatars import looks_like_placeholder
 from backend.shared.models.hit import Hit, hit_to_row
 from backend.shared.models.row import Row
 from backend.shared.text import iter_dicts, normalized_host, parse_normalized_url
@@ -344,7 +345,7 @@ def iter_results(blob: Any) -> Iterator[Hit]:
             url = prof.get("profile_url") or prof.get("url") or profile_url_for(eid, ENTITY_TYPES.get(prof.get("__typename"), "profile"))
             pic = prof.get("profile_picture")
             raw_uri = pic.get("uri", "") if isinstance(pic, dict) else ""
-            has_custom = bool(raw_uri) and not bool(RE_DEFAULT_PIC.search(raw_uri))
+            has_custom = bool(raw_uri) and not looks_like_placeholder("facebook", raw_uri)
             avatar = hd_picture_url(raw_uri) if has_custom else ""
 
             verified = bool(
@@ -603,7 +604,7 @@ async def dom_search_hits(page, keyword: str, tab: str) -> list["Hit"]:
             name=(r.get("name") or "").strip(),
             url=url,
             avatar=avatar,
-            has_custom_pic=bool(avatar) and not bool(RE_DEFAULT_PIC.search(avatar)),
+            has_custom_pic=bool(avatar) and not looks_like_placeholder("facebook", avatar),
             entity_type=kind,
             keyword=keyword,
             tab=tab,

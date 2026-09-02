@@ -75,47 +75,61 @@ _PLATFORM_HOSTS: dict[str, str] = {
 QUEUED, RUNNING, DONE, CANCELLED, FAILED = "queued", "running", "done", "cancelled", "failed"
 _TERMINAL = frozenset({DONE, CANCELLED, FAILED})
 
-# How many of one platform's URLs run at once, inside its single held
-# session. YouTube (an official API call) and Telegram (one MTProto RPC)
-# have no browser fingerprint to protect, so their whole batch runs
-# concurrently. The browser-driven platforms -- Facebook, Instagram,
-# Twitter, TikTok -- get a conservative step up from strictly serial (1)
-# to 2, not higher: see ScanOptions.concurrency's own comment ("faster and
-# more conspicuous"). Several requests at once from one session/IP reads
-# far more like a bot than one every ~2.5s+jitter, and every engine's loop
-# treats a CHECKPOINT/challenge as fatal to the rest of that platform's
-# batch (see `_scrape_one` below) -- so pushing concurrency too high risks
-# losing the REST of the URLs, not just the speed gained.
+# How many of one platform's URLs run at once inside its single held
+# session, and how long to wait between one chunk and the next. Both sets
+# of numbers are ported from unifiedtool-og's analysis runner
+# (backend/api/routes/jobs.py::run_analysis), which pools one browser and
+# hands out N tabs per batch: 3 tabs for the browser-driven platforms
+# (ANALYSIS_CONCURRENT_TABS), 6 for the ones that are really just an API
+# call (ANALYSIS_API_CONCURRENT_TABS), and Instagram pinned to 1 with the
+# longest gap of any platform.
+#
+# The mechanism here was already og's shape -- one session per platform
+# per job, URLs run in chunks of `concurrency`, each URL opening its own
+# tab in the shared stealth context (see each engine's `one()`, which does
+# `self.ctx.new_page()`). Only the numbers moved.
+#
+# What that buys and what it costs: every engine's loop treats a
+# CHECKPOINT/challenge as fatal to the REST of that platform's batch (see
+# `_scrape_platform`), so an over-driven session does not just risk its
+# own URL -- it can cost every URL still queued behind it. These are the
+# numbers og runs in production; drop a platform back a step if its logs
+# start showing checkpoints or rate limits.
 _PLATFORM_CONCURRENCY: dict[str, int] = {
     # Official Data API: quota-metered, not ban-risked, and every call is an
-    # ordinary HTTPS request. Nothing to protect by going slowly.
-    "youtube": 8,
-    # Deliberately NOT as high as YouTube despite also being API-shaped.
-    # Every one of these rides ONE MTProto client, and Telegram answers
-    # bursts of resolve() with FloodWait -- which telegram/analysis_engine.py
-    # turns into CHECKPOINT, and CHECKPOINT stops the whole platform's
-    # remaining batch (see `_scrape_platform`). So over-driving it does not
-    # just slow this platform down, it can cost every URL queued behind the
-    # burst. 3 is a modest step up from serial with far less of that risk.
-    "telegram": 3,
+    # ordinary HTTPS request. Nominal either way -- YouTube's whole batch
+    # goes through ONE channels.list call (`_scrape_youtube_batch`), so
+    # nothing here actually gates it.
+    "youtube": 6,
+    # og groups Telegram with YouTube as an official-API platform. Worth
+    # knowing what that costs here: all of these ride ONE MTProto client,
+    # and Telegram answers bursts of resolve() with FloodWait -- which
+    # telegram/analysis_engine.py turns into CHECKPOINT, and CHECKPOINT
+    # stops the whole platform's remaining batch. This is the first number
+    # to lower if FloodWait shows up.
+    "telegram": 6,
     # Meta is the one place where concurrency is a BEHAVIOURAL tell rather
-    # than just a load question. Every visit rides one logged-in account, and
-    # a person opens one profile at a time -- two profile pages beginning
-    # ~1s apart, over and over, from a single account, is not a shape human
-    # browsing produces, and it is visible to Meta without inspecting the
-    # browser at all.
-    #
-    # Measured before this change: at concurrency 2 with the (also broken)
-    # pacing scale, the effective rate was ~109 profile visits/minute per
-    # platform. A person reading profiles manages a few per minute.
-    #
-    # This is a deliberate throughput trade, and it is the honest one: the
-    # fingerprint work is finished and measured clean, so rate is what is
-    # left to give away. Other platforms are unaffected.
-    "facebook": 1,
+    # than just a load question: every visit rides one logged-in account,
+    # and a person opens one profile at a time. og pins Instagram to 1
+    # unconditionally, ahead of its own configured tab count, and gives it
+    # the longest inter-batch gap below. Facebook is NOT pinned there -- it
+    # takes the browser default with the rest.
     "instagram": 1,
 }
-_DEFAULT_CONCURRENCY = 2
+# Facebook, Twitter, TikTok -- og's ANALYSIS_CONCURRENT_TABS.
+_DEFAULT_CONCURRENCY = 3
+
+# Seconds between one chunk and the next: og's ANALYSIS_INTER_PROFILE_DELAY
+# (1.5) for browser platforms, ANALYSIS_API_INTER_PROFILE_DELAY (0.0) for
+# the API ones, 3.5 for Instagram. Spent through `scraper.pause()` rather
+# than a flat sleep so this app's own jitter/fatigue pacing
+# (stealth/human.py) still shapes the gap; 0 skips the pause entirely.
+_PLATFORM_INTER_BATCH_DELAY: dict[str, float] = {
+    "youtube": 0.0,
+    "telegram": 0.0,
+    "instagram": 3.5,
+}
+_DEFAULT_INTER_BATCH_DELAY = 1.5
 
 
 def parse_direct_url(raw: str) -> Optional[tuple[str, str, str]]:
@@ -465,7 +479,14 @@ class AnalysisRunner:
         progress["current_step"] = "Connecting session..."
         progress["item_started_at_ts"] = time.time()
 
-        concurrency = _PLATFORM_CONCURRENCY.get(platform_id, _DEFAULT_CONCURRENCY)
+        # Clamped to the work actually queued, as og does
+        # (`min(parallelism, total)`): a 1-URL job should not advertise 3
+        # tabs in flight to the progress banner, and ScanOptions.concurrency
+        # is read by engines that batch on their own (facebook's run()).
+        concurrency = max(1, min(
+            _PLATFORM_CONCURRENCY.get(platform_id, _DEFAULT_CONCURRENCY), len(items)))
+        inter_batch_delay = _PLATFORM_INTER_BATCH_DELAY.get(
+            platform_id, _DEFAULT_INTER_BATCH_DELAY)
         options = ScanOptions(
             evidence=None,
             ephemeral_screenshot=True,
@@ -521,9 +542,16 @@ class AnalysisRunner:
                 if any(fatal):
                     session_died = True
                     break
-                if i < len(items):
+                if i < len(items) and inter_batch_delay > 0:
+                    # `pause()` takes a MULTIPLIER on the configured median
+                    # gap (settings.analysis_delay_sec), not a duration, so
+                    # convert og's target seconds into one rather than
+                    # sleeping flat -- that keeps jitter, fatigue and the
+                    # occasional longer rest in play (stealth/browser.py).
+                    base = settings.analysis_delay_sec or 0
+                    mult = (inter_batch_delay / base) if base > 0 else 1.0
                     try:
-                        await scraper.pause()
+                        await scraper.pause(mult)
                     except Exception:
                         pass
 
