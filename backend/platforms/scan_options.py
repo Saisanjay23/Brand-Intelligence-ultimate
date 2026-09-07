@@ -72,9 +72,9 @@ class DiscoveryOptions:
     # falls back to the weaker DOM read or reports fewer results than
     # actually exist. Still bounded (not infinite): discovery_max_seconds
     # (default 300s/sweep) is the real backstop against a sweep hanging.
-    settle: float = 20  # cap on waiting for the first results render
-    page_wait: float = 10.0  # cap on waiting for one more results page
-    patience: int = 5  # scrolls with no new ids before calling it stalled
+    settle: float = 14.0  # cap on waiting for the first results render
+    page_wait: float = 7.0  # cap on waiting for one more results page
+    patience: int = 4  # scrolls with no new ids before calling it stalled
     concurrency: int = 2  # keyword sweeps in flight at once
     progress_every: int = 5  # log a progress line every N result pages
 

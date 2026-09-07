@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import toast from "react-hot-toast";
 import {
   analysisApi,
@@ -15,6 +15,13 @@ import {
 } from "../components/AppIcons";
 import { AvatarImg } from "../components/AvatarImg";
 import { PlatformIcon } from "../components/PlatformIcon";
+import {
+  cancelAnalysis,
+  clearSession,
+  startAnalysis,
+  useAnalysisField,
+  watchJob,
+} from "../services/analysisSession";
 import { download, downloadBlob, rowsToCsv, rowsToTsv } from "../utils/download";
 import { formatElapsed, formatSeconds, useLiveTimer } from "../utils/timeFormat";
 
@@ -393,29 +400,37 @@ interface Props {
 }
 
 export function AnalysisView({ resumeJobId }: Props = {}) {
-  const [urlInput, setUrlInput] = useState("");
+  // Every field below lives in services/analysisSession.ts, NOT in this
+  // component. AnalysisView is unmounted whenever the analyst switches away
+  // from Live Results (App.tsx swaps the whole page), and component state
+  // dies with it -- which is why the results table came back empty after a
+  // trip to the Scheduler tab. The store outlives the component; these
+  // hooks keep useState's exact shape, so the call sites below are
+  // unchanged. It is in-memory only: a page refresh still starts clean.
+  const [urlInput, setUrlInput] = useAnalysisField("urlInput");
 
-  // Job & Results state (in RAM only, lost on refresh)
-  const [jobId, setJobId] = useState<string | null>(null);
-  const [jobData, setJobData] = useState<AnalysisJobResponse | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [cancelling, setCancelling] = useState(false);
+  // Job & Results state (in RAM only, lost on refresh -- not on unmount)
+  const [jobId] = useAnalysisField("jobId");
+  const [jobData] = useAnalysisField("jobData");
+  const [loading] = useAnalysisField("loading");
+  const [cancelling] = useAnalysisField("cancelling");
 
   // Table view & filter state
-  const [formatMode, setFormatMode] = useState<"incident" | "legacy">("incident");
-  const [searchQuery, setSearchQuery] = useState("");
-  const [platformFilter, setPlatformFilter] = useState<string>("all");
-  const [riskFilter, setRiskFilter] = useState<string>("all");
-  const [exporting, setExporting] = useState(false);
+  const [formatMode, setFormatMode] = useAnalysisField("formatMode");
+  const [searchQuery, setSearchQuery] = useAnalysisField("searchQuery");
+  const [platformFilter, setPlatformFilter] = useAnalysisField("platformFilter");
+  const [riskFilter, setRiskFilter] = useAnalysisField("riskFilter");
+  const [exporting, setExporting] = useAnalysisField("exporting");
 
-  // Screenshot modal state
+  // Screenshot modal state. Genuinely local: a modal the analyst had open
+  // when they left should NOT reappear over the table when they come back.
   const [previewScreenshot, setPreviewScreenshot] = useState<{
     url: string;
     profileName: string;
   } | null>(null);
 
   // Inline edits state
-  const [edits, setEdits] = useState<Record<string, Record<string, string>>>({});
+  const [edits, setEdits] = useAnalysisField("edits");
 
   const handleEdit = (itemId: string, field: string, value: string) => {
     setEdits((prev) => {
@@ -465,55 +480,14 @@ export function AnalysisView({ resumeJobId }: Props = {}) {
     return { totalLines: lines.length, validCount, breakdown };
   }, [urlInput]);
 
-  // Polling interval reference
-  const pollingRef = useRef<number | null>(null);
-
-  const stopPolling = useCallback(() => {
-    if (pollingRef.current) {
-      clearInterval(pollingRef.current);
-      pollingRef.current = null;
-    }
-  }, []);
-
-  const pollJob = useCallback(async (id: string) => {
-    try {
-      const data = await analysisApi.getJob(id);
-      setJobData(data);
-      if (data.status === "done" || data.status === "cancelled" || data.status === "failed") {
-        setLoading(false);
-        setCancelling(false);
-        stopPolling();
-        if (data.status === "done") {
-          toast.success(`Analysis completed for ${data.completed}/${data.total} URLs`);
-        } else if (data.status === "cancelled") {
-          toast.error("Analysis stopped by user");
-        }
-      }
-    } catch (e) {
-      stopPolling();
-      setLoading(false);
-      setCancelling(false);
-      toast.error((e as Error).message || "Failed to update job status");
-    }
-  }, [stopPolling]);
-
-  useEffect(() => {
-    return () => {
-      stopPolling();
-    };
-  }, [stopPolling]);
-
+  // No unmount cleanup for the poll any more, on purpose. Clearing the
+  // interval here is what made a tab switch stop watching a running job:
+  // the analysis carried on server-side with nothing collecting its
+  // results. The poll is owned by the store and stops when the job reaches
+  // a terminal status, wherever the analyst happens to be looking.
   useEffect(() => {
     if (!resumeJobId) return;
-    setJobId(resumeJobId);
-    setJobData(null);
-    setLoading(true);
-    void pollJob(resumeJobId);
-    stopPolling();
-    pollingRef.current = window.setInterval(() => {
-      pollJob(resumeJobId);
-    }, 1500);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    watchJob(resumeJobId);
   }, [resumeJobId]);
 
   const handleStart = async () => {
@@ -527,51 +501,15 @@ export function AnalysisView({ resumeJobId }: Props = {}) {
       return;
     }
 
-    try {
-      setLoading(true);
-      setJobData(null);
-      const res = await analysisApi.start(lines, "", "");
-      setJobId(res.job_id);
-
-      if (res.skipped && res.skipped.length > 0) {
-        toast(
-          `Skipped ${res.skipped.length} invalid/duplicate URL(s)`,
-          { icon: "ℹ️" }
-        );
-      }
-
-      // Initial poll immediately
-      await pollJob(res.job_id);
-
-      // Start polling interval
-      stopPolling();
-      pollingRef.current = window.setInterval(() => {
-        pollJob(res.job_id);
-      }, 1500);
-    } catch (e) {
-      setLoading(false);
-      toast.error((e as Error).message || "Failed to start analysis");
-    }
+    await startAnalysis(lines);
   };
 
   const handleCancel = async () => {
-    if (!jobId) return;
-    try {
-      setCancelling(true);
-      await analysisApi.cancelJob(jobId);
-      toast("Stopping analysis...", { icon: "⏳" });
-    } catch (e) {
-      setCancelling(false);
-      toast.error((e as Error).message || "Failed to cancel");
-    }
+    await cancelAnalysis();
   };
 
   const handleClear = () => {
-    setUrlInput("");
-    setJobId(null);
-    setJobData(null);
-    setSearchQuery("");
-    stopPolling();
+    clearSession();
     toast.success("Workspace reset");
   };
 
@@ -1403,6 +1341,7 @@ export function AnalysisView({ resumeJobId }: Props = {}) {
                                     the row. See components/AvatarImg.tsx. */}
                                 <AvatarImg
                                   src={it.profile_image_url}
+                                  sha={it.avatar_sha}
                                   style={{ width: "26px", height: "26px", borderRadius: "50%", objectFit: "cover", flexShrink: 0 }}
                                   fallback={
                                     <div

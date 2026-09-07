@@ -64,6 +64,7 @@ alone rather than risk calling someone's real monogram a placeholder.
 from __future__ import annotations
 
 import io
+import re
 from collections import Counter
 from typing import Optional
 
@@ -169,3 +170,64 @@ def is_generated_avatar(platform: str, url: str, image_bytes: bytes) -> Optional
     if share is None:
         return None
     return share >= FLAT_THRESHOLD
+
+
+# fbcdn signs the whole crop range up to `cstp`'s bound, not the specific
+# `ctp` size actually requested. Meta profile-picture URLs (Facebook and Instagram alike)
+# default to tiny crops (e.g. 50x50 or 150x150) while cstp carries the real uploaded
+# photo's native size. Raising ctp to match cstp, with signature tokens untouched,
+# yields the full-resolution upload rather than the thumbnail.
+_CTP = re.compile(r"ctp=s\d+x\d+")
+_CSTP = re.compile(r"cstp=mx(\d+)x(\d+)")
+_STP_SIZE = re.compile(r"([sp])\d+x\d+")
+
+
+def hd_picture_url(url: str) -> str:
+    """Rewrites a Meta CDN (Facebook/Instagram) photo URL to request the full
+    upload resolution instead of the default low-res thumbnail."""
+    if not url:
+        return url
+    cstp = _CSTP.search(url)
+    if not cstp:
+        return url
+    w, h = cstp.group(1), cstp.group(2)
+    if _CTP.search(url):
+        url = _CTP.sub(f"ctp=s{w}x{h}", url)
+    url = _STP_SIZE.sub(lambda m: f"{m.group(1)}{w}x{h}", url)
+    return url
+
+
+def extract_instagram_hd_avatar(node: dict) -> str:
+    """Extracts the highest-resolution avatar URL available from an Instagram user node."""
+    if not isinstance(node, dict):
+        return ""
+
+    candidates: list[str] = []
+
+    # 1. Mobile API v1 hd_profile_pic_url_info dict (primary for mobile search)
+    hd_info = node.get("hd_profile_pic_url_info")
+    if isinstance(hd_info, dict) and hd_info.get("url"):
+        candidates.append(str(hd_info["url"]).strip())
+
+    # 2. hd_profile_pic_versions list (sorted by width descending)
+    versions = node.get("hd_profile_pic_versions")
+    if isinstance(versions, list) and versions:
+        sorted_versions = sorted(
+            [v for v in versions if isinstance(v, dict) and v.get("url")],
+            key=lambda v: int(v.get("width") or 0),
+            reverse=True,
+        )
+        if sorted_versions:
+            candidates.append(str(sorted_versions[0]["url"]).strip())
+
+    # 3. Direct hd field or standard field (GraphQL / web-search topsearch)
+    if node.get("profile_pic_url_hd"):
+        candidates.append(str(node["profile_pic_url_hd"]).strip())
+    if node.get("profile_pic_url"):
+        candidates.append(str(node["profile_pic_url"]).strip())
+
+    for c in candidates:
+        if c:
+            return hd_picture_url(c)
+    return ""
+

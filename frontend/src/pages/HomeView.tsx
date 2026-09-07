@@ -1,18 +1,25 @@
 import { useCallback, useEffect, useMemo, useState, Fragment } from "react";
 import { toast } from "react-hot-toast";
-import { clientsApi } from "../api/clientsApi";
+
 import { discoveryApi } from "../api/discoveryApi";
-import type { Client, KeywordGroup, PlatformState } from "../api/types";
+import type { Client, ClientConfig, KeywordGroup, PlatformState } from "../api/types";
 import {
   mergeGeneratedChildren,
   parseBulkKeywordGroups,
   mergeBulkKeywordGroups,
 } from "../services/keywordGroups";
 import { PlatformIcon } from "../components/PlatformIcon";
+import { KeywordLogoCell } from "../components/KeywordLogoCell";
+import { logosApi, type ClientLogo } from "../api/logosApi";
 import { GlobalSearchModal } from "../components/GlobalSearchModal";
 import { confirmAction } from "../utils/confirmAction";
-import { saveClientKeywords } from "../services/clientKeywords";
-import { listSavedClients, saveClientLocally, deleteClientLocally } from "../services/savedClients";
+import {
+  createClient as createDirectoryClient,
+  deleteClient as deleteDirectoryClient,
+  refresh as refreshDirectory,
+  updateClient as updateDirectoryClient,
+  useClientDirectory,
+} from "../services/clientDirectory";
 import {
   DiscoverIcon,
   AnalyseIcon,
@@ -849,6 +856,10 @@ function KeywordGroupEditor({
   childPlaceholder,
   accent,
   disabled,
+  clientId,
+  kind,
+  logos,
+  onLogosChanged,
 }: {
   groups: KeywordGroup[];
   onChange: (next: KeywordGroup[]) => void;
@@ -856,6 +867,13 @@ function KeywordGroupEditor({
   childPlaceholder: string;
   accent: string;
   disabled?: boolean;
+  // Optional brand mark per keyword -- see components/KeywordLogoCell.tsx.
+  // Absent until the client is saved, since a logo is stored against a
+  // client id server-side.
+  clientId: string;
+  kind: "individual" | "domain";
+  logos: ClientLogo[];
+  onLogosChanged: () => void;
 }) {
   const [parentInput, setParentInput] = useState("");
   const [childInput, setChildInput] = useState("");
@@ -1011,6 +1029,18 @@ function KeywordGroupEditor({
                     lineHeight: "28px",
                   }}>
                     {g.parent}
+                  </div>
+                  {/* The brand mark for THIS keyword. Optional: a keyword
+                      with none behaves exactly as it always has. */}
+                  <div style={{ marginTop: "6px" }}>
+                    <KeywordLogoCell
+                      clientId={clientId}
+                      keyword={g.parent}
+                      kind={kind}
+                      logos={logos}
+                      onChanged={onLogosChanged}
+                      disabled={disabled}
+                    />
                   </div>
                   <div style={{
                     fontSize: "10px",
@@ -1199,6 +1229,7 @@ function KeywordTabs({
   onDomainGroups,
   platforms,
   disabled,
+  clientId,
 }: {
   activeTab: KeywordTab;
   onTab: (t: KeywordTab) => void;
@@ -1213,7 +1244,22 @@ function KeywordTabs({
   onDomainGroups: (next: KeywordGroup[]) => void;
   platforms: PlatformState[];
   disabled?: boolean;
+  /** Empty until the client is saved -- logos are stored against a client id. */
+  clientId: string;
 }) {
+  // Loaded once per client and handed to every keyword row, so a grid with
+  // 40 keywords makes ONE request rather than one per row.
+  const [logos, setLogos] = useState<ClientLogo[]>([]);
+  const reloadLogos = useCallback(() => {
+    if (!clientId) { setLogos([]); return; }
+    logosApi.list(clientId)
+      .then((r) => setLogos(r.items))
+      // A client with no logos, or a backend that predates them, is the
+      // normal case -- not something to put an error toast in front of an
+      // analyst who never asked for the feature.
+      .catch(() => setLogos([]));
+  }, [clientId]);
+  useEffect(() => { reloadLogos(); }, [reloadLogos]);
   const [genOpen, setGenOpen] = useState(false);
 
   return (
@@ -1263,6 +1309,10 @@ function KeywordTabs({
           childPlaceholder="Add a search term for this name and press Enter…"
           accent="var(--cyan, #00E5FF)"
           disabled={disabled}
+          clientId={clientId}
+          kind="individual"
+          logos={logos}
+          onLogosChanged={reloadLogos}
         />
       </div>
 
@@ -1274,6 +1324,10 @@ function KeywordTabs({
           childPlaceholder="Add a search term for this keyword and press Enter…"
           accent="var(--purple, #8838DD)"
           disabled={disabled}
+          clientId={clientId}
+          kind="domain"
+          logos={logos}
+          onLogosChanged={reloadLogos}
         />
       </div>
 
@@ -1510,7 +1564,11 @@ export function HomeView({
   onAnalyseStarted,
   onError,
 }: Props) {
-  const [clients, setClients] = useState<Client[]>([]);
+  // Subscribed to the directory rather than copied out of it: this used
+  // to be a snapshot taken on mount, so a client that arrived afterwards
+  // -- migrated from localStorage, created in another tab -- did not
+  // appear until something happened to remount the page.
+  const { clients } = useClientDirectory();
   const [loadingClients, setLoadingClients] = useState(true);
   const [mode, setMode] = useState<Mode>(clientId ? "select" : "create");
   const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<WorkspaceTab>("overview");
@@ -1577,25 +1635,13 @@ export function HomeView({
   // client's saved scraping profile.
   const [sweepMaxMinutes, setSweepMaxMinutes] = useState("");
 
+  // Straight from the clients database, through the shared directory
+  // (services/clientDirectory.ts). Each client is one server document
+  // owning its own keywords and caps -- nothing here merges two of them.
   const refreshClients = useCallback(() => {
     setLoadingClients(true);
-    clientsApi
-      .listClients()
-      // GET /clients has no backend on the rebuilt API -- this always
-      // 404s in that configuration, which is expected (see saveConfig's
-      // local-only fallback). Locally-saved clients (savedClients.ts) are
-      // what actually populates the directory today; merged in regardless
-      // of whether the API call above succeeded, so a real future backend
-      // and this browser's own saved list both show up rather than one
-      // silently hiding the other.
-      .then((res) => res.items)
-      .catch(() => [] as Client[])
-      .then((serverClients) => {
-        const local = listSavedClients();
-        const byId = new Map(serverClients.map((c) => [c.client_id, c]));
-        for (const c of local) if (!byId.has(c.client_id)) byId.set(c.client_id, c);
-        setClients([...byId.values()]);
-      })
+    void refreshDirectory()
+      // No setClients: `clients` is the subscribed directory itself.
       .finally(() => setLoadingClients(false));
   }, []);
 
@@ -1753,6 +1799,10 @@ export function HomeView({
   const saveConfig = async (): Promise<Client | null> => {
     const id = idInput.trim();
     const name = nameInput.trim() || id;
+    // An EDIT is "the analyst had this client open and pressed save". Any
+    // other save is a CREATE, and a create under a taken org id is refused
+    // by the server rather than overwriting whoever is already there.
+    const editingExisting = activeClient?.client_id === id;
     if (!id) {
       onError("Enter an org id first.");
       return null;
@@ -1779,7 +1829,7 @@ export function HomeView({
         }
         if (Object.keys(perType).length) fbTabLimits[tab] = perType;
       }
-      const upsertBody: Parameters<typeof clientsApi.upsertClient>[0] = {
+      const upsertBody: ClientConfig = {
         client_id: id,
         name,
         domain: domainInput.trim(),
@@ -1794,40 +1844,33 @@ export function HomeView({
         platform_tab_limits: Object.keys(fbTabLimits).length ? { facebook: fbTabLimits } : {},
         cron: cron.trim() || null,
       };
-      let client: Client;
-      let persisted = true;
-      try {
-        client = await clientsApi.upsertClient(upsertBody);
-      } catch {
-        // POST /clients has no backend on the rebuilt API (only
-        // /discovery, /analysis, /sessions survive) -- fall back to a
-        // browser-local client so the actual point of this form (giving
-        // Discover something with a group id + keywords to sweep with)
-        // still works. Persisted to localStorage (savedClients.ts), not
-        // just this render's state, so it survives a page reload instead
-        // of vanishing the moment "Clients Directory" refetches.
-        persisted = false;
-        client = { ...upsertBody, domain: upsertBody.domain || "" } as Client;
-        saveClientLocally(client);
-        // GET /clients will keep coming back empty (no backend), so the
-        // sidebar list would otherwise never reflect what's actually
-        // usable right now -- merge this local client into it directly.
-        setClients((prev) => [client, ...prev.filter((c) => c.client_id !== client.client_id)]);
-      }
+      // Saved to the database. CREATE and EDIT are deliberately different
+      // calls: saving used to be one upsert keyed on the org id, so
+      // entering a NEW client under an id that was already taken silently
+      // overwrote that client's keywords, caps and cron and reported
+      // success -- two customers, one record, the first one's setup gone.
+      // `createClient` is refused with 409 when the id exists, and the
+      // message says so, so the analyst picks another id or edits the
+      // client that is genuinely there.
+      //
+      // `editingExisting` is the analyst's own intent (they opened a client
+      // and pressed save), not a guess from whether the id happens to be
+      // free -- guessing is exactly what turned an accidental collision
+      // into a silent overwrite.
+      const { client_id: _omit, ...config } = upsertBody;
+      const client = editingExisting
+        ? await updateDirectoryClient(id, config)
+        : await createDirectoryClient(upsertBody);
       setActiveClient(client);
-      // The "Individual + Domain" filter on Live Results reads this back
-      // to classify each profile's own keywords[] -- see clientKeywords.ts.
-      saveClientKeywords(client.client_id, nameKeywords, domainKeywords);
       setMode("select");
       setEditing(false);
       onClient(client.client_id, client.name);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
-      if (persisted) {
-        toast.success(`Client "${client.name}" saved!`, { icon: "💾" });
-      } else {
-        toast(`"${client.name}" is local-only for this session -- no /clients backend to persist it to.`, { icon: "⚠️" });
-      }
+      toast.success(
+        editingExisting ? `Client "${client.name}" updated.` : `Client "${client.name}" created.`,
+        { icon: "💾" },
+      );
       refreshClients();
       return client;
     } catch (e) {
@@ -1921,33 +1964,29 @@ export function HomeView({
 
   const handleDelete = async () => {
     if (!activeClient) return;
+    // Says what actually happens, and only that. It used to promise that
+    // ALL associated discovery profiles, validated profiles, analyst tags
+    // and incidents went with the client; nothing deletes those, and
+    // overstating a deletion is the kind of wrong that gets someone to
+    // click through expecting a clean slate.
     const confirmed = await confirmAction(
-      `Permanently delete client "${activeClient.name || activeClient.client_id}"? This will delete ALL associated discovery profiles, validated profiles, analyst tags, and incidents. This cannot be undone.`,
+      `Delete client "${activeClient.name || activeClient.client_id}"? This removes its keywords, scrape caps and cron from the database, for everyone -- not just this browser. Discovery profiles already found under this org id are NOT deleted: they stay in the database and reappear if you re-create the client with the same org id.`,
     );
     if (!confirmed) return;
     setDeleting(true);
     const deletedId = activeClient.client_id;
-    let persisted = true;
-    try {
-      await clientsApi.deleteClient(deletedId);
-    } catch {
-      // DELETE /clients/{id} has no backend either -- remove it from this
-      // browser's local list regardless, so the UI doesn't get stuck.
-      // Any discovery profiles already saved server-side under this
-      // group_id are untouched (no route exposes deleting them).
-      persisted = false;
-    }
-    deleteClientLocally(deletedId);
-    setClients((prev) => prev.filter((c) => c.client_id !== deletedId));
+    // Local only: DELETE /clients/{id} has no backend either, so attempting
+    // it just cost a 404 before doing the local delete anyway. Any
+    // discovery profiles already stored server-side under this group_id are
+    // untouched -- no route exposes deleting those.
+    await deleteDirectoryClient(deletedId);
     onForgetClient(deletedId);
     setActiveClient(null);
     setEditing(false);
     clearForm();
     onClient("", "");
     setDeleting(false);
-    toast(persisted ? `Client "${deletedId}" deleted.` : `Removed "${deletedId}" locally -- no /clients backend to delete it from.`, {
-      icon: persisted ? "🗑️" : "⚠️",
-    });
+    toast(`Client "${deletedId}" deleted.`, { icon: "🗑️" });
   };
 
   const filteredClients = useMemo(() => {
@@ -2168,6 +2207,7 @@ export function HomeView({
                   onDomainGroups={setDomainGroups}
                   platforms={platforms}
                   disabled={busy}
+                  clientId={activeClient?.client_id || ""}
                 />
               </div>
             </div>
@@ -2560,6 +2600,7 @@ export function HomeView({
                   onDomainGroups={setDomainGroups}
                   platforms={platforms}
                   disabled={busy}
+                  clientId={activeClient?.client_id || ""}
                 />
 
                 <div style={{ marginTop: "20px", display: "flex", justifyContent: "flex-end" }}>
@@ -2695,7 +2736,7 @@ export function HomeView({
                   >
                     {deleting ? "Deleting Organization…" : (
                       <>
-                        <TrashIcon size={14} /> Delete Organization & All Associated Data
+                        <TrashIcon size={14} /> Delete Client
                       </>
                     )}
                   </button>

@@ -63,10 +63,35 @@ export interface Client {
   // both are set; uncapped ("scrape everything found") when neither is.
   platform_tab_limits: Record<string, Record<string, Record<string, number>>>;
   // The round-robin engine's rotation position and the Scheduler tab's own
-  // list order, ascending. See clientsApi.reorderClients.
+  // list order, ascending. Vestigial: the engine that consumed it lived in
+  // the deleted /clients backend, and the Scheduler now orders its queue
+  // itself (services/scheduleRunner.ts).
   order?: number;
   cron?: string | null;
   created_at?: string;
+}
+
+// What the Clients form produces for one client. Formerly the request body
+// of POST /clients; that route was deleted with the rest of the clients
+// backend, and the config is now saved to this browser instead
+// (services/savedClients.ts), but the SHAPE is still the shape -- it is
+// what the form fills in and what discovery reads caps and keywords out of.
+export interface ClientConfig {
+  client_id: string;
+  name: string;
+  domain?: string;
+  name_keywords?: string[];
+  domain_keywords?: string[];
+  platform_limits_individual?: Record<string, number>;
+  platform_limits_domain?: Record<string, number>;
+  // { [platform]: { [tab]: { [keywordType]: number } } }, e.g.
+  // { facebook: { people: { individual: 5, domain: 20 }, ... } }
+  platform_tab_limits?: Record<string, Record<string, Record<string, number>>>;
+  cron?: string | null;
+  // { individual: KeywordGroup[], domain: KeywordGroup[] } -- parents (what
+  // results are matched/filed against) and their children (what is actually
+  // searched).
+  keyword_groups?: Record<string, KeywordGroup[]>;
 }
 
 // Four distinct not-successful outcomes, because each calls for a different

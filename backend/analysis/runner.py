@@ -218,6 +218,7 @@ class AnalysisItem:
     risk_score: int = 2
     priority: str = "Low"
     profile_image_url: str = ""
+    avatar_sha: str = ""
     verified: Optional[bool] = None
     comments: str = ""
     has_screenshot: bool = False
@@ -241,7 +242,8 @@ class AnalysisItem:
             "is_active": self.is_active, "has_logo": self.has_logo,
             "has_name_match": self.has_name_match, "name_score": self.name_score,
             "risk_score": self.risk_score, "priority": self.priority,
-            "profile_image_url": self.profile_image_url, "verified": self.verified,
+            "profile_image_url": self.profile_image_url, "avatar_sha": self.avatar_sha,
+            "verified": self.verified,
             "comments": self.comments, "has_screenshot": self.has_screenshot,
             "incident_row": self.incident_row, "legacy_row": self.legacy_row,
         }
@@ -523,6 +525,8 @@ class AnalysisRunner:
                     f"{registry.display_name(platform_id)} session is not usable -- "
                     "check credentials under Sessions")
             await sessions_engine.mark_session_ok(platform_id, session_item.get("id", ""))
+            if inner is not None and hasattr(inner, "sync_cookies"):
+                await inner.sync_cookies()
 
             if platform_id == "youtube":
                 await self._scrape_youtube_batch(job, platform_id, items, scraper, session_item, progress)
@@ -539,6 +543,8 @@ class AnalysisRunner:
                     *(self._scrape_one(job, it, scraper, platform_id, session_item, stagger=idx)
                       for idx, it in enumerate(chunk))
                 )
+                if inner is not None and hasattr(inner, "sync_cookies"):
+                    await inner.sync_cookies()
                 if any(fatal):
                     session_died = True
                     break
@@ -714,6 +720,8 @@ class AnalysisRunner:
                 it.created_date = known["created_at"]
             if not it.profile_image_url and known.get("profile_image_url"):
                 it.profile_image_url = known["profile_image_url"]
+            if known.get("avatar_sha"):
+                it.avatar_sha = known["avatar_sha"]
             if it.verified is None and known.get("verified") is not None:
                 it.verified = known["verified"]
             if it.has_logo is None and known.get("has_logo") is not None:
@@ -730,6 +738,34 @@ class AnalysisRunner:
                 # and what compute_incident_risk_score reads. Re-derive the
                 # verdict from the score actually being used.
                 it.has_name_match = it.name_score >= NAME_THRESHOLD
+
+        if it.profile_image_url and not it.avatar_sha:
+            try:
+                from backend.services import avatar_cache
+                # cache_one returns (sha, fingerprint) -- the fingerprint
+                # comes free with the decode discovery already pays for, and
+                # is what the logo-match comparison reads later. Analysis's
+                # own behaviour is unchanged: it still only needs the sha.
+                # (sha, fingerprint, embedding). Analysis asks for no
+                # embedding: the logo tier is a DISCOVERY ranking signal, and
+                # spending ~70ms an image here would slow analysis for a
+                # feature it does not surface.
+                sha, fp, _vec = await avatar_cache.cache_one(it.profile_image_url)
+                if sha:
+                    it.avatar_sha = sha
+                    client_id = job.org_id or (known.get("client_id") if known else "")
+                    if client_id:
+                        from backend.database.repositories import profile_repository as profiles_db
+                        await profiles_db.set_avatar_sha(
+                            client_id, it.platform, sha, url=it.url, entity_id=it.entity_id,
+                        )
+                        if fp:
+                            await profiles_db.set_avatar_fingerprint(
+                                client_id, it.platform, fp["phash"], fp["dhash"],
+                                url=it.url, entity_id=it.entity_id,
+                            )
+            except Exception:
+                pass
 
         # LAST, and deliberately after the `known` merge above. Risk and
         # priority are DERIVED from name/logo/location/activity, so reading

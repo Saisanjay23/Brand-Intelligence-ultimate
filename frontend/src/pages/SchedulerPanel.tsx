@@ -17,9 +17,9 @@
 // POST /discovery/jobs and its poll.
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { toast } from "react-hot-toast";
-import { clientsApi } from "../api/clientsApi";
+
 import type { Client } from "../api/types";
-import { listSavedClients } from "../services/savedClients";
+import { refresh as refreshDirectory, useClientDirectory } from "../services/clientDirectory";
 import {
   clearQueue,
   dequeue,
@@ -31,10 +31,14 @@ import {
   start,
   stop,
   subscribe,
+  unfinishedPlatformsOf,
   type EntryStatus,
+  type PlatformDetail,
+  type PlatformOutcome,
   type ScheduleEntry,
 } from "../services/scheduleRunner";
 import { PlayIcon, StopIcon, SearchIcon, AlertTriangleIcon } from "../components/AppIcons";
+import { PlatformIcon } from "../components/PlatformIcon";
 
 // Drag payloads are prefixed so one drop handler can tell "a new client from
 // the left pane" from "an entry being reordered within the queue".
@@ -50,6 +54,24 @@ const STATUS_LOOK: Record<EntryStatus, { color: string; label: string; dot: stri
   // Cancelled from outside this scheduler (another tab, a direct API call).
   // Terminal on purpose -- see the comment in scheduleRunner.ts's poll loop.
   cancelled: { color: "var(--warn-yellow, #fdb71b)", label: "cancelled", dot: "●" },
+};
+
+// A sweep's outcome is per platform, and the row's single word cannot say
+// which. "done, 9 found" reads as a clean sweep even when Facebook lost its
+// session a third of the way in and two thirds of the results are simply
+// missing -- the most common partial outcome there is, and the one worth
+// re-running. These chips are what say so.
+const PLATFORM_LOOK: Record<PlatformOutcome, { fg: string; bg: string; label: string }> = {
+  done: { fg: "var(--success, #36b5a0)", bg: "rgba(54,181,160,0.14)", label: "done" },
+  partial: { fg: "var(--warn-yellow, #fdb71b)", bg: "rgba(253,183,27,0.15)", label: "partial" },
+  failed: { fg: "var(--danger, #e95053)", bg: "rgba(233,80,83,0.14)", label: "failed" },
+  // Not an error and not a result: this platform had no usable session, so
+  // it was never swept at all.
+  skipped: { fg: "var(--text-dim, #667085)", bg: "rgba(102,112,133,0.12)", label: "no session" },
+  running: { fg: "var(--accent, #7c5cff)", bg: "rgba(124,92,255,0.14)", label: "running" },
+  // Listed by the sweep but never reached, because it was stopped or
+  // cancelled first.
+  pending: { fg: "var(--text-dim, #667085)", bg: "rgba(102,112,133,0.12)", label: "not reached" },
 };
 
 const PANE: React.CSSProperties = {
@@ -104,24 +126,19 @@ function useNowTick(active: boolean): number {
 
 export function SchedulerPanel() {
   const state = useSyncExternalStore(subscribe, getSnapshot);
-  const [clients, setClients] = useState<Client[]>([]);
+  // Subscribed, not copied: a one-time copy taken on mount goes stale the
+  // moment a client is created anywhere else, and never catches up.
+  const { clients } = useClientDirectory();
   const [filter, setFilter] = useState("");
   const [dragOverQueue, setDragOverQueue] = useState(false);
   const [busy, setBusy] = useState(false);
   const now = useNowTick(state.running);
 
-  // Same merge the Clients page does: whatever the (currently backendless)
-  // /clients route returns, plus this browser's own saved clients.
+  // Straight from the clients database, via the shared directory cache
+  // (services/clientDirectory.ts). Refreshed on mount so a client created
+  // on another machine -- or in another tab -- shows up here.
   const loadClients = useCallback(() => {
-    clientsApi
-      .listClients()
-      .then((res) => res.items)
-      .catch(() => [] as Client[])
-      .then((server) => {
-        const byId = new Map(server.map((c) => [c.client_id, c]));
-        for (const c of listSavedClients()) if (!byId.has(c.client_id)) byId.set(c.client_id, c);
-        setClients([...byId.values()]);
-      });
+    void refreshDirectory();
   }, []);
 
   useEffect(() => {
@@ -184,7 +201,8 @@ export function SchedulerPanel() {
   const handleRun = async () => {
     setBusy(true);
     try {
-      if (!state.entries.some((e) => e.status === "pending")) resetStatuses();
+      // start() now auto-resets all entries to a clean slate, so there is
+      // no need to call resetStatuses() separately.
       await start();
     } finally {
       setBusy(false);
@@ -421,6 +439,95 @@ export function SchedulerPanel() {
   );
 }
 
+// Empty until this entry has swept once, so a queued client stays as quiet
+// as it was before this existed.
+function PlatformChips({ entry }: { entry: ScheduleEntry }) {
+  const ids = Object.keys(entry.platforms ?? {}).sort();
+  if (!ids.length) return null;
+  const owing = unfinishedPlatformsOf(entry).length;
+  const details = entry.platform_details ?? {};
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "4px", marginTop: "6px" }}>
+      <div style={{ display: "flex", gap: "5px", flexWrap: "wrap", alignItems: "center" }}>
+        {ids.map((pid) => {
+          const outcome = entry.platforms[pid];
+          const look = PLATFORM_LOOK[outcome] ?? PLATFORM_LOOK.skipped;
+          const detail: PlatformDetail | undefined = details[pid];
+          const hasCounts = detail && (detail.found > 0 || detail.new > 0);
+          return (
+            <span
+              key={pid}
+              title={
+                detail?.note
+                  ? `${pid}: ${look.label} — ${detail.note}`
+                  : `${pid}: ${look.label}${hasCounts ? ` (${detail!.found} found, ${detail!.new} new)` : ""}`
+              }
+              style={{
+                display: "inline-flex", alignItems: "center", gap: "5px",
+                background: look.bg, color: look.fg, borderRadius: "999px",
+                padding: "2px 8px", fontSize: "10.5px", fontWeight: 700,
+              }}
+            >
+              <PlatformIcon platform={pid} size={11} />
+              {hasCounts ? (
+                <span style={{ fontWeight: 600 }}>
+                  {detail!.found}<span style={{ fontWeight: 400, opacity: 0.7 }}> found</span>
+                  {detail!.new > 0 && (
+                    <span style={{ marginLeft: "3px", fontWeight: 400, opacity: 0.7 }}>
+                      · {detail!.new} new
+                    </span>
+                  )}
+                </span>
+              ) : (
+                <span style={{ fontWeight: 500, opacity: 0.9 }}>{look.label}</span>
+              )}
+            </span>
+          );
+        })}
+        {owing > 0 && (
+          <span style={{ fontSize: "10.5px", color: "var(--warn-yellow, #fdb71b)", fontWeight: 700 }}>
+            {owing} still owing
+          </span>
+        )}
+      </div>
+
+      {/* Failure / partial notes: show why each non-done platform had issues */}
+      {ids.some((pid) => {
+        const outcome = entry.platforms[pid];
+        return (outcome === "failed" || outcome === "partial") && details[pid]?.note;
+      }) && (
+        <div style={{
+          display: "flex", flexDirection: "column", gap: "2px",
+          marginTop: "2px", paddingLeft: "2px",
+        }}>
+          {ids
+            .filter((pid) => {
+              const outcome = entry.platforms[pid];
+              return (outcome === "failed" || outcome === "partial") && details[pid]?.note;
+            })
+            .map((pid) => (
+              <span
+                key={pid}
+                style={{
+                  fontSize: "10px",
+                  color: entry.platforms[pid] === "failed"
+                    ? "var(--danger, #e95053)"
+                    : "var(--warn-yellow, #fdb71b)",
+                  display: "inline-flex", alignItems: "center", gap: "4px",
+                  lineHeight: 1.5,
+                }}
+              >
+                <PlatformIcon platform={pid} size={10} />
+                {details[pid].note}
+              </span>
+            ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function QueueRow({
   entry,
   index,
@@ -493,6 +600,7 @@ function QueueRow({
             <span style={{ color: "var(--success)" }}> · {entry.found} found, {entry.new_profiles} new</span>
           )}
         </div>
+        <PlatformChips entry={entry} />
       </span>
 
       {elapsed && (

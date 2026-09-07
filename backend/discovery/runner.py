@@ -35,6 +35,7 @@ from typing import Any, Optional
 from backend.config.settings import settings
 from backend.database.repositories import profile_repository as profiles_db
 from backend.platforms import registry
+from backend.services import avatar_cache
 from backend.platforms.scan_options import DiscoveryOptions
 from backend.sessions import manager as sessions_engine
 from backend.shared.job_store import JobStore
@@ -153,6 +154,18 @@ class CompletedSweep:
     hits_found: int
     hits_new: int
     timestamp: str
+    # HOW the sweep ended, not just that it did. Without these, tuning the
+    # engine's timing knobs is unmeasurable from outside: shortening a wait
+    # makes a sweep faster AND makes it give up sooner, and those two look
+    # identical in a duration alone. `complete` is the engine's own answer
+    # to "did this run to one of its real stopping signals", and `stopped`
+    # names which one.
+    complete: bool = True
+    stopped: str = ""
+    # What the profile-visit reconciliation phase cost. It is the slowest
+    # part of a sweep and the most detectable, so it is the number to watch.
+    resolved_visits: int = 0
+    resolve_seconds: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -164,6 +177,10 @@ class CompletedSweep:
             "hits_found": self.hits_found,
             "hits_new": self.hits_new,
             "timestamp": self.timestamp,
+            "complete": self.complete,
+            "stopped": self.stopped,
+            "resolved_visits": self.resolved_visits,
+            "resolve_seconds": self.resolve_seconds,
         }
 
 
@@ -223,6 +240,11 @@ class DiscoveryJob:
     started_at_ts: Optional[float] = None
     finished_at_ts: Optional[float] = None
     history: list[CompletedSweep] = field(default_factory=list)
+    # Avatar caching started behind each completed sweep. Held on the JOB
+    # rather than in a local: a task with no live reference can be garbage
+    # collected mid-flight, which would cache nothing under exactly the
+    # load where it matters. Settled in `_run`'s finally.
+    avatar_tasks: list[Any] = field(default_factory=list)
 
     @property
     def keywords(self) -> list[str]:
@@ -419,8 +441,37 @@ class DiscoveryRunner:
             job.message = f"{type(e).__name__}: {e}"
             log.error(f"discovery job {job.id} failed: {job.message}")
         finally:
+            # Reported finished BEFORE the avatars are settled: the sweep's
+            # own work is done, its profiles are saved and readable, and the
+            # pictures are an enhancement landing behind it. Waiting here
+            # first would make every job's reported duration include image
+            # downloads it deliberately kept off the critical path.
             job.finished_at = datetime.now(timezone.utc).isoformat()
             job.finished_at_ts = time.time()
+            await self._settle_avatars(job)
+
+    async def _settle_avatars(self, job: DiscoveryJob) -> None:
+        """Let the behind-the-sweep avatar caching finish (or stop it).
+
+        Nothing here can fail the job -- it is already finished and
+        reported. The point is that these tasks end DETERMINISTICALLY:
+        awaited to completion normally, cancelled when the job was, and
+        never left running past the job that owns them.
+        """
+        tasks = [t for t in job.avatar_tasks if t is not None]
+        job.avatar_tasks = []
+        if not tasks:
+            return
+        if job.cancel.is_set():
+            for t in tasks:
+                t.cancel()
+        try:
+            cached = await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception:                        # noqa: BLE001 - never fatal
+            return
+        total = sum(c for c in cached if isinstance(c, int))
+        if total:
+            log.info(f"discovery job {job.id}: cached {total} avatar(s)")
 
     async def _sweep_platform(
         self, job: DiscoveryJob, platform_id: str,
@@ -448,6 +499,12 @@ class DiscoveryRunner:
             max_results=max_results,
             max_seconds=max_seconds if max_seconds is not None else settings.discovery_max_seconds,
             headful=not settings.headless,
+            # Ceilings on waiting for a real signal -- see settings.py for
+            # why lowering them buys nothing on a healthy sweep and why the
+            # telemetry below is what says whether a change actually helped.
+            settle=settings.discovery_settle_sec,
+            page_wait=settings.discovery_page_wait_sec,
+            patience=settings.discovery_patience,
         )
 
         session = None
@@ -485,6 +542,8 @@ class DiscoveryRunner:
                         f"{registry.display_name(platform_id)} session is not usable -- "
                         "check credentials under /sessions")
                 await sessions_engine.mark_session_ok(platform_id, session_item.get("id", ""))
+                if session is not None and hasattr(session, "sync_cookies"):
+                    await session.sync_cookies()
                 discoverer = plat_obj.discoverer()(options, session.ctx)
 
             incomplete = 0
@@ -519,7 +578,11 @@ class DiscoveryRunner:
                             hits_found=0,
                             hits_new=0,
                             timestamp=datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                            complete=False,
+                            stopped="error",
                         ))
+                        if session is not None and hasattr(session, "sync_cookies"):
+                            await session.sync_cookies()
                         if reason := classify_failure(e):
                             await sessions_engine.mark_session_failed(
                                 platform_id, session_item.get("id", ""), reason, detail=str(e))
@@ -537,19 +600,34 @@ class DiscoveryRunner:
                         # Saved per completed sweep, not batched at the end,
                         # so a caller polling this job (or reading /profiles)
                         # sees results within seconds of them being found.
+                        rows = [row_to_fields(h, keyword) for h in hits]
                         saved, new = await profiles_db.save_many(
                             job.group_id, platform_id, profiles_db.PHASE_DISCOVERY,
-                            [row_to_fields(h, keyword) for h in hits],
+                            rows,
                         )
                         saved_count = saved
                         new_count = new
+                        # Pull each picture into our own store, BEHIND this
+                        # sweep rather than inside it. The CDN links just
+                        # saved are signed and expire within hours, so a card
+                        # built on one goes blank overnight; the cached bytes
+                        # do not. Awaiting it here would undo the reason this
+                        # engine never downloads an image during a sweep
+                        # (a Facebook profile visit alone requests 74), so it
+                        # runs as its own task and the sweep moves on.
+                        task = avatar_cache.spawn(job.group_id, platform_id, rows)
+                        if task is not None:
+                            job.avatar_tasks.append(task)
                         prog.found += saved
                         prog.new += new
                         job.found += saved
                         job.new += new
-                    if not getattr(sweep, "complete", True):
+                    sweep_complete = bool(getattr(sweep, "complete", True))
+                    if not sweep_complete:
                         incomplete += 1
                     prog.keywords_done += 1
+                    # getattr throughout: `Sweep` is each platform engine's
+                    # own dataclass, and only some of them carry these.
                     job.history.append(CompletedSweep(
                         platform=platform_id,
                         display_name=prog.display_name,
@@ -559,7 +637,13 @@ class DiscoveryRunner:
                         hits_found=saved_count,
                         hits_new=new_count,
                         timestamp=datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                        complete=sweep_complete,
+                        stopped=str(getattr(sweep, "stopped", "") or ""),
+                        resolved_visits=int(getattr(sweep, "resolved_visits", 0) or 0),
+                        resolve_seconds=float(getattr(sweep, "resolve_seconds", 0.0) or 0.0),
                     ))
+                    if session is not None and hasattr(session, "sync_cookies"):
+                        await session.sync_cookies()
 
                     stop_reason = ""
                     if getattr(sweep, "stopped", "") == "flood-wait":

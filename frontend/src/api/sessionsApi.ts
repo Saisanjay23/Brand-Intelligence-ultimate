@@ -66,34 +66,6 @@ export const sessionsApi = {
     post(`/sessions/${platform}/${sessionId}/check`, {}).then(
       json<{ ok: boolean; detail: string; conclusive: boolean; session: SessionInfo }>,
     ),
-  setSessionProxy: (
-    platform: string,
-    sessionId: string,
-    proxy: { server: string; username?: string; password?: string; timezone_id?: string },
-  ) =>
-    fetch(url(`/sessions/${platform}/${sessionId}/proxy`), {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ proxy }),
-    }).then(json<SessionInfo>),
-  // Checks a proxy BEFORE it is attached to anything: the backend starts a
-  // throwaway browser through it (and one without it, to compare) and
-  // reports the address the world actually sees. Slow by API standards --
-  // it is launching real browsers -- so callers should show a spinner.
-  testProxy: (proxy: { server: string; username?: string; password?: string }) =>
-    fetch(url(`/sessions/proxy/test`), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ proxy }),
-    }).then(json<ProxyTestResult>),
-  // Backend has no separate DELETE-proxy route, clearing is PUT with
-  // proxy: null (see backend/controllers/session_controller.py::set_proxy).
-  clearSessionProxy: (platform: string, sessionId: string) =>
-    fetch(url(`/sessions/${platform}/${sessionId}/proxy`), {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ proxy: null }),
-    }).then(json<SessionInfo>),
   deleteSessionItem: (platform: string, sessionId: string) =>
     fetch(url(`/sessions/${platform}/${sessionId}`), { method: "DELETE" }).then(json<SessionInfo>),
   deleteSessionPool: (platform: string) =>

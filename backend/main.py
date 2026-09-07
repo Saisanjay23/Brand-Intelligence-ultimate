@@ -72,7 +72,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from backend.api.alerts import router as alerts_router
 from backend.api.analysis import router as analysis_router
+from backend.api.clients import router as clients_router
+from backend.api.logos import router as logos_router
 from backend.api.discovery import router as discovery_router
 from backend.api.health import router as health_router
 from backend.api.media import close as media_close
@@ -81,6 +84,8 @@ from backend.api.sessions import router as sessions_router
 from backend.config.settings import settings
 from backend.database.connection import close as mongo_close
 from backend.database.connection import ping as mongo_ping
+from backend.database.repositories import avatar_repository as avatars_db
+from backend.database.repositories import logo_repository as logos_db
 from backend.database.repositories import profile_repository as profiles_db
 from backend.database.repositories import session_repository as sessions_db
 from backend.sessions import manager as sessions_engine
@@ -128,6 +133,8 @@ async def lifespan(app: FastAPI):
     if await mongo_ping():
         await sessions_db.ensure_indexes()
         await profiles_db.ensure_indexes()
+        await avatars_db.ensure_indexes()
+        await logos_db.ensure_indexes()
         from backend.platforms import registry
         for p in registry.PLATFORMS.values():
             await registry.session_state(p)
@@ -151,6 +158,9 @@ app = FastAPI(
     description=__doc__,
     lifespan=lifespan,
     openapi_tags=[
+        {"name": "clients", "description":
+            "The org records discovery and analysis are scoped to. One "
+            "document per org id, owning its own keywords and scrape caps."},
         {"name": "discovery", "description":
             "Keywords in, candidate profiles out. Results are persisted and "
             "readable while the sweep is still running."},
@@ -185,9 +195,13 @@ async def domain_error_handler(request: Request, exc: DomainError) -> JSONRespon
 
 
 app.include_router(health_router)
+app.include_router(clients_router)
+# Reference brand marks, nested under /clients/{id}/logos.
+app.include_router(logos_router)
 app.include_router(discovery_router)
 app.include_router(analysis_router)
 app.include_router(sessions_router)
+app.include_router(alerts_router)
 # Serves remote avatars from this origin -- see backend/api/media.py for why
 # Instagram's CDN cannot be embedded directly.
 app.include_router(media_router)

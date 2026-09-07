@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import re
 import sys
 import time
@@ -56,6 +57,7 @@ from backend.shared.models.hit import Hit, hit_to_row
 from backend.shared.models.row import Row
 from backend.shared.text import iter_dicts, normalized_host, parse_normalized_url
 from backend.stealth.browser import Session
+from backend.stealth.mouse_movement import natural_scroll_down
 
 # Session / login state
 
@@ -598,7 +600,8 @@ async def dom_search_hits(page, keyword: str, tab: str) -> list["Hit"]:
         url = (r.get("url") or "").strip()
         if not eid or not url:
             continue
-        avatar = (r.get("avatar") or "").strip()
+        raw_avatar = (r.get("avatar") or "").strip()
+        avatar = hd_picture_url(raw_avatar) if raw_avatar else ""
         hits.append(Hit(
             entity_id=eid,
             name=(r.get("name") or "").strip(),
@@ -633,6 +636,13 @@ class Sweep:
     # the rendered results page had to stand in
     source: str = "graphql"
     extraction: Optional["ExtractionResult"] = None
+    # What the resolve phase cost: how many candidates got a profile-page
+    # visit, and how long that phase took. Recorded because resolve is both
+    # the slowest part of a sweep and its biggest detection surface, so
+    # "is this tuning working" is a question about THESE two numbers -- and
+    # the answer was previously invisible from outside the engine.
+    resolved_visits: int = 0
+    resolve_seconds: float = 0.0
 
     def summary(self) -> str:
         """One-line log form. Reports `backfilled` and `unshown` counts
@@ -646,6 +656,8 @@ class Sweep:
             note += f", {self.backfilled} backfilled"
         if self.unshown:
             note += f", {self.unshown} matched-but-unshown"
+        if self.resolved_visits:
+            note += f", {self.resolved_visits} resolved in {self.resolve_seconds}s"
         if self.reported_total is not None and self.reported_total != len(self.hits):
             note += f", facebook counted {self.reported_total}"
         return note
@@ -672,7 +684,7 @@ class Sweep:
 # to starve a second keyword's sweep of its own turn (see RESOLVE_TIME_
 # BUDGET_SEC below for how that's actually addressed instead). Restored to
 # a modest step up from the original, not a multiplier.
-RESOLVE_CONCURRENCY = 4
+RESOLVE_CONCURRENCY = 2
 
 # The pagination loop above has its own max_seconds budget; this phase
 # didn't, so removing the count cap could in principle let ONE sweep's
@@ -711,7 +723,7 @@ RESOLVE_TIME_BUDGET_SEC = 180
 # condition also means the common fast case returns as soon as the data is
 # there, typically quicker than the old flat 1.2s, so a much more
 # generous ceiling costs nothing on profiles that load normally.
-RESOLVE_SETTLE_SEC = 12
+RESOLVE_SETTLE_SEC = 8
 
 # The condition that actually matters on a profile page: EITHER the page
 # has committed to an identity (canonical/og:url, what the identity gate
@@ -1036,15 +1048,18 @@ class Discovery:
         nameless) still gets its blank-name Hit from the caller, nothing
         here demotes a candidate, it only enriches one.
         """
+        if not ids:
+            return {}
         out: dict[str, Hit] = {}
         sem = asyncio.Semaphore(RESOLVE_CONCURRENCY)
-        self_avatar_assets = await self._self_avatar_assets()
+        self_avatar_assets = await self._self_avatar_assets() if TRUST_PAGE_CONTEXT_AVATAR else set()
 
         async def one(eid: str) -> None:
             """Backfills one entity that search listed without enough
             detail to score, by visiting it directly. Holds a concurrency
             slot for the duration of the visit."""
             async with sem:
+                await asyncio.sleep(random.uniform(0.5, 1.2))
                 page = await self.ctx.new_page()
                 blobs: list[Any] = []
 
@@ -1375,7 +1390,7 @@ class Discovery:
                 before = len(by_id)
                 arrived.clear()
                 try:
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await natural_scroll_down(page, distance=random.randint(700, 1050), to_bottom=True)
                 except Exception as e:
                     out.stopped = "error"
                     out.error = f"scroll failed: {e}"
@@ -1434,9 +1449,35 @@ class Discovery:
             # Best-effort: an id this can't resolve still gets tracked with
             # a blank name below, exactly as it always has.
             resolved: dict[str, Hit] = {}
+            #
+            # A CANDIDATE IS WORTH A PAGE VISIT ONLY FOR DATA THE VISIT CAN
+            # ACTUALLY RETURN. This used to include "has no avatar", and that
+            # was work that could not succeed: the visit's only picture source
+            # is `_extract_entity`, whose avatar branch is behind
+            # `trust_page_context_avatar`, which is OFF in production
+            # (TRUST_PAGE_CONTEXT_AVATAR = False). So every profile whose
+            # search result carried a DEFAULT picture -- `iter_results` stores
+            # avatar="" for those, and Facebook has a great many of them --
+            # bought itself a full profile-page load that returned an empty
+            # avatar by construction, every sweep, forever.
+            #
+            # That cost was paid twice over: it is the slowest phase of the
+            # sweep, AND profile visits under one live account are the single
+            # most detectable thing this engine does (see RESOLVE_CONCURRENCY's
+            # own note on burst activity). Cutting work that cannot pay off is
+            # strictly better than adding parallelism to absorb it.
+            #
+            # Keyed off the flag rather than hardcoded, so re-enabling
+            # TRUST_PAGE_CONTEXT_AVATAR restores avatar-driven resolution
+            # automatically instead of leaving it silently switched off here.
+            def _needs_name(eid: str, h: Hit) -> bool:
+                n = (h.name or "").strip()
+                return not n or n == eid or n.isdigit()
+
             unresolved_in_by_id = {
                 eid for eid, h in by_id.items()
-                if not h.name or h.name.strip() == eid or h.name.strip().isdigit() or not h.avatar or not h.has_custom_pic
+                if _needs_name(eid, h)
+                or (TRUST_PAGE_CONTEXT_AVATAR and (not h.avatar or not h.has_custom_pic))
             }
             # deliberately NOT `| unshown`, see the comment above: those
             # ids mostly have no viewable profile behind them, so visiting
@@ -1444,11 +1485,15 @@ class Discovery:
             # live session) on data that cannot exist, while starving the
             # ids that DO resolve.
             to_resolve = sorted(missing | unresolved_in_by_id)
+            out.resolved_visits = len(to_resolve)
             if to_resolve:
+                _resolve_started = time.time()
                 try:
                     resolved = await self._resolve_missing(to_resolve, kind)
                 except Exception:
                     resolved = {}
+                finally:
+                    out.resolve_seconds = round(time.time() - _resolve_started, 1)
 
             for eid in sorted(unresolved_in_by_id):
                 if r := resolved.get(eid):

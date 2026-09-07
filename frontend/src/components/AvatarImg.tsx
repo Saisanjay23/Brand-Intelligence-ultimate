@@ -12,6 +12,8 @@ import { avatarSources } from "../utils/avatar";
 
 interface Props {
   src: string | null | undefined;
+  /** A profile's `avatar_sha`: the copy we stored, which never expires. */
+  sha?: string | null;
   alt?: string;
   className?: string;
   style?: React.CSSProperties;
@@ -19,14 +21,14 @@ interface Props {
   fallback?: React.ReactNode;
 }
 
-export function AvatarImg({ src, alt = "", className, style, fallback = null }: Props) {
-  const sources = useMemo(() => avatarSources(src), [src]);
+export function AvatarImg({ src, sha, alt = "", className, style, fallback = null }: Props) {
+  const sources = useMemo(() => avatarSources(src, sha), [src, sha]);
   const [attempt, setAttempt] = useState(0);
 
   // A grid row can be recycled onto a different profile while mounted; without
   // this the new picture would inherit the old one's failure count and could
   // skip straight to the fallback.
-  useEffect(() => setAttempt(0), [src]);
+  useEffect(() => setAttempt(0), [src, sha]);
 
   if (attempt >= sources.length) return <>{fallback}</>;
 

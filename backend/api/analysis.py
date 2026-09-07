@@ -102,6 +102,9 @@ class AnalysedProfile(BaseModel):
     risk_score: int = Field(2, description="2-9. Higher is more likely a real impersonation.")
     priority: str = Field("Low", description="High | Low, derived from the risk rubric.")
     profile_image_url: str = ""
+    avatar_sha: str = Field(
+        "", description="sha256 digest of the profile picture in the durable store, or blank.",
+    )
     verified: Optional[bool] = None
     comments: str = ""
     has_screenshot: bool = Field(

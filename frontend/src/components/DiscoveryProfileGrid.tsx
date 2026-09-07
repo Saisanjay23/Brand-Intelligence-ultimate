@@ -4,6 +4,15 @@
 // explicitly validated it, from either New or Old). There is no reject
 // action in this UI -- validate is the only triage decision it exposes.
 //
+// Validated carries its OWN New/Old split, on a different clock: how long
+// ago the ANALYST VALIDATED it, not how long ago the sweep found it. A
+// profile discovered in March and validated this morning is old by
+// discovery and new by decision, and the point of that tab is to separate
+// "decisions I just made and may still want to review" from the settled
+// backlog. It is a server filter (`validated_age`) reading `validated_at`,
+// not a client-side slice, so it survives pagination -- see the note below
+// on why New/Old up top could not be done that way.
+//
 // New/Old are both just the `pending` triage status client-side split by
 // age; the backend has no age-bucketed status of its own, so both tabs
 // share ONE fetch (up to MAX_LIMIT pending rows) and are re-sliced
@@ -26,8 +35,9 @@ import toast from "react-hot-toast";
 import { analysisApi } from "../api/analysisApi";
 import { discoveryApi } from "../api/discoveryApi";
 import type { DiscoveredProfile } from "../api/discoveryApi";
-import { getClientKeywords } from "../services/clientKeywords";
-import { listSavedClients } from "../services/savedClients";
+import { useRefreshOnFocus } from "../hooks/useRefreshOnFocus";
+import { findClient, keywordCategories } from "../services/clientDirectory";
+
 import { confirmAction } from "../utils/confirmAction";
 import { download, rowsToCsv } from "../utils/download";
 import { AvatarImg } from "./AvatarImg";
@@ -45,6 +55,10 @@ interface Props {
 }
 
 type Tab = "new" | "old" | "validated";
+// Which half of the Validated tab is showing. Only meaningful while
+// `tab === "validated"`; kept across tab switches so leaving and coming
+// back does not silently reset the analyst to the other half.
+type ValidatedAge = "new" | "old";
 
 const PAGE_SIZE_OPTIONS = [25, 50, 100, 200] as const;
 // High Match no longer thresholds name_score at all -- see matchLevelOf,
@@ -107,11 +121,61 @@ function exportRow(p: DiscoveredProfile): Record<string, unknown> {
   };
 }
 
+// Drawn when this profile's picture matched one of the client's own
+// reference logos. Deliberately says how it matched: "identical file" is a
+// different claim from "near-identical image", and an analyst deciding
+// whether to act deserves to know which one they are looking at.
+// Each tier is a DIFFERENT STRENGTH OF CLAIM, and the badge says which:
+//   exact  the identical file was re-uploaded -- not an opinion, a fact
+//   phash  near-identical image (re-encoded, resized)
+//   embed  the same mark re-presented (new background, shrunk, recoloured)
+// An analyst deciding whether to act on it deserves to know which of those
+// they are looking at, so the tier is never flattened into one word.
+const LOGO_TIER = {
+  exact: {
+    label: "EXACT",
+    fg: "var(--danger, #e95053)", bg: "rgba(233,80,83,0.16)", bd: "rgba(233,80,83,0.4)",
+    hint: "This profile is using the client's reference logo file itself, byte for byte.",
+  },
+  phash: {
+    label: "", // similarity is shown instead
+    fg: "var(--warn-yellow, #fdb71b)", bg: "rgba(253,183,27,0.15)", bd: "rgba(253,183,27,0.4)",
+    hint: "Near-identical to the client's reference logo -- re-encoded or resized.",
+  },
+  embed: {
+    label: "",
+    fg: "var(--accent, #7c5cff)", bg: "rgba(124,92,255,0.14)", bd: "rgba(124,92,255,0.4)",
+    hint: "Visually the same mark as the client's reference logo, re-presented "
+        + "(different background, cropped, recoloured). Worth an eye -- this tier "
+        + "reads likeness rather than an exact copy.",
+  },
+} as const;
+
+function LogoMatchBadge({ p }: { p: DiscoveredProfile }) {
+  if (p.logo_similarity == null) return null;
+  const tier = LOGO_TIER[(p.logo_match_tier || "phash") as keyof typeof LOGO_TIER]
+    ?? LOGO_TIER.phash;
+  return (
+    <span
+      title={`${tier.hint} (${p.logo_similarity}% match)`}
+      style={{
+        display: "inline-flex", alignItems: "center", gap: "4px",
+        padding: "2px 7px", borderRadius: "10px", fontSize: "9px", fontWeight: 800,
+        letterSpacing: "0.3px", whiteSpace: "nowrap",
+        background: tier.bg, color: tier.fg, border: `1px solid ${tier.bd}`,
+      }}
+    >
+      LOGO MATCH · {tier.label || `${p.logo_similarity}%`}
+    </span>
+  );
+}
+
 function Avatar({ p }: { p: DiscoveredProfile }) {
   const label = p.display_name || p.username || "?";
   return (
     <AvatarImg
       src={p.profile_image_url}
+      sha={p.avatar_sha}
       style={{ width: "100%", height: "100%", objectFit: "cover" }}
       fallback={
         <span className="profile-avatar-circle" style={{ width: 64, height: 64, fontSize: 26, borderRadius: "50%" }}>
@@ -168,6 +232,7 @@ function ProfileCard({
               new
             </span>
           )}
+          <LogoMatchBadge p={p} />
         </div>
         {p.name_score != null && (() => {
           const level = matchLevelOf(p);
@@ -303,10 +368,16 @@ function ProfileTable({
 
 export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseStarted }: Props) {
   const [tab, setTab] = useState<Tab>("new");
+  const [validatedAge, setValidatedAge] = useState<ValidatedAge>("new");
+  // Show only profiles whose picture matched one of the client's reference
+  // logos. Server-side, so it survives pagination; inert for a client that
+  // has uploaded none.
+  const [logoOnly, setLogoOnly] = useState(false);
   const [pendingItems, setPendingItems] = useState<DiscoveredProfile[] | null>(null);
   // True totals for both age tabs, from the server, independent of which one
   // is open and of how the current page happens to be filled.
   const [ageCounts, setAgeCounts] = useState<{ new: number; old: number }>({ new: 0, old: 0 });
+  const [validatedAgeCounts, setValidatedAgeCounts] = useState<{ new: number; old: number }>({ new: 0, old: 0 });
   const [keywordCounts, setKeywordCounts] = useState<Record<string, number>>({});
   const [loadingPending, setLoadingPending] = useState(false);
   const [validatedPage, setValidatedPage] = useState<{ items: DiscoveredProfile[]; total: number } | null>(null);
@@ -369,7 +440,7 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
   // Any filter (or tab) changing resets to page 1.
   useEffect(() => {
     setOffset(0);
-  }, [tab, keywordFilter, search, pageSize, platform]);
+  }, [tab, validatedAge, logoOnly, keywordFilter, search, pageSize, platform]);
 
   const loadPending = useCallback(async () => {
     setLoadingPending(true);
@@ -381,6 +452,7 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
         // On the Validated tab this call exists only to keep the New/Old
         // badges truthful, so it asks for one row and reads `counts`.
         age: tab === "validated" ? undefined : tab,
+        logo_matched: logoOnly || undefined,
         limit: tab === "validated" ? 1 : pageSize,
         offset: tab === "validated" ? 0 : offset,
       });
@@ -392,7 +464,7 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
     } finally {
       setLoadingPending(false);
     }
-  }, [groupId, platform, keywordFilter, search, matchLevel, entityType, tab, pageSize, offset]);
+  }, [groupId, platform, keywordFilter, search, matchLevel, entityType, tab, pageSize, offset, logoOnly]);
 
   const loadValidated = useCallback(async () => {
     setLoadingValidated(true);
@@ -400,15 +472,24 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
       const res = await discoveryApi.listProfiles({
         group_id: groupId, platform: platform || undefined, status: "validated",
         keyword: keywordFilter || undefined, search: search || undefined,
+        // Server-side, so the split holds across pages. `counts.validated_ages`
+        // comes back with THIS filter dropped, so the badge for the tab the
+        // analyst is not looking at is still the true total.
+        validated_age: validatedAge,
+        logo_matched: logoOnly || undefined,
         limit: pageSize, offset,
       });
       setValidatedPage(res);
+      setValidatedAgeCounts({
+        new: res.counts?.validated_ages?.new ?? 0,
+        old: res.counts?.validated_ages?.old ?? 0,
+      });
     } catch (e) {
       toast.error((e as Error).message);
     } finally {
       setLoadingValidated(false);
     }
-  }, [groupId, platform, keywordFilter, search, pageSize, offset]);
+  }, [groupId, platform, keywordFilter, search, pageSize, offset, validatedAge, logoOnly]);
 
   // Imperative use only (e.g. after a bulk delete) -- NOT an effect
   // dependency anywhere, see the two load effects below for why: bundling
@@ -434,6 +515,22 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
     void loadValidated();
   }, [loadValidated, refreshKey]);
 
+  // Pick up decisions made somewhere else -- a second tab, another analyst,
+  // the same person on another machine. Nothing else does: the loads above
+  // fire on mount and on filter changes, so a profile validated elsewhere
+  // stays listed as pending here indefinitely.
+  //
+  // `reloadAll` is safe to call at any time by design: it re-runs both
+  // fetches and touches neither `selected` nor the current page, so an
+  // analyst who tabs away mid-triage comes back to fresher data with their
+  // selection and position intact (see the selection effect below for why
+  // that separation exists).
+  //
+  // Paused during a bulk action: those write, then reload themselves, and a
+  // refresh landing in between would paint the pre-action state back over
+  // the rows the analyst just acted on.
+  useRefreshOnFocus(reloadAll, { paused: bulkBusy || analysing !== null });
+
   // Selection IS reset here, but only on what actually changes the
   // dataset being browsed -- a different client/platform/keyword/search,
   // switching tabs, or a fresh sweep landing (refreshKey). Deliberately
@@ -444,11 +541,13 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [groupId, platform, keywordFilter, search, tab, refreshKey]);
 
-  // Individual/Domain classification: no server-side data for this any
-  // more -- read back whatever HomeView's saveConfig last remembered for
-  // this client (see services/clientKeywords.ts) and match each profile's
-  // own keywords[] against those two sets, case-insensitively.
-  const { individual: individualKw, domain: domainKw } = getClientKeywords(groupId);
+  // Individual/Domain classification, from this client's OWN record in
+  // the database -- its two curated keyword lists, matched against each
+  // profile's keywords[] case-insensitively. This used to read a
+  // localStorage mirror written by whichever browser last saved the
+  // client, so a machine that had never saved it could not classify
+  // anything.
+  const { individual: individualKw, domain: domainKw } = keywordCategories(groupId);
   const individualSet = new Set(individualKw.map((k) => k.toLowerCase()));
   const domainSet = new Set(domainKw.map((k) => k.toLowerCase()));
   const matchesCategory = (p: DiscoveredProfile, cat: "individual" | "domain"): boolean => {
@@ -472,6 +571,8 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
 
   const total =
     tab === "new" ? ageCounts.new
+    // Already scoped to the active Validated sub-tab: the server applied
+    // `validated_age`, so `total` is that half's size, not both halves.
     : tab === "old" ? ageCounts.old
     : (validatedPage?.total || 0);
   const loading = tab === "validated" ? loadingValidated : loadingPending;
@@ -745,7 +846,7 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
       // (an ad-hoc/API-only group_id), which the backend already treats
       // as "no client behind this batch" -- same fallback as a pasted-URL
       // analysis job.
-      const client = listSavedClients().find((c) => c.client_id === groupId);
+      const client = findClient(groupId);
       const res = await discoveryApi.analyseValidated({ group_id: groupId, ids, domain: client?.domain });
       toast.success(`Analysis started: ${res.accepted} profile(s)`);
       onAnalyseStarted(res.job_id);
@@ -793,7 +894,12 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
         {([
           ["new", "🆕 New Profiles", "var(--cyan-bright, var(--cyan))", ageCounts.new],
           ["old", "🕓 Old Profiles", "var(--purple)", ageCounts.old],
-          ["validated", "✅ Validated Profiles", "var(--success, #12B76A)", validatedPage?.total || 0],
+          // The PARENT badge is both halves, not the open one. `validatedPage.total`
+          // is scoped to the active sub-tab now that the split is a server
+          // filter, so using it here read "Validated Profiles 3" while six
+          // profiles were validated -- the tab under-reporting its own size.
+          ["validated", "✅ Validated Profiles", "var(--success, #12B76A)",
+            validatedAgeCounts.new + validatedAgeCounts.old],
         ] as const).map(([t, label, color, count]) => (
           <button
             key={t}
@@ -814,6 +920,76 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
           </button>
         ))}
       </div>
+
+      {/* Logo match filter. Applies to whichever tab is open, and is
+          server-side so it survives paging. Rendered unconditionally --
+          a client with no reference logos simply gets an empty result and
+          the analyst learns the feature exists. */}
+      <div style={{ marginTop: "10px" }}>
+        <button
+          type="button"
+          className={`status-chip ${logoOnly ? "on" : ""}`}
+          onClick={() => setLogoOnly((v) => !v)}
+          title={
+            "Show only profiles whose picture matches one of this client's "
+            + "reference logos. Attach logos to keywords on the Clients page."
+          }
+          style={{
+            display: "inline-flex", alignItems: "center", gap: "8px",
+            padding: "5px 12px", borderRadius: "20px", cursor: "pointer",
+            fontSize: "11px", fontWeight: 600,
+            border: `1px solid ${logoOnly ? "var(--danger, #e95053)" : "var(--border-color)"}`,
+            background: logoOnly ? "var(--bg-surface)" : "transparent",
+            color: logoOnly ? "var(--danger, #e95053)" : "var(--text-muted)",
+          }}
+        >
+          <span>🎯 Logo match only</span>
+        </button>
+      </div>
+
+      {/* Validated's own two halves, split by WHEN IT WAS VALIDATED rather
+          than when it was discovered. Server-filtered (`validated_age`), so
+          unlike New/Old above this one survives pagination and needs no
+          client-side re-slicing. A profile crosses from New Validated to Old
+          Validated 24h after the decision, on its own. */}
+      {tab === "validated" && (
+        <div
+          className="status-summary-row"
+          style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginTop: "10px", paddingLeft: "4px" }}
+        >
+          {([
+            ["new", "🆕 New Validated", "var(--cyan-bright, var(--cyan))", validatedAgeCounts.new],
+            ["old", "🕓 Old Validated", "var(--purple)", validatedAgeCounts.old],
+          ] as const).map(([v, label, color, count]) => (
+            <button
+              key={v}
+              className={`status-chip ${validatedAge === v ? "on" : ""}`}
+              onClick={() => setValidatedAge(v)}
+              title={
+                v === "new"
+                  ? "Validated in the last 24 hours"
+                  : "Validated more than 24 hours ago (and anything validated before this was tracked)"
+              }
+              style={{
+                display: "flex", alignItems: "center", gap: "8px", padding: "5px 12px", borderRadius: "20px",
+                border: `1px solid ${validatedAge === v ? color : "var(--border-color)"}`,
+                background: validatedAge === v ? "var(--bg-surface)" : "transparent",
+                cursor: "pointer", fontSize: "11px", fontWeight: 600,
+                color: validatedAge === v ? color : "var(--text-muted)",
+              }}
+            >
+              <span>{label}</span>
+              <span style={{
+                background: validatedAge === v ? color : "var(--bg-inner)",
+                color: validatedAge === v ? "#fff" : "var(--text-dim)",
+                padding: "2px 7px", borderRadius: "12px", fontSize: "10px", fontWeight: 700,
+              }}>
+                {count}
+              </span>
+            </button>
+          ))}
+        </div>
+      )}
 
       {/* Click a card/row to select it; validate whatever's selected.
           New/Old only -- Validated already has its own selected-scoped

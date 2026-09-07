@@ -84,3 +84,78 @@ async def humanize_interaction(page, scroll: bool = True, moves: int = 3) -> Non
     except Exception:
         # Swallow any Playwright navigation/lifecycle exceptions safely
         pass
+
+
+async def natural_scroll_down(page, distance: int = 800, to_bottom: bool = False) -> None:
+    """Performs natural mouse-wheel scrolling downwards in discrete, human-like ticks.
+
+    Rather than jumping the page instantly with `window.scrollTo(0, document.body.scrollHeight)`,
+    which emits synthetic untrusted events with 0 duration, this dispatches real Playwright
+    CDP wheel events (`Input.dispatchMouseEvent`) with subtle velocity variations and
+    inter-tick pauses. This matches real human finger scrolling on a mouse wheel or trackpad,
+    avoiding anti-bot behavioral detection heuristics on Meta (Facebook/Instagram) and X.
+    """
+    if not page:
+        return
+    try:
+        if hasattr(page, "is_closed") and page.is_closed():
+            return
+    except Exception:
+        pass
+
+    try:
+        target_distance = distance
+        if to_bottom:
+            # Determine current scroll position vs total scrollable height
+            try:
+                info = await page.evaluate(
+                    """() => ({
+                        scrollY: window.scrollY || window.pageYOffset || 0,
+                        scrollHeight: document.documentElement.scrollHeight || document.body.scrollHeight || 0,
+                        innerHeight: window.innerHeight || 800
+                    })"""
+                )
+                if isinstance(info, dict):
+                    remaining = (info.get("scrollHeight") or 0) - ((info.get("scrollY") or 0) + (info.get("innerHeight") or 800))
+                    if remaining > 0:
+                        target_distance = max(distance, remaining + random.randint(150, 350))
+            except Exception:
+                pass
+
+        # Split total scroll into realistic wheel chunks (~60-120px each)
+        steps = max(4, int(target_distance / random.randint(70, 110)))
+        chunk_base = target_distance / steps
+
+        # Position mouse cursor plausibly inside viewport if mouse object exists
+        if hasattr(page, "mouse") and hasattr(page.mouse, "move"):
+            try:
+                curr_x = random.randint(350, 750)
+                curr_y = random.randint(300, 600)
+                await page.mouse.move(curr_x, curr_y)
+            except Exception:
+                pass
+
+        if hasattr(page, "mouse") and hasattr(page.mouse, "wheel"):
+            for _ in range(steps):
+                jitter = random.uniform(-12, 12)
+                dy = max(10.0, chunk_base + jitter)
+                await page.mouse.wheel(0, dy)
+                # Human finger wheel tick delay: 15-45ms
+                await asyncio.sleep(random.uniform(0.015, 0.045))
+        else:
+            # Fallback to smooth scrollBy if page has no mouse controller
+            await page.evaluate(f"window.scrollBy({{ top: {target_distance}, behavior: 'smooth' }})")
+
+        # Brief settle time after scrolling completes
+        await asyncio.sleep(random.uniform(0.12, 0.28))
+
+    except Exception:
+        # Ultimate fallback
+        try:
+            if to_bottom:
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            else:
+                await page.evaluate(f"window.scrollBy(0, {distance})")
+        except Exception:
+            pass
+

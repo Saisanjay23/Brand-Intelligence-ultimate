@@ -36,6 +36,7 @@ export interface AnalysisItemData {
   risk_score?: number;
   priority?: string;
   profile_image_url?: string;
+  avatar_sha?: string;
   verified?: boolean | null;
   comments?: string;
   has_screenshot?: boolean;

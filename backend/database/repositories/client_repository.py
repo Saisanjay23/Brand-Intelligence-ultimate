@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from backend.shared.errors import NotFoundError
+from backend.shared.errors import ConflictError, NotFoundError
 from backend.database.connection import db
 from backend.shared import keywords as _keywords
 
@@ -94,20 +94,26 @@ def _to_out(doc: dict) -> dict:
     }
 
 
-async def upsert(
-    client_id: str, name: str, domain: str = "",
-    name_keywords: Optional[list[str]] = None, domain_keywords: Optional[list[str]] = None,
-    platform_limits_individual: Optional[dict[str, int]] = None,
-    platform_limits_domain: Optional[dict[str, int]] = None,
-    platform_tab_limits: Optional[dict[str, dict[str, object]]] = None,
-    cron: Optional[str] = None,
-    keyword_groups: Optional[dict] = None,
+def _config_fields(
+    name: str, domain: str,
+    name_keywords: Optional[list[str]], domain_keywords: Optional[list[str]],
+    platform_limits_individual: Optional[dict[str, int]],
+    platform_limits_domain: Optional[dict[str, int]],
+    platform_tab_limits: Optional[dict[str, dict[str, object]]],
+    cron: Optional[str],
+    keyword_groups: Optional[dict],
 ) -> dict:
-    """`cron` is optional, a client with keywords but no cron only ever
-    gets swept when `POST /discovery` is called for it explicitly; setting
-    cron additionally schedules an automatic recurring sweep (see
-    sessions/manager.py / services/scheduler_service.py)."""
-    now = datetime.now(timezone.utc)
+    """The stored shape of one client's own configuration.
+
+    Shared by `create` and `upsert` so the two can never normalise a
+    client's keywords differently -- the whole point of keeping this in one
+    place is that a client created through one path and edited through the
+    other ends up with identical structure.
+
+    Nothing here reads or merges any OTHER client's document: every value
+    comes from this call's arguments alone, keyed under this client's own
+    `_id` by the callers below.
+    """
     # `keyword_groups` is authoritative when supplied: the flat parent
     # lists are DERIVED from it rather than trusted from the request, so
     # the two physically cannot drift apart no matter what a caller sends.
@@ -124,18 +130,92 @@ async def upsert(
         name_kw = name_keywords or []
         domain_kw = domain_keywords or []
         groups = _keywords.groups_from_flat(name_kw, domain_kw)
+    return {
+        "name": name, "domain": domain,
+        "name_keywords": name_kw, "domain_keywords": domain_kw,
+        "keyword_groups": groups,
+        "platform_limits_individual": platform_limits_individual or {},
+        "platform_limits_domain": platform_limits_domain or {},
+        "platform_tab_limits": platform_tab_limits or {},
+        "cron": cron,
+    }
+
+
+async def create(
+    client_id: str, name: str, domain: str = "",
+    name_keywords: Optional[list[str]] = None, domain_keywords: Optional[list[str]] = None,
+    platform_limits_individual: Optional[dict[str, int]] = None,
+    platform_limits_domain: Optional[dict[str, int]] = None,
+    platform_tab_limits: Optional[dict[str, dict[str, object]]] = None,
+    cron: Optional[str] = None,
+    keyword_groups: Optional[dict] = None,
+) -> dict:
+    """Create a NEW client, refusing to touch an existing one.
+
+    WHY THIS EXISTS SEPARATELY FROM `upsert`: `upsert` keys on `_id`, so
+    saving a brand-new client under an org id that is already taken did not
+    fail -- it silently overwrote that client's keywords, caps and cron with
+    the new one's. Two different customers entered under one org id became
+    one document, and the first one's configuration was simply gone, with
+    the UI reporting a successful save.
+
+    `insert_one` against the unique `_id` index is what makes this safe
+    under concurrency: two simultaneous creates of the same id cannot both
+    win, because the second gets DuplicateKeyError from Mongo itself rather
+    than from a check-then-write that another request can slip between.
+    """
+    from pymongo.errors import DuplicateKeyError
+
+    now = datetime.now(timezone.utc)
+    doc = {
+        "_id": client_id,
+        "created_at": now,
+        # epoch-ms at insert time: monotonically increasing, so a new client
+        # always sorts at the END of the rotation/list order by default.
+        "order": int(now.timestamp() * 1000),
+        **_config_fields(
+            name, domain, name_keywords, domain_keywords,
+            platform_limits_individual, platform_limits_domain,
+            platform_tab_limits, cron, keyword_groups,
+        ),
+    }
+    try:
+        await db()[CLIENTS].insert_one(doc)
+    except DuplicateKeyError:
+        raise ConflictError(
+            f"client id {client_id!r} is already taken -- pick a different org id, "
+            "or open that client and edit it instead"
+        )
+    return _to_out(doc)
+
+
+async def upsert(
+    client_id: str, name: str, domain: str = "",
+    name_keywords: Optional[list[str]] = None, domain_keywords: Optional[list[str]] = None,
+    platform_limits_individual: Optional[dict[str, int]] = None,
+    platform_limits_domain: Optional[dict[str, int]] = None,
+    platform_tab_limits: Optional[dict[str, dict[str, object]]] = None,
+    cron: Optional[str] = None,
+    keyword_groups: Optional[dict] = None,
+) -> dict:
+    """`cron` is optional, a client with keywords but no cron only ever
+    gets swept when `POST /discovery` is called for it explicitly; setting
+    cron additionally schedules an automatic recurring sweep (see
+    sessions/manager.py / services/scheduler_service.py).
+
+    Creates the client when it does not exist. For the "the analyst is
+    adding a NEW client" case use `create` instead, which refuses to
+    overwrite one that is already there -- see its docstring.
+    """
+    now = datetime.now(timezone.utc)
     await db()[CLIENTS].update_one(
         {"_id": client_id},
         {
-            "$set": {
-                "name": name, "domain": domain,
-                "name_keywords": name_kw, "domain_keywords": domain_kw,
-                "keyword_groups": groups,
-                "platform_limits_individual": platform_limits_individual or {},
-                "platform_limits_domain": platform_limits_domain or {},
-                "platform_tab_limits": platform_tab_limits or {},
-                "cron": cron,
-            },
+            "$set": _config_fields(
+                name, domain, name_keywords, domain_keywords,
+                platform_limits_individual, platform_limits_domain,
+                platform_tab_limits, cron, keyword_groups,
+            ),
             # legacy pre-split field, if any, is superseded the moment this
             # client is saved through the current form, _to_out's own
             # fallback only ever needs to cover a document nobody has

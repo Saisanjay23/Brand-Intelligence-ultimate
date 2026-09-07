@@ -68,10 +68,11 @@ from urllib.parse import quote, urlparse
 
 from backend.shared.models.row import Row
 from backend.platforms.scan_options import captures_screenshot
+from backend.stealth.mouse_movement import humanize_interaction, natural_scroll_down
 from backend.shared.text import (MONTHS, name_score,
                                    normalized_host, parse_count,
                                    parse_normalized_url)
-from backend.shared.avatars import looks_like_placeholder
+from backend.shared.avatars import hd_picture_url, looks_like_placeholder
 from backend.platforms.instagram.discovery_engine import (ABOUT_PANEL_APPID,
                                                            MOBILE_UA,
                                                            PROFILE_ENDPOINTS,
@@ -188,6 +189,11 @@ class Scraper:
     async def check_session(self) -> bool:
         """Is this cookie set still logged in and unchallenged?"""
         return await self.session.check_session()
+
+    async def sync_cookies(self) -> None:
+        """Persists the live context cookie jar mid-session."""
+        if hasattr(self.session, "sync_cookies"):
+            await self.session.sync_cookies()
 
     # ─────────────────────────── direct API call ───────────────────────── #
 
@@ -417,6 +423,7 @@ class Scraper:
                     wait_until="domcontentloaded",
                     timeout=self.a.timeout * 1000,
                 )
+                await humanize_interaction(page, scroll=False, moves=1)
                 await page.wait_for_timeout(1500)
                 iso = await page.evaluate(self.JS_POST_TIME)
                 # the element's own datetime attribute is already a UTC ISO
@@ -519,6 +526,7 @@ class Scraper:
                 f"https://www.instagram.com/{quote(username)}/",
                 wait_until="domcontentloaded", timeout=self.a.timeout * 1000,
             )
+            await humanize_interaction(page, scroll=False, moves=2)
             # The Options button is NOT on the page at domcontentloaded --
             # measured live, it first exists somewhere between 0 and 3
             # seconds in. Clicking without this wait is why the panel
@@ -934,8 +942,8 @@ class Scraper:
 
         avatar = dom.get("avatar") or ""
         if avatar:
-            row.profile_pic_url = avatar
-            row.has_custom_pic = not looks_like_placeholder("instagram", avatar)
+            row.profile_pic_url = hd_picture_url(avatar)
+            row.has_custom_pic = not looks_like_placeholder("instagram", row.profile_pic_url)
             row.mark("logo", "dom-header")
 
         if dom.get("verified"):

@@ -53,9 +53,6 @@ class LoginIn(BaseModel):
     identifier: str = ""
 
 
-class ProxyIn(BaseModel):
-    proxy: Optional[dict] = None
-
 
 class TelegramLoginStart(BaseModel):
     api_id: int
@@ -126,33 +123,6 @@ async def update_session(platform_id: str, session_id: str, body: SessionUpdateI
 @router.post("/{platform_id}/login", response_model=LoginState)
 async def login(platform_id: str, body: LoginIn) -> dict:
     return await sessions_engine.launch_login(platform_id, body.timeout_s, body.identifier)
-
-
-@router.put("/{platform_id}/{session_id}/proxy", response_model=SessionPool)
-async def set_proxy(platform_id: str, session_id: str, body: ProxyIn) -> dict:
-    return await sessions_engine.set_proxy(platform_id, session_id, body.proxy)
-
-
-@router.post("/proxy/test", summary="Test a proxy before assigning it")
-async def test_proxy(body: ProxyIn) -> dict:
-    """Launch a throwaway browser through this proxy and report what an
-    origin server would actually see.
-
-    Not bound to a platform or a session on purpose -- the point is to check
-    a proxy BEFORE committing it to one. Answers the two questions that a
-    saved-and-forgotten proxy silently gets wrong:
-
-      * is traffic really leaving through it (a Chromium SOCKS fallback
-        sends it out on the host's own IP while still looking configured), and
-      * is the exit a datacenter range, which is the loudest network-layer
-        signal there is regardless of how clean the browser looks.
-
-    Slow by API standards (it starts a real browser, twice, to compare the
-    proxied address against the direct one) -- a few seconds is expected.
-    """
-    from backend.stealth.proxy import probe_proxy
-
-    return await probe_proxy(body.proxy)
 
 
 @router.delete("/{platform_id}/{session_id}", response_model=SessionPool)

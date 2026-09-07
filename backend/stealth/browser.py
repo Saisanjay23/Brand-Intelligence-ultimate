@@ -66,7 +66,7 @@ from backend.stealth.fingerprint import (
     get_identity,
 )
 from backend.stealth.headers import build_extra_headers
-from backend.stealth.mouse_movement import humanize_interaction
+from backend.stealth.mouse_movement import humanize_interaction, natural_scroll_down
 from backend.stealth.navigator_spoofing import build_init_js
 from backend.stealth.proxy import build_proxy_config
 from backend.stealth.timezone import resolve_timezone_id
@@ -238,6 +238,21 @@ class Session:
 
         await route.continue_()
 
+    async def sync_cookies(self) -> None:
+        """Persists the live context cookie jar mid-session.
+
+        Saves updated rotation tokens (e.g. Meta fr/xs/datr or Instagram sessionid/csrftoken)
+        so that interruptions, long sweeps, or unexpected aborts don't leave MongoDB with
+        stale superseded tokens.
+        """
+        if self.on_cookies is not None and self.ctx is not None:
+            try:
+                cookies = await self.ctx.cookies()
+                if cookies:
+                    await self.on_cookies(cookies)
+            except Exception as e:
+                log.warning(f"could not persist refreshed cookies: {type(e).__name__}: {e}")
+
     async def stop(self):
         """Closes the context and browser.
 
@@ -261,11 +276,7 @@ class Session:
         Best-effort throughout -- a failed save must never stop a browser
         from closing, or the next run inherits a leaked process.
         """
-        if self.on_cookies is not None and self.ctx is not None:
-            try:
-                await self.on_cookies(await self.ctx.cookies())
-            except Exception as e:
-                log.warning(f"could not persist refreshed cookies: {type(e).__name__}: {e}")
+        await self.sync_cookies()
 
         for obj, meth in (
             (self.ctx, "close"),
@@ -306,6 +317,10 @@ class Session:
     async def interact(self, page, scroll: bool = True, moves: int = 3) -> None:
         """Executes passive human pointer motion and micro-scrolling on a page."""
         await humanize_interaction(page, scroll=scroll, moves=moves)
+
+    async def natural_scroll(self, page, distance: int = 800, to_bottom: bool = False) -> None:
+        """Dispatches natural mouse wheel scrolling on the page."""
+        await natural_scroll_down(page, distance=distance, to_bottom=to_bottom)
 
     async def wait_for_visible_content(
         self, page, min_chars: int = 200, timeout_ms: int = 4000, poll_ms: int = 250,

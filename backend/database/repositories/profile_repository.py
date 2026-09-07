@@ -51,7 +51,20 @@ PHASE_ANALYSIS = "analysis"
 # populate, whichever ran most recently and actually had a value.
 DISCOVERY_FIELDS = (
     "entity_id", "username", "display_name", "entity_type",
-    "discovery_source", "profile_image_url", "has_logo", "verified", "name_score",
+    # `profile_image_url` is the CDN link the platform handed us, and it
+    # EXPIRES (fbcdn signs it, hours not days). `avatar_sha` is the digest of
+    # the bytes we pulled down and kept, which does not -- see
+    # repositories/avatar_repository.py. The URL is still stored: it is what
+    # a re-fetch would use while the signature is alive, and what a card
+    # falls back to before the bytes have landed.
+    "discovery_source", "profile_image_url", "avatar_sha", "has_logo", "verified",
+    # Perceptual fingerprints of the cached avatar, and how close it came to
+    # one of the client's reference logos. `logo_match` is NOT here on
+    # purpose -- that one is the analyst's own call (see scoring.
+    # resolve_match), and nothing automated may overwrite it.
+    "avatar_phash", "avatar_dhash", "avatar_embedding",
+    "logo_similarity", "logo_ref_id", "logo_match_tier",
+    "name_score",
     "name_exact_run", "followers", "friends", "location", "bio", "created_at",
 )
 
@@ -312,6 +325,31 @@ def _age_clause(age: str) -> dict:
     ]}
 
 
+def _validated_age_clause(age: str) -> dict:
+    """Splits VALIDATED profiles by how recently the analyst validated them,
+    on the same 24h boundary the discovery New/Old split uses.
+
+    Distinct from `_age_clause`, which reads `first_seen` -- when the profile
+    was FOUND. A profile discovered in March and validated this morning is
+    old by discovery and new by decision, and this tab is about the decision.
+
+    "Old" also swallows a missing `validated_at`, which is what every profile
+    validated before this field existed has. That is the deliberate choice:
+    those decisions are by definition not recent, and the alternative --
+    treating an absent timestamp as brand new -- would dump the entire
+    historical backlog into the New tab on the day this ships. Same
+    convention as `_age_clause`.
+    """
+    cutoff = _new_cutoff()
+    if age == "new":
+        return {"validated_at": {"$gte": cutoff}}
+    return {"$or": [
+        {"validated_at": {"$lt": cutoff}},
+        {"validated_at": None},
+        {"validated_at": {"$exists": False}},
+    ]}
+
+
 def _without(query: dict, field: str) -> dict:
     """`query` with every constraint on `field` removed, whether it sits at
     the top level or inside `$and`.
@@ -524,6 +562,112 @@ async def save(
         return False
 
 
+async def set_avatar_sha(
+    client_id: str, platform: str, sha: str, *, url: str, entity_id: str = "",
+) -> bool:
+    """Attach a cached picture's digest to one profile. True when a row was
+    matched and changed.
+
+    Matched by the SAME identity rules `save` uses (platform id first, URL
+    as the fallback, `urls` for a profile seen at more than one address),
+    because this runs after the sweep that saved the row and has to find the
+    same document that sweep wrote -- a profile whose canonical `url` was
+    rewritten between the two would otherwise quietly miss.
+
+    Deliberately a narrow single-field write rather than a `save()` call:
+    it must not touch `last_seen`, must not re-run the status/phase logic,
+    and must never be able to blank a field just because this caller did not
+    have it. Caching a picture is not a rediscovery of the profile.
+    """
+    if not sha or not url:
+        return False
+    eid = (entity_id or "").strip()
+    keys: list[dict] = []
+    if eid:
+        keys.append({"entity_id": eid})
+    keys.append({"url": url})
+    keys.append({"urls": url})
+    res = await db()[PROFILES].update_one(
+        {"client_id": client_id, "platform": platform, "$or": keys},
+        {"$set": {"avatar_sha": sha}},
+    )
+    return res.matched_count > 0
+
+
+async def set_logo_match(
+    client_id: str, platform: str, fields: dict, *, url: str, entity_id: str = "",
+) -> bool:
+    """Record how closely one profile's avatar matched a reference logo.
+
+    Matched by the SAME identity rules `save` uses, because this runs after
+    the sweep that saved the row and has to find the document that sweep
+    wrote.
+
+    A narrow single-field write on purpose: it must not touch `last_seen`,
+    must not re-run the status/phase logic, and above all must never write
+    `logo_match`, `risk_score` or `priority`. Those belong to the analyst
+    and to the existing rubric respectively -- this feature ranks and
+    filters, it does not re-score anything that already exists.
+    """
+    safe = {k: v for k, v in (fields or {}).items()
+            if k in ("logo_similarity", "logo_ref_id", "logo_match_tier")}
+    if not safe or not url:
+        return False
+    eid = (entity_id or "").strip()
+    keys: list[dict] = []
+    if eid:
+        keys.append({"entity_id": eid})
+    keys.append({"url": url})
+    keys.append({"urls": url})
+    res = await db()[PROFILES].update_one(
+        {"client_id": client_id, "platform": platform, "$or": keys},
+        {"$set": safe},
+    )
+    return res.matched_count > 0
+
+
+async def set_avatar_fingerprint(
+    client_id: str, platform: str, phash: str, dhash: str, *, url: str,
+    entity_id: str = "", embedding: Optional[list] = None,
+) -> bool:
+    """Store the cached avatar's perceptual hashes. Same narrow-write
+    reasoning as `set_logo_match`; kept separate so an avatar can be
+    fingerprinted for the shared-image signal even when the client has no
+    reference logos configured at all."""
+    if not (phash and dhash and url):
+        return False
+    eid = (entity_id or "").strip()
+    keys: list[dict] = []
+    if eid:
+        keys.append({"entity_id": eid})
+    keys.append({"url": url})
+    keys.append({"urls": url})
+    res = await db()[PROFILES].update_one(
+        {"client_id": client_id, "platform": platform, "$or": keys},
+        {"$set": {"avatar_phash": phash, "avatar_dhash": dhash,
+                  **({"avatar_embedding": embedding} if embedding else {})}},
+    )
+    return res.matched_count > 0
+
+
+async def existing_avatar_shas(client_id: str, platform: str, urls: list[str]) -> set[str]:
+    """Returns the subset of URLs from `urls` that already have a non-empty
+    `avatar_sha` stored in this client's profile records. Used by avatar_cache
+    to skip re-downloading image bytes on repeat sweeps."""
+    if not urls or not client_id or not platform:
+        return set()
+    cur = db()[PROFILES].find(
+        {
+            "client_id": client_id,
+            "platform": platform,
+            "url": {"$in": urls},
+            "avatar_sha": {"$exists": True, "$ne": ""},
+        },
+        {"url": 1},
+    )
+    return {doc["url"] async for doc in cur if doc.get("url")}
+
+
 async def save_many(
     client_id: str, platform: str, phase: str, items: list[dict],
 ) -> tuple[int, int]:
@@ -587,7 +731,8 @@ def _build_query(
     match_level: Optional[str] = None, keyword_match_type: Optional[str] = None,
     search: Optional[str] = None, client_keywords: Optional[dict] = None,
     published: Optional[bool] = None, data_quality: Optional[str] = None,
-    age: Optional[str] = None,
+    age: Optional[str] = None, validated_age: Optional[str] = None,
+    logo_matched: bool = False,
 ) -> dict[str, Any]:
     """The filter `find()` queries with, factored out so `delete_matching()`
     (the "Delete Platform Data" button) can delete EXACTLY the set of
@@ -687,6 +832,14 @@ def _build_query(
         clauses.append(incomplete if data_quality == "incomplete" else {"$nor": [incomplete]})
     if age in ("new", "old"):
         clauses.append(_age_clause(age))
+    if validated_age in ("new", "old"):
+        clauses.append(_validated_age_clause(validated_age))
+    if logo_matched:
+        # Only profiles whose cached avatar matched one of the client's
+        # reference logos. `logo_similarity` is written solely by
+        # services/logo_match.py and only when a match cleared the
+        # threshold, so its presence IS the filter.
+        clauses.append({"logo_similarity": {"$exists": True, "$ne": None}})
     if search and search.strip():
         rx = {"$regex": re.escape(search.strip()), "$options": "i"}
         clauses.append({"$or": [{"display_name": rx}, {"username": rx}, {"url": rx}]})
@@ -727,7 +880,8 @@ async def find(
     match_level: Optional[str] = None, keyword_match_type: Optional[str] = None,
     search: Optional[str] = None, client_keywords: Optional[dict] = None,
     published: Optional[bool] = None, data_quality: Optional[str] = None,
-    age: Optional[str] = None,
+    age: Optional[str] = None, validated_age: Optional[str] = None,
+    logo_matched: bool = False,
 ) -> tuple[list[dict], int, dict]:
     """`include_held=False` (the default, used by any caller that doesn't
     explicitly ask otherwise, i.e. the SaaS backend's normal poll) hides a
@@ -748,6 +902,7 @@ async def find(
         keyword=keyword, entity_type=entity_type, priority=priority, match_level=match_level,
         keyword_match_type=keyword_match_type, search=search, client_keywords=client_keywords,
         published=published, data_quality=data_quality, age=age,
+        validated_age=validated_age, logo_matched=logo_matched,
     )
 
     coll = db()[PROFILES]
@@ -775,8 +930,27 @@ async def find(
         # analysis keeps the recency sort, newest finding first is what
         # an analyst reviewing scored results actually wants.
         sort_field, sort_dir = "last_seen", -1
+    # A profile wearing the client's own logo goes to the top -- that is the
+    # whole point of matching it. Everything else keeps the exact order
+    # chosen above.
+    #
+    # INERT UNTIL SOMEONE UPLOADS A LOGO. `logo_similarity` is only ever
+    # written by a successful match, so for a client with no reference logos
+    # every row is missing it, Mongo sorts them all equal, and this
+    # collapses to precisely the single-key sort it always was.
+    #
+    # Descending puts a missing value LAST, which is what keeps unmatched
+    # profiles below matched ones instead of above them.
+    #
+    # The rejected view is excluded on purpose: its ordering exists so the
+    # profile an analyst JUST rejected is at the top, and floating an old
+    # logo match over that would defeat the one thing that view is for.
+    sort_spec = [(sort_field, sort_dir)]
+    if not (phase == PHASE_DISCOVERY and status == "rejected"):
+        sort_spec = [("logo_similarity", -1), (sort_field, sort_dir)]
+
     rows = []
-    async for doc in coll.find(q).sort(sort_field, sort_dir).skip(offset).limit(limit):
+    async for doc in coll.find(q).sort(sort_spec).skip(offset).limit(limit):
         doc["id"] = str(doc.pop("_id"))
         rows.append(_stamp_utc_for_api(doc))
 
@@ -826,8 +1000,36 @@ async def find(
         if doc.get("_id") in age_counts:
             age_counts[str(doc["_id"])] = doc["count"]
 
+    # Recently-validated vs older-validated totals, for the Validated tab's
+    # own two badges. Counted with the validated_age filter dropped (and the
+    # age filter left alone), so each badge states the real size of its tab
+    # rather than the size of whichever one is open -- exactly what the
+    # age_counts block above does for New/Old.
+    validated_age_counts = {"new": 0, "old": 0}
+    async for doc in coll.aggregate([
+        {"$match": _build_query(
+            client_id, platform=platform, status=status, phase=phase,
+            include_held=include_held, keyword=keyword, entity_type=entity_type,
+            priority=priority, match_level=match_level,
+            keyword_match_type=keyword_match_type, search=search,
+            client_keywords=client_keywords, published=published,
+            data_quality=data_quality, age=age,
+        )},
+        {"$group": {
+            # `$gte` against a missing field is false in Mongo, so a profile
+            # validated before `validated_at` existed lands in "old" -- the
+            # same answer _validated_age_clause gives, which is what keeps
+            # the badge and the list agreeing.
+            "_id": {"$cond": [{"$gte": ["$validated_at", cutoff]}, "new", "old"]},
+            "count": {"$sum": 1},
+        }},
+    ]):
+        if doc.get("_id") in validated_age_counts:
+            validated_age_counts[str(doc["_id"])] = doc["count"]
+
     counts = {"platforms": plat_counts, "statuses": status_counts,
-              "keywords": keyword_counts, "ages": age_counts}
+              "keywords": keyword_counts, "ages": age_counts,
+              "validated_ages": validated_age_counts}
     return rows, total, counts
 
 
@@ -1118,6 +1320,20 @@ async def patch(doc_id: str, fields: dict) -> dict:
         if field_name in safe:
             safe[f"sources.{source_key}"] = "manual"
     safe["last_seen"] = datetime.now(timezone.utc)
+    if safe.get("status") == "approved":
+        # The moment an analyst VALIDATED this profile -- the same reasoning
+        # as `rejected_at` below. `last_seen` cannot stand in: a routine
+        # re-discovery sweep bumps it on any already-seen profile with no
+        # analyst action at all, so a profile validated last month would
+        # keep jumping back into "recently validated" every time a sweep
+        # re-found it. `first_seen` is no good either: that is when the
+        # profile was DISCOVERED, which is what the existing New/Old split
+        # already means and is often long before anyone looked at it.
+        #
+        # Set on every transition INTO approved, including a re-validation
+        # after an undo -- the analyst deciding again is a new decision, and
+        # the New Validated tab is about decisions, not about profiles.
+        safe["validated_at"] = datetime.now(timezone.utc)
     if safe.get("status") == "rejected":
         # a dedicated timestamp for exactly the moment an analyst rejected
         # this profile, last_seen is no good for that ordering since a

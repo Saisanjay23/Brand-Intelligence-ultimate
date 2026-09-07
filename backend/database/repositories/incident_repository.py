@@ -60,5 +60,26 @@ async def delete_for_client(client_id: str) -> int:
     return res.deleted_count
 
 
+async def delete_incident(incident_id: str) -> bool:
+    """Delete / dismiss a specific incident by ObjectId or string id."""
+    from bson import ObjectId
+    from bson.errors import InvalidId
+
+    try:
+        oid = ObjectId(incident_id)
+        res = await db()[INCIDENTS].delete_one({"_id": oid})
+        return res.deleted_count > 0
+    except (InvalidId, TypeError):
+        res = await db()[INCIDENTS].delete_one({"_id": incident_id})
+        return res.deleted_count > 0
+
+
+async def clear_all() -> int:
+    """Clear all stored incidents."""
+    res = await db()[INCIDENTS].delete_many({})
+    return res.deleted_count
+
+
 async def ensure_indexes() -> None:
     await db()[INCIDENTS].create_index("ts", expireAfterSeconds=RETENTION_DAYS * 86400, name="ttl_ts")
+

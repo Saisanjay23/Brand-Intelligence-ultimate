@@ -141,7 +141,11 @@ PROFILE_ENDPOINTS = (
 # hold on its own -- Instagram rotated the asset, so checking only the old
 # id silently stopped detecting anything and every account with no picture
 # was recorded as having a real one.
-from backend.shared.avatars import looks_like_placeholder
+from backend.shared.avatars import (
+    extract_instagram_hd_avatar,
+    hd_picture_url,
+    looks_like_placeholder,
+)
 
 
 @dataclass
@@ -278,7 +282,7 @@ def user_from_node(node: dict) -> Optional[InstagramUser]:
         followers=_count(node, "edge_followed_by", "follower_count"),
         following=_count(node, "edge_follow", "following_count"),
         posts=_count(node, "edge_owner_to_timeline_media", "media_count"),
-        avatar=(node.get("profile_pic_url_hd") or node.get("profile_pic_url") or ""),
+        avatar=extract_instagram_hd_avatar(node),
         biography=(node.get("biography") or "").strip(),
         verified=bool(node.get("is_verified")),
         private=bool(node.get("is_private")),
@@ -570,7 +574,7 @@ async def web_search_users(ctx, keyword: str, timeout_s: int = 45) -> list[Insta
             entity_id=str(u.get("pk") or u.get("id") or ""),
             username=username,
             full_name=(u.get("full_name") or "").strip(),
-            avatar=(u.get("profile_pic_url") or "").strip(),
+            avatar=extract_instagram_hd_avatar(u),
             verified=bool(u.get("is_verified")),
             private=bool(u.get("is_private")),
         ))

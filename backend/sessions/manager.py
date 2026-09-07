@@ -102,6 +102,12 @@ def pool_summary_of(items: list[dict], now: float) -> dict:
     }
 
 
+async def pool_summary(platform_id: str) -> dict:
+    items = await sessions_db.list_pool(platform_id)
+    return pool_summary_of(items, _now())
+
+
+
 def _get_platform(platform_id: str):
     from backend.platforms import registry
 
@@ -584,6 +590,17 @@ async def mark_session_failed(
                 "fix": "Re-export cookies or re-authenticate this account under Sessions.",
                 "ts": datetime.now(timezone.utc),
             })
+            from backend.services import email_service
+            asyncio.create_task(
+                email_service.send_session_failure_alert(
+                    platform=platform_id,
+                    identifier=identifier,
+                    session_id=session_id,
+                    reason=reason,
+                    detail=detail,
+                )
+            )
+
 
 
 async def mark_session_ok(platform_id: str, session_id: str) -> None:
@@ -813,84 +830,6 @@ async def update_session_credentials(platform_id: str, session_id: str, blob: st
     return await status(platform_id)
 
 
-# Playwright's own accepted proxy schemes. See stealth/proxy.py::
-# build_proxy_config, which passes `server` straight through to Playwright's
-# context-launch option unvalidated, this is the one place that stands
-# between a malformed string and a browser launch failing three steps into
-# a job, instead of at the moment the proxy is actually configured.
-_ALLOWED_PROXY_SCHEMES = ("http", "https", "socks4", "socks5", "socks5h")
-
-
-def _validate_proxy(proxy: dict) -> dict:
-    """Rejects anything Playwright would reject (or silently misuse), and
-    strips the result down to exactly the keys `build_proxy_config` reads,
-    so a caller-supplied dict can never smuggle unrelated fields into the
-    stored session document."""
-    server = str(proxy.get("server") or "").strip()
-    if not server:
-        raise ValidationError("proxy.server is required")
-    parsed = urlparse(server)
-    if parsed.scheme not in _ALLOWED_PROXY_SCHEMES:
-        raise ValidationError(
-            f"proxy.server must start with one of {'/'.join(s + '://' for s in _ALLOWED_PROXY_SCHEMES)} -- got {server!r}"
-        )
-    if not parsed.hostname:
-        raise ValidationError(f"proxy.server has no host: {server!r}")
-    if not parsed.port:
-        raise ValidationError(f"proxy.server has no port: {server!r}")
-
-    out: dict = {"server": server}
-    if username := str(proxy.get("username") or "").strip():
-        out["username"] = username
-    if password := str(proxy.get("password") or "").strip():
-        out["password"] = password
-
-    # Refused rather than warned about, because this combination fails
-    # DANGEROUSLY: Chromium has no SOCKS username/password auth, so it drops
-    # the credentials, the proxy refuses, and the browser silently falls
-    # back to a DIRECT connection. The session would report healthy and be
-    # proxied in the UI while every request left on the host's real IP --
-    # the exact opposite of what assigning a proxy is for. Storing it would
-    # be storing a false sense of safety.
-    from backend.stealth.proxy import socks_auth_warning
-
-    if warn := socks_auth_warning(out):
-        raise ValidationError(warn)
-    if tz := str(proxy.get("timezone_id") or "").strip():
-        # not validated against the IANA database here, resolve_timezone_id
-        # (stealth/timezone.py) just hands whatever string this is straight
-        # to Playwright's own `timezone_id` context option, which will
-        # itself reject a bogus zone at browser-launch time; duplicating
-        # that whole database here isn't worth it for a value an analyst
-        # typed once and will notice is wrong the first time a session runs.
-        out["timezone_id"] = tz
-    return out
-
-
-async def set_proxy(platform_id: str, session_id: str, proxy: Optional[dict]) -> dict:
-    p = _get_platform(platform_id)
-    if proxy and (p.uses_api_key or p.env_keys):
-        # A per-session PROXY is a Playwright context option, it only
-        # means anything for the cookie-authed platforms that actually
-        # launch a browser through sessions/manager.py::session_for_job.
-        # YouTube (api_key) talks to a REST API directly, never a browser;
-        # Telegram (env_keys/MTProto) connects via Telethon, which has its
-        # own separate proxy mechanism this field was never wired to.
-        # Accepting either here would store a proxy that LOOKS configured
-        # in the pool but is silently never read by anything, exactly the
-        # trap this check exists to close.
-        raise ConflictError(
-            f"{platform_id}: has no per-session browser proxy "
-            f"({'API-key' if p.uses_api_key else 'MTProto'} access doesn't route through one)"
-        )
-    item = await sessions_db.get_item(platform_id, session_id)
-    if item is None:
-        raise NotFoundError(f"{platform_id}: session {session_id!r} not in pool")
-    if proxy:
-        await sessions_db.update_item(platform_id, session_id, proxy=_validate_proxy(proxy))
-    else:
-        await sessions_db.unset_proxy(platform_id, session_id)
-    return await status(platform_id)
 
 
 def _clear_env_credentials(platform_id: str) -> None:
@@ -1321,6 +1260,8 @@ async def _monitor_loop() -> None:
     while True:
         try:
             await check_all_once()
+            from backend.services.session_canary_service import check_token_expiries
+            await check_token_expiries()
             if purged := await purge_stale_dead_sessions():
                 log.info(f"session cleanup: purged {purged} stale dead session(s)")
         except Exception as e:

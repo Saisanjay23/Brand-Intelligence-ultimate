@@ -53,6 +53,15 @@ export interface CompletedSweepTelemetry {
   hits_found: number;
   hits_new: number;
   timestamp: string;
+  // How the sweep ENDED, not just how long it took. Shortening a timing knob
+  // makes a sweep faster and makes it give up sooner, and those are
+  // indistinguishable in a duration alone -- these are what tell them apart.
+  complete?: boolean;
+  stopped?: string;
+  // The profile-visit reconciliation phase: the slowest part of a sweep, and
+  // the one that costs the most in detection surface.
+  resolved_visits?: number;
+  resolve_seconds?: number;
 }
 
 export interface PlatformSweepState {
@@ -103,6 +112,18 @@ export interface DiscoveredProfile {
   display_name: string;
   username: string;
   profile_image_url: string;
+  // sha256 of the picture bytes held by the backend. Prefer it over the
+  // URL above, which is signed by the CDN and expires within hours.
+  // Empty until the sweep's background caching has fetched it (and stays
+  // empty if that never succeeded).
+  avatar_sha?: string;
+  // 0-100 resemblance to one of the client's reference logos, absent when
+  // it did not match (or the client uploaded none). A RANKING signal only:
+  // it never sets has_logo and never changes the risk score.
+  logo_similarity?: number | null;
+  logo_ref_id?: string;
+  // "exact" (the identical file re-uploaded) or "phash" (near-identical).
+  logo_match_tier?: string;
   has_logo: boolean | null;
   verified: boolean | null;
   followers: number | null;
@@ -134,6 +155,11 @@ export interface DiscoveredProfilePage {
   // ones regardless of which tab is being viewed.
   counts?: {
     ages?: { new?: number; old?: number };
+    // The same split for VALIDATED rows, on a different clock: how long
+    // ago the analyst validated it, not how long ago it was discovered.
+    // Counted with the `validated_age` filter dropped, so the badge for
+    // the half that is not open is still the real total.
+    validated_ages?: { new?: number; old?: number };
     // Per-keyword totals across the WHOLE filtered set. The dropdown used to
     // tally the rows it happened to have loaded, which with server-side
     // paging would have meant one page -- a keyword only present further in
@@ -153,6 +179,12 @@ export interface ListProfilesQuery {
   // computed in the browser over one capped fetch, which silently hid every
   // pending profile past the cap from both tabs.
   age?: "new" | "old";
+  // "new" = validated within the last 24h, "old" = everything else, INCLUDING
+  // anything validated before the timestamp existed. Splits the Validated tab
+  // by the analyst's decision time rather than by discovery time.
+  validated_age?: "new" | "old";
+  // Only profiles whose picture matched a reference logo.
+  logo_matched?: boolean;
   match_level?: "high" | "medium" | "low";
   entity_type?: string;
   limit?: number;
@@ -205,6 +237,8 @@ export const discoveryApi = {
     if (q.keyword) p.set("keyword", q.keyword);
     if (q.search) p.set("search", q.search);
     if (q.age) p.set("age", q.age);
+    if (q.validated_age) p.set("validated_age", q.validated_age);
+    if (q.logo_matched) p.set("logo_matched", "true");
     if (q.match_level) p.set("match_level", q.match_level);
     if (q.entity_type) p.set("entity_type", q.entity_type);
     if (q.limit) p.set("limit", String(q.limit));

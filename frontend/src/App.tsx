@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Toaster } from "react-hot-toast";
-import { clientsApi } from "./api/clientsApi";
+import toast, { Toaster } from "react-hot-toast";
 import type { Client } from "./api/types";
 import type { ViewPage } from "./components/Header";
 import { AppLayout } from "./layouts/AppLayout";
@@ -9,7 +8,13 @@ import { HomeView } from "./pages/HomeView";
 import { LiveResultsView } from "./pages/LiveResultsView";
 import { useDiscoveryJobPoll } from "./hooks/useDiscoveryJobPoll";
 import { usePlatformState } from "./hooks/usePlatformState";
+import { useRefreshOnFocus } from "./hooks/useRefreshOnFocus";
 import { loadRecentClients, rememberClient, forgetClient, type RecentClient } from "./services/recentClients";
+import {
+  migrateLegacyLocalClients,
+  refresh as refreshDirectory,
+  useClientDirectory,
+} from "./services/clientDirectory";
 
 export default function App() {
   const [page, setPage] = useState<ViewPage>("home");
@@ -38,22 +43,52 @@ export default function App() {
     localStorage.setItem("theme", theme);
   }, [theme]);
 
-  // Client CRUD (create/edit/delete/list) has no backend behind it any
-  // more -- the rebuilt backend only exposes discovery/analysis/sessions,
-  // no /clients. Kept anyway (as the user asked) as the old UI's per-brand
-  // scoping mental model: it renders, and the recent-clients list still
-  // works (that's local/localStorage, see recentClients.ts), but the
-  // "Saved Clients" list from the server will come back empty and any
-  // save/delete will fail with a clear error toast rather than crash --
-  // that's the accepted tradeoff of restoring the old frontend without
-  // also restoring the old client_routes.py/controllers/dto/engine layer.
+  // Clients live in the database (backend/api/clients.py), read through
+  // services/clientDirectory.ts. They were localStorage for a while, after
+  // the old /clients route group was deleted, which meant a client only
+  // existed on the machine that created it.
+  const directory = useClientDirectory();
   const refreshAllClients = useCallback(() => {
-    clientsApi.listClients().then((res) => setAllClients(res.items)).catch(() => {});
+    void refreshDirectory();
   }, []);
 
   useEffect(() => {
-    refreshAllClients();
-  }, [refreshAllClients]);
+    setAllClients(directory.clients);
+  }, [directory.clients]);
+
+  // One-time move of any clients still sitting in this browser's
+  // localStorage into the database, THEN the first load. Ordered, not
+  // parallel: loading first would show an empty directory for as long as
+  // the migration took and invite the analyst to re-create a client that
+  // was about to arrive.
+  useEffect(() => {
+    let cancelled = false;
+    void migrateLegacyLocalClients()
+      .then((moved) => {
+        if (!cancelled && moved > 0) {
+          toast.success(
+            `Moved ${moved} client${moved === 1 ? "" : "s"} from this browser into the database.`,
+          );
+        }
+      })
+      .finally(() => {
+        if (!cancelled) void refreshDirectory();
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Clients are shared server-side now, so this tab's copy of the directory
+  // can go stale the same way a profile list can -- someone creates a client
+  // on another machine and this one never hears about it. Re-read on return.
+  useRefreshOnFocus(refreshAllClients);
+
+  // The database is the only store now, so a failure to reach it is a real
+  // outage rather than something to fall back from silently.
+  useEffect(() => {
+    if (directory.error) setError(`Clients database unreachable: ${directory.error}`);
+  }, [directory.error]);
 
   useEffect(() => {
     const recents = loadRecentClients();

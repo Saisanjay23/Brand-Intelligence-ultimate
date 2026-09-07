@@ -52,89 +52,45 @@ security controls, not tidiness.
 
 from __future__ import annotations
 
-import asyncio
 import json
-from urllib.parse import urlparse
+import re
 
-import aiohttp
-from fastapi import APIRouter, Query, Response
+from fastapi import APIRouter, Path, Query, Response
 
+from backend.database.repositories import avatar_repository as avatars_db
+from backend.shared.imagefetch import ImageFetchError, allowed as _allowed
+from backend.shared.imagefetch import close as _close_fetcher
+from backend.shared.imagefetch import fetch_image
 from backend.shared.logging import get_logger
 
 router = APIRouter(tags=["media"])
 log = get_logger("media")
 
-# Suffix-matched against the parsed hostname, never against the raw string:
-# a substring test would let `notfbcdn.net.attacker.com` through, and a
-# check on the URL text would be fooled by `https://evil.com/?x=.fbcdn.net`.
-# Each entry matches the bare apex too (`fbcdn.net` as well as `*.fbcdn.net`).
-_ALLOWED_HOST_SUFFIXES = (
-    ".fbcdn.net",           # facebook (scontent.*) and instagram (instagram.*)
-    ".cdninstagram.com",    # instagram, when Meta routes it off the shared CDN
-    ".twimg.com",           # twitter/X -- pbs.twimg.com, abs.twimg.com
-    ".ggpht.com",           # youtube channel avatars -- yt3.ggpht.com
-    ".googleusercontent.com",   # youtube's other avatar host
-    ".licdn.com",           # linkedin
-    ".tiktokcdn.com",       # tiktok
-    ".tiktokcdn-us.com",
-)
-
-# Avatars are thumbnails -- the Instagram ones measured here are 5-9 KB, and
-# the largest `profile_pic_url_hd` variant is well under a megabyte. 8 MB is
-# generous headroom that still refuses to let this endpoint be used to pull
-# arbitrarily large files through the server.
-_MAX_BYTES = 8 * 1024 * 1024
-_CHUNK_BYTES = 64 * 1024
-_TIMEOUT = aiohttp.ClientTimeout(total=15, connect=5)
+# The allowlist, size cap and fetch loop all live in shared/imagefetch.py --
+# this route and the durable avatar store (services/avatar_cache.py) use the
+# same one, because a second copy of an SSRF guard is a second place for it
+# to drift.
 
 # A Meta CDN node briefly refusing connections is routine (one of the
 # `*.fna.*` nodes did exactly that while this was being diagnosed), so the
 # browser cache is what keeps a card's picture stable across re-renders and
 # tab switches rather than re-fetching on every paint. Six hours is well
-# inside the signed URL's own lifetime -- Instagram's `oe=` parameter is
-# typically ~3 days out -- so a cached copy never outlives the signature
-# that would let us refresh it.
+# inside the signed URL's own lifetime.
 _CACHE_CONTROL = "public, max-age=21600"
 
-_session: aiohttp.ClientSession | None = None
-_session_lock = asyncio.Lock()
+# The stored copy is addressed by the sha256 of its own bytes, so it can
+# never change under a given URL. That is what makes `immutable` correct
+# here and not merely optimistic: a year is the max-age ceiling browsers
+# honour, and no revalidation is possible or needed.
+_STORED_CACHE_CONTROL = "public, max-age=31536000, immutable"
 
-
-async def _client() -> aiohttp.ClientSession:
-    """One shared session for the process. A per-request session would mean
-    a fresh TLS handshake for every avatar on a 25-card page."""
-    global _session
-    if _session is None or _session.closed:
-        async with _session_lock:
-            if _session is None or _session.closed:
-                _session = aiohttp.ClientSession(timeout=_TIMEOUT)
-    return _session
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 async def close() -> None:
-    """Called from main.py's lifespan shutdown, alongside the Mongo close."""
-    global _session
-    if _session is not None and not _session.closed:
-        await _session.close()
-    _session = None
-
-
-def _allowed(raw: str) -> bool:
-    try:
-        p = urlparse(raw)
-    except ValueError:
-        return False
-    if p.scheme != "https" or not p.hostname:
-        return False
-    # Anything but the default TLS port is a sign of a hand-built URL aimed
-    # at something other than a CDN.
-    try:
-        if p.port not in (None, 443):
-            return False
-    except ValueError:      # malformed port, e.g. "https://host:notaport/"
-        return False
-    host = p.hostname.lower()
-    return any(host == s[1:] or host.endswith(s) for s in _ALLOWED_HOST_SUFFIXES)
+    """Called from main.py's lifespan shutdown. Delegates: the session it
+    closes belongs to shared/imagefetch.py now."""
+    await _close_fetcher()
 
 
 def _err(status: int, detail: str) -> Response:
@@ -151,62 +107,61 @@ def _err(status: int, detail: str) -> Response:
 async def avatar(
     url: str = Query(..., description="Absolute https URL of the image, on an allowlisted CDN host."),
 ) -> Response:
-    """Fetch `url` server-side and return the bytes from this origin."""
+    """Fetch `url` server-side and return the bytes from this origin.
+
+    LIVE, NOT STORED. This is the fallback for a picture we have not cached
+    -- it re-fetches from the CDN on demand, so it works only while that
+    URL's signature is alive. `/media/avatar/{sha}` below is the durable one.
+    """
     if not _allowed(url):
         # 400, not 403: from the browser's side this is a malformed request
-        # for this endpoint. The detail deliberately does not echo the URL
-        # back into the response.
+        # for this endpoint.
         return _err(400, "url host is not an allowlisted image CDN")
-
-    host = urlparse(url).hostname
     try:
-        session = await _client()
-        # No cookies, no referer -- the CDN needs neither (verified against
-        # the live hosts), and sending either would hand a third party more
-        # than the fetch requires.
-        async with session.get(url, allow_redirects=True) as resp:
-            if resp.status != 200:
-                log.warning(f"avatar upstream {resp.status} from {host}")
-                return _err(502, "upstream image fetch failed")
-
-            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-            if not ctype.startswith("image/"):
-                # An allowlisted host answering with non-image content means
-                # the URL pointed at something that is not an avatar.
-                return _err(502, "upstream did not return an image")
-
-            # MUST loop. `resp.content.read(n)` returns up to n bytes -- in
-            # practice whatever is in the first chunk off the socket -- NOT n
-            # bytes. Using it directly served a 1-byte "image" for a 110 KB
-            # Facebook avatar: a 200 with a valid image/jpeg content-type and
-            # a truncated, undecodable body, so the browser fired onerror and
-            # the card fell back to its letter circle exactly as if the fetch
-            # had failed. Small avatars (Instagram's are ~6 KB) happened to
-            # arrive in one chunk and hid the bug completely.
-            chunks: list[bytes] = []
-            total = 0
-            async for chunk in resp.content.iter_chunked(_CHUNK_BYTES):
-                total += len(chunk)
-                if total > _MAX_BYTES:
-                    return _err(502, "upstream image too large")
-                chunks.append(chunk)
-            body = b"".join(chunks)
-            if not body:
-                return _err(502, "upstream returned an empty image")
-    except asyncio.TimeoutError:
-        return _err(504, "upstream image fetch timed out")
-    except aiohttp.ClientError as e:
-        log.warning(f"avatar fetch failed for {host}: {type(e).__name__}")
-        return _err(502, "upstream image fetch failed")
+        img = await fetch_image(url)
+    except ImageFetchError as e:
+        return _err(e.status, e.detail)
 
     return Response(
-        content=body,
-        media_type=ctype,
+        content=img.data,
+        media_type=img.content_type,
         headers={
             "Cache-Control": _CACHE_CONTROL,
             # The whole point of this route. Set explicitly rather than left
             # to the default, because the UI is not always same-origin with
             # this API -- see VITE_API_BASE_URL in frontend/src/api/httpClient.ts.
+            "Cross-Origin-Resource-Policy": "cross-origin",
+        },
+    )
+
+
+@router.get("/media/avatar/{sha}",
+            summary="Serve a profile picture from our own store")
+async def stored_avatar(
+    sha: str = Path(..., description="sha256 of the image bytes, from a profile's `avatar_sha`."),
+) -> Response:
+    """The cached copy: bytes we pulled from the CDN once and kept.
+
+    WHY THIS EXISTS. The CDN URL a profile was discovered with is signed and
+    expires within hours, so a card built on it goes blank overnight -- and
+    it cannot be refreshed, because the signature is the very part that
+    died. This route answers from our own store and keeps answering.
+
+    404 is a normal answer: caching runs behind the sweep and is best-effort,
+    so a very recently discovered profile may not have its bytes yet. The
+    client falls back to the live URL, then to the initial-letter circle.
+    """
+    if not _SHA256.match(sha or ""):
+        return _err(400, "not a sha256 digest")
+    found = await avatars_db.read(sha)
+    if not found:
+        return _err(404, "no stored image for that digest")
+    data, ctype = found
+    return Response(
+        content=data,
+        media_type=ctype,
+        headers={
+            "Cache-Control": _STORED_CACHE_CONTROL,
             "Cross-Origin-Resource-Policy": "cross-origin",
         },
     )

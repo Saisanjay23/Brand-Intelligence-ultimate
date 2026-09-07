@@ -171,6 +171,18 @@ class CompletedSweepTelemetry(BaseModel):
     hits_found: int
     hits_new: int
     timestamp: str
+    complete: bool = Field(
+        True, description="Did this sweep reach one of its real stopping signals "
+                          "(exhausted / end-of-serp), rather than stopping on a cap, "
+                          "a stall or an error?")
+    stopped: str = Field(
+        "", description="Which signal ended it: exhausted | end-of-serp | stalled | "
+                        "cap:results | cap:pages | cap:seconds | error.")
+    resolved_visits: int = Field(
+        0, description="Candidates given a profile-page visit to recover a missing "
+                       "name. The slowest and most detectable part of a sweep.")
+    resolve_seconds: float = Field(
+        0.0, description="Wall-clock seconds that reconciliation phase took.")
 
 
 class DiscoveryJobState(BaseModel):
@@ -218,7 +230,27 @@ class DiscoveredProfile(BaseModel):
     entity_type: str = Field("", description="profile | page | group | channel")
     display_name: str = ""
     username: str = ""
-    profile_image_url: str = ""
+    profile_image_url: str = Field(
+        "", description="The platform's own CDN link. SIGNED AND SHORT-LIVED on "
+                        "Meta's CDNs -- prefer `avatar_sha` when it is set.")
+    avatar_sha: str = Field(
+        "", description="sha256 of this picture's bytes, held in our own store. "
+                        "Fetch at GET /media/avatar/{sha}, which never expires. "
+                        "Empty when the picture has not been cached (yet, or at "
+                        "all -- caching runs behind the sweep and is best-effort).")
+    logo_similarity: Optional[int] = Field(
+        None, description="0-100 resemblance between this profile's picture and one "
+                          "of the client's reference logos. Absent when it did not "
+                          "match, or when the client has uploaded no reference. "
+                          "A RANKING signal -- it never sets `has_logo` and never "
+                          "changes the risk score.")
+    logo_ref_id: str = Field(
+        "", description="Id of the reference logo it matched. Its image is at "
+                        "GET /clients/{client_id}/logos/{id}/image, for showing "
+                        "side by side with the avatar.")
+    logo_match_tier: str = Field(
+        "", description="How it matched: `exact` (byte-identical file re-uploaded) "
+                        "or `phash` (near-identical image -- re-encoded, resized).")
     has_logo: Optional[bool] = None
     verified: Optional[bool] = None
     followers: Optional[int] = None
@@ -253,6 +285,14 @@ class ProfileCounts(BaseModel):
                     "last 24h) and `old`. Counted with the `age` filter itself "
                     "dropped, so both are the true totals.",
     )
+    validated_ages: dict[str, int] = Field(
+        default_factory=dict,
+        description="VALIDATED rows by how recently they were validated: `new` "
+                    "(validated within the last 24h) and `old`. Distinct from "
+                    "`ages`, which splits by when the profile was first "
+                    "discovered. Counted with the `validated_age` filter itself "
+                    "dropped, so both are the true totals.",
+    )
     keywords: dict[str, int] = Field(
         default_factory=dict,
         description="Matching rows per keyword, across the whole filtered set "
@@ -285,6 +325,10 @@ def _to_profile(doc: dict) -> DiscoveredProfile:
         display_name=doc.get("display_name", "") or "",
         username=doc.get("username", "") or "",
         profile_image_url=doc.get("profile_image_url", "") or "",
+        avatar_sha=doc.get("avatar_sha", "") or "",
+        logo_similarity=doc.get("logo_similarity"),
+        logo_ref_id=doc.get("logo_ref_id", "") or "",
+        logo_match_tier=doc.get("logo_match_tier", "") or "",
         has_logo=doc.get("has_logo"),
         verified=doc.get("verified"),
         followers=doc.get("followers"),
@@ -416,6 +460,20 @@ async def list_profiles(
                     "else (a profile with no first_seen counts as old). Applied "
                     "server-side so the split survives pagination.",
     ),
+    validated_age: Optional[Literal["new", "old"]] = Query(
+        None,
+        description="Split by how recently the profile was VALIDATED: `new` = "
+                    "validated within the last 24h, `old` = everything else. "
+                    "A profile validated before this was recorded counts as "
+                    "`old`. Meaningful with `status=validated`; distinct from "
+                    "`age`, which splits by first discovery instead.",
+    ),
+    logo_matched: bool = Query(
+        False,
+        description="Only profiles whose picture matched one of the client's "
+                    "reference logos (see POST /clients/{id}/logos). Off by "
+                    "default; a client with no references never has any.",
+    ),
     search: Optional[str] = Query(None, max_length=200, description="Substring match on name/username/url."),
     limit: int = Query(DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
     offset: int = Query(0, ge=0),
@@ -427,13 +485,16 @@ async def list_profiles(
         status=_TO_DB_STATUS[status_.value] if status_ else None,
         phase=profiles_db.PHASE_DISCOVERY,
         keyword=keyword, search=search, limit=limit, offset=offset,
-        include_held=True, age=age, match_level=match_level,
-        entity_type=entity_type,
+        include_held=True, age=age, validated_age=validated_age,
+        logo_matched=logo_matched,
+        match_level=match_level, entity_type=entity_type,
     )
     return DiscoveredProfilePage(
         items=[_to_profile(d) for d in docs], total=total, limit=limit, offset=offset,
         counts=ProfileCounts(
-            ages=counts.get("ages") or {}, keywords=counts.get("keywords") or {},
+            ages=counts.get("ages") or {},
+            validated_ages=counts.get("validated_ages") or {},
+            keywords=counts.get("keywords") or {},
         ),
     )
 
@@ -571,7 +632,7 @@ async def _validated_docs(group_id: str, platform: Optional[str]) -> list[dict]:
 # has no matching slot for them on Row (see shared/models/row.py) and would
 # have nowhere to go.
 _SEED_FIELDS = (
-    "entity_id", "display_name", "profile_image_url", "has_logo", "verified",
+    "entity_id", "display_name", "profile_image_url", "avatar_sha", "has_logo", "verified",
     "followers", "friends", "location", "bio", "created_at", "name_score",
 )
 

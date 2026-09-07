@@ -99,6 +99,25 @@ class Settings(BaseSettings):
     # Left declared so a .env that already carries it still loads.
     analysis_concurrency: int = 2
     discovery_concurrency: int = 2
+
+    # DISCOVERY TIMING, EXPOSED SO IT CAN BE MEASURED RATHER THAN GUESSED.
+    #
+    # All three are CEILINGS on waiting for a real signal, not fixed sleeps:
+    # a fast response returns immediately and never touches them, so lowering
+    # one does not speed up a healthy sweep at all -- it only truncates a slow
+    # one. That asymmetry is why these defaults match the values the engine
+    # was deliberately raised TO (from 12/6/3) after live measurement: the
+    # thing being bought was not latency, it was not missing real responses.
+    #
+    # They are settings rather than constants so the trade can be re-tested
+    # against real sweeps without a code change. Watch `complete` and
+    # `stopped` on each sweep's telemetry (GET /discovery/jobs/{id} ->
+    # history[]): if lowering these raises the share of sweeps that end
+    # "stalled" instead of "exhausted"/"end-of-serp", the speed was paid for
+    # in results, not won.
+    discovery_settle_sec: float = 20.0      # first results render
+    discovery_page_wait_sec: float = 10.0   # one more results page
+    discovery_patience: int = 5             # empty scrolls before "stalled"
     # 15 min, not 5: live-timed against a genuinely broad keyword ("nasa")
     # on Facebook, People and Pages were STILL finding ~1 new result/sec at
     # the old 300s ceiling, no sign of slowing -- that config was cutting

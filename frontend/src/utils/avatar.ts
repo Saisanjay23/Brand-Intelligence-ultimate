@@ -63,9 +63,23 @@ function matches(host: string, suffixes: string[]): boolean {
   return suffixes.some((s) => host === s.slice(1) || host.endsWith(s));
 }
 
-/** Candidate URLs for this avatar, best first. Empty when there is no picture. */
-export function avatarSources(raw: string | null | undefined): string[] {
-  if (!raw) return [];
+/**
+ * Candidate URLs for this avatar, best first. Empty when there is no picture.
+ *
+ * `sha` is the digest of the bytes the backend already pulled down and kept
+ * (a profile's `avatar_sha`). When it is set it goes FIRST, ahead of the CDN
+ * itself, because it is the only candidate that does not expire: Meta signs
+ * its picture URLs and the signature dies within hours, which is what made a
+ * card look right when it was discovered and blank by the next morning. The
+ * live CDN URL stays in the list behind it, so a profile whose bytes have not
+ * been cached yet -- caching runs behind the sweep -- still shows a picture.
+ */
+export function avatarSources(
+  raw: string | null | undefined,
+  sha?: string | null,
+): string[] {
+  const stored = sha ? [url(`/media/avatar/${sha}`)] : [];
+  if (!raw) return stored;
   // Telegram stores the picture itself rather than a link to one.
   if (raw.startsWith("data:")) return [raw];
 
@@ -75,11 +89,11 @@ export function avatarSources(raw: string | null | undefined): string[] {
   } catch {
     // Not something we can reason about (relative, or malformed) -- hand it
     // to the browser unchanged rather than routing it at the proxy.
-    return [raw];
+    return [...stored, raw];
   }
 
   const proxied = url(`/media/avatar?url=${encodeURIComponent(raw)}`);
-  if (isKnownBlocked(host)) return [proxied];
-  if (matches(host, PROXYABLE_HOST_SUFFIXES)) return [raw, proxied];
-  return [raw];
+  if (isKnownBlocked(host)) return [...stored, proxied];
+  if (matches(host, PROXYABLE_HOST_SUFFIXES)) return [...stored, raw, proxied];
+  return [...stored, raw];
 }

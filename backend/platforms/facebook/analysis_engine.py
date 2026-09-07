@@ -919,6 +919,11 @@ class Scraper:
         to FacebookSession.check_session() above."""
         return await self.session.check_session()
 
+    async def sync_cookies(self) -> None:
+        """Persists the live context cookie jar mid-session."""
+        if hasattr(self.session, "sync_cookies"):
+            await self.session.sync_cookies()
+
     # ─────────────────────────── page scripts ─────────────────────────── #
 
     # Ready when the profile's own payload has landed: the social-context block

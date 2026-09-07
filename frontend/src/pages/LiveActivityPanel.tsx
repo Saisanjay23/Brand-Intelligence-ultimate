@@ -15,16 +15,26 @@
 // - GET /clients
 // - GET/POST /profiles, GET/POST /profiles/retry-queue
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { incidentsApi, type Incident } from "../api/incidentsApi";
-import { clientsApi } from "../api/clientsApi";
+
 import { jobsApi } from "../api/jobsApi";
 import { profilesApi } from "../api/profilesApi";
 import type { Client, Job, JobEvent, PlatformProgress, Profile } from "../api/types";
 import { confirmAction } from "../utils/confirmAction";
 import { download } from "../utils/download";
 import { PlatformIcon } from "../components/PlatformIcon";
-import { schedulerApi, type SchedulerClientStatus } from "../api/schedulerApi";
+import {
+  listClients as directoryClients,
+  refresh as refreshDirectory,
+  useClientDirectory,
+} from "../services/clientDirectory";
+import {
+  getSnapshot,
+  subscribe,
+  unfinishedPlatformsOf,
+  type ScheduleEntry,
+} from "../services/scheduleRunner";
 import {
   ZapIcon,
   DiscoverIcon,
@@ -1162,88 +1172,145 @@ const LA_SELECT_STYLE: React.CSSProperties = {
   outline: "none",
 };
 
-// ══════════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════════════
 // CLIENT COVERAGE
 //
 // Answers the one question no other view can: for THIS client, which
-// platforms finished their last turn and which still owe work? An in-flight
+// platforms finished their last sweep and which still owe work? An in-flight
 // job card shows one run in progress; the Scheduler tab shows one aggregate
 // word per client. Neither can express "Instagram and X are done, Facebook
 // lost its session halfway" -- the most common partial outcome, and the only
 // one that needs following up.
 //
-// Fed by GET /scheduler/status. `last_run_platforms` is written by
-// round_robin_service after every turn from the finished job's own
-// per-platform breakdown; `unfinished_platforms` is the subset a resume turn
-// would re-run. Both are OPTIONAL: a backend older than them omits both, so
-// every read goes through the accessors below rather than the property.
-// ══════════════════════════════════════════════════════════════════════════
+// Fed by THE SCHEDULER'S OWN RECORD (services/scheduleRunner.ts), not a
+// server route. This tab used to poll GET /scheduler/status, written after
+// every turn by a server-side round-robin engine -- and that engine went
+// with the old backend. The rebuilt API has no /scheduler at all, so every
+// poll 404'd, this tab was a permanent "Could not load coverage", and its
+// badge sat at zero however much work was owing. The scheduler now runs in
+// the browser, and its loop records each sweep's own per-platform breakdown
+// as the job reports it: the same data the deleted engine used to persist.
+//
+// SCOPE, therefore: what THIS browser's scheduler has run. A sweep started
+// by hand from the Discovery page, or by someone on another machine, is not
+// in here -- which is why every label below says "scheduled sweep" rather
+// than "sweep".
+// ═════════════════════════════════════════════════════════════════════════
 
+// Only the saved-client half of the list needs polling at all now; the
+// scheduler's own record arrives by subscription.
 const COVERAGE_REFRESH_MS = 6_000;
 
 const OUTCOME_LABEL: Record<string, string> = {
   done: "done",
   partial: "partial",
-  interrupted: "interrupted",
   failed: "failed",
   skipped: "no session",
   running: "running",
-  pending: "pending",
+  // A platform the sweep listed but never got to, because it was cancelled
+  // or stopped first. Not an error, just unswept.
+  pending: "not reached",
 };
 
-const unfinishedOf = (c: SchedulerClientStatus): string[] => c.unfinished_platforms ?? [];
-const outcomesOf = (c: SchedulerClientStatus): Record<string, string> =>
-  c.last_run_platforms ?? {};
+// One row of the list: a scheduler queue entry where there is one, and a
+// saved client that has never been through the queue where there is not.
+interface CoverageRow {
+  client_id: string;
+  name: string;
+  outcomes: Record<string, string>;
+  unfinished: string[];
+  neverRun: boolean;
+  running: boolean;
+  finished_at: number | null;
+  note: string;
+}
+
+function coverageRows(entries: ScheduleEntry[], currentId: string): CoverageRow[] {
+  const rows: CoverageRow[] = entries.map((e) => ({
+    client_id: e.client_id,
+    name: e.name,
+    outcomes: e.platforms ?? {},
+    unfinished: unfinishedPlatformsOf(e),
+    neverRun: Object.keys(e.platforms ?? {}).length === 0,
+    // `currentId` is set only while the run loop is on this client's turn.
+    running: Boolean(currentId) && e.client_id === currentId,
+    finished_at: e.finished_at,
+    note: e.message,
+  }));
+
+  // A saved client that has never been near the queue is the biggest
+  // coverage gap there is, so it is listed rather than quietly left out --
+  // which is exactly what showing only the queue would do.
+  const queued = new Set(rows.map((r) => r.client_id));
+  for (const c of directoryClients()) {
+    if (queued.has(c.client_id)) continue;
+    rows.push({
+      client_id: c.client_id,
+      name: c.name || c.client_id,
+      outcomes: {},
+      unfinished: [],
+      neverRun: true,
+      running: false,
+      finished_at: null,
+      note: "",
+    });
+  }
+  return rows;
+}
+
+// "Open" = not fully covered, either because a platform did not finish on
+// the last scheduled sweep or because there has never been one. Both are
+// work owing; only the wording differs.
+const isOpen = (r: CoverageRow): boolean => r.neverRun || r.unfinished.length > 0;
 
 function ClientCoverage({ onCount }: { onCount: (n: number) => void }) {
-  const [clients, setClients] = useState<SchedulerClientStatus[]>([]);
-  const [loaded, setLoaded] = useState(false);
-  const [err, setErr] = useState("");
+  const state = useSyncExternalStore(subscribe, getSnapshot);
   const [onlyOpen, setOnlyOpen] = useState(false);
 
+  // The scheduler half of this list is a real subscription and updates the
+  // instant a sweep reports in. The never-swept half is not: saved clients
+  // live in localStorage, which emits nothing to subscribe to, so a client
+  // created while this tab is open would otherwise never appear. Hence a
+  // slow tick, purely to re-read them -- `tick` is a `useMemo` dependency
+  // and nothing else.
+  const [tick, setTick] = useState(0);
   useEffect(() => {
-    let alive = true;
-    const pull = async () => {
-      try {
-        const st = await schedulerApi.status();
-        if (!alive) return;
-        setClients(st.clients);
-        setErr("");
-        onCount(st.clients.filter((c) => unfinishedOf(c).length > 0).length);
-      } catch (e) {
-        if (alive) setErr(e instanceof Error ? e.message : String(e));
-      } finally {
-        if (alive) setLoaded(true);
-      }
-    };
-    void pull();
-    const t = setInterval(() => void pull(), COVERAGE_REFRESH_MS);
-    return () => { alive = false; clearInterval(t); };
-  }, [onCount]);
+    const t = setInterval(() => setTick((n) => n + 1), COVERAGE_REFRESH_MS);
+    return () => clearInterval(t);
+  }, []);
 
-  const openCount = clients.filter((c) => unfinishedOf(c).length > 0).length;
-  const shown = onlyOpen ? clients.filter((c) => unfinishedOf(c).length > 0) : clients;
+  const rows = useMemo(
+    () => coverageRows(state.entries, state.currentId),
+    [state.entries, state.currentId, tick],
+  );
+  const openCount = rows.filter(isOpen).length;
 
-  if (!loaded) {
-    return <EmptyState icon={<ClockIcon size={26} color="var(--cyan)" />}
-                       title="Loading coverage…" text="Reading the scheduler's per-client platform record." />;
+  // In an effect, not in render: the badge this feeds is the PARENT's state,
+  // and setting parent state during a child's render is both a React warning
+  // and a re-render loop.
+  useEffect(() => {
+    onCount(openCount);
+  }, [onCount, openCount]);
+
+  if (!rows.length) {
+    return (
+      <EmptyState
+        icon={<DatabaseIcon size={26} color="var(--cyan)" />}
+        title="No clients yet"
+        text="Create a client, then queue it on the Scheduler tab. Coverage is recorded as each scheduled sweep reports in."
+      />
+    );
   }
-  if (err) {
-    return <EmptyState icon={<AlertTriangleIcon size={26} color="var(--danger)" />}
-                       title="Could not load coverage" text={err} />;
-  }
-  if (!clients.length) {
-    return <EmptyState icon={<DatabaseIcon size={26} color="var(--cyan)" />}
-                       title="No clients yet" text="No clients with keywords set." />;
-  }
+
+  const shown = onlyOpen ? rows.filter(isOpen) : rows;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
         <span style={{ fontSize: 12.5, color: "var(--text-muted, #98a2b3)" }}>
           {openCount > 0
-            ? `${openCount} of ${clients.length} client(s) have platforms still owing work — these run first on the next lap.`
-            : `All ${clients.length} client(s) completed every platform on their last turn.`}
+            ? `${openCount} of ${rows.length} client(s) are not fully covered — a platform that did not finish, or no scheduled sweep at all.`
+            : `All ${rows.length} client(s) completed every platform on their last scheduled sweep.`}
         </span>
         <button
           type="button"
@@ -1262,9 +1329,8 @@ function ClientCoverage({ onCount }: { onCount: (n: number) => void }) {
       </div>
 
       {shown.map((c) => {
-        const outcomes = outcomesOf(c);
-        const ids = Object.keys(outcomes).sort();
-        const open = unfinishedOf(c).length > 0;
+        const ids = Object.keys(c.outcomes).sort();
+        const open = isOpen(c);
         return (
           <div
             key={c.client_id}
@@ -1276,23 +1342,29 @@ function ClientCoverage({ onCount }: { onCount: (n: number) => void }) {
           >
             <div style={{ display: "flex", alignItems: "center", gap: 9, flexWrap: "wrap" }}>
               <strong style={{ fontSize: 13.5 }}>{c.name}</strong>
-              {c.current_phase && <Badge color="var(--accent, #7c5cff)">running · {c.current_phase}</Badge>}
-              {open && !c.current_phase && <Badge color="var(--warn-yellow, #fdb71b)">resumes next lap</Badge>}
-              {!c.scheduler_enabled && <Badge color="var(--text-dim, #667085)">parked</Badge>}
+              {c.running && <Badge color="var(--accent, #7c5cff)">sweeping now</Badge>}
+              {c.neverRun && !c.running && <Badge color="var(--text-dim, #667085)">never swept</Badge>}
+              {open && !c.neverRun && !c.running && (
+                <Badge color="var(--warn-yellow, #fdb71b)">{c.unfinished.length} still owing</Badge>
+              )}
               <span style={{ marginLeft: "auto", fontSize: 11.5, color: "var(--text-dim, #667085)" }}>
-                {c.last_run_at ? relativeTime(c.last_run_at) : "never run"}
+                {c.running
+                  ? "in progress"
+                  : c.finished_at
+                  ? relativeTime(new Date(c.finished_at).toISOString())
+                  : "never run"}
               </span>
             </div>
 
             {ids.length === 0 ? (
               <div style={{ fontSize: 11.5, color: "var(--text-dim, #667085)", marginTop: 7 }}>
-                No per-platform record yet — this client has not completed a turn since
-                coverage tracking was added.
+                No per-platform record yet — this client has not completed a scheduled sweep.
+                Queue it on the Scheduler tab.
               </div>
             ) : (
               <div style={{ display: "flex", gap: 7, flexWrap: "wrap", marginTop: 9 }}>
                 {ids.map((pid) => {
-                  const st = outcomes[pid];
+                  const st = c.outcomes[pid];
                   const look = PLAT_STATUS_LOOK[st] ?? PLAT_STATUS_LOOK.skipped;
                   return (
                     <span
@@ -1314,9 +1386,9 @@ function ClientCoverage({ onCount }: { onCount: (n: number) => void }) {
               </div>
             )}
 
-            {c.last_run_note && (
+            {c.note && (
               <div style={{ fontSize: 11.5, color: "var(--text-muted, #98a2b3)", marginTop: 8 }}>
-                {c.last_run_note}
+                {c.note}
               </div>
             )}
           </div>
@@ -1333,7 +1405,8 @@ export function LiveActivityPanel() {
   const [unfinishedClients, setUnfinishedClients] = useState(0);
   const [triageSubTab, setTriageSubTab] = useState<"retry" | "records">("retry");
   const [jobs, setJobs] = useState<Job[]>([]);
-  const [clients, setClients] = useState<Client[]>([]);
+  // Subscribed, not copied -- see SchedulerPanel's note.
+  const { clients } = useClientDirectory();
   const [error, setError] = useState("");
   const [stoppingId, setStoppingId] = useState("");
   const now = useNowTick();
@@ -1371,12 +1444,11 @@ export function LiveActivityPanel() {
   const [retryActingId, setRetryActingId] = useState("");
   const [retryBulkBusy, setRetryBulkBusy] = useState(false);
 
-  // Fetch Clients once
+  // The client directory, from the database. Refreshed on mount rather
+  // than trusted from cache, since this panel is where an analyst comes to
+  // check coverage across every client there is.
   useEffect(() => {
-    clientsApi
-      .listClients()
-      .then((r) => setClients(r.items))
-      .catch(() => {});
+    void refreshDirectory();
   }, []);
 
   // Poll Jobs & Incidents Header Counts
