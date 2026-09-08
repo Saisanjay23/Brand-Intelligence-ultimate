@@ -59,7 +59,7 @@ def _to_item(doc: dict) -> dict:
         "platform": doc["platform"], "id": doc["session_id"],
         "identifier": doc.get("identifier", doc["session_id"]),
         "status": doc.get("status", "ready"),
-        "cookies": doc.get("cookies", []), "proxy": doc.get("proxy"),
+        "cookies": doc.get("cookies", []),
         "rate_limited_until": float(doc.get("rate_limited_until") or 0),
         "last_used": float(doc.get("last_used") or 0),
         # Epoch seconds a REAL JOB last proved this session healthy
@@ -106,7 +106,7 @@ def _to_item(doc: dict) -> dict:
         # Why this entry last stopped working, in words, kept ON the entry
         # rather than only in the logs, an auto-login that fails at 2am
         # otherwise leaves a row that just reads "checkpointed" with the
-        # actual reason (wrong password? proxy timeout? 2FA prompt?) buried
+        # actual reason (wrong password? network timeout? 2FA prompt?) buried
         # in a log file nobody is reading. Cleared whenever credentials are
         # rewritten, since it described the previous ones.
         "last_error": doc.get("last_error", ""),
@@ -150,13 +150,13 @@ async def get_item(platform: str, session_id: str) -> Optional[dict]:
 _NEW_SESSION_LAST_USED = _now  # stamped at insert; see the note above
 
 
-async def add_item(platform: str, cookies: list[dict], identifier: str, proxy: Optional[dict] = None) -> dict:
+async def add_item(platform: str, cookies: list[dict], identifier: str) -> dict:
     if await count_pool(platform) >= 20:
         raise ValueError(f"Session pool capacity limit (20) reached for {platform}. Please update an expired session or delete one.")
     session_id = uuid.uuid4().hex[:8]
     doc = {
         "_id": _doc_id(platform, session_id), "platform": platform, "session_id": session_id,
-        "identifier": identifier, "status": "ready", "cookies": cookies, "proxy": proxy,
+        "identifier": identifier, "status": "ready", "cookies": cookies,
         "rate_limited_until": 0.0, "last_used": _NEW_SESSION_LAST_USED(),
         "username": "", "password": "", "two_factor_secret": "",
         "credentials_updated_at": _now(),
@@ -173,7 +173,7 @@ async def save_api_key_session(platform: str, key: str, identifier: str) -> dict
     doc = {
         "_id": _doc_id(platform, session_id), "platform": platform, "session_id": session_id,
         "identifier": identifier, "status": "ready", "api_key": key, "cookies": [],
-        "proxy": None, "rate_limited_until": 0.0, "last_used": _NEW_SESSION_LAST_USED(),
+        "rate_limited_until": 0.0, "last_used": _NEW_SESSION_LAST_USED(),
         "credentials_updated_at": _now(),
     }
     await db()[SESSIONS].update_one({"_id": _doc_id(platform, session_id)}, {"$set": doc}, upsert=True)
@@ -188,7 +188,7 @@ async def save_mtproto_session(platform: str, identifier: str, api_id: int, api_
     doc = {
         "_id": _doc_id(platform, session_id), "platform": platform, "session_id": session_id,
         "identifier": identifier, "status": "ready", "api_id": api_id, "api_hash": api_hash,
-        "phone": phone, "session_blob": session_blob, "cookies": [], "proxy": None,
+        "phone": phone, "session_blob": session_blob, "cookies": [],
         "rate_limited_until": 0.0, "last_used": _NEW_SESSION_LAST_USED(),
         "credentials_updated_at": _now(),
     }
@@ -235,11 +235,6 @@ async def increment_use_count(platform: str, session_id: str) -> int:
         return_document=ReturnDocument.AFTER,
     )
     return int(doc.get("use_count") or 0) if doc else 0
-
-
-async def unset_proxy(platform: str, session_id: str) -> bool:
-    res = await db()[SESSIONS].update_one({"_id": _doc_id(platform, session_id)}, {"$unset": {"proxy": ""}})
-    return res.matched_count > 0
 
 
 async def delete_item(platform: str, session_id: str) -> bool:

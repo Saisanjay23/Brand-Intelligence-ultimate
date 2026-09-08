@@ -68,8 +68,7 @@ from backend.stealth.fingerprint import (
 from backend.stealth.headers import build_extra_headers
 from backend.stealth.mouse_movement import humanize_interaction, natural_scroll_down
 from backend.stealth.navigator_spoofing import build_init_js
-from backend.stealth.proxy import build_proxy_config
-from backend.stealth.timezone import resolve_timezone_id
+from backend.stealth.timezone import DEFAULT_TIMEZONE_ID
 
 log = get_logger("browser")
 
@@ -134,9 +133,8 @@ class Session:
         options,
         cookies: list[dict],
         load_images: bool = False,
-        timezone_id: str = "Asia/Kolkata",
+        timezone_id: str = DEFAULT_TIMEZONE_ID,
         session_id: str = "",
-        proxy: dict | None = None,
     ):
         self.o = options
         self.cookies = cookies
@@ -149,8 +147,7 @@ class Session:
         # Optional async callback, `await on_cookies(list[dict])`, invoked
         # by stop() with the live jar before the context closes. See stop().
         self.on_cookies = None
-        self.timezone_id = resolve_timezone_id(proxy, timezone_id)
-        self.proxy = proxy
+        self.timezone_id = timezone_id or DEFAULT_TIMEZONE_ID
         self.identity = get_identity(session_id)
         self.viewport = self.identity["viewport"]
         self.human = Human()
@@ -197,10 +194,6 @@ class Session:
             "timezone_id": self.timezone_id,
             "viewport": self.viewport,
         }
-        # Playwright's per-context proxy override (Chromium only).
-        proxy_config = build_proxy_config(self.proxy)
-        if proxy_config:
-            ctx_opts["proxy"] = proxy_config
         self.ctx = await self.browser.new_context(**ctx_opts)
 
         # No hardware arguments any more: hardwareConcurrency/deviceMemory
@@ -268,7 +261,7 @@ class Session:
 
         `on_cookies` is an ATTRIBUTE rather than a constructor argument on
         purpose: every platform's Session subclass is constructed with the
-        same fixed (args, cookies, session_id, proxy) signature by
+        same fixed (args, cookies, session_id) signature by
         analysis_service/discovery_service, and threading a new parameter
         through all five engines would buy nothing over setting it on the
         instance that the service already holds.

@@ -891,7 +891,6 @@ class Scraper:
         args,
         cookies: list[dict],
         session_id: str = "",
-        proxy: Optional[dict] = None,
     ):
         """WHAT: binds this Scraper to one FacebookSession (a fresh
         browser context) built from `cookies`. HOW: `args` is a
@@ -908,7 +907,6 @@ class Scraper:
             cookies,
             load_images=captures_screenshot(args),
             session_id=session_id,
-            proxy=proxy,
         )
 
     # ───────────────────────────── browser ────────────────────────────── #

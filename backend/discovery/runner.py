@@ -167,21 +167,6 @@ def _worker_semaphore() -> asyncio.Semaphore:
     return sem
 
 
-def _egress_key(session_item: dict) -> str:
-    """What this session actually leaves the host THROUGH -- the one thing
-    two parallel workers must not have in common. See analysis/runner.py's
-    identical helper for the full reasoning; kept as its own copy here
-    rather than a shared import so this module and analysis's each stay
-    independently correct."""
-    proxy = session_item.get("proxy") or {}
-    if not isinstance(proxy, dict):
-        return str(proxy).strip().lower()
-    server = str(proxy.get("server") or "").strip().lower()
-    if not server:
-        return ""
-    return f"{server}|{str(proxy.get('username') or '').strip()}"
-
-
 def _sessions_wanted(platform_id: str, keyword_count: int) -> int:
     """How many sessions it is worth claiming for this platform's sweep.
     Never more than there are keywords to sweep -- a claimed session is
@@ -582,17 +567,17 @@ class DiscoveryRunner:
         job.started_at_ts = time.time()
         try:
             # Every ready platform swept CONCURRENTLY. Each is a fully
-            # separate account, browser context and proxy on a fully
+            # separate account and browser context on a fully
             # separate host (facebook.com, x.com, instagram.com, ...) --
             # there is no shared-session risk running them at once the way
             # there would be two sessions open on the SAME platform
             # simultaneously (that risk is what JobStore's per-
             # (platform, session_id) hold guards against, together with
-            # _claim_sessions' egress check -- see _sweep_platform below).
+            # see _sweep_platform below).
             # WITHIN one platform, its keywords may now ALSO run several at
             # a time when the pool has more than one usable session for it
             # (see _sweep_platform/_keyword_worker), each on its own
-            # account and proxy -- never two sessions on one platform at
+            # account -- never one session driven twice at
             # once, which is exactly what those two guards exist to keep
             # true regardless of how many workers a platform is running.
             #
@@ -838,13 +823,12 @@ class DiscoveryRunner:
     async def _claim_sessions(
         self, platform_id: str, want: int,
     ) -> tuple[Any, list[dict]]:
-        """Up to `want` pooled sessions, each on its own egress, claimed for
+        """Up to `want` pooled sessions, claimed for
         the life of this platform's sweep. See analysis/runner.py's
         identical method for the full reasoning; kept as its own copy so
         this module and analysis's stay independently correct."""
         plat_obj: Any = None
         claimed: list[dict] = []
-        egress: set[str] = set()
         while len(claimed) < want:
             try:
                 plat_obj, session_item = await sessions_engine.session_for_job(platform_id)
@@ -862,24 +846,6 @@ class DiscoveryRunner:
                 if not claimed:
                     claimed.append(session_item)
                 break
-            key = _egress_key(session_item)
-            if claimed and key in egress:
-                # DISTINCT EGRESS, OR ONE WORKER. Two accounts on one
-                # platform from one IP at the same moment is the pattern
-                # sessions/manager.py's own claim comment calls the most
-                # reliable way to earn a checkpoint, and buying throughput
-                # with it would cost the very sessions this feature exists
-                # to survive the loss of. Handed straight back so another
-                # job -- or this platform's own second round after a
-                # failure -- can still use it.
-                sessions_engine.release_claim(platform_id, session_id)
-                log.info(
-                    f"[{platform_id}] session "
-                    f"{session_item.get('identifier') or session_id} shares its egress "
-                    f"with one already claimed -- staying on {len(claimed)} worker(s) "
-                    f"rather than running two accounts through one IP")
-                break
-            egress.add(key)
             claimed.append(session_item)
         return plat_obj, claimed
 
@@ -894,7 +860,7 @@ class DiscoveryRunner:
         stop.
 
         Nothing about HOW a keyword is swept changes with worker count --
-        its own browser context, its own proxy, its own DiscoveryOptions,
+        its own browser context, its own cookie jar, its own DiscoveryOptions,
         the same tab-concurrency/stagger logic, the same cap resolution,
         the same `discoverer.sweep()`. A worker is a second reader of one
         queue, not a cheaper kind of read.
@@ -955,7 +921,7 @@ class DiscoveryRunner:
                 make_discoverer = None
 
                 if session_item.get("anonymous"):
-                    anon_cm = plat_obj.anonymous_context()(session_item.get("proxy"))
+                    anon_cm = plat_obj.anonymous_context()()
                     ctx = await anon_cm.__aenter__()
                     make_discoverer = lambda o, _c=ctx: plat_obj.discoverer()(o, _c, anonymous=True)
                     discoverer = make_discoverer(options)
@@ -965,7 +931,7 @@ class DiscoveryRunner:
                 else:
                     session = plat_obj.session_cls()(
                         options, session_item.get("cookies", []),
-                        session_id=session_id, proxy=session_item.get("proxy"),
+                        session_id=session_id,
                     )
                     session.on_cookies = sessions_engine.cookie_saver(platform_id, session_id)
                     await session.start()

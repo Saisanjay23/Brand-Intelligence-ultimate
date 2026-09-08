@@ -1,5 +1,5 @@
 """Session pool management: pasting cookies, saving an API key, an
-interactive login, proxy assignment, deletion.
+interactive login, deletion.
 
 The analysis tool cannot scrape anything without a live session for the
 platform being scraped, so this is the one piece of operational surface it
@@ -34,7 +34,6 @@ class CredentialsIn(BaseModel):
     username: str
     password: str
     two_factor_secret: str = ""
-    proxy: Optional[str] = None
 
 
 class ApiKeyIn(BaseModel):
@@ -105,7 +104,7 @@ async def add_cookies(platform_id: str, body: CookiesIn) -> dict:
 async def add_credentials(platform_id: str, body: CredentialsIn) -> dict:
     return await sessions_engine.save_credentials(
         platform_id, body.identifier, body.username, body.password,
-        body.two_factor_secret, body.proxy,
+        body.two_factor_secret,
     )
 
 

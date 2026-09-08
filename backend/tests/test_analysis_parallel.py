@@ -18,13 +18,10 @@ THE TWO DEFECTS THESE EXIST TO PIN DOWN, both found while building this:
                     `test_a_retried_url_is_not_counted_twice` is what keeps it
                     doing that.
 
-  two accounts,     parallel sessions are only safer than one session when
-  one IP            they are genuinely separate identities. A pool whose
-                    entries share a proxy (or have none) would otherwise have
-                    turned this feature into two accounts hitting one platform
-                    from one address at the same moment, which is the pattern
-                    sessions/manager.py's own claim comment calls the most
-                    reliable way to earn a checkpoint.
+  one account,      two workers must be two ACCOUNTS. A claim that handed
+  twice             the same pooled session to both would be one identity
+                    driven twice as hard while reporting as two -- the
+                    opposite of what splitting a batch is for.
 """
 
 from __future__ import annotations
@@ -107,10 +104,9 @@ def _scraper_class(fail_urls: dict[str, set[str]], live: dict):
     class FakeScraper:
         instances: list["FakeScraper"] = []
 
-        def __init__(self, options, cookies, session_id="", proxy=None, anonymous=False):
+        def __init__(self, options, cookies, session_id="", anonymous=False):
             self.options = options
             self.session_id = session_id
-            self.proxy = proxy
             self.anonymous = anonymous
             self.session = FakeInnerSession()
             self.seen: list[str] = []
@@ -145,10 +141,9 @@ def _scraper_class(fail_urls: dict[str, set[str]], live: dict):
     return FakeScraper
 
 
-def _session(sid: str, server: str = "", username: str = "") -> dict:
-    proxy = {"server": server, "username": username} if server else None
+def _session(sid: str) -> dict:
     return {"id": sid, "identifier": f"acct-{sid}", "cookies": [{"name": "auth"}],
-            "proxy": proxy, "last_ok": 1.0}
+            "last_ok": 1.0}
 
 
 def _wire(monkeypatch, sessions: list[dict], fail_urls: dict[str, set[str]] | None = None):
@@ -219,23 +214,6 @@ class TestHowManySessionsAreWorthClaiming:
         assert R._sessions_wanted("telegram", 40, 6) == 1
 
 
-class TestWhatCountsAsTheSameEgress:
-    def test_the_same_proxy_is_the_same_egress(self):
-        a = R._egress_key(_session("a", "http://p:1", "u1"))
-        b = R._egress_key(_session("b", "http://p:1", "u1"))
-        assert a == b
-
-    def test_a_per_session_username_on_one_gateway_is_a_different_egress(self):
-        """Residential providers hand out one host and rotate the exit by
-        username, so `server` alone would refuse to parallelise a pool that is
-        genuinely on different addresses."""
-        a = R._egress_key(_session("a", "http://gw:1", "user-1"))
-        b = R._egress_key(_session("b", "http://gw:1", "user-2"))
-        assert a != b
-
-    def test_no_proxy_is_an_egress_too_and_it_is_shared(self):
-        assert R._egress_key(_session("a")) == R._egress_key(_session("b")) == ""
-
 
 # ----------------------------------------------------------- the split itself
 
@@ -245,7 +223,7 @@ class TestOneSession:
     async def test_it_reads_every_url_exactly_once(self, monkeypatch):
         """The single-session pool is not a special path -- it is this code
         with one worker -- so it has to stay exactly as complete as it was."""
-        _, scraper_cls, _ = _wire(monkeypatch, [_session("a", "http://p1:1")])
+        _, scraper_cls, _ = _wire(monkeypatch, [_session("a")])
         job, items = _job([f"https://x.com/u{n}" for n in range(4)])
 
         await _scrape(job, items)
@@ -258,7 +236,7 @@ class TestOneSession:
 
     @pytest.mark.asyncio
     async def test_it_reads_them_in_order(self, monkeypatch):
-        _, scraper_cls, _ = _wire(monkeypatch, [_session("a", "http://p1:1")])
+        _, scraper_cls, _ = _wire(monkeypatch, [_session("a")])
         job, items = _job([f"https://x.com/u{n}" for n in range(5)])
         await _scrape(job, items)
         assert scraper_cls.instances[0].seen == [i.url for i in items]
@@ -268,7 +246,7 @@ class TestTwoSessions:
     @pytest.mark.asyncio
     async def test_the_batch_is_split_between_them(self, monkeypatch):
         _, scraper_cls, _ = _wire(
-            monkeypatch, [_session("a", "http://p1:1"), _session("b", "http://p2:1")])
+            monkeypatch, [_session("a"), _session("b")])
         job, items = _job([f"https://x.com/u{n}" for n in range(6)])
 
         await _scrape(job, items)
@@ -282,24 +260,22 @@ class TestTwoSessions:
         assert job.completed == job.total == 6
 
     @pytest.mark.asyncio
-    async def test_each_worker_gets_its_own_session_and_proxy(self, monkeypatch):
+    async def test_each_worker_gets_its_own_account(self, monkeypatch):
         """The isolation claim, checked rather than asserted in a comment: two
-        workers must never be two contexts on one account."""
+        workers must never be two contexts on ONE account."""
         _, scraper_cls, _ = _wire(
-            monkeypatch, [_session("a", "http://p1:1"), _session("b", "http://p2:1")])
+            monkeypatch, [_session("a"), _session("b")])
         job, items = _job([f"https://x.com/u{n}" for n in range(6)])
 
         await _scrape(job, items)
 
         ids = {s.session_id for s in scraper_cls.instances}
-        proxies = {s.proxy["server"] for s in scraper_cls.instances}
-        assert ids == {"a", "b"}
-        assert proxies == {"http://p1:1", "http://p2:1"}
+        assert ids == {"a", "b"}, "the same session was handed to both workers"
 
     @pytest.mark.asyncio
     async def test_the_progress_chip_reports_the_worker_count(self, monkeypatch):
         _, _, _ = _wire(
-            monkeypatch, [_session("a", "http://p1:1"), _session("b", "http://p2:1")])
+            monkeypatch, [_session("a"), _session("b")])
         job, items = _job([f"https://x.com/u{n}" for n in range(6)])
         await _scrape(job, items)
         # back to 0 once they are done -- the field says what is running NOW
@@ -308,46 +284,11 @@ class TestTwoSessions:
     @pytest.mark.asyncio
     async def test_every_claimed_session_is_released(self, monkeypatch):
         pool, _, _ = _wire(
-            monkeypatch, [_session("a", "http://p1:1"), _session("b", "http://p2:1")])
+            monkeypatch, [_session("a"), _session("b")])
         job, items = _job([f"https://x.com/u{n}" for n in range(6)])
         await _scrape(job, items)
         assert pool.claimed == set(), "a session stayed claimed and is now invisible to every job"
 
-
-class TestSessionsThatShareAnEgress:
-    @pytest.mark.asyncio
-    async def test_two_accounts_on_one_ip_do_not_run_in_parallel(self, monkeypatch):
-        pool, scraper_cls, _ = _wire(
-            monkeypatch, [_session("a", "http://one:1"), _session("b", "http://one:1")])
-        job, items = _job([f"https://x.com/u{n}" for n in range(6)])
-
-        await _scrape(job, items)
-
-        assert len(scraper_cls.instances) == 1, "ran two accounts through one IP"
-        assert [i.status for i in items] == ["done"] * 6, "the batch still has to complete"
-
-    @pytest.mark.asyncio
-    async def test_a_proxyless_pool_stays_on_one_worker(self, monkeypatch):
-        """The common case on a fresh install: several accounts, no proxies,
-        so every one of them leaves through this machine's own address."""
-        _, scraper_cls, _ = _wire(monkeypatch, [_session("a"), _session("b"), _session("c")])
-        job, items = _job([f"https://x.com/u{n}" for n in range(6)])
-        await _scrape(job, items)
-        assert len(scraper_cls.instances) == 1
-
-    @pytest.mark.asyncio
-    async def test_the_refused_session_is_handed_straight_back(self, monkeypatch):
-        """It was claimed to be looked at, so leaving it claimed would hide a
-        healthy account from every other job for the life of the batch."""
-        pool, scraper_cls, _ = _wire(
-            monkeypatch, [_session("a", "http://one:1"), _session("b", "http://one:1")])
-        job, items = _job([f"https://x.com/u{n}" for n in range(4)])
-        await _scrape(job, items)
-        # released WITHOUT having been used -- a worker's own `finally` releases
-        # too, so "it was released" alone would pass even if it had run
-        assert "b" in pool.released
-        assert not [s for s in scraper_cls.instances if s.session_id == "b"]
-        assert pool.claimed == set()
 
 
 # --------------------------------------------------------------- failover
@@ -363,7 +304,7 @@ class TestASessionDyingMidRun:
         urls = [f"https://x.com/u{n}" for n in range(6)]
         pool, scraper_cls, _ = _wire(
             monkeypatch,
-            [_session("a", "http://p1:1"), _session("b", "http://p2:1")],
+            [_session("a"), _session("b")],
             fail_urls={"a": set(urls)},
         )
         job, items = _job(urls)
@@ -382,7 +323,7 @@ class TestASessionDyingMidRun:
         """Its first attempt was already counted and already saved as an
         error. Counting the retry as well walks the bar past 100%."""
         urls = [f"https://x.com/u{n}" for n in range(6)]
-        _wire(monkeypatch, [_session("a", "http://p1:1"), _session("b", "http://p2:1")],
+        _wire(monkeypatch, [_session("a"), _session("b")],
               fail_urls={"a": set(urls)})
         job, items = _job(urls)
 
@@ -398,7 +339,7 @@ class TestASessionDyingMidRun:
         self, monkeypatch,
     ):
         urls = [f"https://x.com/u{n}" for n in range(6)]
-        _wire(monkeypatch, [_session("a", "http://p1:1"), _session("b", "http://p2:1")],
+        _wire(monkeypatch, [_session("a"), _session("b")],
               fail_urls={"a": set(urls)})
         job, items = _job(urls)
         await _scrape(job, items)
@@ -408,13 +349,13 @@ class TestASessionDyingMidRun:
     async def test_a_replacement_session_is_claimed_when_the_only_worker_dies(
         self, monkeypatch,
     ):
-        """One worker at a time (both accounts share an egress), so the second
+        """The replacement-claim round, reached when every claimed session
         session can only be reached by the replacement round -- which is the
         case the round exists for."""
         urls = ["https://x.com/u0", "https://x.com/u1", "https://x.com/u2"]
         pool, scraper_cls, _ = _wire(
             monkeypatch,
-            [_session("a", "http://one:1"), _session("b", "http://one:1")],
+            [_session("a"), _session("b")],
             fail_urls={"a": {"https://x.com/u1"}},
         )
         job, items = _job(urls)
@@ -435,7 +376,7 @@ class TestAUrlThatKillsEverySession:
         urls = ["https://x.com/ok0", "https://x.com/bad", "https://x.com/ok1"]
         pool, scraper_cls, _ = _wire(
             monkeypatch,
-            [_session("a", "http://one:1"), _session("b", "http://one:1")],
+            [_session("a"), _session("b")],
             fail_urls={"a": {"https://x.com/bad"}, "b": {"https://x.com/bad"}},
         )
         job, items = _job(urls)
@@ -471,7 +412,7 @@ class TestWhenNothingCanBeClaimed:
         self, monkeypatch,
     ):
         urls = [f"https://x.com/u{n}" for n in range(4)]
-        _wire(monkeypatch, [_session("a", "http://p1:1")], fail_urls={"a": set(urls)})
+        _wire(monkeypatch, [_session("a")], fail_urls={"a": set(urls)})
         job, items = _job(urls)
 
         await _scrape(job, items)
@@ -489,7 +430,7 @@ class TestASessionThatWasNeverUsable:
         so became every item's error. It now raises inside a worker, where
         another worker or another round could still cover for it -- when none
         does, the analyst has to end up reading the same thing."""
-        pool, scraper_cls, _ = _wire(monkeypatch, [_session("a", "http://p1:1")])
+        pool, scraper_cls, _ = _wire(monkeypatch, [_session("a")])
         monkeypatch.setattr(R.sessions_engine, "proven_fresh", lambda item: False)
 
         async def _dead(self):
@@ -514,7 +455,7 @@ class TestCancellation:
     ):
         """Failing the rest would turn the analyst's own cancel into a
         screenful of errors."""
-        _wire(monkeypatch, [_session("a", "http://p1:1")])
+        _wire(monkeypatch, [_session("a")])
         job, items = _job([f"https://x.com/u{n}" for n in range(4)])
         job.cancel.set()
 
@@ -534,7 +475,7 @@ class TestTheProcessWideWorkerCap:
         per-platform cap cannot see the total. This is the number that can."""
         monkeypatch.setattr(R.settings, "analysis_max_browser_workers", 1)
         _, scraper_cls, live = _wire(
-            monkeypatch, [_session("a", "http://p1:1"), _session("b", "http://p2:1")])
+            monkeypatch, [_session("a"), _session("b")])
         job, items = _job([f"https://x.com/u{n}" for n in range(6)])
 
         await _scrape(job, items)
@@ -548,7 +489,7 @@ class TestTheProcessWideWorkerCap:
     ):
         monkeypatch.setattr(R.settings, "analysis_max_browser_workers", 1)
         pool, scraper_cls, _ = _wire(
-            monkeypatch, [_session("a", "http://p1:1"), _session("b", "http://p2:1")])
+            monkeypatch, [_session("a"), _session("b")])
         job, items = _job([f"https://x.com/u{n}" for n in range(6)])
 
         await _scrape(job, items)
@@ -560,7 +501,7 @@ class TestTheProcessWideWorkerCap:
     async def test_two_workers_are_allowed_when_the_ceiling_permits(self, monkeypatch):
         monkeypatch.setattr(R.settings, "analysis_max_browser_workers", 4)
         _, scraper_cls, live = _wire(
-            monkeypatch, [_session("a", "http://p1:1"), _session("b", "http://p2:1")])
+            monkeypatch, [_session("a"), _session("b")])
         job, items = _job([f"https://x.com/u{n}" for n in range(6)])
 
         await _scrape(job, items)
@@ -574,3 +515,49 @@ class TestTheProcessWideWorkerCap:
         first = R._worker_semaphore()
         assert R._worker_semaphore() is first
         assert asyncio.get_running_loop() in R._worker_slots
+
+
+# ------------------------------------------- parallelism is by session count
+
+
+class TestParallelismIsPurelyBySessionCount:
+    """WHAT CHANGED, AND WHY THIS IS PINNED. Claiming used to refuse a second
+    session unless it left the host through a different egress, which meant a
+    proxy-less pool could never run more than one worker. Proxy support has
+    been removed from the tool, so the only question left is how many pooled
+    ACCOUNTS a platform has: two sessions means two workers, splitting the
+    batch, regardless of the address they share."""
+
+    @pytest.mark.asyncio
+    async def test_two_proxyless_sessions_run_in_parallel(self, monkeypatch):
+        _, scraper_cls, live = _wire(monkeypatch, [_session("a"), _session("b")])
+        job, items = _job([f"https://x.com/u{n}" for n in range(6)])
+
+        await _scrape(job, items)
+
+        assert len(scraper_cls.instances) == 2
+        assert live["max"] == 2, "both workers must actually be open at once"
+        seen = [s.seen for s in scraper_cls.instances]
+        assert all(s for s in seen), f"one worker did no work: {seen}"
+        assert sorted(seen[0] + seen[1]) == sorted(i.url for i in items)
+        assert [i.status for i in items] == ["done"] * 6
+
+    @pytest.mark.asyncio
+    async def test_three_sessions_give_three_workers(self, monkeypatch):
+        """Capped only by _sessions_wanted -- the pool size and the work."""
+        _, scraper_cls, _ = _wire(
+            monkeypatch, [_session("a"), _session("b"), _session("c")])
+        job, items = _job([f"https://x.com/u{n}" for n in range(9)])
+
+        await _scrape(job, items)
+
+        assert len(scraper_cls.instances) == 3
+        assert [i.status for i in items] == ["done"] * 9
+
+    @pytest.mark.asyncio
+    async def test_one_session_still_does_the_whole_batch(self, monkeypatch):
+        _, scraper_cls, _ = _wire(monkeypatch, [_session("a")])
+        job, items = _job([f"https://x.com/u{n}" for n in range(4)])
+        await _scrape(job, items)
+        assert len(scraper_cls.instances) == 1
+        assert scraper_cls.instances[0].seen == [i.url for i in items]

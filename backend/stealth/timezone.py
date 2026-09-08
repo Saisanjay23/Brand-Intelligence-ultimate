@@ -1,18 +1,16 @@
-"""Resolves which IANA timezone id a session's browser context should claim.
+"""The IANA timezone id a session's browser context claims.
 
-Deliberately not diversified by default: without a matching per-session
-egress IP (see `stealth.proxy`), a claimed timezone that disagrees with the
-real IP's geo is a worse tell than every session sharing one default. A
-proxy's own declared region is the one case where a non-default timezone is
-safe, the claimed timezone and the real egress IP then agree.
+ONE DEFAULT, ON PURPOSE. A claimed timezone that disagrees with the real
+egress IP's geography is a worse tell than every session sharing one, and
+with no per-session egress there is nothing for a diversified timezone to
+agree WITH -- every context leaves from this host's own address, so they
+genuinely are all in one place. Claiming so is the honest answer.
+
+(This used to derive the id from a proxy's declared region, which was the
+one case where a non-default was safe. Proxy support has since been removed
+from the tool, so that branch went with it.)
 """
 
 from __future__ import annotations
 
-from typing import Optional
-
 DEFAULT_TIMEZONE_ID = "Asia/Kolkata"
-
-
-def resolve_timezone_id(proxy: Optional[dict], default: str = DEFAULT_TIMEZONE_ID) -> str:
-    return (proxy or {}).get("timezone_id") or default

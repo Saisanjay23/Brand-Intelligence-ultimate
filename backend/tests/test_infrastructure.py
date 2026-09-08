@@ -1,4 +1,4 @@
-"""Failure classification, job eviction, cap resolution, proxy safety.
+"""Failure classification, job eviction, cap resolution.
 
 Every test here corresponds to a defect that actually shipped:
 
@@ -7,9 +7,6 @@ Every test here corresponds to a defect that actually shipped:
     instead of being reported as a dead session.
   * JobStore evicted down to exactly max_jobs and THEN inserted, leaving the
     table one over its ceiling until the next put().
-  * socks_auth_warning guards the one proxy shape that fails DANGEROUSLY --
-    Chromium drops SOCKS credentials and silently goes direct, so traffic
-    leaves on the real IP while the UI shows a proxy attached.
 """
 
 from __future__ import annotations
@@ -23,7 +20,6 @@ import pytest
 from backend.discovery.runner import _effective_cap, _resolve_cap
 from backend.shared.job_store import JobStore
 from backend.shared.resilience import classify_failure, is_transient
-from backend.stealth.proxy import build_proxy_config, socks_auth_warning
 
 
 # ------------------------------------------------------- classify_failure
@@ -162,32 +158,3 @@ class TestCapResolution:
                             {"individual": {"twitter": 30}}, {}) == 30
         assert _resolve_cap("twitter", "people", "individual", 100, {}, {}) == 100
         assert _resolve_cap("twitter", "people", "individual", 0, {}, {}) == 0
-
-
-# --------------------------------------------------------- proxy safety
-
-class TestProxySafety:
-    def test_socks_with_credentials_is_flagged(self):
-        # Chromium cannot authenticate to SOCKS: it drops the credentials and
-        # falls back to a DIRECT connection, exposing the real IP.
-        warn = socks_auth_warning({"server": "socks5://h:1080", "username": "u", "password": "p"})
-        assert warn and "DIRECT" in warn
-
-    def test_socks_without_credentials_is_fine(self):
-        assert socks_auth_warning({"server": "socks5://h:1080"}) is None
-
-    def test_http_with_credentials_is_fine(self):
-        assert socks_auth_warning(
-            {"server": "http://h:8080", "username": "u", "password": "p"}) is None
-
-    def test_no_proxy_is_not_a_warning(self):
-        assert socks_auth_warning(None) is None
-
-    def test_build_config_shape_and_omissions(self):
-        assert build_proxy_config(None) is None
-        assert build_proxy_config({}) is None
-        assert build_proxy_config({"server": "http://h:8080"}) == {"server": "http://h:8080"}
-        cfg = build_proxy_config(
-            {"server": "http://h:8080", "username": "u", "password": "p", "timezone_id": "UTC"})
-        # timezone_id is context config, not proxy config -- must not leak through
-        assert cfg == {"server": "http://h:8080", "username": "u", "password": "p"}

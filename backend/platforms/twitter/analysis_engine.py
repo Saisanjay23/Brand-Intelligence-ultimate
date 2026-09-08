@@ -159,7 +159,6 @@ class Scraper:
         args,
         cookies: list[dict],
         session_id: str = "",
-        proxy: dict | None = None,
     ):
         """WHAT: binds this Scraper to one TwitterSession built from
         `cookies`. HOW: `args` is a ScanOptions-shaped object
@@ -171,7 +170,6 @@ class Scraper:
             cookies,
             load_images=captures_screenshot(args),
             session_id=session_id,
-            proxy=proxy,
         )
 
     @property

@@ -77,16 +77,16 @@ class Scraper:
     this class (loaded dynamically), and backend/services/
     analysis_service.py is the actual caller -- it constructs and drives
     every platform's Scraper identically, which is why this class's
-    `__init__` accepts the same (args, cookies, session_id, proxy) shape
+    `__init__` accepts the same (args, cookies, session_id) shape
     even though MTProto uses none of the last three.
     """
 
     normalize_url = staticmethod(normalize_url)
 
-    def __init__(self, args, cookies=None, session_id: str = "", proxy=None):
-        """MTProto, not a browser. `cookies`, `session_id` and `proxy` are
-        accepted and unused so services/analysis_service.py can construct
-        every platform's Scraper with one signature."""
+    def __init__(self, args, cookies=None, session_id: str = ""):
+        """MTProto, not a browser. `cookies` and `session_id` are accepted
+        and unused so services/analysis_service.py can construct every
+        platform's Scraper with one signature."""
         self.a = args
         self.tg = Telegram(args)
 

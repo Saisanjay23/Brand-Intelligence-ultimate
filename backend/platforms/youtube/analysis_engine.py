@@ -76,10 +76,10 @@ class Scraper:
 
     normalize_url = staticmethod(normalize_url)
 
-    def __init__(self, args, cookies=None, session_id: str = "", proxy=None):
-        """API-key authed, no browser. `cookies`, `session_id` and `proxy`
-        are accepted and unused so services/analysis_service.py can
-        construct every platform's Scraper with one signature."""
+    def __init__(self, args, cookies=None, session_id: str = ""):
+        """API-key authed, no browser. `cookies` and `session_id` are
+        accepted and unused so services/analysis_service.py can construct
+        every platform's Scraper with one signature."""
         self.a = args
         self.api = YouTubeAPI()
 

@@ -25,10 +25,9 @@ THE TWO DEFECTS THESE EXIST TO PIN DOWN:
                     worker's OWN keyword is incrementing those same shared
                     counters at the same moment).
 
-  two accounts,     identical reasoning to analysis's egress test: a pool
-  one IP            whose sessions share a proxy (or have none) must stay
-                    on one worker, or "parallel sessions" becomes two
-                    accounts hitting one platform from one IP at once.
+  one account,      two workers must be two ACCOUNTS. A claim that handed
+  twice             the same pooled session to both would be one identity
+                    driven twice as hard while reporting as two.
 """
 
 from __future__ import annotations
@@ -136,9 +135,8 @@ def _discoverer_class(fail_keywords: dict[str, set[str]], live: dict):
 
 def _session_class(live: dict):
     class FakeSession:
-        def __init__(self, options, cookies, session_id: str = "", proxy=None):
+        def __init__(self, options, cookies, session_id: str = ""):
             self.session_id = session_id
-            self.proxy = proxy
             self.on_cookies = None
             self.ctx = f"ctx-{session_id}"
             self.started = False
@@ -166,10 +164,9 @@ def _session_class(live: dict):
     return FakeSession
 
 
-def _session(sid: str, server: str = "", username: str = "") -> dict:
-    proxy = {"server": server, "username": username} if server else None
+def _session(sid: str) -> dict:
     return {"id": sid, "identifier": f"acct-{sid}", "cookies": [{"name": "auth"}],
-            "proxy": proxy, "last_ok": 1.0}
+            "last_ok": 1.0}
 
 
 def _wire(monkeypatch, sessions: list[dict], fail_keywords: dict[str, set[str]] | None = None,
@@ -258,18 +255,6 @@ class TestHowManySessionsAreWorthClaiming:
         assert R._sessions_wanted(PLATFORM, 10) == 1
 
 
-class TestWhatCountsAsTheSameEgress:
-    def test_the_same_proxy_is_the_same_egress(self):
-        assert R._egress_key(_session("a", "http://p:1", "u1")) == \
-            R._egress_key(_session("b", "http://p:1", "u1"))
-
-    def test_a_per_session_username_on_one_gateway_is_a_different_egress(self):
-        assert R._egress_key(_session("a", "http://gw:1", "user-1")) != \
-            R._egress_key(_session("b", "http://gw:1", "user-2"))
-
-    def test_no_proxy_is_a_shared_egress(self):
-        assert R._egress_key(_session("a")) == R._egress_key(_session("b")) == ""
-
 
 # ----------------------------------------------------------- the split itself
 
@@ -280,7 +265,7 @@ class TestOneSession:
         """The single-session pool is not a special path -- it is this code
         with one worker -- so it has to stay exactly as complete as it
         was."""
-        _, disc_cls, _ = _wire(monkeypatch, [_session("a", "http://p1:1")])
+        _, disc_cls, _ = _wire(monkeypatch, [_session("a")])
         keywords = [f"kw{n}" for n in range(4)]
         job = _job(keywords)
 
@@ -296,7 +281,7 @@ class TestOneSession:
 
     @pytest.mark.asyncio
     async def test_it_sweeps_them_in_order(self, monkeypatch):
-        _, disc_cls, _ = _wire(monkeypatch, [_session("a", "http://p1:1")])
+        _, disc_cls, _ = _wire(monkeypatch, [_session("a")])
         keywords = [f"kw{n}" for n in range(5)]
         job = _job(keywords)
         await _sweep(job, PLATFORM)
@@ -307,7 +292,7 @@ class TestTwoSessions:
     @pytest.mark.asyncio
     async def test_the_plan_is_split_between_them(self, monkeypatch):
         _, disc_cls, _ = _wire(
-            monkeypatch, [_session("a", "http://p1:1"), _session("b", "http://p2:1")])
+            monkeypatch, [_session("a"), _session("b")])
         keywords = [f"kw{n}" for n in range(6)]
         job = _job(keywords)
 
@@ -323,9 +308,9 @@ class TestTwoSessions:
         assert prog.status == "done"
 
     @pytest.mark.asyncio
-    async def test_each_worker_gets_its_own_session_and_proxy(self, monkeypatch):
+    async def test_each_worker_gets_its_own_account(self, monkeypatch):
         _, disc_cls, _ = _wire(
-            monkeypatch, [_session("a", "http://p1:1"), _session("b", "http://p2:1")])
+            monkeypatch, [_session("a"), _session("b")])
         job = _job([f"kw{n}" for n in range(6)])
         await _sweep(job, PLATFORM)
         ids = {d.session_id for d in disc_cls.instances}
@@ -337,7 +322,7 @@ class TestTwoSessions:
     async def test_the_progress_chip_reports_the_worker_count_while_running(self, monkeypatch):
         seen_workers: list[int] = []
         _, disc_cls, _ = _wire(
-            monkeypatch, [_session("a", "http://p1:1"), _session("b", "http://p2:1")])
+            monkeypatch, [_session("a"), _session("b")])
         job = _job([f"kw{n}" for n in range(6)])
 
         orig_sweep = disc_cls.sweep
@@ -355,40 +340,11 @@ class TestTwoSessions:
     @pytest.mark.asyncio
     async def test_every_claimed_session_is_released(self, monkeypatch):
         pool, _, _ = _wire(
-            monkeypatch, [_session("a", "http://p1:1"), _session("b", "http://p2:1")])
+            monkeypatch, [_session("a"), _session("b")])
         job = _job([f"kw{n}" for n in range(6)])
         await _sweep(job, PLATFORM)
         assert pool.claimed == set(), "a session stayed claimed and is now invisible to every job"
 
-
-class TestSessionsThatShareAnEgress:
-    @pytest.mark.asyncio
-    async def test_two_accounts_on_one_ip_do_not_sweep_in_parallel(self, monkeypatch):
-        _, disc_cls, _ = _wire(
-            monkeypatch, [_session("a", "http://one:1"), _session("b", "http://one:1")])
-        job = _job([f"kw{n}" for n in range(6)])
-
-        await _sweep(job, PLATFORM)
-
-        assert len(disc_cls.instances) == 1, "ran two accounts through one IP"
-        assert job.platforms[PLATFORM].keywords_done == 6, "the sweep still has to complete"
-
-    @pytest.mark.asyncio
-    async def test_a_proxyless_pool_stays_on_one_worker(self, monkeypatch):
-        _, disc_cls, _ = _wire(monkeypatch, [_session("a"), _session("b"), _session("c")])
-        job = _job([f"kw{n}" for n in range(6)])
-        await _sweep(job, PLATFORM)
-        assert len(disc_cls.instances) == 1
-
-    @pytest.mark.asyncio
-    async def test_the_refused_session_is_handed_straight_back(self, monkeypatch):
-        pool, disc_cls, _ = _wire(
-            monkeypatch, [_session("a", "http://one:1"), _session("b", "http://one:1")])
-        job = _job([f"kw{n}" for n in range(4)])
-        await _sweep(job, PLATFORM)
-        assert "b" in pool.released
-        assert not [d for d in disc_cls.instances if d.session_id == "b"]
-        assert pool.claimed == set()
 
 
 # --------------------------------------------------------------- failover
@@ -400,7 +356,7 @@ class TestASessionDyingMidSweep:
         keywords = [f"kw{n}" for n in range(6)]
         pool, disc_cls, _ = _wire(
             monkeypatch,
-            [_session("a", "http://p1:1"), _session("b", "http://p2:1")],
+            [_session("a"), _session("b")],
             fail_keywords={"a": set(keywords)},
         )
         job = _job(keywords)
@@ -421,7 +377,7 @@ class TestASessionDyingMidSweep:
         the shared counters. Adding them again on the retry walks the bar
         past 100% and inflates found/new for a profile counted twice."""
         keywords = [f"kw{n}" for n in range(6)]
-        _wire(monkeypatch, [_session("a", "http://p1:1"), _session("b", "http://p2:1")],
+        _wire(monkeypatch, [_session("a"), _session("b")],
               fail_keywords={"a": set(keywords)})
         job = _job(keywords)
 
@@ -434,13 +390,13 @@ class TestASessionDyingMidSweep:
 
     @pytest.mark.asyncio
     async def test_a_replacement_session_is_claimed_when_the_only_worker_dies(self, monkeypatch):
-        """One worker at a time (both accounts share an egress), so the
+        """The replacement-claim round, reached when every claimed
         second session can only be reached by the replacement round --
         which is the case the round exists for."""
         keywords = ["kw0", "kw1", "kw2"]
         pool, disc_cls, _ = _wire(
             monkeypatch,
-            [_session("a", "http://one:1"), _session("b", "http://one:1")],
+            [_session("a"), _session("b")],
             fail_keywords={"a": {"kw1"}},
         )
         job = _job(keywords)
@@ -458,12 +414,12 @@ class TestAKeywordThatKillsEverySession:
     async def test_it_is_retried_once_and_then_left_as_is(self, monkeypatch):
         """Ambiguous by nature: usually the session died, sometimes the
         keyword is what trips the challenge. Both sessions here share an
-        egress, so this also exercises the replacement-claim round (round 1
-        claims "a", "a" dies on "bad", round 2 claims "b" as a replacement)."""
+        Both sessions are claimed up front now, so "bad" is attempted on
+        one and then re-queued onto the other."""
         keywords = ["ok0", "bad", "ok1"]
         pool, disc_cls, _ = _wire(
             monkeypatch,
-            [_session("a", "http://one:1"), _session("b", "http://one:1")],
+            [_session("a"), _session("b")],
             fail_keywords={"a": {"bad"}, "b": {"bad"}},
         )
         job = _job(keywords)
@@ -504,7 +460,7 @@ class TestWhenNothingCanBeClaimed:
         session. Distinct from the "some keywords done, then everything
         died" case, which is "partial" (see TestAKeywordThatKillsEverySession)."""
         keywords = [f"kw{n}" for n in range(4)]
-        _wire(monkeypatch, [_session("a", "http://p1:1")], fail_keywords={"a": set(keywords)})
+        _wire(monkeypatch, [_session("a")], fail_keywords={"a": set(keywords)})
         job = _job(keywords)
 
         await _sweep(job, PLATFORM)
@@ -518,7 +474,7 @@ class TestWhenNothingCanBeClaimed:
 class TestCancellation:
     @pytest.mark.asyncio
     async def test_a_cancelled_platform_keeps_what_it_read_and_fails_nothing(self, monkeypatch):
-        _wire(monkeypatch, [_session("a", "http://p1:1")])
+        _wire(monkeypatch, [_session("a")])
         job = _job([f"kw{n}" for n in range(4)])
         job.cancel.set()
 
@@ -537,7 +493,7 @@ class TestTheProcessWideWorkerCap:
     async def test_it_bounds_how_many_browsers_are_open_at_once(self, monkeypatch):
         monkeypatch.setattr(R.settings, "discovery_max_browser_workers", 1)
         _, disc_cls, live = _wire(
-            monkeypatch, [_session("a", "http://p1:1"), _session("b", "http://p2:1")])
+            monkeypatch, [_session("a"), _session("b")])
         job = _job([f"kw{n}" for n in range(6)])
 
         await _sweep(job, PLATFORM)
@@ -549,7 +505,7 @@ class TestTheProcessWideWorkerCap:
     async def test_two_workers_are_allowed_when_the_ceiling_permits(self, monkeypatch):
         monkeypatch.setattr(R.settings, "discovery_max_browser_workers", 4)
         _, _, live = _wire(
-            monkeypatch, [_session("a", "http://p1:1"), _session("b", "http://p2:1")])
+            monkeypatch, [_session("a"), _session("b")])
         job = _job([f"kw{n}" for n in range(6)])
         await _sweep(job, PLATFORM)
         assert live["max"] == 2
@@ -575,7 +531,7 @@ class TestTheSweepItselfIsUnchanged:
             captured.extend(rows)
             return len(rows), len(rows)
 
-        _wire(monkeypatch, [_session("a", "http://p1:1")])
+        _wire(monkeypatch, [_session("a")])
         monkeypatch.setattr(R.profiles_db, "save_many", _save_many)
         job = _job(["acme"])
 
@@ -612,7 +568,7 @@ class TestInterKeywordPacing:
     ):
         """A pause before releasing the session buys nothing and only makes
         the sweep look slower."""
-        _, _, live = _wire(monkeypatch, [_session("a", "http://p1:1")], pace=True)
+        _, _, live = _wire(monkeypatch, [_session("a")], pace=True)
         monkeypatch.setitem(R._PLATFORM_INTER_KEYWORD_DELAY, PLATFORM, 6.0)
         job = _job(["kw0", "kw1", "kw2"])
 
@@ -626,7 +582,7 @@ class TestInterKeywordPacing:
         target seconds have to be converted into one -- a multiplier of 1.0
         would silently be the median, not the number configured here."""
         monkeypatch.setattr(R.settings, "discovery_delay_sec", 2.5)
-        _, _, live = _wire(monkeypatch, [_session("a", "http://p1:1")], pace=True)
+        _, _, live = _wire(monkeypatch, [_session("a")], pace=True)
         monkeypatch.setitem(R._PLATFORM_INTER_KEYWORD_DELAY, PLATFORM, 10.0)
         job = _job(["kw0", "kw1"])
 
@@ -636,7 +592,7 @@ class TestInterKeywordPacing:
 
     @pytest.mark.asyncio
     async def test_a_zero_gap_platform_never_pauses(self, monkeypatch):
-        _, _, live = _wire(monkeypatch, [_session("a", "http://p1:1")], pace=True)
+        _, _, live = _wire(monkeypatch, [_session("a")], pace=True)
         monkeypatch.setitem(R._PLATFORM_INTER_KEYWORD_DELAY, PLATFORM, 0.0)
         job = _job(["kw0", "kw1", "kw2"])
 
@@ -647,7 +603,7 @@ class TestInterKeywordPacing:
     @pytest.mark.asyncio
     async def test_a_cancelled_sweep_does_not_sit_out_its_gap(self, monkeypatch):
         """Cancel should stop promptly, not after one more pacing wait."""
-        _, disc_cls, live = _wire(monkeypatch, [_session("a", "http://p1:1")], pace=True)
+        _, disc_cls, live = _wire(monkeypatch, [_session("a")], pace=True)
         monkeypatch.setitem(R._PLATFORM_INTER_KEYWORD_DELAY, PLATFORM, 6.0)
         job = _job(["kw0", "kw1", "kw2"])
 
@@ -662,3 +618,52 @@ class TestInterKeywordPacing:
         await _sweep(job, PLATFORM)
 
         assert live.get("pauses", []) == []
+
+
+# ------------------------------------------- parallelism is by session count
+
+
+class TestParallelismIsPurelyBySessionCount:
+    """WHAT CHANGED, AND WHY THIS IS PINNED. Claiming used to refuse a second
+    session unless it left the host through a different egress, which meant a
+    proxy-less pool could never sweep with more than one worker. Proxy support
+    has been removed from the tool, so the only question left is how many
+    pooled ACCOUNTS a platform has: two sessions means two workers splitting
+    the keyword list, regardless of the address they share."""
+
+    @pytest.mark.asyncio
+    async def test_two_proxyless_sessions_split_the_keywords(self, monkeypatch):
+        _, disc_cls, live = _wire(monkeypatch, [_session("a"), _session("b")])
+        keywords = [f"kw{n}" for n in range(6)]
+        job = _job(keywords)
+
+        await _sweep(job, PLATFORM)
+
+        assert len(disc_cls.instances) == 2
+        assert live["max"] == 2, "both workers must actually be open at once"
+        seen = [d.seen for d in disc_cls.instances]
+        assert all(s for s in seen), f"one worker did no work: {seen}"
+        assert sorted(seen[0] + seen[1]) == sorted(keywords)
+        prog = job.platforms[PLATFORM]
+        assert prog.keywords_done == prog.keywords_total == 6
+
+    @pytest.mark.asyncio
+    async def test_three_sessions_give_three_workers(self, monkeypatch):
+        monkeypatch.setattr(R.settings, "discovery_max_parallel_sessions", 3)
+        _, disc_cls, _ = _wire(
+            monkeypatch, [_session("a"), _session("b"), _session("c")])
+        job = _job([f"kw{n}" for n in range(9)])
+
+        await _sweep(job, PLATFORM)
+
+        assert len(disc_cls.instances) == 3
+        assert job.platforms[PLATFORM].keywords_done == 9
+
+    @pytest.mark.asyncio
+    async def test_one_session_still_sweeps_the_whole_plan(self, monkeypatch):
+        _, disc_cls, _ = _wire(monkeypatch, [_session("a")])
+        keywords = [f"kw{n}" for n in range(4)]
+        job = _job(keywords)
+        await _sweep(job, PLATFORM)
+        assert len(disc_cls.instances) == 1
+        assert disc_cls.instances[0].seen == keywords

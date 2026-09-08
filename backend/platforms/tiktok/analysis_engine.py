@@ -102,13 +102,13 @@ class Scraper:
 
     LINKED TO: `analysis_path` in backend/platforms/registry.py names this
     class, and services/analysis_service.py constructs and drives it with
-    the same (args, cookies, session_id, proxy) signature it uses for
+    the same (args, cookies, session_id) signature it uses for
     every platform."""
 
     normalize_url = staticmethod(normalize_url)
 
     def __init__(
-        self, args, cookies: list[dict], session_id: str = "", proxy: Optional[dict] = None,
+        self, args, cookies: list[dict], session_id: str = "",
         anonymous: bool = False,
     ):
         """Builds either a cookie-backed TikTokSession or, in anonymous
@@ -130,9 +130,8 @@ class Scraper:
         self._anon_cm = None
         self._anon_ctx = None
         self.session = None if anonymous else TikTokSession(
-            args, cookies, load_images=captures_screenshot(args), session_id=session_id, proxy=proxy,
+            args, cookies, load_images=captures_screenshot(args), session_id=session_id,
         )
-        self._proxy = proxy
 
     @property
     def ctx(self):
@@ -149,7 +148,7 @@ class Scraper:
         if self.anonymous:
             from backend.platforms.tiktok.discovery_engine import anonymous_context
 
-            self._anon_cm = anonymous_context(self._proxy)
+            self._anon_cm = anonymous_context()
             self._anon_ctx = await self._anon_cm.__aenter__()
             return
         await self.session.start()

@@ -165,12 +165,6 @@ def _public(s: dict, plat: object = None, health: Optional[dict] = None) -> dict
     deadline, which is what turns a red dot into something an operator can
     act on without going to the logs.
     """
-    proxy = s.get("proxy") or {}
-    proxy_host = ""
-    if proxy.get("server"):
-        parsed = urlparse(proxy["server"])
-        proxy_host = parsed.hostname or proxy["server"].split("://")[-1].split("@")[-1].split(":")[0]
-
     # A verdict recorded before these credentials were pasted describes the
     # ones they replaced, same rule `status()` applies to the pool-level
     # cache, applied per row.
@@ -195,7 +189,7 @@ def _public(s: dict, plat: object = None, health: Optional[dict] = None) -> dict
         "rate_limited_until": s["rate_limited_until"], "last_used": s["last_used"],
         "use_count": s.get("use_count", 0),
         "in_use": _session_in_use(s.get("platform", ""), s["id"]),
-        "cookie_count": len(s.get("cookies", []) or []), "proxy_host": proxy_host,
+        "cookie_count": len(s.get("cookies", []) or []),
         "is_api_key": bool(s.get("api_key")),
         # so the Sessions panel can show "cooling off, 3rd consecutive
         # failure" instead of a bare red dot with no sense of whether this
@@ -479,7 +473,7 @@ def release_claim(platform_id: str, session_id: str) -> None:
 
 async def session_for_job(platform_id: str) -> tuple[object, dict]:
     """What a discovery/analysis job needs to actually run: the Platform
-    metadata plus a healthy pooled session's credentials (+proxy for
+    metadata plus a healthy pooled session's credentials (cookies for
     cookie-authed platforms, api_key for key-authed ones, or just
     id/identifier for MTProto since its credentials go into os.environ +
     a session file rather than being handed to the caller directly)."""
@@ -543,7 +537,7 @@ async def session_for_job(platform_id: str) -> tuple[object, dict]:
             return plat, {"id": "", "identifier": "anonymous", "anonymous": True}
         raise ConflictError(f"{platform_id}: no healthy sessions available -- please add more cookies")
     return plat, {"id": item["id"], "identifier": item["identifier"],
-                  "cookies": item["cookies"], "proxy": item["proxy"],
+                  "cookies": item["cookies"],
                   # When real work last proved this session healthy. Carried
                   # through so a caller can decide whether its own login
                   # probe would tell it anything it does not already know --
@@ -762,7 +756,6 @@ async def save_credentials(
     username: str,
     password: str,
     two_factor_secret: str = "",
-    proxy: str | None = None
 ) -> dict:
     p = _get_platform(platform_id)
     if p.uses_api_key or p.env_keys:
@@ -775,7 +768,7 @@ async def save_credentials(
     
     # Pre-emptively save to DB with "checkpointed" status so the UI knows it's doing work
     try:
-        item = await sessions_db.add_item(platform_id, [], identifier, proxy)
+        item = await sessions_db.add_item(platform_id, [], identifier)
         await sessions_db.update_session_credentials(
             platform_id, item["id"],
             username=username,
@@ -788,7 +781,7 @@ async def save_credentials(
 
     async def _do_login():
         try:
-            cookies = await run_auto_login(platform_id, username, password, two_factor_secret, proxy)
+            cookies = await run_auto_login(platform_id, username, password, two_factor_secret)
             if cookies:
                 missing = [n for n in p.required_cookies if n not in {c["name"] for c in cookies}]
                 if missing:
@@ -809,7 +802,7 @@ async def save_credentials(
             log.error(f"{platform_id}: auto-login failed: {e}")
             # the reason goes ON the row, not only into the log, otherwise
             # this row just reads "checkpointed" and the operator has no way
-            # to tell a wrong password from a proxy timeout
+            # to tell a wrong password from a network timeout
             await sessions_db.update_item(
                 platform_id, item["id"], status="checkpointed",
                 last_error=f"auto-login failed: {type(e).__name__}: {e}",

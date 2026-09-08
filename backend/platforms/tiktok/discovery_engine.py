@@ -819,7 +819,7 @@ def _profile_dir():
 
 
 @asynccontextmanager
-async def anonymous_context(proxy: Optional[dict] = None):
+async def anonymous_context():
     """A credential-free TikTok browser context, on a persistent profile.
 
     BOTH halves matter and both are load-bearing:
@@ -841,8 +841,7 @@ async def anonymous_context(proxy: Optional[dict] = None):
     from backend.stealth.fingerprint import LAUNCH_ARGS, chrome_binary, get_identity
     from backend.stealth.headers import build_extra_headers
     from backend.stealth.navigator_spoofing import build_init_js
-    from backend.stealth.proxy import build_proxy_config
-    from backend.stealth.timezone import resolve_timezone_id
+    from backend.stealth.timezone import DEFAULT_TIMEZONE_ID
 
     profile = _profile_dir()
     profile.mkdir(parents=True, exist_ok=True)
@@ -888,12 +887,10 @@ async def anonymous_context(proxy: Optional[dict] = None):
         # measurement behind this exact spelling.
         "locale": f"{locale},{locale.split('-')[0]}",
         "extra_http_headers": build_extra_headers(locale=locale),
-        "timezone_id": resolve_timezone_id(proxy),
+        "timezone_id": DEFAULT_TIMEZONE_ID,
     }
     if binary := chrome_binary():
         launch["executable_path"] = binary
-    if proxy and (cfg := build_proxy_config(proxy)):
-        launch["proxy"] = cfg
 
     async with _profile_lock():
         pw = ctx = None
@@ -1008,7 +1005,7 @@ async def user_cards(page) -> list[TikTokUser]:
 
 
 async def search_users(
-    keywords: list[str], proxy: Optional[dict] = None, timeout_s: float = 45.0,
+    keywords: list[str], timeout_s: float = 45.0,
 ) -> dict[str, list[TikTokUser]]:
     """{keyword: name-matched accounts} from TikTok's Users tab.
 
@@ -1019,7 +1016,7 @@ async def search_users(
     if not keywords:
         return out
     try:
-        async with anonymous_context(proxy) as ctx:
+        async with anonymous_context() as ctx:
             for kw in keywords:
                 out[kw] = await _users_for(ctx, kw, timeout_s)
                 log.info(f"tiktok/users {kw!r}: {len(out[kw])} account(s)")
@@ -1431,7 +1428,7 @@ class Discovery:
             else:
                 # search_users takes the lock itself, via anonymous_context
                 found = (await search_users(
-                    [out.keyword], proxy=getattr(self.a, "proxy", None),
+                    [out.keyword],
                 )).get(out.keyword) or []
         except Exception as e:
             log.warning(f"tiktok/users {out.keyword!r}: skipped -- {type(e).__name__}: {e}")

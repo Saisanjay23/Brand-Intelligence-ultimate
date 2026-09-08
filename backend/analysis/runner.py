@@ -31,7 +31,7 @@ ROBUSTNESS. Sessions are taken per platform per job, never per URL, so a
 40-URL paste does not open 40 browser sessions -- a platform claims as many
 pooled sessions as it can safely work with at once (see `_scrape_platform`
 and _MAX_SESSIONS_PER_PLATFORM: usually one, up to three when the pool has
-that many accounts on genuinely separate egress, and never more than the
+that many accounts, and never more than the
 batch has work for). Those sessions pull from one shared queue, which is
 what makes a session dying mid-run survivable: the URLs it had not finished
 are still queue entries, so another session takes them instead of the batch
@@ -207,30 +207,6 @@ def _worker_semaphore() -> asyncio.Semaphore:
         sem = asyncio.Semaphore(max(1, settings.analysis_max_browser_workers))
         _worker_slots[loop] = sem
     return sem
-
-
-def _egress_key(session_item: dict) -> str:
-    """What this session actually leaves the host THROUGH -- the one thing two
-    parallel workers must not have in common.
-
-    Two accounts on one platform from one IP at the same moment is the pattern
-    sessions/manager.py's own claim comment calls the most reliable way to earn
-    a checkpoint, and it is exactly what parallel workers would create on a
-    pool whose entries carry no proxy, or the same one. The username is part of
-    the key deliberately: residential providers hand out a single gateway host
-    with a per-session username, so `server` alone would read two genuinely
-    different exit IPs as one egress and refuse to parallelise.
-
-    A blank key means "this machine's own address", which is a shared egress
-    like any other -- so two proxy-less sessions collide, as they should.
-    """
-    proxy = session_item.get("proxy") or {}
-    if not isinstance(proxy, dict):
-        return str(proxy).strip().lower()
-    server = str(proxy.get("server") or "").strip().lower()
-    if not server:
-        return ""
-    return f"{server}|{str(proxy.get('username') or '').strip()}"
 
 
 def _sessions_wanted(platform_id: str, item_count: int, concurrency: int) -> int:
@@ -589,7 +565,7 @@ class AnalysisRunner:
             for it in job.items:
                 by_platform.setdefault(it.platform, []).append(it)
             # Every platform scraped CONCURRENTLY. Each is a fully separate
-            # account, browser context and proxy on a fully separate host --
+            # account and browser context on a fully separate host --
             # there is no shared-session risk running Twitter and Instagram
             # at once the way there would be two sessions open on the SAME
             # platform simultaneously (guarded by JobStore's per-
@@ -763,7 +739,7 @@ class AnalysisRunner:
     async def _claim_sessions(
         self, platform_id: str, want: int,
     ) -> tuple[Any, list[dict]]:
-        """Up to `want` pooled sessions, each on its own egress, claimed for
+        """Up to `want` pooled sessions, claimed for
         the life of this platform's batch.
 
         Raises whatever `session_for_job` raised when it could not supply even
@@ -775,7 +751,6 @@ class AnalysisRunner:
         """
         plat: Any = None
         claimed: list[dict] = []
-        egress: set[str] = set()
         while len(claimed) < want:
             try:
                 plat, session_item = await sessions_engine.session_for_job(platform_id)
@@ -792,25 +767,6 @@ class AnalysisRunner:
                 if not claimed:
                     claimed.append(session_item)
                 break
-            key = _egress_key(session_item)
-            if claimed and key in egress:
-                # DISTINCT EGRESS, OR ONE WORKER. Parallel sessions are only
-                # safer than one when they are genuinely separate identities:
-                # two accounts hitting one platform from one IP at the same
-                # moment is the pattern sessions/manager.py's own claim
-                # comment calls the most reliable way to earn a checkpoint,
-                # and buying throughput with it would cost the very sessions
-                # this exists to survive the loss of. Handed straight back so
-                # another job -- or this platform's own second round after a
-                # failure -- can still use it.
-                sessions_engine.release_claim(platform_id, session_id)
-                log.info(
-                    f"[{platform_id}] session "
-                    f"{session_item.get('identifier') or session_id} shares its egress "
-                    f"with one already claimed -- staying on {len(claimed)} worker(s) "
-                    f"rather than running two accounts through one IP")
-                break
-            egress.add(key)
             claimed.append(session_item)
         return plat, claimed
 
@@ -822,7 +778,7 @@ class AnalysisRunner:
         queue); False if it worked the queue out or was cancelled.
 
         Nothing about HOW a URL is read changes with worker count, and all of
-        it is per-worker: its own browser context, its own proxy, its own
+        it is per-worker: its own browser context, its own cookie jar, its own
         cookie jar, its own `concurrency` tabs, the same `scraper.one()` and
         therefore the same waits, the same extraction and the same full-page
         evidence screenshot. A worker is a second reader of one queue, not a
@@ -846,12 +802,12 @@ class AnalysisRunner:
                 held = self._store.hold_session(platform_id, session_id)
                 if session_item.get("anonymous"):
                     scraper = plat.scraper()(
-                        run.options, [], proxy=session_item.get("proxy"), anonymous=True,
+                        run.options, [], anonymous=True,
                     )
                 else:
                     scraper = plat.scraper()(
                         run.options, session_item.get("cookies", []),
-                        session_id=session_id, proxy=session_item.get("proxy"),
+                        session_id=session_id,
                     )
                 inner = getattr(scraper, "session", None)
                 if inner is not None:

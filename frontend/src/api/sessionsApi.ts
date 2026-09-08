@@ -6,29 +6,6 @@
 import { json, post, url } from "./httpClient";
 import type { SessionInfo } from "./types";
 
-/** What POST /sessions/proxy/test reports back. `ok` false means traffic did
- * NOT actually egress through the proxy -- see `warnings`, which is ordered
- * most-severe first and is written to be shown verbatim. */
-export interface ProxyTestResult {
-  ok: boolean;
-  exit_ip?: string | null;
-  direct_ip?: string | null;
-  country?: string | null;
-  country_code?: string | null;
-  city?: string | null;
-  timezone?: string | null;
-  isp?: string | null;
-  org?: string | null;
-  /** true = hosting range (loud), false = residential/mobile (quiet), null = unknown */
-  is_datacenter?: boolean | null;
-  is_known_proxy?: boolean | null;
-  is_mobile?: boolean | null;
-  latency_ms?: number;
-  intel_source?: string | null;
-  warnings?: string[];
-  error?: string;
-}
-
 export const sessionsApi = {
   // Every platform's pool in one request. Preferred over fanning
   // sessionStatus out across the platform list: it's one round trip instead

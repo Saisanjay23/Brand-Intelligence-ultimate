@@ -363,7 +363,6 @@ export interface SessionItem {
   // that job stops running rather than needing anything to "release" it
   in_use: boolean;
   cookie_count: number;
-  proxy_host: string;
   is_api_key?: boolean;
   // consecutive failures since this session last demonstrably worked --
   // drives the graduated quarantine ladder (15m -> 1h -> 6h -> 24h), so a

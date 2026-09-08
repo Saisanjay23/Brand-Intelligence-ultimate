@@ -45,14 +45,12 @@ async def _handle_totp(page: Page, totp_secret: str, input_selector: str, submit
         return False
 
 
-async def run_auto_login(platform_id: str, username: str, password: str, two_factor_secret: str, proxy: dict | None) -> list[dict]:
+async def run_auto_login(platform_id: str, username: str, password: str, two_factor_secret: str) -> list[dict]:
     """Launch a stealth browser, log in automatically, and return the new cookies."""
     log.info(f"Starting automated credential login for {platform_id} ({username})")
     opts = SimpleNamespace(headful=True, timeout=60, delay=0)
     # Initialize with an empty session (no initial cookies)
     session = Session(opts, [], load_images=True)
-    if proxy:
-        session.proxy = proxy
 
     try:
         ctx = await session.start()

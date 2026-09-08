@@ -119,7 +119,6 @@ class SessionEntry(BaseModel):
     last_used: float = 0
     dead_since: float = Field(0, description="Epoch seconds since it was declared dead; 0 if alive.")
     purge_in_days: Optional[float] = Field(None, description="Auto-removal countdown once dead.")
-    proxy_host: str = Field("", description="Host only -- never the proxy credentials.")
     last_error: str = ""
     last_checked: str = ""
     last_check_ok: Optional[bool] = None

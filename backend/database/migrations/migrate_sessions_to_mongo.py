@@ -42,8 +42,7 @@ def _read_pool_file(path) -> list[dict]:
         return [{"identifier": "Legacy Session", "cookies": obj}]
     if isinstance(obj, dict) and obj.get("version") == 2:
         return [
-            {"identifier": s.get("identifier", s.get("id", "Session")), "cookies": s.get("cookies", []),
-             "proxy": s.get("proxy")}
+            {"identifier": s.get("identifier", s.get("id", "Session")), "cookies": s.get("cookies", [])}
             for s in obj.get("sessions", [])
         ]
     return []
@@ -88,7 +87,7 @@ async def migrate(dry_run: bool) -> None:
                 f"session {entry['identifier']!r} ({len(cookies)} cookies)"
             )
             if not dry_run:
-                await sessions_db.add_item(platform_id, cookies, entry["identifier"], entry.get("proxy"))
+                await sessions_db.add_item(platform_id, cookies, entry["identifier"])
 
         print(f"{platform_id}: {migrated} session(s) migrated, {skipped_dupe} already present")
 
