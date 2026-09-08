@@ -22,13 +22,26 @@ function notifyFinished(job: DiscoveryJobState): void {
 // the snapshot on an interval until the job reaches a terminal status,
 // keeping the epoch-guard + visibility-aware structure that made the old
 // useJobPolling hook safe to unmount/restart mid-poll.
-export function useDiscoveryJobPoll(onFinish?: () => void) {
+// `onProgress` fires whenever the running job's counts MOVE, not only when
+// it ends. Without it the grid had no idea results were landing: the backend
+// writes profiles per completed sweep (see discovery/runner.py -- "so a
+// caller polling this job sees results within seconds"), but nothing on this
+// side re-read them until the job hit a terminal status. The rows were in
+// Mongo the whole time; the only way to see them was to leave the tab and
+// come back, which remounted the grid and forced a fetch.
+export function useDiscoveryJobPoll(onFinish?: () => void, onProgress?: () => void) {
   const [job, setJob] = useState<DiscoveryJobState | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const epoch = useRef(0);
   const mounted = useRef(true);
   const finish = useRef(onFinish);
   finish.current = onFinish;
+  const progress = useRef(onProgress);
+  progress.current = onProgress;
+  // Last counts we told the caller about. Compared rather than fired on
+  // every tick so a 2s poll on an idle platform does not re-query the grid
+  // (and its four facet aggregates) for nothing.
+  const lastCounts = useRef("");
   const [cancelling, setCancelling] = useState(false);
 
   const stop = useCallback(() => {
@@ -39,6 +52,7 @@ export function useDiscoveryJobPoll(onFinish?: () => void) {
   const watch = useCallback((jobId: string) => {
     stop();
     const myEpoch = (epoch.current += 1);
+    lastCounts.current = "";
     const stale = () => !mounted.current || epoch.current !== myEpoch;
 
     const poll = async () => {
@@ -46,6 +60,12 @@ export function useDiscoveryJobPoll(onFinish?: () => void) {
         const updated = await discoveryApi.getJob(jobId);
         if (stale()) return;
         setJob(updated);
+        // Counts moved -> new rows are already saved and readable.
+        const counts = `${updated.found}/${updated.new}/${updated.completed}`;
+        if (counts !== lastCounts.current) {
+          lastCounts.current = counts;
+          progress.current?.();
+        }
         if (TERMINAL.has(updated.status)) {
           timer.current = null;
           notifyFinished(updated);

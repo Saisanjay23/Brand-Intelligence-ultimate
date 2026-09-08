@@ -77,6 +77,11 @@ class DiscoveryOptions:
     patience: int = 4  # scrolls with no new ids before calling it stalled
     concurrency: int = 2  # keyword sweeps in flight at once
     progress_every: int = 5  # log a progress line every N result pages
+    # Median seconds between one keyword sweep and the next on one session.
+    # Read by stealth/browser.py::Session.pause() exactly as ScanOptions.delay
+    # is for analysis -- 0 leaves pause() on its own BASE median rather than
+    # disabling it. Set from settings.discovery_delay_sec by the runner.
+    delay: float = 0.0
 
     # Caps. People search is effectively unbounded on some platforms, so a
     # sweep needs a stop somewhere. Hitting any cap marks the sweep

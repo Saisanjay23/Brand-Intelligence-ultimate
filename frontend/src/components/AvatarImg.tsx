@@ -43,6 +43,15 @@ export function AvatarImg({ src, sha, alt = "", className, style, fallback = nul
       className={className}
       style={style}
       referrerPolicy="no-referrer"
+      // Decode off the main thread so a gridful of avatars cannot stall
+      // scrolling or the next render while the browser unpacks JPEGs.
+      decoding="async"
+      // Eager on purpose: these are ABOVE the fold in a card grid the
+      // analyst is looking at right now, and the stored copies are served
+      // `immutable, max-age=1y` (backend/api/media.py), so the second view
+      // of any profile is a cache hit. Lazy-loading them would trade a
+      // guaranteed local hit for a visible pop-in.
+      loading="eager"
       onError={() => setAttempt((n) => n + 1)}
     />
   );

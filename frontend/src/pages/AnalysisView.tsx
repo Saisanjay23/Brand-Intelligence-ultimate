@@ -325,6 +325,23 @@ function AnalysisProgressBanner({
             <span style={{ color: "var(--text-dim, #98a2b3)" }}>
               {prog.completed}/{prog.total}
             </span>
+            {/* Only when the batch was actually split -- a "1 session" badge on
+                every chip would be noise, since one session is the norm. */}
+            {(prog.workers ?? 0) > 1 && (
+              <span
+                title={`Split across ${prog.workers} sessions running in parallel`}
+                style={{
+                  fontSize: "10px",
+                  fontWeight: 700,
+                  color: "var(--cyan, #00F0FF)",
+                  border: "1px solid rgba(0, 240, 255, 0.35)",
+                  borderRadius: "4px",
+                  padding: "1px 5px",
+                }}
+              >
+                x{prog.workers}
+              </span>
+            )}
             <span
               style={{
                 fontSize: "10px",

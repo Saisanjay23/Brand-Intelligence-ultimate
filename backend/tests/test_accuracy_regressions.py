@@ -157,13 +157,20 @@ class TestRiskScoreUsesRestoredFields:
             has_location=bool(location), last_post_iso=last_post,
         )
 
-    def test_a_real_non_match_still_sits_on_the_floor(self):
-        """The fix must not inflate rows that genuinely do not match."""
+    def test_username_is_always_yes_regardless_of_score(self):
+        """`Row.name_yes` no longer thresholds on `name_score` at all -- see
+        its own docstring: a row only reaches analysis because discovery
+        already matched it to the client's keywords, so this property no
+        longer second-guesses that with a stricter, independent bar. A low
+        `name_score` (10, well under NAME_THRESHOLD) restored from `known`
+        must still read Name=Yes and score off the BASE+W_NAME floor (3),
+        never the old no-match floor (2)."""
         item = self._populate(
             dict(has_custom_pic=False, location="", last_post_iso=""),
             {"name_score": 10},
         )
-        assert item.risk_score == 2
+        assert item.has_name_match is True
+        assert item.risk_score == 3
 
 
 class TestParseCountNeverRaises:

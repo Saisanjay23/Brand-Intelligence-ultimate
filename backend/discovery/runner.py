@@ -28,7 +28,9 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from dataclasses import dataclass, field
+import weakref
+from collections import deque
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -45,6 +47,40 @@ from backend.shared.resilience import classify_failure
 from backend.shared.text import handle_from_url, name_score
 
 log = get_logger("discovery.runner")
+
+# Seconds between one concurrent tab's start and the next. Three searches
+# leaving in the same instant is a pattern; a second apart is three tabs
+# opened by hand. Cheap insurance -- it costs at most 2s per keyword and
+# only when discovery_tab_concurrency > 1.
+TAB_STAGGER_SEC = 1.0
+
+# MEDIAN SECONDS BETWEEN ONE KEYWORD AND THE NEXT on the same session, per
+# platform. Discovery had no gap here at all -- `for keyword in
+# job.keyword_plan` ran each sweep straight into the next, so a 15-keyword
+# client put 45 Facebook searches (15 keywords x three tabs) through one
+# logged-in account with only page-load time between them. Analysis has had
+# _PLATFORM_INTER_BATCH_DELAY for exactly this reason since it was written;
+# discovery simply never grew the equivalent.
+#
+# Spent through the session's own `pause()` rather than a flat sleep, so
+# jitter, fatigue and the occasional longer rest still shape the gap
+# (stealth/human.py) -- these are medians, not fixed waits. 0 skips the
+# pause entirely.
+#
+# Facebook is the largest on purpose: it is the only platform sweeping
+# three tabs per keyword, it is the one that also visits profiles to
+# reconcile names, and it is where this pool has actually had accounts
+# disabled.
+_PLATFORM_INTER_KEYWORD_DELAY: dict[str, float] = {
+    # Official API calls, not a browser session driving a logged-in account.
+    # Telegram governs itself through FloodWait, which is a real signal
+    # rather than a guess, and youtube's quota is metered not ban-risked.
+    "youtube": 0.0,
+    "telegram": 0.0,
+    "facebook": 12.0,
+    "instagram": 8.0,
+}
+_DEFAULT_INTER_KEYWORD_DELAY = 6.0
 
 MAX_JOBS = 200
 JOB_TTL_SECONDS = 6 * 3600
@@ -64,6 +100,146 @@ PLATFORM_TABS: dict[str, list[str]] = {
     "telegram": ["all"],
     "tiktok": ["people"],
 }
+
+# ------------------------------------------------- parallel sessions, failover
+#
+# See analysis/runner.py's own block of the same name for the full
+# reasoning -- this mirrors it keyword-for-URL. The short version: one
+# platform, several sessions, pulling KEYWORDS off one shared queue instead
+# of one session working through the whole `keyword_plan` alone. A session
+# that dies mid-sweep gives back exactly what its current keyword
+# contributed and re-queues it for a surviving session, instead of every
+# keyword still behind it in the plan going unswept with nothing to explain
+# why (which is what happened before this: see `_sweep_platform`'s old
+# `fatal[0]: return` shortcut).
+#
+# 1 SESSION IS NOT A DEGRADED PATH. A single-session pool claims one session
+# and runs the identical one-keyword-at-a-time loop it always did.
+_MAX_SESSIONS_PER_PLATFORM: dict[str, int] = {
+    # Telethon keeps ONE local session file open at a time behind an SQLite
+    # lock (see sessions/manager.py::session_for_job), so a second Telegram
+    # worker would be two clients fighting over one file, not two clients.
+    "telegram": 1,
+    # An API-key platform has no browser session to isolate a second worker
+    # behind -- session_for_job hands the key over via os.environ, so a
+    # second claim would overwrite the first rather than run beside it.
+    "youtube": 1,
+}
+
+# How many sessions one KEYWORD may be handed to before whatever its last
+# attempt completed is left standing. 2 means one retry, on one other
+# session. Bounded because the failure being recovered from is ambiguous:
+# usually the session died, but sometimes the keyword itself (an unusual
+# character, a platform-side block on that exact term) is what trips the
+# challenge, and an uncapped retry would let one keyword walk the whole pool
+# killing accounts as it goes.
+_MAX_KEYWORD_ATTEMPTS = 2
+
+# How many times a platform may go back to the pool for REPLACEMENT sessions
+# after everything it had claimed died. Round 1 is the ordinary claim; round
+# 2 exists for a session coming free (another job finished, or the monitor
+# revived one) while this sweep was running.
+_MAX_CLAIM_ROUNDS = 2
+
+# Each worker's browser starts this many seconds after the one before it, so
+# N sessions never open their first request to a platform in the same
+# instant -- the same reasoning TAB_STAGGER_SEC already applies within one
+# session's concurrent tabs, one level up.
+WORKER_STAGGER_SEC = 2.0
+
+# Bound on browser workers open at once across the WHOLE process, which is
+# the number that actually decides whether the host copes. `_run` sweeps
+# every ready platform concurrently, so a per-platform cap cannot see the
+# total. Keyed by running loop, not one module-level Semaphore: asyncio
+# primitives bind to the loop that first awaits them, so a test suite that
+# builds a fresh loop per test would otherwise inherit one bound to a loop
+# that is already closed. Weak keys so closed loops do not accumulate.
+_worker_slots: "weakref.WeakKeyDictionary[Any, asyncio.Semaphore]" = (
+    weakref.WeakKeyDictionary())
+
+
+def _worker_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    sem = _worker_slots.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(max(1, settings.discovery_max_browser_workers))
+        _worker_slots[loop] = sem
+    return sem
+
+
+def _egress_key(session_item: dict) -> str:
+    """What this session actually leaves the host THROUGH -- the one thing
+    two parallel workers must not have in common. See analysis/runner.py's
+    identical helper for the full reasoning; kept as its own copy here
+    rather than a shared import so this module and analysis's each stay
+    independently correct."""
+    proxy = session_item.get("proxy") or {}
+    if not isinstance(proxy, dict):
+        return str(proxy).strip().lower()
+    server = str(proxy.get("server") or "").strip().lower()
+    if not server:
+        return ""
+    return f"{server}|{str(proxy.get('username') or '').strip()}"
+
+
+def _sessions_wanted(platform_id: str, keyword_count: int) -> int:
+    """How many sessions it is worth claiming for this platform's sweep.
+    Never more than there are keywords to sweep -- a claimed session is
+    invisible to every other job for the life of the sweep, so claiming one
+    that would sit idle costs another job an account for nothing.
+
+    API-key and MTProto platforms are pinned to one: `session_for_job` hands
+    those credentials over by mutating os.environ or one local session file,
+    so a second claim would overwrite the first rather than run beside it.
+    """
+    cap = _MAX_SESSIONS_PER_PLATFORM.get(
+        platform_id, settings.discovery_max_parallel_sessions)
+    plat = registry.PLATFORMS.get(platform_id)
+    if plat is not None and (plat.uses_api_key or plat.env_keys or not plat.session_path):
+        cap = 1
+    return max(1, min(cap, keyword_count))
+
+
+@dataclass
+class _KeywordItem:
+    """One (keyword, kw_type) pair from `job.keyword_plan`, tracked for
+    retry the way analysis/runner.py's AnalysisItem tracks `attempts` for a
+    URL -- see _MAX_KEYWORD_ATTEMPTS."""
+
+    keyword: str
+    kw_type: str
+    attempts: int = 0
+
+
+@dataclass
+class _PlatformSweepRun:
+    """One platform's sweep, shared by every worker on it -- the queue IS
+    the coordination, exactly as analysis/runner.py's _PlatformRun. A plain
+    deque, not asyncio.Queue: every worker runs on one event loop, so a
+    truthiness check followed by `popleft` cannot be interleaved, which
+    makes the lock and task_done() bookkeeping an asyncio.Queue would add
+    pure cost."""
+
+    platform_id: str
+    queue: "deque[_KeywordItem]"
+    tabs: list[str]
+    max_results: int
+    max_seconds: Optional[float]
+    platform_limits: dict[str, dict[str, int]]
+    platform_tab_limits: dict[str, dict[str, dict[str, int]]]
+    prog: PlatformSweep
+    # Set by a worker that hit a NON-session-fatal stop -- Telegram's
+    # FloodWait is the only source today. Every worker, including others
+    # still mid-sweep, stops pulling once this is true, because the reason
+    # has nothing to do with WHICH session is running -- another one would
+    # hit the identical wall. Distinct from a session dying (see
+    # _requeue_keyword), which only removes that one session and lets the
+    # others carry on.
+    hard_stop: bool = False
+    incomplete: int = 0
+    sweep_errors: list[str] = field(default_factory=list)
+
+
 
 
 def _effective_cap(*caps: int) -> int:
@@ -203,6 +379,11 @@ class PlatformSweep:
     item_started_at_ts: Optional[float] = None
     started_at_ts: Optional[float] = None
     finished_at_ts: Optional[float] = None
+    # How many pooled sessions are sweeping this platform in parallel right
+    # now. 0 outside a sweep round; 1 is the ordinary single-session case;
+    # >1 means the keyword list was split across accounts -- see
+    # _MAX_SESSIONS_PER_PLATFORM.
+    workers: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -216,6 +397,7 @@ class PlatformSweep:
             "item_started_at_ts": self.item_started_at_ts,
             "started_at_ts": self.started_at_ts,
             "finished_at_ts": self.finished_at_ts,
+            "workers": self.workers,
         }
 
 
@@ -405,10 +587,14 @@ class DiscoveryRunner:
             # there is no shared-session risk running them at once the way
             # there would be two sessions open on the SAME platform
             # simultaneously (that risk is what JobStore's per-
-            # (platform, session_id) hold guards against, see
-            # _sweep_platform below). WITHIN one platform, its keywords
-            # still run one at a time, in the exact order the client
-            # configured them -- see _sweep_platform's inner loop.
+            # (platform, session_id) hold guards against, together with
+            # _claim_sessions' egress check -- see _sweep_platform below).
+            # WITHIN one platform, its keywords may now ALSO run several at
+            # a time when the pool has more than one usable session for it
+            # (see _sweep_platform/_keyword_worker), each on its own
+            # account and proxy -- never two sessions on one platform at
+            # once, which is exactly what those two guards exist to keep
+            # true regardless of how many workers a platform is running.
             #
             # Exceptions are already caught and recorded per-platform
             # inside _sweep_platform (it never raises out), so
@@ -508,98 +694,340 @@ class DiscoveryRunner:
         platform_limits_individual: dict[str, int], platform_limits_domain: dict[str, int],
         platform_tab_limits: dict[str, dict[str, dict[str, int]]],
     ) -> None:
+        """Every keyword on one platform, swept by every session that
+        platform can safely lend at once.
+
+        A QUEUE AND N WORKERS, not a loop over `job.keyword_plan`. See
+        analysis/runner.py's _scrape_platform for the identical shape and
+        reasoning -- a two-account pool splits the keyword list and halves
+        the sweep, and a session dying mid-sweep is RECOVERABLE: the
+        keywords it had not reached are still queue entries, so a
+        surviving worker takes them instead of the platform reporting a
+        silent gap between keywords_done and keywords_total. With one
+        session in the pool this is the same one-keyword-at-a-time loop it
+        has always been -- the single-session path is not a fallback, it
+        is this code with one worker.
+        """
         prog = job.platforms[platform_id]
         prog.status = "running"
         prog.started_at_ts = time.time()
         registry.get(platform_id)
         tabs = PLATFORM_TABS.get(platform_id, ["people"])
         platform_limits = {"individual": platform_limits_individual, "domain": platform_limits_domain}
-        options = DiscoveryOptions(
-            concurrency=settings.discovery_concurrency,
-            # Placeholder -- every platform's Discoverer.sweep() reads
-            # `self.a.max_results` fresh at the top of each call (confirmed
-            # across all six engines), never cached at construction, so
-            # setting the real per-(tab,keyword-type) cap on THIS SAME
-            # options object right before each `discoverer.sweep(...)`
-            # call below is enough; no per-cell Discoverer needed. Safe
-            # because sweeps for one platform run strictly sequentially
-            # (see this method's own loop) -- never two sweep() calls on
-            # the same Discoverer concurrently mutating this.
+
+        run = _PlatformSweepRun(
+            platform_id=platform_id,
+            queue=deque(_KeywordItem(kw, kt) for kw, kt in job.keyword_plan),
+            tabs=tabs,
             max_results=max_results,
-            max_seconds=max_seconds if max_seconds is not None else settings.discovery_max_seconds,
-            headful=not settings.headless,
-            # Ceilings on waiting for a real signal -- see settings.py for
-            # why lowering them buys nothing on a healthy sweep and why the
-            # telemetry below is what says whether a change actually helped.
-            settle=settings.discovery_settle_sec,
-            page_wait=settings.discovery_page_wait_sec,
-            patience=settings.discovery_patience,
+            max_seconds=max_seconds,
+            platform_limits=platform_limits,
+            platform_tab_limits=platform_tab_limits,
+            prog=prog,
         )
+
+        want = _sessions_wanted(platform_id, len(job.keyword_plan))
+        prog.workers = 0
+        setup_error = ""
+        worker_error = ""
+        rounds = 0
+
+        try:
+            while rounds < _MAX_CLAIM_ROUNDS and run.queue and not job.cancel.is_set() and not run.hard_stop:
+                rounds += 1
+                try:
+                    plat_obj, claimed = await self._claim_sessions(platform_id, want)
+                except Exception as e:
+                    if rounds == 1:
+                        # Nothing to sweep with AT ALL -- the pool is empty,
+                        # dead or entirely rate-limited. Recorded as this
+                        # platform's failure detail so the analyst reads
+                        # ConflictError's own actionable message on the
+                        # progress chip rather than a generic one.
+                        setup_error = f"{type(e).__name__}: {e}"
+                        log.error(f"discovery job {job.id}: {platform_id} failed -- {setup_error}")
+                    break
+                if not claimed:
+                    break
+
+                if rounds > 1:
+                    log.info(
+                        f"[{platform_id}] {len(run.queue)} keyword(s) still queued after "
+                        f"every session failed -- retrying on {len(claimed)} replacement "
+                        f"session(s)")
+                elif len(claimed) > 1:
+                    log.info(
+                        f"[{platform_id}] {len(job.keyword_plan)} keyword(s) split across "
+                        f"{len(claimed)} sessions in parallel")
+
+                prog.workers = len(claimed)
+                results = await asyncio.gather(
+                    *(self._keyword_worker(job, run, plat_obj, session_item, worker_index)
+                      for worker_index, session_item in enumerate(claimed)),
+                    return_exceptions=True,
+                )
+                prog.workers = 0
+                for result in results:
+                    if isinstance(result, BaseException):
+                        # A worker's SETUP failed (its own session was
+                        # unusable), which is not this platform's failure
+                        # while another worker or another round can still
+                        # drain the queue -- held onto as the detail to
+                        # report only if nothing does.
+                        worker_error = f"{type(result).__name__}: {result}"
+                        log.error(
+                            f"discovery job {job.id}: {platform_id} worker failed -- "
+                            f"{worker_error}")
+        except Exception as e:
+            prog.status = "failed"
+            prog.note = f"{type(e).__name__}: {e}"
+            log.error(f"discovery job {job.id}: {platform_id} failed -- {prog.note}")
+            prog.current_keyword = ""
+            prog.current_tab = ""
+            prog.current_step = ""
+            prog.item_started_at_ts = None
+            prog.finished_at_ts = time.time()
+            return
+
+        prog.current_keyword = ""
+        prog.current_tab = ""
+        prog.current_step = ""
+        prog.item_started_at_ts = None
+        prog.finished_at_ts = time.time()
+
+        if job.cancel.is_set():
+            # A cancelled platform keeps what it read; failing the rest
+            # would turn the analyst's own cancel into a screenful of
+            # errors.
+            if run.incomplete:
+                prog.status = "partial"
+                if not prog.note:
+                    prog.note = f"{run.incomplete} sweep(s) did not run to completion"
+            else:
+                prog.status = "done"
+            return
+
+        if run.queue:
+            # WHATEVER NO SESSION EVER REACHED. Either every claimed session
+            # died on this platform (or _MAX_CLAIM_ROUNDS ran out of
+            # replacements) with keywords still unattempted -- explicit now,
+            # rather than the silent gap between keywords_done and
+            # keywords_total this used to leave with no note explaining it.
+            if not prog.note:
+                prog.note = setup_error or worker_error or (
+                    "every available session for this platform failed or checkpointed -- "
+                    "see the earlier failed sweep(s) for why")
+            prog.status = "failed" if prog.keywords_done == 0 else "partial"
+            return
+
+        if run.incomplete:
+            prog.status = "partial"
+            if run.sweep_errors:
+                # The diagnosis first, the count second -- the count is the
+                # part an analyst can do nothing with.
+                detail = " | ".join(run.sweep_errors[:2])
+                prog.note = f"{detail} ({run.incomplete} sweep(s) incomplete)"
+            else:
+                prog.note = f"{run.incomplete} sweep(s) did not run to completion"
+        else:
+            # Includes the case this was built for: a session died
+            # mid-sweep, another one finished its keywords, and the
+            # analyst gets a complete platform anyway.
+            prog.status = "done"
+
+    async def _claim_sessions(
+        self, platform_id: str, want: int,
+    ) -> tuple[Any, list[dict]]:
+        """Up to `want` pooled sessions, each on its own egress, claimed for
+        the life of this platform's sweep. See analysis/runner.py's
+        identical method for the full reasoning; kept as its own copy so
+        this module and analysis's stay independently correct."""
+        plat_obj: Any = None
+        claimed: list[dict] = []
+        egress: set[str] = set()
+        while len(claimed) < want:
+            try:
+                plat_obj, session_item = await sessions_engine.session_for_job(platform_id)
+            except Exception:
+                if not claimed:
+                    raise
+                break
+            session_id = str(session_item.get("id") or "")
+            if not session_id or session_item.get("anonymous"):
+                # NOT A POOL ENTRY. `session_for_job` fell back to a
+                # logged-out context (tiktok) or an env API key; there is
+                # no second identity behind that to claim and it would hand
+                # back this same dict forever, so it is this platform's one
+                # worker.
+                if not claimed:
+                    claimed.append(session_item)
+                break
+            key = _egress_key(session_item)
+            if claimed and key in egress:
+                # DISTINCT EGRESS, OR ONE WORKER. Two accounts on one
+                # platform from one IP at the same moment is the pattern
+                # sessions/manager.py's own claim comment calls the most
+                # reliable way to earn a checkpoint, and buying throughput
+                # with it would cost the very sessions this feature exists
+                # to survive the loss of. Handed straight back so another
+                # job -- or this platform's own second round after a
+                # failure -- can still use it.
+                sessions_engine.release_claim(platform_id, session_id)
+                log.info(
+                    f"[{platform_id}] session "
+                    f"{session_item.get('identifier') or session_id} shares its egress "
+                    f"with one already claimed -- staying on {len(claimed)} worker(s) "
+                    f"rather than running two accounts through one IP")
+                break
+            egress.add(key)
+            claimed.append(session_item)
+        return plat_obj, claimed
+
+    async def _keyword_worker(
+        self, job: DiscoveryJob, run: "_PlatformSweepRun", plat_obj: Any,
+        session_item: dict, worker_index: int,
+    ) -> bool:
+        """One held session, pulling keywords off `run.queue` until it is
+        empty. -> True if this session DIED (its in-progress keyword's
+        contribution was undone and re-queued for another session); False
+        if it worked the queue out, was cancelled, or hit a non-session
+        stop.
+
+        Nothing about HOW a keyword is swept changes with worker count --
+        its own browser context, its own proxy, its own DiscoveryOptions,
+        the same tab-concurrency/stagger logic, the same cap resolution,
+        the same `discoverer.sweep()`. A worker is a second reader of one
+        queue, not a cheaper kind of read.
+        """
+        platform_id = run.platform_id
+        prog = run.prog
+        session_id = str(session_item.get("id") or "")
+        label = session_item.get("identifier") or session_id or "anonymous"
+        inter_keyword_delay = _PLATFORM_INTER_KEYWORD_DELAY.get(
+            platform_id, _DEFAULT_INTER_KEYWORD_DELAY)
+
+        if worker_index:
+            # Staggered so N sessions never open their first request to the
+            # platform in the same instant -- the same reasoning
+            # TAB_STAGGER_SEC already applies within one session's own
+            # concurrent tabs, one level up.
+            await asyncio.sleep(worker_index * WORKER_STAGGER_SEC)
 
         session = None
         discoverer = None
         held: Optional[tuple[str, str]] = None
         anon_cm = None
-        session_item: Optional[dict] = None
-        try:
-            plat_obj, session_item = await sessions_engine.session_for_job(platform_id)
-            held = self._store.hold_session(platform_id, session_item.get("id", ""))
 
-            if session_item.get("anonymous"):
-                anon_cm = plat_obj.anonymous_context()(session_item.get("proxy"))
-                ctx = await anon_cm.__aenter__()
-                discoverer = plat_obj.discoverer()(options, ctx, anonymous=True)
-            elif not plat_obj.session_path:
-                # No browser session on this platform (YouTube's API key,
-                # Telegram's MTProto). The discoverer owns its own
-                # connection and must be closed by us -- see
-                # telegram/discovery_engine.py::Discovery.stop().
-                discoverer = plat_obj.discoverer()(options, None)
-            else:
-                session = plat_obj.session_cls()(
-                    options, session_item.get("cookies", []),
-                    session_id=session_item.get("id", ""),
-                    proxy=session_item.get("proxy"),
+        # Ceilinged process-wide, not per-platform -- see `_worker_semaphore`.
+        async with _worker_semaphore():
+            if not run.queue or job.cancel.is_set() or run.hard_stop:
+                # Another worker drained it (or a hard stop fired) while
+                # this one waited for a slot. Do not pay for a browser
+                # launch to discover that.
+                sessions_engine.release_claim(platform_id, session_id)
+                return False
+            try:
+                held = self._store.hold_session(platform_id, session_id)
+
+                # A per-WORKER options object, not a shared one. The
+                # original single-session code safely mutated one shared
+                # `options.max_results` in place between cells because
+                # sweeps for one platform ran strictly sequentially; with
+                # several sessions now sweeping concurrently, two workers
+                # racing to mutate a shared options object would each see
+                # the other's cap. Each worker gets its own, exactly as
+                # each gets its own discoverer.
+                options = DiscoveryOptions(
+                    concurrency=settings.discovery_concurrency,
+                    # The median this session paces its keyword gaps against
+                    # -- see _PLATFORM_INTER_KEYWORD_DELAY and
+                    # settings.discovery_delay_sec.
+                    delay=settings.discovery_delay_sec,
+                    max_results=run.max_results,
+                    max_seconds=(
+                        run.max_seconds if run.max_seconds is not None
+                        else settings.discovery_max_seconds),
+                    headful=not settings.headless,
+                    settle=settings.discovery_settle_sec,
+                    page_wait=settings.discovery_page_wait_sec,
+                    patience=settings.discovery_patience,
                 )
-                session.on_cookies = sessions_engine.cookie_saver(
-                    platform_id, session_item.get("id", ""))
-                await session.start()
-                if not await session.check_session():
-                    await sessions_engine.mark_session_failed(
-                        platform_id, session_item.get("id", ""), "expired")
-                    raise RuntimeError(
-                        f"{registry.display_name(platform_id)} session is not usable -- "
-                        "check credentials under /sessions")
-                await sessions_engine.mark_session_ok(platform_id, session_item.get("id", ""))
-                if session is not None and hasattr(session, "sync_cookies"):
-                    await session.sync_cookies()
-                discoverer = plat_obj.discoverer()(options, session.ctx)
+                make_discoverer = None
 
-            incomplete = 0
+                if session_item.get("anonymous"):
+                    anon_cm = plat_obj.anonymous_context()(session_item.get("proxy"))
+                    ctx = await anon_cm.__aenter__()
+                    make_discoverer = lambda o, _c=ctx: plat_obj.discoverer()(o, _c, anonymous=True)
+                    discoverer = make_discoverer(options)
+                elif not plat_obj.session_path:
+                    make_discoverer = lambda o: plat_obj.discoverer()(o, None)
+                    discoverer = make_discoverer(options)
+                else:
+                    session = plat_obj.session_cls()(
+                        options, session_item.get("cookies", []),
+                        session_id=session_id, proxy=session_item.get("proxy"),
+                    )
+                    session.on_cookies = sessions_engine.cookie_saver(platform_id, session_id)
+                    await session.start()
+                    # SKIPPED WHEN THE ANSWER IS ALREADY KNOWN -- see
+                    # analysis/runner.py's identical reasoning.
+                    if sessions_engine.proven_fresh(session_item):
+                        log.info(
+                            f"[{platform_id}] login probe skipped -- proven healthy "
+                            f"{(time.time() - float(session_item.get('last_ok') or 0)) / 60:.0f}m ago"
+                        )
+                    else:
+                        if not await session.check_session():
+                            await sessions_engine.mark_session_failed(
+                                platform_id, session_id, "expired")
+                            raise RuntimeError(
+                                f"{registry.display_name(platform_id)} session is not usable -- "
+                                "check credentials under /sessions")
+                        await sessions_engine.mark_session_ok(platform_id, session_id)
+                    if session is not None and hasattr(session, "sync_cookies"):
+                        await session.sync_cookies()
+                    make_discoverer = lambda o, _s=session: plat_obj.discoverer()(o, _s.ctx)
+                    discoverer = make_discoverer(options)
 
-            sweep_errors: list[str] = []
-            stop_platform = False
-            for keyword, kw_type in job.keyword_plan:
-                if stop_platform:
-                    break
-                for tab in tabs:
-                    if job.cancel.is_set():
-                        break
+                # ONE (keyword, tab) SWEEP, as a coroutine -- unchanged from
+                # the single-session original except for what it reports
+                # back on a session-fatal signal: `stats` is what THIS
+                # keyword-attempt has contributed so far (units/found/new),
+                # handed to `_requeue_keyword` to undo precisely if this
+                # attempt needs a retry, and `fatal_kind` distinguishes a
+                # dead SESSION (another one should take over) from a
+                # non-session stop like Telegram's FloodWait (nothing would
+                # be gained by a different session, so the whole platform
+                # stops instead -- see `run.hard_stop`).
+                async def _sweep_tab(
+                    keyword: str, kw_type: str, tab: str, stats: dict, fatal_kind: list,
+                    stagger: float = 0.0, own_options: bool = False,
+                ) -> str:
+                    if stagger:
+                        await asyncio.sleep(stagger)
+                    if job.cancel.is_set() or run.hard_stop:
+                        return ""
                     prog.current_keyword = keyword
                     prog.current_tab = tab
                     prog.current_step = f"Searching {tab.upper()} tab..."
                     prog.item_started_at_ts = time.time()
                     t0 = time.time()
-                    options.max_results = _resolve_cap(
-                        platform_id, tab, kw_type, max_results,
-                        platform_limits, platform_tab_limits,
+                    cap = _resolve_cap(
+                        platform_id, tab, kw_type, run.max_results,
+                        run.platform_limits, run.platform_tab_limits,
                     )
+                    if own_options:
+                        disc = make_discoverer(replace(options, max_results=cap))
+                    else:
+                        options.max_results = cap
+                        disc = discoverer
                     try:
-                        sweep = await discoverer.sweep(keyword, tab)
+                        sweep = await disc.sweep(keyword, tab)
                     except Exception as e:
                         dur = time.time() - t0
                         log.error(f"[{platform_id}] {keyword!r}/{tab}: {type(e).__name__}: {e}")
                         prog.keywords_done += 1
+                        stats["units"] += 1
                         job.history.append(CompletedSweep(
                             platform=platform_id,
                             display_name=prog.display_name,
@@ -616,12 +1044,13 @@ class DiscoveryRunner:
                             await session.sync_cookies()
                         if reason := classify_failure(e):
                             await sessions_engine.mark_session_failed(
-                                platform_id, session_item.get("id", ""), reason, detail=str(e))
+                                platform_id, session_id, reason, detail=str(e))
                             prog.note = f"session {reason} mid-sweep"
-                            prog.status = "partial"
-                            return
-                        incomplete += 1
-                        continue
+                            if fatal_kind[0] != "session":
+                                fatal_kind[0] = "session"
+                            return reason
+                        run.incomplete += 1
+                        return ""
 
                     dur = time.time() - t0
                     hits = [h for h in (sweep.hits or []) if h.url]
@@ -629,8 +1058,9 @@ class DiscoveryRunner:
                     new_count = 0
                     if hits:
                         # Saved per completed sweep, not batched at the end,
-                        # so a caller polling this job (or reading /profiles)
-                        # sees results within seconds of them being found.
+                        # so a caller polling this job (or reading
+                        # /profiles) sees results within seconds of them
+                        # being found.
                         rows = [row_to_fields(h, keyword) for h in hits]
                         saved, new = await profiles_db.save_many(
                             job.group_id, platform_id, profiles_db.PHASE_DISCOVERY,
@@ -639,13 +1069,9 @@ class DiscoveryRunner:
                         saved_count = saved
                         new_count = new
                         # Pull each picture into our own store, BEHIND this
-                        # sweep rather than inside it. The CDN links just
-                        # saved are signed and expire within hours, so a card
-                        # built on one goes blank overnight; the cached bytes
-                        # do not. Awaiting it here would undo the reason this
-                        # engine never downloads an image during a sweep
-                        # (a Facebook profile visit alone requests 74), so it
-                        # runs as its own task and the sweep moves on.
+                        # sweep rather than inside it -- see the original
+                        # method's own reasoning for why this is a spawned
+                        # task, not an await.
                         task = avatar_cache.spawn(job.group_id, platform_id, rows)
                         if task is not None:
                             job.avatar_tasks.append(task)
@@ -653,26 +1079,16 @@ class DiscoveryRunner:
                         prog.new += new
                         job.found += saved
                         job.new += new
+                        stats["found"] += saved
+                        stats["new"] += new
                     sweep_complete = bool(getattr(sweep, "complete", True))
                     if not sweep_complete:
-                        incomplete += 1
-                        # KEEP THE REASON, not just the count. Engines report
-                        # a diagnosed failure on `error` rather than raising
-                        # (a geo-block, a CAPTCHA, an auth wall found
-                        # mid-page), and the note built below used to replace
-                        # all of it with "N sweep(s) did not run to
-                        # completion" -- so TikTok telling us verbatim
-                        # "blocked for this IP, route through a proxy in a
-                        # region where TikTok is available" reached the log
-                        # and never the analyst, who saw a generic count and
-                        # no way to act on it. Deduplicated because one cause
-                        # usually stops every keyword on that platform.
+                        run.incomplete += 1
                         if reason := str(getattr(sweep, "error", "") or "").strip():
-                            if reason not in sweep_errors:
-                                sweep_errors.append(reason)
+                            if reason not in run.sweep_errors:
+                                run.sweep_errors.append(reason)
                     prog.keywords_done += 1
-                    # getattr throughout: `Sweep` is each platform engine's
-                    # own dataclass, and only some of them carry these.
+                    stats["units"] += 1
                     job.history.append(CompletedSweep(
                         platform=platform_id,
                         display_name=prog.display_name,
@@ -693,87 +1109,185 @@ class DiscoveryRunner:
                     stop_reason = ""
                     if getattr(sweep, "stopped", "") == "flood-wait":
                         stop_reason = "flood-wait"
+                        if fatal_kind[0] != "session":
+                            fatal_kind[0] = "hard"
                     else:
                         # A sweep that caught its own session-shaped problem
                         # (TikTok's CAPTCHA/checkpoint, an auth failure a
-                        # platform detected mid-page rather than as a raised
-                        # exception) reports it via `error`/`stopped`
-                        # instead of raising -- the `except Exception`
-                        # branch above never sees it, so nothing would ever
-                        # tell `sessions/manager.py` this session is bad.
+                        # platform detected mid-page rather than as a
+                        # raised exception) reports it via `error`/`stopped`
+                        # instead of raising -- classified and marked
+                        # exactly like the exception path above, so a
+                        # session that fails THIS way is just as eligible
+                        # for another worker to take over from.
                         session_reason = classify_failure(
                             getattr(sweep, "error", "") or getattr(sweep, "stopped", "")
                         )
                         if session_reason:
                             await sessions_engine.mark_session_failed(
-                                platform_id, session_item.get("id", ""), session_reason,
+                                platform_id, session_id, session_reason,
                                 detail=getattr(sweep, "error", "") or getattr(sweep, "stopped", ""),
                             )
+                            fatal_kind[0] = "session"
                             stop_reason = session_reason
-                    if stop_reason:
-                        # Stop only THIS platform's remaining keywords --
-                        # job.cancel is shared across every platform running
-                        # concurrently in this job, so setting it would
-                        # wrongly cancel the others too. Firing the next
-                        # keyword immediately at a session that just told us
-                        # it's rate-limited/checkpointed/expired would only
-                        # make things worse.
-                        log.warning(f"[{platform_id}] {stop_reason} -- stopping remaining keywords this run")
-                        prog.note = f"stopped early: session {stop_reason}"
-                        stop_platform = True
-                        break
-                if job.cancel.is_set() or stop_platform:
-                    break
+                    return stop_reason
 
-            if incomplete:
-                prog.status = "partial"
-                if sweep_errors:
-                    # The diagnosis first, the count second -- the count is
-                    # the part an analyst can do nothing with.
-                    detail = " | ".join(sweep_errors[:2])
-                    prog.note = f"{detail} ({incomplete} sweep(s) incomplete)"
-                else:
-                    prog.note = f"{incomplete} sweep(s) did not run to completion"
-            else:
-                prog.status = "done"
-        except Exception as e:
-            prog.status = "failed"
-            prog.note = f"{type(e).__name__}: {e}"
-            log.error(f"discovery job {job.id}: {platform_id} failed -- {prog.note}")
-        finally:
-            prog.current_keyword = ""
-            prog.current_tab = ""
-            prog.current_step = ""
-            prog.item_started_at_ts = None
-            prog.finished_at_ts = time.time()
-            self._store.release_session(held)
-            # The other half of get_healthy_session's cross-runner claim
-            # (see sessions/manager.py) -- `held` only guards this SAME
-            # runner's own JobStore-level "in use" tracking, which can't
-            # see a job on the OTHER runner (discovery vs analysis) holding
-            # the same session; this is the real exclusion that must be
-            # released regardless, or the session looks permanently
-            # claimed to every future job on either runner.
-            if session_item is not None:
-                sessions_engine.release_claim(platform_id, session_item.get("id", ""))
-            # Telegram holds a lock on its local session file until its
-            # discoverer is closed; a missed stop() here is what makes the
-            # NEXT Telegram run fail with "database is locked".
-            if discoverer is not None and hasattr(discoverer, "stop"):
-                try:
-                    await discoverer.stop()
-                except Exception:
-                    pass
-            if session is not None:
-                try:
-                    await session.stop()
-                except Exception:
-                    pass
-            if anon_cm is not None:
-                try:
-                    await anon_cm.__aexit__(None, None, None)
-                except Exception:
-                    pass
+                while run.queue and not job.cancel.is_set() and not run.hard_stop:
+                    item = run.queue.popleft()
+                    item.attempts += 1
+                    prog.current_keyword = item.keyword
+                    stats = {"units": 0, "found": 0, "new": 0}
+                    fatal_kind = [""]
+
+                    # CONCURRENT ONLY WHEN IT IS SAFE AND WORTH IT: more than
+                    # one tab, a factory to give each its own cap, and the
+                    # setting left above 1 -- identical gate to the original.
+                    concurrent = (
+                        len(run.tabs) > 1
+                        and make_discoverer is not None
+                        and settings.discovery_tab_concurrency > 1
+                    )
+                    if concurrent:
+                        prog.current_tab = "+".join(run.tabs)
+                        prog.current_step = f"Searching {len(run.tabs)} tabs..."
+                        prog.item_started_at_ts = time.time()
+                        sem = asyncio.Semaphore(settings.discovery_tab_concurrency)
+
+                        async def _slot(i: int, tab: str) -> str:
+                            async with sem:
+                                return await _sweep_tab(
+                                    item.keyword, item.kw_type, tab, stats, fatal_kind,
+                                    stagger=i * TAB_STAGGER_SEC, own_options=True,
+                                )
+
+                        reasons = await asyncio.gather(
+                            *(_slot(i, t) for i, t in enumerate(run.tabs)),
+                            return_exceptions=True,
+                        )
+                        for r in reasons:
+                            if isinstance(r, BaseException):
+                                log.error(f"[{platform_id}] tab sweep crashed: {type(r).__name__}: {r}")
+                        reason = next((r for r in reasons if isinstance(r, str) and r), "")
+                    else:
+                        reason = ""
+                        for tab in run.tabs:
+                            if job.cancel.is_set() or run.hard_stop:
+                                break
+                            reason = await _sweep_tab(item.keyword, item.kw_type, tab, stats, fatal_kind)
+                            if reason or fatal_kind[0]:
+                                break
+
+                    if fatal_kind[0] == "hard":
+                        run.hard_stop = True
+                        prog.note = f"stopped early: session {reason}"
+                        return False
+                    if fatal_kind[0] == "session":
+                        # THIS SESSION IS DONE, THE PLATFORM IS NOT. The
+                        # keyword it died on goes back on the queue for
+                        # another session; everything still queued was
+                        # never touched and stays there.
+                        self._requeue_keyword(job, run, item, stats, label)
+                        return True
+
+                    # BREATHING ROOM BEFORE THE NEXT KEYWORD. Only between
+                    # keywords, never after the last one (a gap before
+                    # releasing the session buys nothing and just makes the
+                    # sweep look slower), and never on a cancelled job.
+                    #
+                    # `pause()` takes a MULTIPLIER on the session's own
+                    # configured median (options.delay), not a duration, so
+                    # the target seconds are converted into one rather than
+                    # slept flat -- that keeps jitter, fatigue and the
+                    # occasional longer rest in play (stealth/browser.py).
+                    if (run.queue and inter_keyword_delay > 0
+                            and not job.cancel.is_set() and not run.hard_stop
+                            and session is not None and hasattr(session, "pause")):
+                        base = settings.discovery_delay_sec or 0
+                        mult = (inter_keyword_delay / base) if base > 0 else 1.0
+                        try:
+                            await session.pause(mult)
+                        except Exception:
+                            pass
+                return False
+            finally:
+                prog.current_keyword = ""
+                prog.current_tab = ""
+                prog.current_step = ""
+                prog.item_started_at_ts = None
+                self._store.release_session(held)
+                # The other half of get_healthy_session's cross-runner claim
+                # -- see analysis/runner.py's identical release for why this
+                # happens regardless of what `session_item` looked like.
+                sessions_engine.release_claim(platform_id, session_id)
+                # Telegram holds a lock on its local session file until its
+                # discoverer is closed; a missed stop() here is what makes
+                # the NEXT Telegram run fail with "database is locked".
+                if discoverer is not None and hasattr(discoverer, "stop"):
+                    try:
+                        await discoverer.stop()
+                    except Exception:
+                        pass
+                if session is not None:
+                    try:
+                        await session.stop()
+                    except Exception:
+                        pass
+                if anon_cm is not None:
+                    try:
+                        await anon_cm.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+
+    def _requeue_keyword(
+        self, job: DiscoveryJob, run: "_PlatformSweepRun", item: "_KeywordItem",
+        stats: dict, label: str,
+    ) -> None:
+        """A keyword whose session died under it, put back for another
+        session. See analysis/runner.py's _requeue for the identical
+        reasoning: undo exactly what THIS attempt contributed -- never more,
+        never less, since sibling workers are incrementing the same shared
+        `prog`/`job` counters for their OWN keywords at the same time, so a
+        snapshot-and-reset would discard their progress instead of just this
+        attempt's.
+
+        CAPPED AT _MAX_KEYWORD_ATTEMPTS, checked BEFORE any rollback: past
+        that, this attempt's partial progress is left standing rather than
+        erased -- "give up" must not mean "give up AND lose what was
+        already found", it means no more sessions will be spent chasing the
+        rest.
+
+        A GIVE-UP COUNTS AS INCOMPLETE, not a silent "done". This keyword's
+        own last word was a session dying on it, not a real answer -- if
+        that also happened to be the only unattempted work left on this
+        platform, `keywords_done` reaching `keywords_total` on the strength
+        of a failed final attempt must not read as the sweep having gone
+        cleanly, so it feeds the same `run.incomplete`/`run.sweep_errors`
+        machinery an ordinary incomplete sweep does.
+        """
+        if item.attempts >= _MAX_KEYWORD_ATTEMPTS:
+            run.incomplete += 1
+            note = f"{item.keyword!r} failed on every available session"
+            if note not in run.sweep_errors:
+                run.sweep_errors.append(note)
+            log.warning(
+                f"[{run.platform_id}] {item.keyword!r} took down {item.attempts} "
+                f"session(s) -- not re-queued again, whatever this attempt "
+                f"completed stands")
+            return
+        prog = run.prog
+        if stats["units"]:
+            prog.keywords_done = max(0, prog.keywords_done - stats["units"])
+        if stats["found"]:
+            prog.found = max(0, prog.found - stats["found"])
+            job.found = max(0, job.found - stats["found"])
+        if stats["new"]:
+            prog.new = max(0, prog.new - stats["new"])
+            job.new = max(0, job.new - stats["new"])
+        run.queue.append(item)
+        log.info(
+            f"[{run.platform_id}] session {label} failed on {item.keyword!r} -- "
+            f"re-queued for another session (attempt {item.attempts + 1} of "
+            f"{_MAX_KEYWORD_ATTEMPTS})")
 
     async def stats(self) -> dict:
         return await self._store.stats()

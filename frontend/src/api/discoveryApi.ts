@@ -79,6 +79,11 @@ export interface PlatformSweepState {
   item_started_at_ts?: number | null;
   started_at_ts?: number | null;
   finished_at_ts?: number | null;
+  // How many pooled sessions are sweeping this platform in parallel right
+  // now. 1 (or absent) is the ordinary single-session run; >1 means the
+  // keyword list was split across accounts -- see
+  // _MAX_SESSIONS_PER_PLATFORM in backend/discovery/runner.py.
+  workers?: number;
 }
 
 export interface DiscoveryJobState {

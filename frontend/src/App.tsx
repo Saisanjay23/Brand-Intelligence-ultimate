@@ -29,6 +29,11 @@ export default function App() {
   // Bumped whenever a discovery job finishes, to force Live Results to
   // reload its cards.
   const [refreshKey, setRefreshKey] = useState(0);
+  // Bumped on every tick where a running sweep's counts move. Deliberately
+  // SEPARATE from refreshKey: that one also clears the analyst's card
+  // selection (a finished sweep is a new dataset), which would be
+  // destructive to do every two seconds while they are mid-triage.
+  const [liveKey, setLiveKey] = useState(0);
   // Set when "Analyse Validated Profiles" (or Home's "Analyse" action)
   // starts a job -- handed to LiveResultsView, which switches its own
   // Discovery/Analysis toggle to Analysis and passes it into the embedded
@@ -141,10 +146,13 @@ export default function App() {
   // own -- a job that hit a login wall has just quarantined the session
   // it was holding. GET /discovery/jobs/{id} is a plain snapshot poll
   // (no event log, that route group is gone), see the hook.
-  const discoveryPoll = useDiscoveryJobPoll(() => {
-    refreshPlatformState();
-    setRefreshKey((k) => k + 1);
-  });
+  const discoveryPoll = useDiscoveryJobPoll(
+    () => {
+      refreshPlatformState();
+      setRefreshKey((k) => k + 1);
+    },
+    () => setLiveKey((k) => k + 1),
+  );
 
   return (
     <AppLayout
@@ -197,6 +205,7 @@ export default function App() {
           cancelling={discoveryPoll.cancelling}
           onCancel={discoveryPoll.cancel}
           refreshKey={refreshKey}
+          liveKey={liveKey}
           resumeAnalysisJobId={resumeAnalysisJobId}
           onAnalyseStarted={(jobId) => {
             setError("");

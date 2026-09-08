@@ -18,11 +18,13 @@ served to three or more unrelated accounts:
              Nothing to guess -- handled in that engine, not here.
   twitter    EXACT. One fixed asset, `default_profile*.png` under
              /sticky/default_profile. Already detected correctly.
-  facebook   EXACT, and was being MISSED. Two stock assets, both stable
-             ids: the grey silhouette (104 of our rows) and the
-             illustrated default GROUP avatar (63 rows, shared by 55
-             unrelated names -- a pastor's group, a real-estate group,
-             a book page).
+  facebook   TWO KINDS, and they need different answers. The shared
+             stock assets are EXACT and stable-id: the grey silhouette
+             (104 of our rows) and the illustrated default GROUP avatar
+             (63 rows, shared by 55 unrelated names -- a pastor's group,
+             a real-estate group, a book page). But Facebook ALSO draws a
+             per-account letter avatar, which has a per-account id and no
+             URL tell at all -- see below, it needs the image.
   instagram  EXACT, and was being MISSED. The anonymous avatar has a
              stable id -- but Instagram ROTATED it. The id this codebase
              checked for (44884218_345707102882519_...) is the old one;
@@ -36,10 +38,20 @@ served to three or more unrelated accounts:
              verify a marker against, and an unverified marker is worse
              than none.
 
-WHY YOUTUBE IS DIFFERENT, and why it needs the image itself. YouTube does
-not serve one shared placeholder. It GENERATES a per-channel avatar: one
-letter on a solid colour, varying by both letter and colour, delivered
-from the same host and the same URL shape as a real upload. Measured over
+WHY YOUTUBE AND FACEBOOK NEED THE IMAGE ITSELF. Neither serves one shared
+placeholder for this case. Both GENERATE a per-account avatar -- one letter
+on a solid colour, varying by letter and colour, delivered from the same
+host and the same URL shape as a real upload -- so no URL rule can see it,
+and `looks_like_placeholder` returns False on every one of them.
+
+Facebook's is decided by its PALETTE plus flatness (see
+FACEBOOK_GENERATED_BG and `_facebook_generated`): the ground is one of
+eight exact colours it draws, which no amount of URL inspection reveals but
+which the pixels state outright. Audited over all 4095 distinct stored
+Facebook avatars -- 122 flagged, every one of them genuinely generated, and
+121 of those had been scored as real pictures.
+
+YouTube's needs a different pair of signals. Measured over
 960 stored YouTube avatars:
 
   * no URL discriminator exists. `/ytc/AIdro_` covers the generated ones
@@ -50,9 +62,12 @@ from the same host and the same URL shape as a real upload. Measured over
 
 The two signals TOGETHER are precise: `/ytc/AIdro_` and a two-colour share
 above FLAT_THRESHOLD flagged 164 of 960, and a random sample of 30 audited
-by eye was 30/30 genuine generated avatars. That needs the image bytes, so
-it is `is_generated_avatar()` below and belongs in analysis, which already
-pays a per-profile cost -- never in discovery, which is bulk.
+by eye was 30/30 genuine generated avatars.
+
+BOTH need the image bytes, so both live in `is_generated_avatar()` below,
+and the caller is `services/avatar_cache.py` -- which has already fetched
+and decoded the picture, making the verdict free -- never a discovery
+sweep, which must not download images at all.
 
 DELIBERATELY CONSERVATIVE. Every rule here is precision-first: it only
 says "placeholder" where the evidence is a fixed asset or two agreeing
@@ -125,6 +140,91 @@ def looks_like_placeholder(platform: str, url: str) -> bool:
     return any(m in url for m in markers)
 
 
+# Facebook's GENERATED avatar backgrounds, sampled exactly. Like YouTube,
+# Facebook draws a per-account letter avatar for an entity with no uploaded
+# picture -- one glyph on a solid ground -- and serves it from the ordinary
+# `t39.30808-1` profile-picture path with a per-account asset id, so no URL
+# rule can see it. Unlike YouTube, the ground is drawn from a small FIXED
+# palette, which is what makes this decidable rather than merely likely.
+#
+# Established by decoding all 4095 distinct stored Facebook avatars and
+# taking each one's modal colour. Among the 275 that are flat, the modal
+# colour collapses onto these eight and nothing else -- every remaining flat
+# image is a real logo on white (77) or black (22) or some brand colour.
+# Recorded at full precision because they are drawn, not photographed: the
+# same eight RGB triples repeat exactly across hundreds of accounts.
+FACEBOOK_GENERATED_BG: tuple[tuple[int, int, int], ...] = (
+    (135, 214, 228),   # cyan
+    (208, 148, 217),   # lilac
+    (244, 131, 125),   # salmon
+    (99, 163, 242),    # blue
+    (255, 220, 135),   # amber
+    (130, 132, 135),   # grey
+    (255, 171, 111),   # orange
+    (152, 214, 109),   # green
+)
+
+# Facebook's own flatness bar, NOT shared with YouTube's. YouTube's 0.93 was
+# tuned against a different question -- there flatness is doing most of the
+# discriminating, because `/ytc/AIdro_` is only 60% precise on its own. Here
+# the palette is the precise signal and flatness only has to exclude
+# photographs, so the bar sits where the data actually separates.
+#
+# Sorted by flatness, the palette-background images run: ... 0.9062, 0.9009,
+# then a gap, then 0.8813 (still generated), then 0.8674 -- an "ellex"
+# wordmark on a grey disc -- and 0.8386, a screenshot of a payment
+# confirmation. Those last two are real pictures. 0.90 clears the nearest of
+# them by 0.034 and matches exactly the 122-image set audited one by one.
+#
+# It costs four generated avatars sitting at 0.8813, and that is the trade
+# taken deliberately: a miss leaves a stale Yes, which is the status quo,
+# while a false positive calls a real logo a placeholder and under-scores a
+# genuine impersonation. 0.88 would catch those four with only 0.013 of
+# margin -- too thin to spend a real logo on.
+FACEBOOK_FLAT_THRESHOLD = 0.90
+
+# Room for JPEG re-encoding of a drawn flat colour, and nothing more. These
+# are not photographed colours that need a wide catchment; a real photograph
+# landing within 10/255 of a palette entry AND reading as two flat colours
+# is the case the flatness test is there to exclude.
+_BG_TOLERANCE = 10
+
+
+def _dominant_pixels(image_bytes: bytes) -> Optional[tuple[tuple[int, int, int], float]]:
+    """The image's modal colour and the share of the image it covers, or
+    None if the bytes are not a readable image.
+
+    NOT quantised, unlike `_two_colour_share`. That function is asking "is
+    this image flat", where 4-bit quantisation usefully absorbs JPEG noise.
+    This one is asking "is this ground one of eight exact colours Facebook
+    drew", and quantising to 16-value buckets would merge palette entries
+    with their neighbours and throw away the precision that makes the answer
+    exact.
+    """
+    try:
+        from PIL import Image
+    except ImportError:  # pragma: no cover - Pillow is a hard dep of analysis
+        return None
+    try:
+        im = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        im.thumbnail((48, 48))
+        data = list(im.get_flattened_data() if hasattr(im, "get_flattened_data")
+                    else im.getdata())
+    except Exception:
+        return None
+    if not data:
+        return None
+    colour, n = Counter(data).most_common(1)[0]
+    return colour, n / len(data)
+
+
+def _is_facebook_palette_bg(colour: tuple[int, int, int]) -> bool:
+    return any(
+        all(abs(a - b) <= _BG_TOLERANCE for a, b in zip(colour, entry))
+        for entry in FACEBOOK_GENERATED_BG
+    )
+
+
 def _two_colour_share(image_bytes: bytes) -> Optional[float]:
     """How much of the image its two commonest colours account for, or None
     if the bytes are not a readable image. Quantised to 4 bits per channel
@@ -151,14 +251,17 @@ def is_generated_avatar(platform: str, url: str, image_bytes: bytes) -> Optional
     """True when this is a platform-GENERATED placeholder rather than a
     picture anyone chose; None when the evidence does not settle it.
 
-    Only YouTube needs this -- every other platform is answered by
+    Facebook and YouTube need this -- every other platform is answered by
     `looks_like_placeholder` from the URL alone. Requires the image, so call
-    it from analysis, never from a discovery sweep.
+    it from `avatar_cache`, which has the bytes already, and never from a
+    discovery sweep.
 
     Returns None rather than False on an unreadable image or an unhandled
     platform, so a caller can leave `has_custom_pic` unset instead of
     recording a guess as a fact.
     """
+    if platform == "facebook":
+        return _facebook_generated(image_bytes)
     if platform != "youtube":
         return None
     if YOUTUBE_GENERATED_PREFIX not in (url or ""):
@@ -170,6 +273,43 @@ def is_generated_avatar(platform: str, url: str, image_bytes: bytes) -> Optional
     if share is None:
         return None
     return share >= FLAT_THRESHOLD
+
+
+def _facebook_generated(image_bytes: bytes) -> Optional[bool]:
+    """TWO AGREEING SIGNALS, the same shape as the YouTube rule and for the
+    same reason: neither one alone is safe.
+
+    Flatness alone would condemn real logos. 153 of this repo's stored
+    Facebook avatars read as two flat colours and are genuine brand marks --
+    a white monogram on black, a navy swoosh on white, a wordmark on a solid
+    brand colour. Those are pictures the account chose and must stay Yes.
+
+    The palette alone would condemn photographs. 22 stored avatars have a
+    modal colour within tolerance of a palette entry and are ordinary
+    photographs that happen to be mostly sky or mostly skin.
+
+    Together they were exact on the whole stored population: 122 flagged,
+    audited by eye one by one, 122 of them genuine generated letter avatars
+    (121 were being scored as real pictures before this). No genuine logo
+    was flagged, and no photograph.
+
+    Returns None, never False, when the evidence does not settle it -- so a
+    caller leaves `has_custom_pic` at whatever the URL rule decided rather
+    than recording a guess. A palette Facebook adds later is therefore a
+    MISS (a stale Yes), never a false No, which is the direction this module
+    is built to fail in.
+    """
+    share = _two_colour_share(image_bytes)
+    if share is None or share < FACEBOOK_FLAT_THRESHOLD:
+        return None
+    dominant = _dominant_pixels(image_bytes)
+    if dominant is None:
+        return None
+    colour, _ = dominant
+    if not _is_facebook_palette_bg(colour):
+        # Flat, but on a ground Facebook does not draw. A real logo.
+        return None
+    return True
 
 
 # fbcdn signs the whole crop range up to `cstp`'s bound, not the specific

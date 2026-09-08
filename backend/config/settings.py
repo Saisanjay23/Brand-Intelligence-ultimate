@@ -98,7 +98,70 @@ class Settings(BaseSettings):
     # platform's URLs run at once and how long it waits between chunks.
     # Left declared so a .env that already carries it still loads.
     analysis_concurrency: int = 2
+    # HOW MANY BROWSER WORKERS ANALYSIS MAY HOLD OPEN AT ONCE, PROCESS-WIDE.
+    # A job scrapes every platform concurrently and each platform now works
+    # its URLs through as many pooled sessions as it can safely claim (see
+    # _MAX_SESSIONS_PER_PLATFORM in analysis/runner.py), so this is the only
+    # number that bounds the total -- one worker is one Chromium context plus
+    # its own Playwright driver plus its tabs, and per-platform caps cannot
+    # see each other. Lower it on a small host; raising it costs RAM, not
+    # stealth (each worker is a separate account on a separate egress).
+    analysis_max_browser_workers: int = 4
     discovery_concurrency: int = 2
+    # HOW MANY POOLED SESSIONS ONE PLATFORM'S SWEEP MAY CLAIM AT ONCE. Mirrors
+    # analysis_max_browser_workers' reasoning one level up: a two-account
+    # pool splits a keyword list across two workers instead of one session
+    # working through all of it alone, and a session dying mid-sweep hands
+    # its unfinished keywords to whichever session is still healthy (see
+    # _MAX_SESSIONS_PER_PLATFORM in discovery/runner.py). A separate knob
+    # from analysis's, not the same constant -- discovery and analysis have
+    # different risk profiles (a sweep is many short requests, an analysis
+    # visit is one long one) and different pools may be sized differently.
+    discovery_max_parallel_sessions: int = 3
+    # THE MEDIAN GAP BETWEEN ONE KEYWORD SWEEP AND THE NEXT, in seconds, on
+    # the same session. Discovery had no such gap at all: keywords ran
+    # back-to-back, so a 15-keyword client hit Facebook with 45 searches
+    # (15 x its three tabs) with nothing between them but page-load time.
+    # That request cadence is the most machine-like thing a pooled account
+    # does, and Facebook is where accounts actually get disabled.
+    #
+    # Spent through the session's own `pause()` (stealth/human.py), so this
+    # is a MEDIAN with jitter, fatigue and circadian shaping on top -- not a
+    # fixed sleep. Same meaning and same mechanism as analysis_delay_sec,
+    # which is why the number matches it. Per-platform gaps are scaled off
+    # this by _PLATFORM_INTER_KEYWORD_DELAY in discovery/runner.py.
+    discovery_delay_sec: float = 2.5
+    # Bound on browser workers open at once across the WHOLE process for
+    # discovery, for the identical reason analysis_max_browser_workers
+    # exists: _run sweeps every ready platform concurrently, so a
+    # per-platform cap alone cannot see the total number of Chromium
+    # contexts a job might try to hold at once.
+    discovery_max_browser_workers: int = 4
+    # How many of ONE platform's tabs may sweep at once for a single keyword.
+    # Facebook is the only platform with more than one (people/pages/groups);
+    # everywhere else this is inert. 1 restores strictly sequential tabs.
+    #
+    # DEFAULT 1 -- SEQUENTIAL -- ON PURPOSE. The implementation is complete
+    # and correct (per-tab caps, staggered starts) and raising this to 3 does
+    # work. It is off because the measured trade is bad:
+    #
+    #   concurrent tabs   ~1.3x faster, and THREE simultaneous searches on
+    #                     one account. The tabs also contend for the single
+    #                     browser context (people 5.8s -> 9.2s), so the gain
+    #                     is smaller than the parallelism suggests, and
+    #                     run-to-run variance (18.1s vs 26.1s) is wider than
+    #                     the gain itself.
+    #   skipping the      1.68x faster (42.2s -> 25.1s) AND one fewer
+    #   login probe       authenticated request per job.
+    #
+    # The second is strictly better on both axes, so the first is not worth
+    # buying a new request pattern on a live account for -- especially with
+    # a pool that can be down to a single healthy session, where all three
+    # searches land on the same account.
+    #
+    # Raise it to 3 when throughput matters more than footprint and the pool
+    # is healthy. Nothing else needs to change.
+    discovery_tab_concurrency: int = 1
 
     # DISCOVERY TIMING, EXPOSED SO IT CAN BE MEASURED RATHER THAN GUESSED.
     #
@@ -194,6 +257,20 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             return [int(p.strip()) for p in v.split(",") if p.strip()]
         return v
+
+    @field_validator("mongo_uri", mode="before")
+    @classmethod
+    def _clean_mongo_uri(cls, v):
+        if isinstance(v, str) and not v.strip():
+            return "mongodb://localhost:27017"
+        return v or "mongodb://localhost:27017"
+
+    @field_validator("mongo_db_name", mode="before")
+    @classmethod
+    def _clean_mongo_db_name(cls, v):
+        if isinstance(v, str) and not v.strip():
+            return "brand_intelligence"
+        return v or "brand_intelligence"
 
 
 def write_env(key: str, value: str) -> None:

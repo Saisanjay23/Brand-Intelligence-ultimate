@@ -106,12 +106,36 @@ class ExtractionResult:
         that the primary path is rotting while output still looks fine."""
         return self.ok and bool(self.failures)
 
+    @property
+    def all_empty(self) -> bool:
+        """Every strategy ran fine and simply had nothing to return.
+
+        THE DISTINCTION THIS EXISTS FOR, and it cost real diagnostic time:
+        "the extraction chain is broken" and "this query genuinely matched
+        nothing" used to be the same outcome here -- both end with no value
+        and every strategy sitting in `failures`. They are not the same
+        thing, and conflating them made a search for a brand nobody is
+        impersonating indistinguishable from a doc-id rotation that had
+        silently blinded the sweep.
+
+        A strategy that RAISED is a real failure and keeps this False, so a
+        chain that is genuinely rotting still reports as one.
+        """
+        return (
+            not self.ok
+            and bool(self.failures)
+            and all(f.reason.startswith("returned nothing") for f in self.failures)
+        )
+
+
     def report(self) -> str:
         """Multi-line, aimed at whoever has to fix it, goes into the
         incident body and therefore the alert email."""
         lines = [f.describe() for f in self.failures]
         if self.ok:
             lines.insert(0, f"Recovered using fallback strategy: {self.strategy}")
+        elif self.all_empty:
+            lines.insert(0, "No data to extract -- every strategy ran and found nothing.")
         else:
             lines.insert(0, "Every extraction strategy failed.")
         return "\n".join(f"  {ln}" for ln in lines)
@@ -244,5 +268,15 @@ async def run_strategies(
             )
         return result
 
-    log.error(f"{label}: every strategy failed\n{result.report()}")
+    if result.all_empty:
+        # NOT an error, and logging it as one taught the reader to
+        # distrust this line. Every strategy ran cleanly and found
+        # nothing, which is the ordinary answer for a keyword nobody
+        # is impersonating -- 28 of these were logged as ERROR against
+        # real brand keywords AND against a deliberately nonsense test
+        # keyword before this told the two apart. A genuinely broken
+        # chain (any strategy RAISING) still takes the error branch.
+        log.info(f"{label}: no results\n{result.report()}")
+    else:
+        log.error(f"{label}: every strategy failed\n{result.report()}")
     return result

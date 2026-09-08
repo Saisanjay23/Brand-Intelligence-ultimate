@@ -57,7 +57,7 @@ from backend.shared.models.hit import Hit, hit_to_row
 from backend.shared.models.row import Row
 from backend.shared.text import iter_dicts, normalized_host, parse_normalized_url
 from backend.stealth.browser import Session
-from backend.stealth.mouse_movement import natural_scroll_down
+from backend.stealth.mouse_movement import humanize_interaction, natural_scroll_down
 
 # Session / login state
 
@@ -347,8 +347,22 @@ def iter_results(blob: Any) -> Iterator[Hit]:
             url = prof.get("profile_url") or prof.get("url") or profile_url_for(eid, ENTITY_TYPES.get(prof.get("__typename"), "profile"))
             pic = prof.get("profile_picture")
             raw_uri = pic.get("uri", "") if isinstance(pic, dict) else ""
+            # THE PICTURE IS ALWAYS KEPT; whether it is a REAL one is a
+            # separate question answered by `has_custom_pic`.
+            #
+            # This used to blank the URL whenever the picture was one of
+            # Facebook's stock avatars, so a card for such a profile fell
+            # back to the initial-letter circle -- showing something Facebook
+            # never showed. Discovery's contract is fidelity to what a real
+            # user sees on the platform, and a user browsing that search
+            # result sees the silhouette. Now the card shows the silhouette
+            # too, and the "logo" verdict stays honest and separate:
+            #
+            #   avatar          what Facebook actually renders, always
+            #   has_custom_pic  True real upload / False stock avatar /
+            #                   None never looked (see shared/models/hit.py)
             has_custom = bool(raw_uri) and not looks_like_placeholder("facebook", raw_uri)
-            avatar = hd_picture_url(raw_uri) if has_custom else ""
+            avatar = hd_picture_url(raw_uri) if raw_uri else ""
 
             verified = bool(
                 prof.get("is_verified")
@@ -366,6 +380,41 @@ def iter_results(blob: Any) -> Iterator[Hit]:
                 entity_type=ENTITY_TYPES.get(prof.get("__typename"), "profile"),
                 rank=i,
             )
+
+
+# Facebook's own "there is nothing here" panel, as rendered text.
+#
+# THE SIGNAL THE CURSOR CANNOT GIVE. Every other completeness verdict comes
+# from the search cursor (has_next_page / is_end_of_serp), but a search with
+# NO results never produces one: verified live 2026-09-08 on
+# /search/groups/?q=Pranav%20Adani -- nine GraphQL responses arrived, the only
+# `page_info` among them belonged to the NOTIFICATION dropdown (rt:"notific"),
+# and `page_state()` correctly refused it for want of `result_ids_shown`. So
+# `state` stays None, the `not state.has_next` stop can never fire, and the
+# sweep scrolls an empty page until `patience` gives up: 97.6 seconds to
+# learn what the page said in words the moment it rendered.
+#
+# Matched apostrophe-agnostically (Facebook serves a curly one) and without
+# the leading pronoun, so "We didn't find any results" and "We couldn't find
+# any results" both hit.
+RE_NO_RESULTS = re.compile(
+    r"(find any results|no results found|couldn.t find anything)", re.I
+)
+
+
+async def _shows_no_results(page) -> bool:
+    """Is Facebook explicitly saying this search matched nothing?
+
+    Only ever consulted when zero ids have been parsed, which is what keeps
+    it from ever cutting a sweep short: a page that HAS results does not
+    render this panel, and a page whose payload we merely failed to read does
+    not either -- that case still falls through to the scroll/stall path and
+    the DOM fallback, which is the behaviour a doc-id rotation needs.
+    """
+    try:
+        return bool(RE_NO_RESULTS.search(await page.inner_text("body")))
+    except Exception:
+        return False
 
 
 def page_state(blob: Any) -> Optional[PageState]:
@@ -702,6 +751,29 @@ RESOLVE_CONCURRENCY = 2
 # isn't the same fixed set every time (real-world timing varies), so a
 # later re-sweep has a genuinely different chance at any of them, not a
 # permanently-doomed subset.
+def _worth_visiting(missing: set[str], *, cap: int, parsed: int) -> set[str]:
+    """Which rendered-but-unparsed ids are worth a profile visit.
+
+    Backfilled hits sort BEHIND the graphql-confirmed ones and are then
+    trimmed to `cap` (see sweep()'s extraction chain), so a backfill can only
+    survive while confirmed hits number fewer than the cap. Visiting one that
+    cannot survive spends the slowest and most detectable operation this
+    engine has -- a profile page load under a live account -- on a row that is
+    discarded microseconds later.
+
+    Measured before this existed, one keyword, cap 12, all three tabs: 36
+    visits, 80.7s, and every single one discarded. The sweep went from 89.4s
+    to 12.5s with byte-identical results.
+
+    `cap == 0` means uncapped: nothing is trimmed, so every visit can pay off
+    and all of them are kept.
+    """
+    if not cap:
+        return set(missing)
+    room = max(0, cap - parsed)
+    return set(sorted(missing)[:room])
+
+
 RESOLVE_TIME_BUDGET_SEC = 180
 
 # How long ONE profile-page visit may wait for the profile's own data to
@@ -975,6 +1047,12 @@ class Discovery:
         itself, only drives pages inside one handed to it."""
         self.a = args
         self.ctx = ctx
+        # Whether this context has already been warmed (see `_warm`). One
+        # warm-up per CONTEXT, not per keyword: the point is that the
+        # session's first request is not a search, and paying it again
+        # before every keyword would add exactly the load this is meant to
+        # reduce.
+        self._warmed = False
 
     async def _self_avatar_assets(self) -> set[str]:
         """Every stable asset id (see _photo_asset_id) findable for the
@@ -1235,6 +1313,54 @@ class Discovery:
             pass
         return out
 
+    async def _warm(self, timeout_s: float = 30.0) -> None:
+        """Land on the feed once before this context's first search.
+
+        WHY, and this is a behavioural defence rather than a fingerprint
+        one: a real session never opens with a search. It opens on
+        facebook.com, the feed renders, the person reads for a moment, and
+        only then do they search. A context whose very first request is
+        `/search/people/?q=...` has no such history -- no feed impression,
+        no dwell, nothing between login cookies and a query -- and that
+        shape is visible to Meta regardless of how clean the browser
+        fingerprint is. This pool has had an account disabled, so the cheap
+        realism is worth the one page load.
+
+        Deliberately mirrors tiktok/discovery_engine.py::_warm, including
+        its contract: NON-FATAL by construction. A warm-up that fails costs
+        the sweep nothing and must never be the reason a keyword does not
+        run -- it is added realism, not a prerequisite.
+
+        Runs once per context (`self._warmed`), and is a no-op afterwards.
+        """
+        if self._warmed:
+            return
+        # Set before the attempt, not after: a warm-up that throws must not
+        # leave every later keyword retrying it and paying the timeout again.
+        self._warmed = True
+        page = await self.ctx.new_page()
+        try:
+            await page.goto("https://www.facebook.com/", wait_until="domcontentloaded",
+                            timeout=int(timeout_s * 1000))
+            # A feed impression with a human on the other end of it: a
+            # short read, some pointer motion and a scroll or two, rather
+            # than an instant bounce to the search box.
+            await humanize_interaction(page, scroll=True, moves=3)
+        except Exception as e:
+            # Logger fetched here, not assumed: this module has no
+            # module-level `log`, and a bare reference to one has already
+            # cost this file a NameError raised INSIDE an except block once
+            # (see the resolve-telemetry line further down). A warm-up that
+            # cannot even log its own failure must still not be fatal.
+            from backend.shared.logging import get_logger as _gl
+            _gl("facebook").warning(
+                f"facebook: warm-up skipped -- {type(e).__name__}: {e}")
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+
     async def sweep(self, keyword: str, tab: str, on_progress=None) -> Sweep:
         """One keyword, one tab (people/pages/groups), start to finish --
         the whole engine's core loop, and the method every other function
@@ -1272,9 +1398,16 @@ class Discovery:
         """
         out = Sweep(keyword=keyword, tab=tab)
         started = time.time()
+        # Before the first search this context ever makes -- see `_warm`.
+        # A no-op on every keyword after the first.
+        await self._warm()
         page = await self.ctx.new_page()
 
         by_id: dict[str, Hit] = {}
+
+        # Every edge parsed this sweep, uncapped -- see absorb().
+
+        parsed_any: dict[str, Hit] = {}
         rendered_ids: set[str] = set()
         processed_ids: set[str] = set()
         state: Optional[PageState] = None
@@ -1298,10 +1431,19 @@ class Discovery:
                 # A configured Pages/Groups cap used to only get the coarse
                 # between-scrolls check below, so it could overshoot by a
                 # whole response's worth of edges plus untrimmed backfill.
+                hit.keyword, hit.tab, hit.entity_type = keyword, tab, kind
+                # EVERY parsed edge is remembered, cap or no cap. Parsing is
+                # already done and the bytes are already downloaded; the cap
+                # is about how many results to RETURN, not how much of a
+                # payload to understand. Keeping them is what lets the
+                # reconciliation below fill a rendered-but-unabsorbed id from
+                # the search payload -- the same trusted source the returned
+                # results come from -- instead of guessing at it.
+                if hit.entity_id not in parsed_any:
+                    parsed_any[hit.entity_id] = hit
                 if cap and len(by_id) >= cap:
                     break
                 if hit.entity_id not in by_id:
-                    hit.keyword, hit.tab, hit.entity_type = keyword, tab, kind
                     by_id[hit.entity_id] = hit
             if st := page_state(blob):
                 state = st
@@ -1350,10 +1492,22 @@ class Discovery:
             # domcontentloaded fires. Without this wait, by_id is empty when
             # run_strategies evaluates, producing a false "0 results" report.
             if not by_id:
-                try:
-                    await asyncio.wait_for(arrived.wait(), timeout=self.a.settle)
-                except asyncio.TimeoutError:
-                    pass
+                # DON'T WAIT FOR A RESPONSE THAT IS NEVER COMING. The wait
+                # below exists for a slow search payload, but a search that
+                # matched nothing sends no payload at all -- so on an empty
+                # result page it always ran to the full `settle` (14s) before
+                # concluding what the rendered page already said in words.
+                #
+                # The panel is up by now: the wait_for_function above has
+                # already blocked until the body carried real text, which is
+                # the same paint that renders it.
+                if await _shows_no_results(page):
+                    out.stopped, out.complete = "no-results", True
+                else:
+                    try:
+                        await asyncio.wait_for(arrived.wait(), timeout=self.a.settle)
+                    except asyncio.TimeoutError:
+                        pass
 
             for blob in parse_embedded(await page.evaluate(JS_EMBEDDED)):
                 absorb(blob)
@@ -1371,8 +1525,12 @@ class Discovery:
                 except Exception:
                     pass
 
+            # Nothing parsed and Facebook says why: stop now rather than
+            # scrolling an empty page for `patience` rounds.
+            if not by_id and await _shows_no_results(page):
+                out.stopped, out.complete = "no-results", True
             stalls = 0
-            while True:
+            while not (out.stopped == "no-results"):
                 if cap and len(by_id) >= cap:
                     out.stopped = "cap:results"
                     break
@@ -1419,6 +1577,12 @@ class Discovery:
                         )
                 else:
                     stalls += 1
+                    # Re-checked here too: the panel can render a moment after
+                    # first paint, in which case the pre-loop check above ran
+                    # too early. Still gated on having parsed nothing.
+                    if not by_id and await _shows_no_results(page):
+                        out.stopped, out.complete = "no-results", True
+                        break
                     if stalls >= self.a.patience:
                         out.stopped = "stalled"
                         break
@@ -1484,8 +1648,66 @@ class Discovery:
             # them spent the resolve budget (and real page loads under the
             # live session) on data that cannot exist, while starving the
             # ids that DO resolve.
-            to_resolve = sorted(missing | unresolved_in_by_id)
+            # NEVER VISIT A PROFILE THE CAP IS ABOUT TO DISCARD.
+            #
+            # Backfilled hits are sorted BEHIND the graphql-confirmed ones
+            # (see the chain below) and then trimmed to `cap`. So once
+            # `by_id` already holds `cap` confirmed hits, every backfill is
+            # guaranteed to be cut -- and resolving one first buys a profile
+            # visit whose entire result is thrown away microseconds later.
+            #
+            # Measured before this, one keyword, cap 12, all three tabs:
+            #
+            #   people  27.6s  13 visits (24.6s)  -> all 13 discarded
+            #   pages   28.0s  11 visits (25.0s)  -> all 11 discarded
+            #   groups  33.9s  12 visits (31.1s)  -> all 12 discarded
+            #
+            # 89% of each sweep, spent on rows that could not survive. And
+            # profile visits under one live account are the most detectable
+            # thing this engine does, so the waste was paid twice: in wall
+            # clock and in exposure.
+            #
+            # `room` is how many backfills could actually survive. Uncapped
+            # sweeps (cap == 0) keep resolving everything, which is correct:
+            # there, nothing is trimmed and every visit can pay off.
+            #
+            # Nameless CONFIRMED hits are never bounded by this -- they are
+            # already inside the cap and a visit genuinely improves the row
+            # that ships. Only speculative backfill is rationed.
+            # An id we ALREADY PARSED this sweep needs no visit at all -- the
+            # edge is in hand, it just did not make it into `by_id` (the cap
+            # stopped absorption, or it arrived on a payload after this one).
+            # Subtracted BEFORE the visit budget is worked out, so a profile
+            # page load is never spent recovering something already
+            # downloaded and understood.
+            already_known = missing & parsed_any.keys()
+            missing_worth_visiting = _worth_visiting(
+                missing - already_known, cap=cap, parsed=len(by_id))
+            to_resolve = sorted(missing_worth_visiting | unresolved_in_by_id)
             out.resolved_visits = len(to_resolve)
+            # WHY a visit was needed, not just how many. The resolve phase is
+            # ~80% of a sweep's wall clock (measured: 57.8s of 72.4s across
+            # three tabs), and the two causes have completely different fixes:
+            # `missing` is an edge Facebook rendered that we failed to parse
+            # -- recoverable in code, for free -- while a nameless edge we did
+            # parse is Facebook withholding the name, which no parser change
+            # reaches. Without this split, the only visible number is the
+            # total, which cannot tell the two apart.
+            if to_resolve:
+                # This module has no module-level logger, so one is fetched
+                # here rather than assumed -- an earlier version of this line
+                # referenced a bare `log` and raised NameError inside the
+                # sweep's own try, which turned every Facebook sweep into
+                # `stopped=error` with zero hits. A telemetry line must never
+                # be able to fail the work it is measuring.
+                from backend.shared.logging import get_logger as _gl
+                _gl("facebook").info(
+                    f"[facebook] {keyword!r}/{tab}: resolve {len(to_resolve)} "
+                    f"= {len(missing_worth_visiting)} unparsed-edge + {len(unresolved_in_by_id)} nameless-edge "
+                    f"(of {len(by_id)} parsed, {len(rendered_ids)} rendered, "
+                    f"{len(already_known)} from parsed edges, "
+                    f"{len(missing) - len(already_known) - len(missing_worth_visiting)} skipped as cap-doomed)"
+                )
             if to_resolve:
                 _resolve_started = time.time()
                 try:
@@ -1507,6 +1729,15 @@ class Discovery:
                             h.has_custom_pic = r.has_custom_pic
 
             for eid in sorted(missing):
+                # FIRST: the edge we already parsed this sweep, if we have
+                # one. `missing` means "rendered but not absorbed", and the
+                # commonest reason is the cap stopping absorption mid-payload
+                # -- not that the data was unavailable. Taking it from here
+                # is free, and comes from the SAME search payload that
+                # produced every other result on this page.
+                if (known_hit := parsed_any.get(eid)) is not None:
+                    by_id[eid] = known_hit
+                    continue
                 r = resolved.get(eid)
                 by_id[eid] = Hit(
                     entity_id=eid,
@@ -1518,7 +1749,20 @@ class Discovery:
                     name=r.name if r else "",
                     url=profile_url_for(eid, kind),
                     avatar=r.avatar if r else "",
-                    has_custom_pic=r.has_custom_pic if r else False,
+                    # NEVER False WITHOUT EVIDENCE. A resolve visit cannot
+                    # read a picture at all in production (see
+                    # PAGE_CONTEXT_PICTURE_KEYS: Facebook substitutes the
+                    # VIEWER'S OWN photo into a privacy-restricted profile's
+                    # picture fields, so no signal there is trustworthy), and
+                    # an id we never resolved was never looked at either.
+                    # Recording False in both cases put "no logo" on cards
+                    # whose profiles plainly have one -- 38 of 50 past the
+                    # cap for one live keyword.
+                    #
+                    # None means unknown, and `save()` skips writing it, so
+                    # an unknown can never overwrite a real verdict a
+                    # previous sweep established.
+                    has_custom_pic=(r.has_custom_pic if r else None),
                     entity_type=kind,
                     keyword=keyword,
                     tab=tab,
@@ -1549,6 +1793,25 @@ class Discovery:
             # sweep never pays for it, and a doc-id rotation degrades to
             # "fewer fields per hit" instead of to "zero results, reported
             # as success".
+            # FACEBOOK ALREADY ANSWERED "nothing matched" -- don't go
+            # looking for it twice. `_shows_no_results(page)` read that off
+            # the rendered page and the sweep is already `complete`, so
+            # running the chain here can only walk both strategies over an
+            # empty page and then report "every strategy failed" about a
+            # search that worked perfectly. That error fired 28 times
+            # against real brand keywords -- and against a nonsense test
+            # keyword that SHOULD match nothing -- which is how a healthy
+            # sweep came to look like a broken extractor.
+            #
+            # Guarded on `by_id` too, not just the stop reason: the embedded
+            # first-page parse can still land edges after the no-results
+            # branch above sets the flag, and if anything was parsed it
+            # deserves the normal chain.
+            if out.stopped == "no-results" and not by_id:
+                out.hits = []
+                out.reported_total = state.total_results if state else 0
+                return out
+
             chain = await run_strategies(
                 f"facebook/search[{keyword!r}/{tab}]",
                 [

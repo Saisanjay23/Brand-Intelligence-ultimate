@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from backend.shared.models.scoring import ACTIVE_WINDOW_DAYS, NAME_THRESHOLD, compute_score
+from backend.shared.models.scoring import ACTIVE_WINDOW_DAYS, compute_score
 from backend.shared.text import contiguous_letters_match
 
 
@@ -130,8 +130,27 @@ class Row:
 
     @property
     def name_yes(self) -> str:
-        if self.profile_name:
-            return "Yes" if self.name_score >= NAME_THRESHOLD else "No"
+        """"Yes", unconditionally, for every platform, by explicit product
+        decision -- NOT derived from `name_score`.
+
+        This used to threshold on NAME_THRESHOLD, which put a name-match
+        FLOOR under the risk rubric: `compute_score` returns the bare
+        minimum (2) whenever `name_match` is false, regardless of logo,
+        location or activity (see scoring.py's cascade). But a row only
+        ever reaches analysis because a discovery sweep already matched it
+        to the client's own keywords -- "no clear name match" is not a
+        real state for a profile that is sitting in this pipeline at all,
+        it was this property second-guessing a decision discovery already
+        made, using a stricter, order-sensitive fuzzy-ratio bar than the
+        one discovery itself was matched against.
+        `name_score`/`name_exact_run` are unaffected and still computed:
+        they drive discovery's own High/Medium/Low match-level filter and
+        remain available for an analyst to read, this property alone no
+        longer gates on them. An analyst can still turn this to "No" by
+        hand for a specific profile they've actually looked at (the
+        `username_match` override in `resolve_match`, which wins outright
+        over any default) -- that path is untouched.
+        """
         return "Yes"
 
     @property

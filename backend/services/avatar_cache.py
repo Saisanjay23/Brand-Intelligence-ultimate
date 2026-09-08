@@ -29,12 +29,12 @@ from urllib.parse import urlparse
 
 from backend.database.repositories import avatar_repository as avatars_db
 from backend.database.repositories import profile_repository as profiles_db
-from backend.shared.avatars import looks_like_placeholder
 from backend.database.repositories import logo_repository as logos_db
 from backend.services import logo_match
 from backend.shared.imageembedding import available as embedding_available
 from backend.shared.imageembedding import embed
 from backend.shared.imagefetch import ImageFetchError, allowed, fetch_image
+from backend.shared.avatars import is_generated_avatar
 from backend.shared.imagehashing import fingerprint
 from backend.shared.logging import get_logger
 
@@ -122,9 +122,24 @@ def is_same_avatar_asset(old_url: str, new_url: str) -> bool:
         return False
 
 
-async def cache_one(url: str, retries: int = 1, *, want_embedding: bool = False
-                    ) -> tuple[Optional[str], Optional[dict], Optional[list]]:
-    """Fetch, store and fingerprint one avatar -> (sha256, fingerprint).
+async def cache_one(
+    url: str, retries: int = 1, *, want_embedding: bool = False,
+    platform: str = "",
+) -> tuple[Optional[str], Optional[dict], Optional[list], Optional[bool]]:
+    """Fetch, store and fingerprint one avatar
+    -> (sha256, fingerprint, embedding, generated).
+
+    `generated` is True when the bytes are a picture the PLATFORM drew
+    rather than one the account holder chose -- Facebook's per-account
+    letter avatar, YouTube's per-channel one. It needs the image, which is
+    why it is answered here: this function has already paid for the
+    download and the decode, so the verdict is free. Discovery's own sweep
+    must never download an image (see this module's docstring), and
+    analysis must not re-derive it (see analysis/runner.py) -- so this is
+    the only place in the pipeline that can settle it at all.
+
+    None means "not decided", not "real": an unreadable image, a platform
+    with no rule, or a flat image on a ground the platform does not use.
 
     Either half can be None and that is an ordinary outcome, not an error:
     an expired signature, a CDN node refusing a connection, a file that is
@@ -144,12 +159,12 @@ async def cache_one(url: str, retries: int = 1, *, want_embedding: bool = False
     finishes 5.6x faster, because Pillow releases the GIL while decoding.
     """
     if not url:
-        return None, None, None
+        return None, None, None, None
     # Telegram's MTProto avatars arrive as data: URIs, not HTTP links.
     if url.startswith("data:"):
-        return await _cache_data_uri(url, want_embedding=want_embedding)
+        return (*await _cache_data_uri(url, want_embedding=want_embedding), None)
     if not allowed(url):
-        return None, None, None
+        return None, None, None, None
     for attempt in range(retries + 1):
         try:
             img = await asyncio.wait_for(fetch_image(url), timeout=PER_IMAGE_TIMEOUT_SEC)
@@ -171,16 +186,26 @@ async def cache_one(url: str, retries: int = 1, *, want_embedding: bool = False
                     vec = await asyncio.to_thread(embed, img.data)
                 except Exception as e:               # noqa: BLE001 - never fatal
                     log.warning(f"avatar embed error: {type(e).__name__}: {e}")
-            return sha, (fp.to_dict() if fp else None), vec
+            # Same thread rule as the fingerprint: Pillow decoding is
+            # CPU-bound and this task shares its loop with a running sweep.
+            generated = None
+            if platform:
+                try:
+                    generated = await asyncio.to_thread(
+                        is_generated_avatar, platform, url, img.data,
+                    )
+                except Exception as e:               # noqa: BLE001 - never fatal
+                    log.warning(f"generated-avatar check failed: {type(e).__name__}: {e}")
+            return sha, (fp.to_dict() if fp else None), vec, generated
         except (ImageFetchError, asyncio.TimeoutError):
             if attempt < retries:
                 await asyncio.sleep(1.2)
                 continue
-            return None, None, None
+            return None, None, None, None
         except Exception as e:                       # noqa: BLE001 - never fatal
             log.warning(f"avatar fetch/store error: {type(e).__name__}: {e}")
-            return None, None, None
-    return None, None, None
+            return None, None, None, None
+    return None, None, None, None
 
 
 async def cache_for_profiles(
@@ -203,11 +228,26 @@ async def cache_for_profiles(
         url = (it.get("url") or "").strip()
         if not img or not url:
             continue
-        # A platform's own silhouette is not worth a fetch or a GridFS
-        # object, and storing one would make "has no picture" indistinguishable
-        # from "has a picture we cached".
-        if looks_like_placeholder(platform, img):
-            continue
+        # STOCK AVATARS ARE CACHED TOO, deliberately -- reversing an earlier
+        # decision, for two reasons that have both changed.
+        #
+        # The old reason not to was that storing one would make "has no
+        # picture" indistinguishable from "has a picture we cached". That is
+        # no longer how absence is expressed: `has_custom_pic` is tri-state
+        # now (True real / False stock / None never looked, see
+        # shared/models/hit.py), so the verdict lives in its own field and
+        # does not have to be inferred from whether bytes exist.
+        #
+        # The cost objection is also weaker than it looks. The avatar store
+        # is content-addressed by sha256 (avatar_repository), so every
+        # profile wearing the same silhouette shares ONE stored object --
+        # thousands of rows, a single blob.
+        #
+        # And it buys the thing that matters: a card renders what Facebook
+        # renders. A stock avatar served from a signed CDN URL expires like
+        # any other, so without the cached bytes those cards go blank
+        # overnight and show the initial-letter fallback instead of the
+        # silhouette the platform actually shows.
         key = f"{url}\n{img}"
         if key in seen:
             continue
@@ -249,13 +289,36 @@ async def cache_for_profiles(
     async def one(url: str, entity_id: str, image_url: str) -> None:
         nonlocal stored
         async with sem:
-            sha, fp, vec = await cache_one(image_url, want_embedding=want_embedding)
+            sha, fp, vec, generated = await cache_one(
+                image_url, want_embedding=want_embedding, platform=platform,
+            )
         if not sha:
             return
         try:
             ok = await profiles_db.set_avatar_sha(
                 client_id, platform, sha, url=url, entity_id=entity_id,
             )
+            # WHAT THE SWEEP COULD NOT KNOW. Discovery decides `has_logo`
+            # from the URL alone, because it must never download an image.
+            # That is right for a stock asset with a fixed id, and blind to
+            # a picture the platform DREW for this one account: Facebook's
+            # letter avatar is served from the ordinary profile-picture
+            # path with a per-account id and is indistinguishable from a
+            # real upload until you look at the pixels. 121 of this repo's
+            # Facebook rows were scored as real pictures on that basis.
+            #
+            # Correcting it here costs the sweep nothing -- these bytes were
+            # already fetched and decoded a few lines up -- and it corrects
+            # the ONE record that matters, because analysis now inherits
+            # this verdict rather than re-deriving it (analysis/runner.py).
+            #
+            # Only ever writes False, never True: `generated is False` from
+            # a platform with no rule would be a guess, and this must not be
+            # able to promote an unknown into a claim.
+            if generated is True:
+                await profiles_db.set_has_logo(
+                    client_id, platform, False, url=url, entity_id=entity_id,
+                )
             if fp:
                 await profiles_db.set_avatar_fingerprint(
                     client_id, platform, fp["phash"], fp["dhash"],

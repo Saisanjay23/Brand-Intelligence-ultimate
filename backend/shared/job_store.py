@@ -97,9 +97,40 @@ class JobStore(Generic[J]):
 
     def _evict_locked(self, *, reserve: int = 0) -> None:
         """Expired jobs first (free to lose), then oldest-first once still
-        over the ceiling. Insertion order isn't relied on for age -- this
-        reads each job's own `created_at`, so eviction stays correct even
-        if a caller ever re-inserts an existing id.
+        over the ceiling -- but ONLY among TERMINAL jobs, and only a still-
+        running one if there are truly no terminal jobs left to reclaim.
+
+        THE BUG THIS GUARDS. The ceiling-eviction loop used to pick the
+        globally oldest job by `created_at` with no regard for `status`.
+        That is exactly backwards for which job is safest to forget: a
+        terminal job (done/failed/cancelled) has nothing left to lose by
+        being dropped from this table, while a job that is still RUNNING
+        has a live `asyncio.Task` depending on this table being the thing
+        that keeps it reachable -- `job.task = asyncio.create_task(...)` is
+        the ONLY strong reference to that task once it is created (see
+        discovery/runner.py and analysis/runner.py, both of which do
+        exactly this and never read `.task` again). Per asyncio's own
+        documented behaviour, "the event loop only keeps weak references to
+        tasks. A task that isn't referenced elsewhere may get garbage
+        collected at any time, even before it's done." Evicting a running
+        job's entry here breaks that one reference, which does two things
+        at once: every poller (a client's own poll loop, or the Scheduler's
+        queue runner watching a discovery sweep) starts getting "job not
+        found" the instant this table forgets it, AND the sweep itself
+        becomes eligible for outright garbage collection mid-keyword, with
+        nothing left to log that it happened. A long-running server
+        accumulates terminal jobs from ordinary use far faster than it
+        accumulates genuinely still-running ones, so without this
+        ordering, ceiling pressure was disproportionately likely to pick
+        exactly the wrong job -- an outlier that has been running a long
+        time (and is therefore often the globally oldest) over any of the
+        many short-lived terminal jobs sitting right next to it.
+
+        This module already applies the identical reasoning one level up
+        (job.avatar_tasks' own docstring: "a task with no live reference
+        can be garbage collected mid-flight, which would cache nothing
+        under exactly the load where it matters") -- this is the same fix
+        for the job's own task.
 
         `reserve` leaves room for a job `put()` is about to insert right
         after this call -- without it, evicting down to exactly `max_jobs`
@@ -108,7 +139,9 @@ class JobStore(Generic[J]):
         for jid in [j for j, job in self._jobs.items() if self.age_seconds(job) >= self.ttl_seconds]:
             self._drop_locked(jid)
         while len(self._jobs) > self.max_jobs - reserve:
-            oldest = min(self._jobs, key=lambda j: self._jobs[j].created_at)
+            terminal = [j for j, job in self._jobs.items() if job.status in self._terminal]
+            pool = terminal or list(self._jobs)
+            oldest = min(pool, key=lambda j: self._jobs[j].created_at)
             self._drop_locked(oldest)
 
     # ------------------------------------------------------- session tracking

@@ -213,10 +213,13 @@ async def test_analysis_runner_caches_new_avatar():
         status="OK",
     )
 
-    # cache_one returns (sha, fingerprint) -- the fingerprint rides along on
-    # the decode the fetch already pays for. Analysis only consumes the sha.
+    # cache_one returns (sha, fingerprint, embedding, generated) -- all three
+    # extras ride along on the decode the fetch already pays for. Analysis
+    # consumes only the sha: the generated-avatar verdict is written by the
+    # discovery-side caller, because analysis now INHERITS the logo verdict
+    # rather than deriving one (see test_logo_verdict_is_discoverys.py).
     with patch("backend.services.avatar_cache.cache_one",
-               AsyncMock(return_value=("mock_sha_123", None, None))):
+               AsyncMock(return_value=("mock_sha_123", None, None, None))):
         await runner._populate(job, it, row, known=None)
 
     assert it.avatar_sha == "mock_sha_123"
@@ -238,7 +241,7 @@ async def test_cache_one_retries_transient_failure():
 
     with patch("backend.services.avatar_cache.fetch_image", side_effect=fake_fetch), \
          patch("backend.services.avatar_cache.avatars_db.store", AsyncMock(return_value="sha_recovered")):
-        sha, _fp, _vec = await cache_one("https://scontent.cdninstagram.com/pic.jpg", retries=1)
+        sha, _fp, _vec, _gen = await cache_one("https://scontent.cdninstagram.com/pic.jpg", retries=1)
 
     assert call_count == 2
     assert sha == "sha_recovered"

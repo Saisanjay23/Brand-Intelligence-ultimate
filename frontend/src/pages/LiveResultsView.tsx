@@ -27,6 +27,8 @@ interface Props {
   onCancel: () => void;
   onAnalyseStarted: (jobId: string) => void;
   refreshKey: number;
+  /** Bumped while a sweep is running and its counts move. */
+  liveKey?: number;
   // Set by App.tsx after "Analyse Validated Profiles"/"Analyse Selected"
   // (or Home's own "Analyse" action) starts a job -- switches this page's
   // own toggle to Analysis and hands the id to the embedded AnalysisView so
@@ -104,6 +106,23 @@ function PlatformInFlightItem({
       <span style={{ color: STATUS_COLOR[p.status], fontWeight: 700, display: "inline-flex", alignItems: "center", gap: "4px" }}>
         <StatusDot status={p.status} /> {p.keywords_done}/{p.keywords_total}
       </span>
+      {/* Only when the sweep was actually split -- a "1 session" badge on
+          every chip would be noise, since one session is the norm. */}
+      {(p.workers ?? 0) > 1 && (
+        <span
+          title={`Split across ${p.workers} sessions running in parallel`}
+          style={{
+            fontSize: "10px",
+            fontWeight: 700,
+            color: "var(--cyan)",
+            border: "1px solid rgba(0, 229, 255, 0.35)",
+            borderRadius: "4px",
+            padding: "1px 5px",
+          }}
+        >
+          x{p.workers}
+        </span>
+      )}
       {kw && (
         <span style={{ fontSize: "11.5px", color: "var(--cyan)", fontWeight: 600, background: "rgba(0, 229, 255, 0.1)", padding: "1px 7px", borderRadius: "10px" }}>
           "{kw}"
@@ -387,7 +406,7 @@ function TileProgressRow({ p }: { p: PlatformSweepState }) {
 }
 
 export function LiveResultsView({
-  clientId, clientName, platforms, job, running, cancelling, onCancel, onAnalyseStarted, refreshKey, resumeAnalysisJobId,
+  clientId, clientName, platforms, job, running, cancelling, onCancel, onAnalyseStarted, refreshKey, liveKey, resumeAnalysisJobId,
 }: Props) {
   const [phase, setPhase] = useState<Phase>("discovery");
   const [platform, setPlatform] = useState<string>("");
@@ -499,6 +518,7 @@ export function LiveResultsView({
           groupId={clientId}
           platform={platform || undefined}
           refreshKey={refreshKey}
+          liveKey={liveKey}
           onAnalyseStarted={onAnalyseStarted}
         />
       )}

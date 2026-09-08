@@ -438,6 +438,33 @@ async def get_healthy_session(platform_id: str) -> Optional[dict]:
     return chosen
 
 
+def proven_fresh(session_item: dict) -> bool:
+    """Has real work proved this session healthy recently enough that a login
+    probe would add risk and no information?
+
+    The same PROVEN_FRESH_S window `_pick_batch` uses to skip the background
+    monitor's probe, applied to the probe a JOB runs before it starts. Both
+    ask the identical question -- "do we already know this works?" -- and it
+    was only ever answered in one of the two places.
+
+    A probe is not free. Measured on Facebook: `check_session()` is a real
+    authenticated page load costing 12.65s, larger than all three of that
+    platform's tab sweeps put together, paid on every job. And it is an
+    authenticated request to the platform, on a schedule shaped by how often
+    sweeps run, which is exactly the kind of pattern the rest of this module
+    works to avoid.
+
+    Skipping it is safe because a stale verdict cannot hide for long: if the
+    session has died since, the sweep itself fails, `classify_failure` reads
+    the failure and `mark_session_failed` records it -- the same path that
+    already handles a session dying MID-sweep, which no upfront probe could
+    have prevented either. The probe only ever moved that discovery a few
+    seconds earlier, at the cost of a page load every time.
+    """
+    last_ok = float(session_item.get("last_ok") or 0.0)
+    return bool(last_ok) and (_now() - last_ok) < PROVEN_FRESH_S
+
+
 def release_claim(platform_id: str, session_id: str) -> None:
     """The other half of `get_healthy_session`'s claim -- callers MUST call
     this once they're done with the session (in a `finally`, alongside
@@ -515,7 +542,13 @@ async def session_for_job(platform_id: str) -> tuple[object, dict]:
             # session pool costs it one field, not the whole platform.
             return plat, {"id": "", "identifier": "anonymous", "anonymous": True}
         raise ConflictError(f"{platform_id}: no healthy sessions available -- please add more cookies")
-    return plat, {"id": item["id"], "identifier": item["identifier"], "cookies": item["cookies"], "proxy": item["proxy"]}
+    return plat, {"id": item["id"], "identifier": item["identifier"],
+                  "cookies": item["cookies"], "proxy": item["proxy"],
+                  # When real work last proved this session healthy. Carried
+                  # through so a caller can decide whether its own login
+                  # probe would tell it anything it does not already know --
+                  # see `proven_fresh` below.
+                  "last_ok": item.get("last_ok") or 0.0}
 
 
 async def mark_session_failed(

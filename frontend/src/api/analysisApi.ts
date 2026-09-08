@@ -63,6 +63,11 @@ export interface PlatformProgressData {
   current_url?: string;
   current_step?: string;
   item_started_at_ts?: number | null;
+  // How many pooled sessions are working this platform in parallel right now.
+  // 1 (or absent) is the ordinary single-session run; >1 means the batch was
+  // split across accounts -- see _MAX_SESSIONS_PER_PLATFORM in
+  // backend/analysis/runner.py.
+  workers?: number;
 }
 
 export interface AnalysisJobResponse {

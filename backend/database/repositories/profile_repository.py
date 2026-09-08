@@ -663,6 +663,33 @@ async def save(
         return False
 
 
+async def set_has_logo(
+    client_id: str, platform: str, value: bool, *, url: str, entity_id: str = "",
+) -> bool:
+    """Correct one profile's logo verdict. True when a row was changed.
+
+    Written by avatar_cache after it has decoded the picture, which is the
+    only point in the pipeline that can tell a platform-DRAWN avatar from a
+    real upload -- the sweep that wrote this row saw the URL and nothing
+    else. Same identity rules and the same narrow-write discipline as
+    `set_avatar_sha` above: caching a picture is not a rediscovery, so this
+    must not touch `last_seen` or re-run the status logic.
+    """
+    if not url:
+        return False
+    eid = (entity_id or "").strip()
+    keys: list[dict] = []
+    if eid:
+        keys.append({"entity_id": eid})
+    keys.append({"url": url})
+    keys.append({"urls": url})
+    res = await db()[PROFILES].update_one(
+        {"client_id": client_id, "platform": platform, "$or": keys},
+        {"$set": {"has_logo": bool(value)}},
+    )
+    return res.matched_count > 0
+
+
 async def set_avatar_sha(
     client_id: str, platform: str, sha: str, *, url: str, entity_id: str = "",
 ) -> bool:

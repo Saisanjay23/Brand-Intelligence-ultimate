@@ -752,6 +752,25 @@ async def dom_last_post(page) -> str:
     return max(dates) if dates else ""
 
 
+# Facebook's "you cannot see this" panel, verbatim from the rendered tab.
+#
+# WHY IT IS WORTH KNOWING. About tabs on a `profile.php?id=` URL are refused
+# outright -- verified live 2026-09-08 across three such profiles and three
+# different About sub-tabs: every one came back as the SAME 255-character
+# body, "This content isn't available at the moment ... the owner only shared
+# it with a small group of people". Vanity-URL profiles answered normally
+# (418-736 characters of real content) in the same run.
+#
+# The refusal is per PROFILE, not per tab, so one walled tab means every
+# other About tab on that profile is walled too -- and a second visit can
+# only return the same panel. About 15% of the stored Facebook profiles for
+# a live client are that URL shape, and each was paying two page loads to be
+# told the same thing twice.
+RE_CONTENT_UNAVAILABLE = re.compile(
+    r"content isn.t available at the moment", re.I
+)
+
+
 def read_location(row: Row, h: Harvest) -> None:
     """WHAT: the profile's stated city/hometown, into `row.location`. HOW:
     three tiers -- the entity's own scoped location fields (K_LOCATION)
@@ -1398,11 +1417,39 @@ class Scraper:
             # and wasn't worth the two extra page loads either way.
             if not row.location:
                 await self.pause(0.4)
-                for sk in ("about_profile_transparency", "about"):
+                # `about` FIRST, and stop as soon as it answers.
+                #
+                # These two tab loads exist for one field, and they ran
+                # unconditionally as a pair -- the second even when the first
+                # had already produced a location. `about` is the tab that
+                # carries "Lives in"/"From" for a person, which is what
+                # RE_LIVES_IN/RE_FROM read, so it is the one more likely to
+                # answer; transparency is the fallback (and the better source
+                # for a Page). Checking between them turns a fixed two loads
+                # into one in the common success case.
+                #
+                # NO ACCURACY IS TRADED: when `about` yields nothing, the
+                # transparency tab is still visited exactly as before, and
+                # read_location still runs over the combined harvest with its
+                # own trust tiers and is_place validation. The only thing
+                # removed is a page load whose result was already in hand.
+                #
+                # Each visit is a real page load under a live session -- the
+                # most detectable thing analysis does -- so a skipped one is
+                # worth more than the seconds it saves.
+                for sk in ("about", "about_profile_transparency"):
                     await self.visit(page, tab_url(url, sk), h, sk)
                     await self.pause(0.3)
-
-                read_location(row, h.scoped(pid))
+                    read_location(row, h.scoped(pid))
+                    if row.location:
+                        break
+                    # Facebook refused this profile's About tabs -- the next
+                    # one is the same wall, so stop rather than load it to be
+                    # told the same thing again. Only checked when nothing was
+                    # read: a tab that DID answer is never cut short.
+                    if RE_CONTENT_UNAVAILABLE.search(h.text.get(sk) or ""):
+                        row.note("About tab not visible to this session")
+                        break
 
             row.status = "OK" if row.profile_name else "PARTIAL"
             return row

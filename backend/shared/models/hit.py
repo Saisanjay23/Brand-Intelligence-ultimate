@@ -20,6 +20,7 @@ those `discovery_engine.py`'s own `user_to_row`/`entity_to_row`.
 
 from __future__ import annotations
 
+from typing import Optional
 from dataclasses import dataclass
 
 from backend.shared.models.row import Row
@@ -34,7 +35,21 @@ class Hit:
     name: str
     url: str
     avatar: str = ""
-    has_custom_pic: bool = False
+    # TRI-STATE, and the third state is the point.
+    #   True  -- a real, account-chosen picture was seen in the payload
+    #   False -- the platform's own stock avatar was recognised
+    #   None  -- we never got a picture to judge
+    #
+    # It used to be a plain bool defaulting to False, which made "we did not
+    # look" indistinguishable from "this account has no photo". Facebook's
+    # id-backfill path builds a Hit for every id the search RENDERED but no
+    # edge was parsed for, and it has no picture to pass -- so every one of
+    # those was recorded as "no logo" on a profile nobody had looked at.
+    # Measured on a live client: for one keyword's People tab, 0 of the
+    # first 50 results lacked a picture URL, against 38 of the next 50.
+    # Every one of those 38 was a card asserting "no logo" for a profile
+    # that visibly has one.
+    has_custom_pic: Optional[bool] = None
     verified: bool = False
     entity_type: str = "profile"  # profile | page | channel | group
     keyword: str = ""

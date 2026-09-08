@@ -832,10 +832,28 @@ class Discovery:
                             f"page {out.pages}, {time.time()-started:.0f}s",
                             file=sys.stderr,
                         )
-                    # Natural reading dwell time between scroll events
-                    await asyncio.sleep(random.uniform(1.2, 2.4))
-                    if random.random() < 0.35:
-                        await hover_element_safely(page, '[data-testid="UserCell"]')
+                    # Natural reading dwell time BETWEEN scroll events -- so
+                    # it is only worth paying when another scroll follows.
+                    #
+                    # The cap is tested at the top of the loop, which meant
+                    # the scroll that finally reached it still paid a full
+                    # dwell (and possibly a hover) before the next iteration
+                    # broke out. That is 1.2-2.4s per sweep spent looking
+                    # human at a page this code is about to close without
+                    # touching again -- it simulates reading before a scroll
+                    # that never happens, so it buys no cover.
+                    #
+                    # Deliberately only skipped when the sweep is ENDING.
+                    # Every dwell between two real scrolls is untouched:
+                    # pacing is the measure that matters most here (see
+                    # stealth/browser.py's own note), and this trims the one
+                    # instance that cannot be observed rather than thinning
+                    # the rhythm X actually sees.
+                    finishing = bool(self.a.max_results) and len(by_id) >= self.a.max_results
+                    if not finishing:
+                        await asyncio.sleep(random.uniform(1.2, 2.4))
+                        if random.random() < 0.35:
+                            await hover_element_safely(page, '[data-testid="UserCell"]')
                 else:
                     stalls += 1
                     # Check page body for soft-block or rate-limit notice on repeated stall

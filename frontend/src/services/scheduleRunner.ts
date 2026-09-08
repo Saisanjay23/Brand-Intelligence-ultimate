@@ -41,7 +41,19 @@ const POLL_MS = 2500;
 const MAX_POLL_ERRORS = 5;
 // Breathing room between clients so a long queue doesn't slam straight from
 // one platform sweep into the next.
-const GAP_MS = 1500;
+//
+// 1.5s was breathing room in name only. Every client in the queue is swept
+// through the SAME pooled accounts, so a four-client queue was four sweeps
+// of the same Facebook login inside a couple of minutes -- and this pool has
+// since had a Facebook account disabled. A minute between clients is
+// invisible next to a sweep that already takes minutes (a 15-keyword client
+// is several), and it breaks up the one pattern that reads as automation:
+// sustained, evenly-spaced, back-to-back searching on one account.
+//
+// The per-KEYWORD gap is the other half of this and lives server-side, where
+// the sweeping actually happens -- see _PLATFORM_INTER_KEYWORD_DELAY in
+// backend/discovery/runner.py.
+const GAP_MS = 60_000;
 
 export type EntryStatus = "pending" | "running" | "done" | "failed" | "skipped" | "cancelled";
 

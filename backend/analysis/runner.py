@@ -27,11 +27,18 @@ is what writes the result; both terminal paths (scored and failed) go
 through it, so "every result is saved" is a property of the shape rather
 than a rule six call sites have to remember.
 
-ROBUSTNESS. One session is taken per platform per job, not per URL, so a
-40-URL paste does not open 40 browser sessions. A URL that fails is recorded
-as an errored item, saved like any other result, and never sinks the rest of
-the batch. Cancellation is checked between every profile, and a cancelled
-job keeps whatever it had already read. Persisting can never fail a job: a
+ROBUSTNESS. Sessions are taken per platform per job, never per URL, so a
+40-URL paste does not open 40 browser sessions -- a platform claims as many
+pooled sessions as it can safely work with at once (see `_scrape_platform`
+and _MAX_SESSIONS_PER_PLATFORM: usually one, up to three when the pool has
+that many accounts on genuinely separate egress, and never more than the
+batch has work for). Those sessions pull from one shared queue, which is
+what makes a session dying mid-run survivable: the URLs it had not finished
+are still queue entries, so another session takes them instead of the batch
+reporting them failed. A URL that fails for its own reasons is recorded as
+an errored item, saved like any other result, and never sinks the rest of
+the batch. Cancellation is checked between every chunk, and a cancelled job
+keeps whatever it had already read. Persisting can never fail a job: a
 storage error costs the row its durability and is logged, nothing more.
 """
 
@@ -41,6 +48,8 @@ import asyncio
 import re
 import time
 import uuid
+import weakref
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -54,7 +63,7 @@ from backend.database.repositories import analysis_result_repository as results_
 from backend.shared.job_store import JobStore
 from backend.shared.logging import get_logger
 from backend.shared.models.row import Row
-from backend.shared.models.scoring import NAME_THRESHOLD, compute_incident_risk_score
+from backend.shared.models.scoring import compute_incident_risk_score
 from backend.shared.resilience import classify_failure
 
 log = get_logger("analysis.runner")
@@ -136,6 +145,115 @@ _PLATFORM_INTER_BATCH_DELAY: dict[str, float] = {
 }
 _DEFAULT_INTER_BATCH_DELAY = 1.5
 
+# ------------------------------------------------- parallel sessions, failover
+#
+# ONE PLATFORM, SEVERAL SESSIONS, AT ONCE. `_PLATFORM_CONCURRENCY` above is how
+# many tabs ONE held session opens; this is how many SESSIONS the platform gets
+# to work with at all. A 40-URL Twitter paste against a two-account pool runs
+# as two workers -- two accounts, two proxies, two browser contexts -- pulling
+# chunks off one shared queue. That buys roughly 2x throughput, but the reason
+# it is built this way is the other half: when one session checkpoints, the
+# URLs it had not finished are still QUEUE ENTRIES, so the surviving worker
+# takes them. Before this, one session dying meant every URL still queued
+# behind it was reported failed, with healthy accounts sitting idle in the pool
+# while it happened.
+#
+# 1 IS NOT A DEGRADED PATH. A single-session pool claims one session and runs
+# the identical chunk-and-pause loop it always did.
+_MAX_SESSIONS_PER_PLATFORM: dict[str, int] = {
+    # ONE batched channels.list call covers the whole platform
+    # (`_scrape_youtube_batch`), so there is no per-URL work to split and a
+    # second key would only mean two quota buckets spent on one job.
+    "youtube": 1,
+    # Telethon keeps ONE local session file open at a time behind an SQLite
+    # lock (see sessions/manager.py::session_for_job), so a second Telegram
+    # worker would be two clients fighting over one file, not two clients.
+    "telegram": 1,
+}
+_DEFAULT_MAX_SESSIONS_PER_PLATFORM = 3
+
+# How many sessions one URL may be handed to. 2 means one retry, on one other
+# session, and then it is reported failed with whatever the last session gave
+# it. Bounded because the failure being recovered from is ambiguous: usually
+# the session died, but sometimes the URL itself is what trips the challenge,
+# and an uncapped retry would let one URL walk the whole pool killing accounts
+# as it goes.
+_MAX_ITEM_ATTEMPTS = 2
+
+# How many times a platform may go back to the pool for REPLACEMENT sessions
+# after everything it had claimed died. Round 1 is the ordinary claim; round 2
+# exists for the case where a session came free (another job finished, or the
+# monitor revived one) while this batch was running.
+_MAX_CLAIM_ROUNDS = 2
+
+# Bound on browser workers open at once across the WHOLE process, which is the
+# number that actually decides whether the host copes. `_run` scrapes every
+# platform of a job CONCURRENTLY, so a per-platform cap cannot see the total:
+# without this, a 4-platform job at 3 sessions each would try to hold twelve
+# Chromium contexts, each with its own Playwright driver, plus their tabs.
+#
+# Keyed by running loop rather than one module-level Semaphore: asyncio
+# primitives bind to the loop that first awaits them, so a test suite that
+# builds a fresh loop per test would otherwise inherit one bound to a loop that
+# is already closed. Weak keys so closed loops do not accumulate.
+_worker_slots: "weakref.WeakKeyDictionary[Any, asyncio.Semaphore]" = (
+    weakref.WeakKeyDictionary())
+
+
+def _worker_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    sem = _worker_slots.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(max(1, settings.analysis_max_browser_workers))
+        _worker_slots[loop] = sem
+    return sem
+
+
+def _egress_key(session_item: dict) -> str:
+    """What this session actually leaves the host THROUGH -- the one thing two
+    parallel workers must not have in common.
+
+    Two accounts on one platform from one IP at the same moment is the pattern
+    sessions/manager.py's own claim comment calls the most reliable way to earn
+    a checkpoint, and it is exactly what parallel workers would create on a
+    pool whose entries carry no proxy, or the same one. The username is part of
+    the key deliberately: residential providers hand out a single gateway host
+    with a per-session username, so `server` alone would read two genuinely
+    different exit IPs as one egress and refuse to parallelise.
+
+    A blank key means "this machine's own address", which is a shared egress
+    like any other -- so two proxy-less sessions collide, as they should.
+    """
+    proxy = session_item.get("proxy") or {}
+    if not isinstance(proxy, dict):
+        return str(proxy).strip().lower()
+    server = str(proxy.get("server") or "").strip().lower()
+    if not server:
+        return ""
+    return f"{server}|{str(proxy.get('username') or '').strip()}"
+
+
+def _sessions_wanted(platform_id: str, item_count: int, concurrency: int) -> int:
+    """How many sessions it is worth claiming for this platform.
+
+    Never more than there is work for. A claimed session is invisible to every
+    other job for the life of the batch, so claiming one that would sit idle
+    costs another job an account for nothing -- and one worker already reads
+    `concurrency` URLs at a time, so the second session only has work once the
+    batch is longer than a single chunk.
+
+    API-key and MTProto platforms are pinned to one: `session_for_job` hands
+    those credentials over by mutating os.environ or one local session file, so
+    a second claim would overwrite the first rather than run beside it.
+    """
+    cap = _MAX_SESSIONS_PER_PLATFORM.get(
+        platform_id, _DEFAULT_MAX_SESSIONS_PER_PLATFORM)
+    plat = registry.PLATFORMS.get(platform_id)
+    if plat is not None and (plat.uses_api_key or plat.env_keys):
+        cap = 1
+    chunks = -(-item_count // max(1, concurrency))
+    return max(1, min(cap, item_count, chunks))
+
 
 def parse_direct_url(raw: str) -> Optional[tuple[str, str, str]]:
     """(platform, normalized_url, entity_id) for one pasted URL, or None
@@ -202,6 +320,12 @@ class AnalysisItem:
     status: str = "pending"  # pending | running | done | error
     error: str = ""
     analysed_at: Optional[str] = None
+    # How many SESSIONS this URL has been tried on. Not part of to_dict() --
+    # `to_dict` is a contract with the frontend and this is scheduling state,
+    # not a reading. Bumped in `_scrape_one` and read by `_requeue`, which is
+    # what stops a URL that is itself tripping challenges from walking the
+    # whole pool. See _MAX_ITEM_ATTEMPTS.
+    attempts: int = 0
 
     profile_name: str = ""
     # The PARENT keyword whose discovery sweep found this profile, when it
@@ -325,6 +449,27 @@ class AnalysisJob:
         }
 
 
+@dataclass
+class _PlatformRun:
+    """One platform's work, shared by every worker on it.
+
+    The queue IS the coordination: workers pull chunks off it until it is
+    empty, and a worker whose session dies pushes its unfinished URLs back on
+    for the others. A plain deque rather than an asyncio.Queue because every
+    worker runs on one event loop, so a truthiness check followed by `popleft`
+    cannot be interleaved -- there is no await between them -- which makes the
+    lock and the task_done() bookkeeping an asyncio.Queue would add pure cost,
+    and cost that has to be kept correct across re-queues.
+    """
+
+    platform_id: str
+    queue: deque[AnalysisItem]
+    options: ScanOptions
+    concurrency: int
+    inter_batch_delay: float
+    progress: dict[str, Any]
+
+
 class AnalysisRunner:
     """Owns every live analysis job. Process-wide, in memory, bounded."""
 
@@ -396,7 +541,7 @@ class AnalysisRunner:
         for it in items:
             entry = job.platform_progress.setdefault(it.platform, {
                 "status": "pending", "total": 0, "completed": 0,
-                "displayName": registry.display_name(it.platform),
+                "display_name": registry.display_name(it.platform),
             })
             entry["total"] += 1
 
@@ -485,6 +630,18 @@ class AnalysisRunner:
     async def _scrape_platform(
         self, job: AnalysisJob, platform_id: str, items: list[AnalysisItem],
     ) -> None:
+        """Every URL on one platform, worked by every session that platform
+        can safely lend at once.
+
+        A QUEUE AND N WORKERS, not a loop over `items`. That shape is what
+        lets a two-account pool halve a 40-URL batch, and it is the only
+        shape in which a session dying mid-run is RECOVERABLE: the URLs that
+        session had not finished are still queue entries, so a surviving
+        worker takes them instead of the batch reporting them failed. With
+        one session in the pool N is 1 and this is the same chunk-and-pause
+        loop it has always been -- the single-session path is not a fallback,
+        it is this code with one worker.
+        """
         progress = job.platform_progress[platform_id]
         progress["status"] = "running"
         progress["current_url"] = ""
@@ -497,111 +654,326 @@ class AnalysisRunner:
         # is read by engines that batch on their own (facebook's run()).
         concurrency = max(1, min(
             _PLATFORM_CONCURRENCY.get(platform_id, _DEFAULT_CONCURRENCY), len(items)))
-        inter_batch_delay = _PLATFORM_INTER_BATCH_DELAY.get(
-            platform_id, _DEFAULT_INTER_BATCH_DELAY)
-        options = ScanOptions(
-            evidence=None,
-            ephemeral_screenshot=True,
-            delay=settings.analysis_delay_sec,
+        run = _PlatformRun(
+            platform_id=platform_id,
+            queue=deque(items),
+            options=ScanOptions(
+                evidence=None,
+                ephemeral_screenshot=True,
+                delay=settings.analysis_delay_sec,
+                concurrency=concurrency,
+                headful=not settings.headless,
+            ),
             concurrency=concurrency,
-            headful=not settings.headless,
+            inter_batch_delay=_PLATFORM_INTER_BATCH_DELAY.get(
+                platform_id, _DEFAULT_INTER_BATCH_DELAY),
+            progress=progress,
         )
 
+        want = _sessions_wanted(platform_id, len(items), concurrency)
+        progress["workers"] = 0
+        setup_error = ""
+        worker_error = ""
+        session_died = False
+        rounds = 0
+
+        while rounds < _MAX_CLAIM_ROUNDS and run.queue and not job.cancel.is_set():
+            rounds += 1
+            try:
+                plat, claimed = await self._claim_sessions(platform_id, want)
+            except Exception as e:
+                if rounds == 1:
+                    # Nothing to run with AT ALL -- the pool is empty, dead or
+                    # entirely rate-limited. Recorded as this platform's
+                    # failure detail so the analyst reads ConflictError's own
+                    # "no healthy sessions available -- please add more
+                    # cookies" on the rows rather than a generic message.
+                    setup_error = f"{type(e).__name__}: {e}"
+                    log.error(f"analysis job {job.id}: {platform_id} failed -- {setup_error}")
+                break
+            if not claimed:
+                break
+
+            if rounds > 1:
+                log.info(
+                    f"[{platform_id}] {len(run.queue)} URL(s) still queued after every "
+                    f"session failed -- retrying on {len(claimed)} replacement session(s)")
+            elif len(claimed) > 1:
+                log.info(
+                    f"[{platform_id}] {len(items)} URL(s) split across {len(claimed)} "
+                    f"sessions in parallel, {concurrency} tab(s) each")
+
+            progress["workers"] = len(claimed)
+            results = await asyncio.gather(
+                *(self._platform_worker(job, run, plat, session_item)
+                  for session_item in claimed),
+                return_exceptions=True,
+            )
+            progress["workers"] = 0
+            for result in results:
+                if isinstance(result, BaseException):
+                    # A worker's SETUP failed (its own session was unusable),
+                    # which is not this platform's failure while another
+                    # worker or another round can still drain the queue --
+                    # held onto as the detail to report only if nothing does.
+                    worker_error = f"{type(result).__name__}: {result}"
+                    log.error(
+                        f"analysis job {job.id}: {platform_id} worker failed -- {worker_error}")
+                elif result:
+                    session_died = True
+
+        progress["current_url"] = ""
+        progress["current_step"] = ""
+        progress["item_started_at_ts"] = None
+
+        # WHATEVER NO SESSION EVER REACHED. Both the URLs still sitting in the
+        # queue and any that were re-queued and never picked up again -- both
+        # are "pending", so status is the one thing that has to be asked.
+        stranded = [it for it in items if it.status in ("pending", "running")]
+        if job.cancel.is_set():
+            # A cancelled platform keeps what it read and leaves the rest
+            # pending, which is what `_run` reports as "cancelled after
+            # N/total". Failing them here would turn the analyst's own cancel
+            # into a screenful of errors.
+            progress["status"] = "done"
+        elif stranded:
+            detail = setup_error or worker_error or (
+                "every available session for this platform failed or checkpointed -- "
+                "see the earlier failed item(s) on this platform for why")
+            for it in stranded:
+                await self._fail_item(job, it, detail)
+                job.completed += 1
+                progress["completed"] += 1
+            progress["status"] = "failed"
+        elif progress.get("status") == "failed":
+            # Already reported failed by the work itself rather than by a
+            # session dying -- youtube's batch does this when quota runs out.
+            pass
+        elif session_died and any(it.status == "error" for it in items):
+            # A session died and failover did not cover everything it took
+            # with it. Every URL settled, so nothing is stranded, but the
+            # platform did lose readings to a session rather than to the URLs.
+            progress["status"] = "failed"
+        else:
+            # Includes the case this was built for: a session died mid-run,
+            # another one finished its URLs, and the analyst gets a complete
+            # platform anyway.
+            progress["status"] = "done"
+
+    async def _claim_sessions(
+        self, platform_id: str, want: int,
+    ) -> tuple[Any, list[dict]]:
+        """Up to `want` pooled sessions, each on its own egress, claimed for
+        the life of this platform's batch.
+
+        Raises whatever `session_for_job` raised when it could not supply even
+        ONE: that error carries the message an analyst can act on ("no healthy
+        sessions available -- please add more cookies") and failing the
+        platform on it is what already happened. A shortfall after the first
+        is not a failure at all -- two of three accounts busy on another job
+        just means two workers instead of three.
+        """
+        plat: Any = None
+        claimed: list[dict] = []
+        egress: set[str] = set()
+        while len(claimed) < want:
+            try:
+                plat, session_item = await sessions_engine.session_for_job(platform_id)
+            except Exception:
+                if not claimed:
+                    raise
+                break
+            session_id = str(session_item.get("id") or "")
+            if not session_id or session_item.get("anonymous"):
+                # NOT A POOL ENTRY. `session_for_job` fell back to a
+                # logged-out context (tiktok) or an env API key; there is no
+                # second identity behind that to claim and it would hand back
+                # this same dict forever, so it is this platform's one worker.
+                if not claimed:
+                    claimed.append(session_item)
+                break
+            key = _egress_key(session_item)
+            if claimed and key in egress:
+                # DISTINCT EGRESS, OR ONE WORKER. Parallel sessions are only
+                # safer than one when they are genuinely separate identities:
+                # two accounts hitting one platform from one IP at the same
+                # moment is the pattern sessions/manager.py's own claim
+                # comment calls the most reliable way to earn a checkpoint,
+                # and buying throughput with it would cost the very sessions
+                # this exists to survive the loss of. Handed straight back so
+                # another job -- or this platform's own second round after a
+                # failure -- can still use it.
+                sessions_engine.release_claim(platform_id, session_id)
+                log.info(
+                    f"[{platform_id}] session "
+                    f"{session_item.get('identifier') or session_id} shares its egress "
+                    f"with one already claimed -- staying on {len(claimed)} worker(s) "
+                    f"rather than running two accounts through one IP")
+                break
+            egress.add(key)
+            claimed.append(session_item)
+        return plat, claimed
+
+    async def _platform_worker(
+        self, job: AnalysisJob, run: _PlatformRun, plat: Any, session_item: dict,
+    ) -> bool:
+        """One held session, pulling chunks off `run.queue` until it is empty.
+        -> True if this session DIED (its unfinished URLs are back on the
+        queue); False if it worked the queue out or was cancelled.
+
+        Nothing about HOW a URL is read changes with worker count, and all of
+        it is per-worker: its own browser context, its own proxy, its own
+        cookie jar, its own `concurrency` tabs, the same `scraper.one()` and
+        therefore the same waits, the same extraction and the same full-page
+        evidence screenshot. A worker is a second reader of one queue, not a
+        cheaper kind of read.
+        """
+        platform_id = run.platform_id
+        progress = run.progress
+        session_id = str(session_item.get("id") or "")
+        label = session_item.get("identifier") or session_id or "anonymous"
         scraper = None
         held: Optional[tuple[str, str]] = None
-        session_item: Optional[dict] = None
-        try:
-            plat, session_item = await sessions_engine.session_for_job(platform_id)
-            held = self._store.hold_session(platform_id, session_item.get("id", ""))
-            if session_item.get("anonymous"):
-                scraper = plat.scraper()(
-                    options, [], proxy=session_item.get("proxy"), anonymous=True,
-                )
-            else:
-                scraper = plat.scraper()(
-                    options, session_item.get("cookies", []),
-                    session_id=session_item.get("id", ""), proxy=session_item.get("proxy"),
-                )
-            inner = getattr(scraper, "session", None)
-            if inner is not None:
-                inner.on_cookies = sessions_engine.cookie_saver(
-                    platform_id, session_item.get("id", ""))
-            await scraper.start()
 
-            if not await scraper.check_session():
-                await sessions_engine.mark_session_failed(
-                    platform_id, session_item.get("id", ""), "expired")
-                raise RuntimeError(
-                    f"{registry.display_name(platform_id)} session is not usable -- "
-                    "check credentials under Sessions")
-            await sessions_engine.mark_session_ok(platform_id, session_item.get("id", ""))
-            if inner is not None and hasattr(inner, "sync_cookies"):
-                await inner.sync_cookies()
+        # Ceilinged process-wide, not per-platform -- see `_worker_semaphore`.
+        async with _worker_semaphore():
+            if not run.queue or job.cancel.is_set():
+                # The other workers drained it while this one waited for a
+                # slot. Do not pay for a browser launch to discover that.
+                sessions_engine.release_claim(platform_id, session_id)
+                return False
+            try:
+                held = self._store.hold_session(platform_id, session_id)
+                if session_item.get("anonymous"):
+                    scraper = plat.scraper()(
+                        run.options, [], proxy=session_item.get("proxy"), anonymous=True,
+                    )
+                else:
+                    scraper = plat.scraper()(
+                        run.options, session_item.get("cookies", []),
+                        session_id=session_id, proxy=session_item.get("proxy"),
+                    )
+                inner = getattr(scraper, "session", None)
+                if inner is not None:
+                    inner.on_cookies = sessions_engine.cookie_saver(platform_id, session_id)
+                await scraper.start()
 
-            if platform_id == "youtube":
-                await self._scrape_youtube_batch(job, platform_id, items, scraper, session_item, progress)
-                return
-
-            i = 0
-            session_died = False
-            while i < len(items):
-                if job.cancel.is_set():
-                    break
-                chunk = items[i:i + concurrency]
-                i += len(chunk)
-                fatal = await asyncio.gather(
-                    *(self._scrape_one(job, it, scraper, platform_id, session_item, stagger=idx)
-                      for idx, it in enumerate(chunk))
-                )
+                # SKIPPED WHEN THE ANSWER IS ALREADY KNOWN -- the same reasoning
+                # and the same PROVEN_FRESH_S window discovery/runner.py uses.
+                # `check_session()` is a real authenticated page load (measured at
+                # 12.65s on Facebook) and it ran before every analysis job, asking
+                # a question the session monitor and the last job had already
+                # answered. A session that has died since is caught by the first
+                # profile visit through the identical classify_failure ->
+                # mark_session_failed path, which is what already handles a
+                # session dying mid-job.
+                if sessions_engine.proven_fresh(session_item):
+                    log.info(
+                        f"[{platform_id}] login probe skipped -- proven healthy "
+                        f"{(time.time() - float(session_item.get('last_ok') or 0)) / 60:.0f}m ago"
+                    )
+                else:
+                    if not await scraper.check_session():
+                        await sessions_engine.mark_session_failed(
+                            platform_id, session_id, "expired")
+                        raise RuntimeError(
+                            f"{registry.display_name(platform_id)} session is not usable -- "
+                            "check credentials under Sessions")
+                    await sessions_engine.mark_session_ok(platform_id, session_id)
                 if inner is not None and hasattr(inner, "sync_cookies"):
                     await inner.sync_cookies()
-                if any(fatal):
-                    session_died = True
-                    break
-                if i < len(items) and inter_batch_delay > 0:
-                    # `pause()` takes a MULTIPLIER on the configured median
-                    # gap (settings.analysis_delay_sec), not a duration, so
-                    # convert og's target seconds into one rather than
-                    # sleeping flat -- that keeps jitter, fatigue and the
-                    # occasional longer rest in play (stealth/browser.py).
-                    base = settings.analysis_delay_sec or 0
-                    mult = (inter_batch_delay / base) if base > 0 else 1.0
+
+                if platform_id == "youtube":
+                    # ONE channels.list call for the whole platform, so there
+                    # is no queue to work through: it takes the lot in one go.
+                    # Pinned to a single worker by `_sessions_wanted` for the
+                    # same reason.
+                    batch = list(run.queue)
+                    run.queue.clear()
+                    await self._scrape_youtube_batch(
+                        job, platform_id, batch, scraper, session_item, progress)
+                    return False
+
+                while run.queue and not job.cancel.is_set():
+                    chunk = [run.queue.popleft()
+                             for _ in range(min(run.concurrency, len(run.queue)))]
+                    fatal = await asyncio.gather(
+                        *(self._scrape_one(job, it, scraper, platform_id, session_item,
+                                           stagger=idx)
+                          for idx, it in enumerate(chunk))
+                    )
+                    if inner is not None and hasattr(inner, "sync_cookies"):
+                        await inner.sync_cookies()
+                    if any(fatal):
+                        # THIS SESSION IS DONE, THE BATCH IS NOT. The URLs it
+                        # died on go back on the queue for another session;
+                        # everything still queued was never touched and stays
+                        # there. Both are why this worker stopping is no longer
+                        # the same event as the platform stopping.
+                        for it, is_fatal in zip(chunk, fatal):
+                            if is_fatal:
+                                self._requeue(job, run, it, label)
+                        return True
+                    if run.queue and run.inter_batch_delay > 0:
+                        # `pause()` takes a MULTIPLIER on the configured median
+                        # gap (settings.analysis_delay_sec), not a duration, so
+                        # convert og's target seconds into one rather than
+                        # sleeping flat -- that keeps jitter, fatigue and the
+                        # occasional longer rest in play (stealth/browser.py).
+                        base = settings.analysis_delay_sec or 0
+                        mult = (run.inter_batch_delay / base) if base > 0 else 1.0
+                        try:
+                            await scraper.pause(mult)
+                        except Exception:
+                            pass
+                return False
+            finally:
+                progress["current_url"] = ""
+                progress["current_step"] = ""
+                progress["item_started_at_ts"] = None
+                self._store.release_session(held)
+                sessions_engine.release_claim(platform_id, session_id)
+                if scraper is not None:
                     try:
-                        await scraper.pause(mult)
+                        await scraper.stop()
                     except Exception:
                         pass
 
-            if session_died:
-                detail = "session failed mid-run -- see the earlier failed item(s) on this platform for why"
-                for it in items:
-                    if it.status in ("pending", "running"):
-                        await self._fail_item(job, it, detail)
-                        job.completed += 1
-                        progress["completed"] += 1
-                progress["status"] = "failed"
-            else:
-                progress["status"] = "done"
-        except Exception as e:
-            progress["status"] = "failed"
-            detail = f"{type(e).__name__}: {e}"
-            log.error(f"analysis job {job.id}: {platform_id} failed -- {detail}")
-            for it in items:
-                if it.status in ("pending", "running"):
-                    await self._fail_item(job, it, detail)
-                    job.completed += 1
-                    progress["completed"] += 1
-        finally:
-            progress["current_url"] = ""
-            progress["current_step"] = ""
-            progress["item_started_at_ts"] = None
-            self._store.release_session(held)
-            if session_item is not None:
-                sessions_engine.release_claim(platform_id, session_item.get("id", ""))
-            if scraper is not None:
-                try:
-                    await scraper.stop()
-                except Exception:
-                    pass
+    def _requeue(
+        self, job: AnalysisJob, run: _PlatformRun, it: AnalysisItem, label: str,
+    ) -> None:
+        """A URL whose session died under it, put back for another session.
+
+        BOTH HALVES OF ITS FIRST ATTEMPT ARE UNDONE. `_scrape_one` has already
+        counted it (`job.completed`, and this platform's own `completed`) and
+        `_fail_item` -> `_settle` has already written it to MongoDB as an
+        error. The counters are given back here, because a re-queued URL
+        counted twice walks the progress bar past 100%; the saved row is left
+        alone, because `analysis_result_repository.save` replaces by a
+        result_id derived from platform+url, so the retry's row overwrites the
+        failed one rather than joining it in the analyst's view.
+
+        CAPPED AT `_MAX_ITEM_ATTEMPTS`. Past that the URL keeps the error the
+        last session gave it: a URL that is itself what trips the challenge
+        must not be able to walk the pool killing sessions as it goes.
+        """
+        if it.attempts >= _MAX_ITEM_ATTEMPTS:
+            log.warning(
+                f"[{run.platform_id}] {it.url} took down {it.attempts} session(s) -- "
+                f"not re-queued again, reported as failed")
+            return
+        job.completed = max(0, job.completed - 1)
+        run.progress["completed"] = max(0, int(run.progress.get("completed") or 0) - 1)
+        it.status = "pending"
+        it.error = ""
+        it.comments = ""
+        it.analysed_at = None
+        it.duration_seconds = None
+        it.started_at_ts = None
+        run.queue.append(it)
+        log.info(
+            f"[{run.platform_id}] session {label} failed on {it.url} -- re-queued for "
+            f"another session (attempt {it.attempts + 1} of {_MAX_ITEM_ATTEMPTS})")
 
     async def _scrape_youtube_batch(
         self, job: AnalysisJob, platform_id: str, items: list[AnalysisItem],
@@ -661,6 +1033,7 @@ class AnalysisRunner:
         if stagger:
             await asyncio.sleep(stagger * 1.0)
         it.status = "running"
+        it.attempts += 1
         it.started_at_ts = time.time()
         prog = job.platform_progress.get(platform_id, {})
         prog["current_url"] = it.url
@@ -743,20 +1116,29 @@ class AnalysisRunner:
                 it.avatar_sha = known["avatar_sha"]
             if it.verified is None and known.get("verified") is not None:
                 it.verified = known["verified"]
-            if it.has_logo is None and known.get("has_logo") is not None:
+            # THE LOGO VERDICT IS DISCOVERY'S, NOT ANALYSIS'S -- the one
+            # field here that does not follow the "only fill a gap" rule
+            # above, and deliberately so.
+            #
+            # `known` exists only for a profile that came through
+            # POST /discovery/profiles/analyse, which is to say one an
+            # analyst looked at on a discovery card and validated by hand.
+            # The picture on that card is the thing they judged. Analysis
+            # then re-derives the same verdict from a different visit, and
+            # when the two disagree it is analysis that is wrong more often:
+            # it reads whichever fbcdn URL that page render happened to
+            # expose, including the viewer's own photo substituted into a
+            # privacy-restricted profile (see PAGE_CONTEXT_PICTURE_KEYS).
+            # Discovery's answer is the one a human has already stood
+            # behind, so it wins outright rather than only filling a blank.
+            if known.get("has_logo") is not None:
                 it.has_logo = row.has_custom_pic = known["has_logo"]
             if not it.name_score and known.get("name_score"):
+                # Restored for display only -- `Row.name_yes` no longer
+                # gates on this (see its own docstring), so `has_name_match`
+                # needs no re-derivation here: `_populate` already set it
+                # True, unconditionally, before this merge ran.
                 it.name_score = row.name_score = known["name_score"]
-                # has_name_match was derived from THIS visit's score (see
-                # Row.name_yes), which is 0 whenever the job carries no
-                # target name to score against -- the usual case, since
-                # neither the analysis form nor "Analyse Validated" sends
-                # one any more. Restoring only the score would leave the
-                # row self-contradictory: a real name_score sitting next to
-                # "Name (Yes/No) = No", which is what _build_rows exports
-                # and what compute_incident_risk_score reads. Re-derive the
-                # verdict from the score actually being used.
-                it.has_name_match = it.name_score >= NAME_THRESHOLD
 
         if it.profile_image_url and not it.avatar_sha:
             try:
@@ -769,7 +1151,7 @@ class AnalysisRunner:
                 # embedding: the logo tier is a DISCOVERY ranking signal, and
                 # spending ~70ms an image here would slow analysis for a
                 # feature it does not surface.
-                sha, fp, _vec = await avatar_cache.cache_one(it.profile_image_url)
+                sha, fp, _vec, _gen = await avatar_cache.cache_one(it.profile_image_url)
                 if sha:
                     it.avatar_sha = sha
                     client_id = job.org_id or (known.get("client_id") if known else "")

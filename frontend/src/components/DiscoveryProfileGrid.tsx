@@ -31,6 +31,7 @@
 // POST /discovery/profiles/delete (backend/api/discovery.py), added this
 // session specifically for this button.
 import { useCallback, useEffect, useRef, useState } from "react";
+import { rowAlignedPageSize } from "../utils/gridPaging";
 import toast from "react-hot-toast";
 import { analysisApi } from "../api/analysisApi";
 import { discoveryApi } from "../api/discoveryApi";
@@ -51,6 +52,10 @@ interface Props {
   platform?: string;
   // Bumped by the parent whenever a fresh sweep completes, to force a reload.
   refreshKey: number;
+  // Bumped while a sweep is RUNNING and its counts move. Reloads the rows
+  // without touching the analyst's selection -- a sweep landing new results
+  // every couple of seconds must not keep wiping what they have ticked.
+  liveKey?: number;
   onAnalyseStarted: (jobId: string) => void;
 }
 
@@ -498,7 +503,7 @@ function ProfileTable({
   );
 }
 
-export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseStarted }: Props) {
+export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 0, onAnalyseStarted }: Props) {
   const [tab, setTab] = useState<Tab>("new");
   const [validatedAge, setValidatedAge] = useState<ValidatedAge>("new");
   // Show only profiles whose picture matched one of the client's reference
@@ -538,6 +543,68 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
   const [pageSize, setPageSize] = useState<number>(25);
   const [offset, setOffset] = useState(0);
   const [viewMode, setViewMode] = useState<"cards" | "table">("cards");
+
+  // HOW MANY CARDS FIT ACROSS, measured from the grid itself.
+  //
+  // The card grid is `repeat(auto-fill, minmax(260px, 1fr))`, so the column
+  // count changes with the window AND with browser zoom. A fixed page size
+  // of 25 therefore left a ragged last row at most widths -- 4 columns gives
+  // 6 rows plus one lonely card, 7 columns gives 3 rows plus four.
+  //
+  // Measuring beats computing from window.innerWidth: the container is
+  // inside padded, scrollable layout, and at non-100% zoom the CSS pixel
+  // arithmetic drifts from what actually got laid out.
+  // A CALLBACK REF, not useRef + useEffect. The grid element does not exist
+  // on first render (there are no rows yet), so an effect keyed on anything
+  // else finds `null`, returns, and never re-runs when the element finally
+  // appears -- leaving the column count stuck at 1 and the rounding inert.
+  // A callback ref fires exactly when the node attaches and detaches.
+  const [columns, setColumns] = useState(1);
+  const observer = useRef<ResizeObserver | null>(null);
+  const measureRef = useRef<(() => void) | null>(null);
+  const gridNode = useRef<HTMLDivElement | null>(null);
+  const gridRef = useCallback((el: HTMLDivElement | null) => {
+    gridNode.current = el;
+    observer.current?.disconnect();
+    observer.current = null;
+    measureRef.current = null;
+    if (!el) return;
+    const measure = () => {
+      // The RESOLVED track list -- one entry per real column, which is what
+      // auto-fill actually produced at this width and zoom.
+      const cols = window.getComputedStyle(el)
+        .gridTemplateColumns.split(" ").filter(Boolean).length;
+      setColumns((prev) => (prev === cols ? prev : Math.max(1, cols)));
+    };
+    measureRef.current = measure;
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    observer.current = new ResizeObserver(measure);
+    observer.current.observe(el);
+  }, []);
+
+  // A SECOND trigger, because ResizeObserver alone is not enough in practice.
+  // RO callbacks are delivered as part of the rendering steps, so a tab whose
+  // rendering is suspended (backgrounded, or an embedded pane that is hidden)
+  // queues them instead of running them. `resize` also fires on browser zoom,
+  // which is the case the analyst actually reported. Both call the same
+  // `measure`, which is idempotent and bails when the count is unchanged, so
+  // the two firing together costs nothing.
+  useEffect(() => {
+    const onResize = () => measureRef.current?.();
+    window.addEventListener("resize", onResize);
+    document.addEventListener("visibilitychange", onResize);
+    return () => {
+      window.removeEventListener("resize", onResize);
+      document.removeEventListener("visibilitychange", onResize);
+      observer.current?.disconnect();
+    };
+  }, []);
+
+  // The page size actually used: the analyst's choice rounded UP to a whole
+  // number of rows, so the last row is never half-empty. Table view keeps
+  // the exact number (no columns to fill).
+  const effectivePageSize = rowAlignedPageSize(pageSize, columns, viewMode);
 
   const [copyMenuOpen, setCopyMenuOpen] = useState(false);
   const [exportMenuOpen, setExportMenuOpen] = useState(false);
@@ -584,11 +651,40 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
   const activeWindow = DATE_WINDOWS.find((w) => w.days === windowDays);
 
   // Any filter (or tab) changing resets to page 1.
+  //
+  // `matchLevel` and `entityType` were missing from this list, and they are
+  // SERVER-side params (`match_level`/`entity_type`), so changing one changed
+  // the result set while the offset stayed put: picking "High Match" from
+  // page 7 of the unfiltered list asked the server for rows 168-195 of a set
+  // that no longer had that many, and the grid came back empty. To the
+  // analyst that reads as "the filter did nothing" -- the reported symptom.
+  // `groupId` belongs here for the same reason: a different client is an
+  // entirely different dataset.
   useEffect(() => {
     setOffset(0);
-  }, [tab, validatedAge, logoOnly, originalFilter, seenFrom, keywordFilter, search, pageSize, platform]);
+  }, [tab, validatedAge, logoOnly, originalFilter, seenFrom, keywordFilter,
+      search, pageSize, platform, matchLevel, entityType, groupId]);
+
+  // REQUEST SEQUENCING. Both lists are fetched by an effect keyed on the
+  // filter state, and a single analyst action can legitimately fire two
+  // fetches: changing a filter also resets the offset to 0, so the render
+  // that carries the new filter still carries the OLD offset and issues its
+  // request first. Nothing orders the two responses. Measured live -- last
+  // page of 3428 rows, then "High Match" -- the stale offset-3402 response
+  // arrived second and painted its empty result set over the 27 rows that
+  // had already landed, leaving a grid reading "Page 1 of 10 - 247 total"
+  // with nothing in it. That is the "filters don't reflect immediately"
+  // report: the filter HAD applied, and then a dead request undid it.
+  //
+  // A monotonic ticket per list is enough. Only the newest request is
+  // allowed to write state; an older one that finishes late is dropped,
+  // including its loading flag, so the spinner tracks the request the
+  // analyst is actually waiting on.
+  const pendingSeq = useRef(0);
+  const validatedSeq = useRef(0);
 
   const loadPending = useCallback(async () => {
+    const ticket = ++pendingSeq.current;
     setLoadingPending(true);
     try {
       const res = await discoveryApi.listProfiles({
@@ -601,20 +697,23 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
         logo_matched: logoOnly || undefined,
         is_original: originalFilter ?? undefined,
         first_seen_from: seenFrom,
-        limit: tab === "validated" ? 1 : pageSize,
+        limit: tab === "validated" ? 1 : effectivePageSize,
         offset: tab === "validated" ? 0 : offset,
       });
+      if (ticket !== pendingSeq.current) return;   // superseded -- drop it
       setPendingItems(tab === "validated" ? [] : res.items);
       setAgeCounts({ new: res.counts?.ages?.new ?? 0, old: res.counts?.ages?.old ?? 0 });
       setKeywordCounts(res.counts?.keywords ?? {});
     } catch (e) {
+      if (ticket !== pendingSeq.current) return;
       toast.error((e as Error).message);
     } finally {
-      setLoadingPending(false);
+      if (ticket === pendingSeq.current) setLoadingPending(false);
     }
-  }, [groupId, platform, keywordFilter, search, matchLevel, entityType, tab, pageSize, offset, logoOnly, originalFilter, seenFrom]);
+  }, [groupId, platform, keywordFilter, search, matchLevel, entityType, tab, effectivePageSize, offset, logoOnly, originalFilter, seenFrom]);
 
   const loadValidated = useCallback(async () => {
+    const ticket = ++validatedSeq.current;
     setLoadingValidated(true);
     try {
       const res = await discoveryApi.listProfiles({
@@ -632,19 +731,21 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
         // sweep wants the profiles that sweep discovered, whenever they
         // happened to get triaged.
         first_seen_from: seenFrom,
-        limit: pageSize, offset,
+        limit: effectivePageSize, offset,
       });
+      if (ticket !== validatedSeq.current) return;   // superseded -- drop it
       setValidatedPage(res);
       setValidatedAgeCounts({
         new: res.counts?.validated_ages?.new ?? 0,
         old: res.counts?.validated_ages?.old ?? 0,
       });
     } catch (e) {
+      if (ticket !== validatedSeq.current) return;
       toast.error((e as Error).message);
     } finally {
-      setLoadingValidated(false);
+      if (ticket === validatedSeq.current) setLoadingValidated(false);
     }
-  }, [groupId, platform, keywordFilter, search, pageSize, offset, validatedAge, logoOnly, originalFilter, seenFrom]);
+  }, [groupId, platform, keywordFilter, search, effectivePageSize, offset, validatedAge, logoOnly, originalFilter, seenFrom]);
 
   // Imperative use only (e.g. after a bulk delete) -- NOT an effect
   // dependency anywhere, see the two load effects below for why: bundling
@@ -664,11 +765,11 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
   // set now leaves it alone.
   useEffect(() => {
     void loadPending();
-  }, [loadPending, refreshKey]);
+  }, [loadPending, refreshKey, liveKey]);
 
   useEffect(() => {
     void loadValidated();
-  }, [loadValidated, refreshKey]);
+  }, [loadValidated, refreshKey, liveKey]);
 
   // Pick up decisions made somewhere else -- a second tab, another analyst,
   // the same person on another machine. Nothing else does: the loads above
@@ -1053,8 +1154,28 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
     }
   };
 
-  const pageCount = Math.max(1, Math.ceil(total / pageSize));
-  const currentPage = Math.floor(offset / pageSize) + 1;
+  const pageCount = Math.max(1, Math.ceil(total / effectivePageSize));
+  const currentPage = Math.floor(offset / effectivePageSize) + 1;
+
+  // A LAST-RESORT CLAMP for an offset that has fallen off the end of the
+  // list. The reset above covers every filter the analyst can touch, but not
+  // the list shrinking underneath them -- a bulk validate, a delete, or
+  // another analyst working the same queue. Without this the grid shows a
+  // blank page with a pager reading "Page 7 of 3" and no obvious way back.
+  //
+  // It also re-aligns the offset onto a page boundary, which matters once
+  // the page size follows the column count: zooming out can change
+  // `effectivePageSize` from 25 to 28 mid-browse, leaving an offset of 150
+  // that is no longer the start of any page.
+  useEffect(() => {
+    if (total <= 0) return;
+    const lastPageOffset = (Math.ceil(total / effectivePageSize) - 1) * effectivePageSize;
+    const aligned = Math.min(
+      Math.floor(offset / effectivePageSize) * effectivePageSize,
+      Math.max(0, lastPageOffset),
+    );
+    if (aligned !== offset) setOffset(aligned);
+  }, [total, effectivePageSize, offset]);
 
   // Arrow-key paging -- lets an analyst walk through a long list without
   // reaching for the mouse each time. Ignored while focus is in a text
@@ -1067,14 +1188,38 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
       if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
       if (e.key === "ArrowRight" && currentPage < pageCount) {
-        setOffset(offset + pageSize);
+        setOffset(offset + effectivePageSize);
       } else if (e.key === "ArrowLeft" && offset > 0) {
-        setOffset(Math.max(0, offset - pageSize));
+        setOffset(Math.max(0, offset - effectivePageSize));
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [offset, pageSize, currentPage, pageCount]);
+  }, [offset, effectivePageSize, currentPage, pageCount]);
+
+  // SCROLL TO THE TOP OF THE GRID ON EVERY PAGE CHANGE, all four ways a
+  // page can change: the Prev/Next/First/Last buttons, the arrow keys, and
+  // the clamp effect above re-aligning a stale offset. Without this, an
+  // analyst who scrolled down into page 1 and clicked Next kept the same
+  // scroll position -- page 2's DATA was correct, but the viewport was
+  // still parked wherever it was on the old page, so what they actually
+  // SAW was mid-page-2 content, indistinguishable from "still on the old
+  // page" at a glance. That is the reported bug: Next has to visibly land
+  // on row 1 of the new page, not just fetch it.
+  //
+  // Skips the very first render: `offset` starts at 0 and this effect
+  // would otherwise fire on mount, before the analyst has navigated
+  // anywhere, and yank a page they arrived at (possibly already scrolled
+  // to something else, e.g. via a deep link) back to the grid.
+  const skippedFirstScroll = useRef(false);
+  useEffect(() => {
+    if (!skippedFirstScroll.current) {
+      skippedFirstScroll.current = true;
+      return;
+    }
+    gridNode.current?.scrollIntoView({ block: "start", behavior: "auto" });
+  }, [offset]);
+
   // No per-card validate on the Validated tab -- it's already validated;
   // that tab's actions are the selection-scoped Copy/Export/Analyse ones.
   const onValidateHandler = tab === "validated" ? undefined : onValidateOne;
@@ -1439,7 +1584,7 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
       )}
 
       {viewMode === "cards" ? (
-        <div className="profile-grid-container" style={{ marginTop: "16px" }}>
+        <div ref={gridRef} className="profile-grid-container" style={{ marginTop: "16px" }}>
           {displayed.map((p) => (
             <ProfileCard key={p.id} p={p} selected={selected.has(p.id)} onToggleSelected={toggle} onValidate={onValidateHandler} onUnvalidate={onUnvalidateHandler} onToggleOriginal={tab === "validated" ? onToggleOriginal : undefined} busy={busyId === p.id} />
           ))}
@@ -1459,13 +1604,25 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
             </select>
             per page
           </label>
-          {total > pageSize && (
+          {total > effectivePageSize && (
             <>
+              {/* Steps by effectivePageSize, matching what a page actually
+                  holds -- NOT pageSize, the analyst's raw choice before it
+                  is rounded up to fill a row (see effectivePageSize above).
+                  Stepping by the smaller, un-rounded pageSize used to walk
+                  the offset short of a full page: at 25/page rounded to 28
+                  on-screen, Next advanced the offset by only 25, so page 2's
+                  request (offset 25, limit 28) re-fetched rows 25-27 that
+                  page 1 (offset 0, limit 28) had already shown -- "next
+                  page" opened three rows into content the analyst had just
+                  seen, not row 1 of anything new. First/Last and the
+                  arrow-key handler already stepped by effectivePageSize;
+                  only these two buttons had drifted from that. */}
               <button disabled={offset === 0} onClick={() => setOffset(0)} className="btn-cyber-primary" style={{ width: "auto", padding: "6px 10px", marginTop: 0 }} title="First page">⏮</button>
-              <button disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - pageSize))} className="btn-cyber-primary" style={{ width: "auto", padding: "6px 12px", marginTop: 0 }} title="Previous page (← arrow key)">← Prev</button>
+              <button disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - effectivePageSize))} className="btn-cyber-primary" style={{ width: "auto", padding: "6px 12px", marginTop: 0 }} title="Previous page (← arrow key)">← Prev</button>
               <span style={{ fontSize: "12px", color: "var(--text-dim)" }}>Page {currentPage} of {pageCount} · {total} total</span>
-              <button disabled={currentPage >= pageCount} onClick={() => setOffset(offset + pageSize)} className="btn-cyber-primary" style={{ width: "auto", padding: "6px 12px", marginTop: 0 }} title="Next page (→ arrow key)">Next →</button>
-              <button disabled={currentPage >= pageCount} onClick={() => setOffset((pageCount - 1) * pageSize)} className="btn-cyber-primary" style={{ width: "auto", padding: "6px 10px", marginTop: 0 }} title="Last page">⏭</button>
+              <button disabled={currentPage >= pageCount} onClick={() => setOffset(offset + effectivePageSize)} className="btn-cyber-primary" style={{ width: "auto", padding: "6px 12px", marginTop: 0 }} title="Next page (→ arrow key)">Next →</button>
+              <button disabled={currentPage >= pageCount} onClick={() => setOffset((pageCount - 1) * effectivePageSize)} className="btn-cyber-primary" style={{ width: "auto", padding: "6px 10px", marginTop: 0 }} title="Last page">⏭</button>
             </>
           )}
         </div>
