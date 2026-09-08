@@ -837,15 +837,59 @@ async def anonymous_context(proxy: Optional[dict] = None):
     Serialised on `_profile_lock()`: the profile directory takes an
     exclusive OS lock, so two of these at once would collide.
     """
-    from playwright.async_api import async_playwright
-
-    from backend.stealth.fingerprint import LAUNCH_ARGS, chrome_binary
+    from backend.stealth.browser import STEALTH_DRIVER, async_playwright
+    from backend.stealth.fingerprint import LAUNCH_ARGS, chrome_binary, get_identity
+    from backend.stealth.headers import build_extra_headers
+    from backend.stealth.navigator_spoofing import build_init_js
     from backend.stealth.proxy import build_proxy_config
+    from backend.stealth.timezone import resolve_timezone_id
 
     profile = _profile_dir()
     profile.mkdir(parents=True, exist_ok=True)
 
-    launch: dict[str, Any] = {"headless": settings.headless, "args": LAUNCH_ARGS}
+    # THE SAME STEALTH STACK stealth/browser.py::Session gives Facebook and
+    # Twitter. This path used to import `playwright.async_api` directly and
+    # pass nothing but launch args, which made it the one browser in the
+    # codebase running bare. Measured, both on about:blank, before this:
+    #
+    #   Session (FB/TW)   Chrome/152.0.7977.65 Safari/537.36    1536x864
+    #   TikTok            HeadlessChrome/152.0.0.0 Safari/...   1280x720
+    #
+    # Two unambiguous tells in the User-Agent alone -- the literal string
+    # "HeadlessChrome", and the `.0.0` generic build number no real Chrome
+    # install reports -- plus Playwright's default 1280x720 viewport, which
+    # is not a size real hardware comes in. Every request TikTok's account
+    # search made announced itself.
+    #
+    # `async_playwright` now comes from browser.py, which resolves patchright
+    # first and falls back to vanilla. That matters below JavaScript: the
+    # driver itself leaks over CDP, where no init script can reach it (see
+    # browser.py's own measurement, isBot TRUE on vanilla vs FALSE on
+    # patchright).
+    #
+    # A FIXED session id, so the identity is stable run to run. A browser
+    # whose fingerprint changes every sweep is more suspicious than one that
+    # never changes, and the persistent profile directory below is already
+    # committing to one identity anyway.
+    identity = get_identity("tiktok-anonymous")
+    locale = "en-US"
+
+    launch: dict[str, Any] = {
+        "headless": settings.headless,
+        "args": LAUNCH_ARGS,
+        # launch_persistent_context takes context options in the same call,
+        # which is the only place these can go -- there is no separate
+        # new_context() to pass them to.
+        "user_agent": identity["ua"],
+        "viewport": identity["viewport"],
+        # Chrome always carries the base language behind the region locale;
+        # "en-US" alone truncates navigator.languages to a single entry,
+        # which no ordinary browser produces. See browser.py for the
+        # measurement behind this exact spelling.
+        "locale": f"{locale},{locale.split('-')[0]}",
+        "extra_http_headers": build_extra_headers(locale=locale),
+        "timezone_id": resolve_timezone_id(proxy),
+    }
     if binary := chrome_binary():
         launch["executable_path"] = binary
     if proxy and (cfg := build_proxy_config(proxy)):
@@ -856,6 +900,14 @@ async def anonymous_context(proxy: Optional[dict] = None):
         try:
             pw = await async_playwright().start()
             ctx = await pw.chromium.launch_persistent_context(str(profile), **launch)
+            # webdriver/visibilityState masking and native-code masking on the
+            # overrides -- the same script every other platform gets.
+            await ctx.add_init_script(build_init_js())
+            if STEALTH_DRIVER != "patchright":
+                log.warning(
+                    "tiktok: running on vanilla playwright -- the driver announces "
+                    "itself over CDP. `pip install patchright` to close it."
+                )
             await _warm(ctx)
             yield ctx
         finally:

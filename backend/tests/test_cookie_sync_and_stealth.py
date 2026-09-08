@@ -1,6 +1,5 @@
 """Tests for mid-sweep cookie synchronization and natural wheel scroll stealth mechanisms."""
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
@@ -8,6 +7,7 @@ from backend.stealth.browser import Session
 from backend.stealth.mouse_movement import natural_scroll_down
 from backend.platforms.facebook.analysis_engine import Scraper as FacebookScraper
 from backend.platforms.instagram.analysis_engine import Scraper as InstagramScraper
+from backend.platforms.twitter.analysis_engine import Scraper as TwitterScraper
 from backend.platforms.scan_options import ScanOptions
 
 
@@ -75,6 +75,13 @@ async def test_facebook_and_instagram_scraper_delegate_sync_cookies():
     ig.session.sync_cookies = AsyncMock()
     await ig.sync_cookies()
     ig.session.sync_cookies.assert_awaited_once()
+
+    tw = TwitterScraper(opts, cookies=[])
+    tw.session = MagicMock()
+    tw.session.sync_cookies = AsyncMock()
+    await tw.sync_cookies()
+    tw.session.sync_cookies.assert_awaited_once()
+
 
 
 @pytest.mark.asyncio

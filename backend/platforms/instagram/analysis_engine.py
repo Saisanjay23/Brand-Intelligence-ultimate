@@ -68,7 +68,7 @@ from urllib.parse import quote, urlparse
 
 from backend.shared.models.row import Row
 from backend.platforms.scan_options import captures_screenshot
-from backend.stealth.mouse_movement import humanize_interaction, natural_scroll_down
+from backend.stealth.mouse_movement import humanize_interaction
 from backend.shared.text import (MONTHS, name_score,
                                    normalized_host, parse_count,
                                    parse_normalized_url)

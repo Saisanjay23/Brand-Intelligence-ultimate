@@ -76,6 +76,7 @@ from backend.api.alerts import router as alerts_router
 from backend.api.analysis import router as analysis_router
 from backend.api.clients import router as clients_router
 from backend.api.logos import router as logos_router
+from backend.api.reports import router as reports_router
 from backend.api.discovery import router as discovery_router
 from backend.api.health import router as health_router
 from backend.api.media import close as media_close
@@ -84,6 +85,7 @@ from backend.api.sessions import router as sessions_router
 from backend.config.settings import settings
 from backend.database.connection import close as mongo_close
 from backend.database.connection import ping as mongo_ping
+from backend.database.repositories import analysis_result_repository as analysis_results_db
 from backend.database.repositories import avatar_repository as avatars_db
 from backend.database.repositories import logo_repository as logos_db
 from backend.database.repositories import profile_repository as profiles_db
@@ -126,15 +128,20 @@ async def lifespan(app: FastAPI):
                 "(`python run.py`). Frontend hot-reload via `--dev` alone is unaffected."
             )
 
-    # Mongo backs the session pool (the credentials scrapes log in with)
-    # and discovery's results. Analysis needs neither -- it runs from
-    # memory -- but it still needs a session to scrape with, so a
-    # Mongo-less process cannot usefully do anything.
+    # Mongo backs the session pool (the credentials scrapes log in with),
+    # discovery's results, and now analysis's own 24-hour result store. A
+    # Mongo-less process can still scrape -- a live job runs from memory --
+    # but nothing it reads will survive the tab being reloaded.
     if await mongo_ping():
         await sessions_db.ensure_indexes()
         await profiles_db.ensure_indexes()
         await avatars_db.ensure_indexes()
         await logos_db.ensure_indexes()
+        # The TTL indexes that delete analysis results after 24h. Without
+        # this call nothing ever expires and the collection grows forever,
+        # so it belongs with the other index guarantees rather than in a
+        # code path an operator has to remember to run.
+        await analysis_results_db.ensure_indexes()
         from backend.platforms import registry
         for p in registry.PLATFORMS.values():
             await registry.session_state(p)
@@ -158,6 +165,9 @@ app = FastAPI(
     description=__doc__,
     lifespan=lifespan,
     openapi_tags=[
+        {"name": "reports", "description":
+            "What a sweep found and what an analyst validated, as JSON "
+            "or as an email. Reading never sends."},
         {"name": "clients", "description":
             "The org records discovery and analysis are scoped to. One "
             "document per org id, owning its own keywords and scrape caps."},
@@ -166,7 +176,8 @@ app = FastAPI(
             "readable while the sweep is still running."},
         {"name": "analysis", "description":
             "Profile URLs in, scraped and scored profiles out, with evidence "
-            "screenshots. Results are held in memory only and are never persisted."},
+            "screenshots. Results are saved for 24 hours and then deleted "
+            "automatically; an analyst can delete them sooner."},
         {"name": "sessions", "description":
             "The per-platform credentials discovery and analysis scrape with. "
             "Nothing can be scraped for a platform with no usable session."},
@@ -198,6 +209,8 @@ app.include_router(health_router)
 app.include_router(clients_router)
 # Reference brand marks, nested under /clients/{id}/logos.
 app.include_router(logos_router)
+# Sweep reports: the New/Delta/Total counts, readable or mailable.
+app.include_router(reports_router)
 app.include_router(discovery_router)
 app.include_router(analysis_router)
 app.include_router(sessions_router)

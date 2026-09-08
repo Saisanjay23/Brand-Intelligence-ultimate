@@ -62,6 +62,27 @@ def _to_item(doc: dict) -> dict:
         "cookies": doc.get("cookies", []), "proxy": doc.get("proxy"),
         "rate_limited_until": float(doc.get("rate_limited_until") or 0),
         "last_used": float(doc.get("last_used") or 0),
+        # Epoch seconds a REAL JOB last proved this session healthy
+        # (mark_session_ok). Distinct from `last_used`, which is bumped when
+        # a session is merely handed out, before anything has confirmed it
+        # works.
+        #
+        # THIS WAS MISSING FROM THIS MAPPING, and it silently disabled a
+        # stealth mitigation. `sessions/manager.py::_pick_batch` skips a
+        # probe for a session a job proved healthy within PROVEN_FRESH_S --
+        # but it reads that field off THIS dict, and with the key absent it
+        # resolved to 0.0, making every session look infinitely overdue and
+        # therefore always eligible. The write side was correct all along
+        # (every pooled session carries a current `last_ok` in Mongo); the
+        # value simply never reached the reader.
+        #
+        # What that cost is the exact thing PROVEN_FRESH_S was added to
+        # prevent: with one pooled account per platform, the most-overdue
+        # session is the same account every sweep, so it was loading its own
+        # authenticated settings page 48 times a day on a metronome-regular
+        # 30-minute cadence -- volume and periodicity both being things
+        # these platforms score against an account.
+        "last_ok": float(doc.get("last_ok") or 0),
         # how many times this session has been handed to a job, see
         # increment_use_count(), called only from sessions/manager.py's
         # get_healthy_session() at the moment a session is actually picked

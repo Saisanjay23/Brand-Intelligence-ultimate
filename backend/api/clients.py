@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, Path, Response, status
+from fastapi import APIRouter, Path, status
 from pydantic import BaseModel, Field
 
 from backend.database.repositories import client_repository as clients_db
@@ -82,6 +82,20 @@ class NewClientBody(ClientBody):
     client_id: str
 
 
+class SchedulerPrefsBody(BaseModel):
+    """What the Scheduler should run for this client. Both optional: send
+    only the half you are changing."""
+
+    platforms: Optional[list[str]] = Field(
+        None,
+        description="Platform ids to sweep. EMPTY LIST means every ready "
+                    "platform -- the same thing omitting `platforms` means to "
+                    "POST /discovery/jobs.")
+    keyword_scope: Optional[str] = Field(
+        None,
+        description="'individual' | 'domain' | '' for both.")
+
+
 class ClientOut(BaseModel):
     """A stored client, read back. Extra keys the repository adds over time
     (run history, scheduler flags) pass through untouched."""
@@ -99,6 +113,11 @@ class ClientOut(BaseModel):
     platform_tab_limits: dict = Field(default_factory=dict)
     order: int = 0
     cron: Optional[str] = None
+    scheduler_platforms: list[str] = Field(
+        default_factory=list,
+        description="Scheduler-only: which platforms to sweep. Empty = all.")
+    scheduler_keyword_scope: str = Field(
+        "", description="Scheduler-only: 'individual' | 'domain' | '' for both.")
 
 
 class ClientList(BaseModel):
@@ -160,6 +179,23 @@ async def create_client(body: NewClientBody) -> dict:
 async def reorder_clients(body: ReorderBody) -> dict:
     await clients_db.reorder(body.client_ids)
     return {"items": await clients_db.list_all()}
+
+
+@router.put("/{client_id}/scheduler-prefs", response_model=ClientOut,
+            summary="What the Scheduler should run for this client")
+async def set_scheduler_prefs(
+    body: SchedulerPrefsBody, client_id: str = Path(...),
+) -> dict:
+    """Remembered until an analyst changes it again.
+
+    A NARROW write: it touches these two fields only, so saving the client
+    from the Clients form -- which sends no scheduler preferences -- can
+    never reset them, and setting them here can never disturb the keywords
+    or caps. See `client_repository.set_scheduler_prefs`.
+    """
+    return await clients_db.set_scheduler_prefs(
+        client_id, platforms=body.platforms, keyword_scope=body.keyword_scope,
+    )
 
 
 @router.get("/{client_id}", response_model=ClientOut, summary="Read one client")

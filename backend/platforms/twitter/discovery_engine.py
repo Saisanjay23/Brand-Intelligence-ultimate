@@ -30,10 +30,15 @@ from typing import Any, Iterator, Optional
 from urllib.parse import quote
 
 from backend.shared.extraction import ExtractionResult, run_strategies
-from backend.shared.avatars import looks_like_placeholder
+from backend.shared.avatars import hd_picture_url, looks_like_placeholder
 from backend.shared.models.row import Row
 from backend.shared.text import iter_dicts
 from backend.stealth.browser import Session
+from backend.stealth.mouse_movement import (
+    hover_element_safely,
+    humanize_interaction,
+    natural_scroll_down,
+)
 
 # Session / login state
 
@@ -60,6 +65,13 @@ class TwitterSession(Session):
     `session_path` entry for "twitter", constructed by session_for_job()
     (backend/sessions/manager.py) whenever a job needs a live browser
     context."""
+
+    # Fetch images for real against X/Twitter. Without this, Playwright blocks
+    # images with dummy 1x1 GIFs during discovery sweeps, meaning Twitter's edge
+    # CDN logs observe an authenticated session querying SearchTimeline repeatedly
+    # while never requesting a single avatar from pbs.twimg.com. This is an immediate
+    # headless scraper tell that triggers silent search shadowbans and rate limits.
+    ALWAYS_LOAD_IMAGES = True
 
     async def check_session(self) -> bool:  # type: ignore[override]
         """WHAT: are these cookies still logged in? HOW: visits /home (an
@@ -278,7 +290,7 @@ async def dom_users(page) -> list[TwitterUser]:
             entity_id="",
             handle=handle,
             name=(r.get("name") or "").strip(),
-            avatar=(r.get("avatar") or "").strip(),
+            avatar=hd_picture_url((r.get("avatar") or "").strip()),
             verified=bool(r.get("verified")),
         ))
     return users
@@ -369,7 +381,7 @@ def _user_from_result(res: dict) -> Optional[TwitterUser]:
         created_iso=parse_created(created),
         location=location.strip(),
         # request the larger render; _normal is a 48px thumbnail
-        avatar=avatar.replace("_normal.", "_400x400."),
+        avatar=hd_picture_url(avatar),
         verified=bool(
             res.get("is_blue_verified")
             or legacy.get("verified")
@@ -712,19 +724,32 @@ class Discovery:
         by_id: dict[str, TwitterUser] = {}
         cursor = ""
         arrived = asyncio.Event()
+        rate_limited = False
 
         async def on_response(resp):
             """Absorbs the search payloads and tracks the pagination
             cursor, which X carries in the response BODY rather than a
             header -- so the only way to page is to read it back out of
             what arrived."""
-            nonlocal cursor
+            nonlocal cursor, rate_limited
             try:
                 if SEARCH_QUERY not in resp.url:
+                    return
+                # Check HTTP 429 Too Many Requests
+                if getattr(resp, "status", 200) == 429:
+                    rate_limited = True
+                    arrived.set()
                     return
                 text = await resp.text()
             except Exception:
                 return
+
+            # Detect Twitter-specific rate-limit and error indicators in payload
+            if "Rate limit exceeded" in text or '"code":88' in text or "OverCapacity" in text:
+                rate_limited = True
+                arrived.set()
+                return
+
             for blob in parse_lines(text):
                 st = search_state(blob)
                 for u in st.users:
@@ -750,12 +775,18 @@ class Discovery:
             except Exception:
                 pass
 
+            # Register natural pointer telemetry on search page load
+            try:
+                await humanize_interaction(page, scroll=False, moves=random.randint(1, 2))
+            except Exception:
+                pass
+
             # Wait for the first SearchTimeline response to arrive. X's
             # search payload can lag behind the DOM render, especially under
             # load or when the query requires server-side ranking. Without
             # this, by_id stays empty, the patience loop stalls out, and
             # run_strategies falls back to the weaker dom:UserCell method.
-            if not by_id:
+            if not by_id and not rate_limited:
                 try:
                     await asyncio.wait_for(arrived.wait(), timeout=self.a.settle)
                 except asyncio.TimeoutError:
@@ -763,6 +794,9 @@ class Discovery:
 
             stalls, last_cursor = 0, ""
             while True:
+                if rate_limited:
+                    out.stopped = "rate_limited"
+                    break
                 if self.a.max_results and len(by_id) >= self.a.max_results:
                     out.stopped = "cap:results"
                     break
@@ -772,11 +806,23 @@ class Discovery:
 
                 before = len(by_id)
                 arrived.clear()
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+
+                # Natural discrete mouse wheel scrolling with momentum instead of instant scrollTo
+                try:
+                    await natural_scroll_down(page, distance=random.randint(650, 1050), to_bottom=True)
+                except Exception as e:
+                    out.stopped = "error"
+                    out.error = f"scroll failed: {e}"
+                    break
+
                 try:
                     await asyncio.wait_for(arrived.wait(), timeout=self.a.page_wait)
                 except asyncio.TimeoutError:
                     pass
+
+                if rate_limited:
+                    out.stopped = "rate_limited"
+                    break
 
                 if len(by_id) > before:
                     stalls = 0
@@ -786,8 +832,25 @@ class Discovery:
                             f"page {out.pages}, {time.time()-started:.0f}s",
                             file=sys.stderr,
                         )
+                    # Natural reading dwell time between scroll events
+                    await asyncio.sleep(random.uniform(1.2, 2.4))
+                    if random.random() < 0.35:
+                        await hover_element_safely(page, '[data-testid="UserCell"]')
                 else:
                     stalls += 1
+                    # Check page body for soft-block or rate-limit notice on repeated stall
+                    if stalls >= 2:
+                        try:
+                            body_text = await page.inner_text("body")
+                            if RE_CHECKPOINT.search(body_text):
+                                out.stopped = "checkpoint"
+                                break
+                            if "rate limit" in body_text.lower() or "something went wrong" in body_text.lower():
+                                out.stopped = "rate_limited"
+                                break
+                        except Exception:
+                            pass
+
                     # the same bottom cursor twice with no new users is the end
                     if cursor and cursor == last_cursor and stalls >= 2:
                         out.stopped, out.complete = "exhausted", True
@@ -795,7 +858,8 @@ class Discovery:
                     if stalls >= self.a.patience:
                         out.stopped = "stalled"
                         break
-                    await page.wait_for_timeout(600)
+                    # Progressive adaptive backoff with jitter rather than flat 600ms
+                    await asyncio.sleep(random.uniform(1.5, 3.0) * min(stalls, 3))
                 last_cursor = cursor
 
             # Network payload first (richer), rendered DOM second. The DOM
@@ -851,7 +915,7 @@ class Discovery:
             staggered. Returns its index so the caller can restore the
             original keyword order."""
             async with sem:
-                await asyncio.sleep(i % max(1, self.a.concurrency) * 1.0)
+                await asyncio.sleep(i % max(1, self.a.concurrency) * random.uniform(1.5, 3.0))
                 s = await self.sweep(keyword)
                 print(
                     f"  [x/people] {keyword!r}: {s.summary()} ({s.seconds:.1f}s)",
@@ -861,4 +925,5 @@ class Discovery:
 
         pairs = await asyncio.gather(*(one(i, k) for i, k in enumerate(keywords)))
         return [s for _, s in sorted(pairs, key=lambda p: p[0])]
+
 

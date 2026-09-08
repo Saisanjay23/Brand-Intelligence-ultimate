@@ -50,7 +50,8 @@ from backend.platforms.tiktok.discovery_engine import (RE_CHECKPOINT, RE_GONE,
                                                         TikTokUser, geoblocked,
                                                         newest_post_iso,
                                                         newest_post_via_search,
-                                                        profile_from, read_hydration)
+                                                        profile_from, read_hydration,
+                                                        search_users_in)
 
 BAD_SEGMENTS = {
     "video", "live", "tag", "music", "discover", "explore", "upload",
@@ -280,9 +281,51 @@ class Scraper:
         try:
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=self.a.timeout * 1000)
-            except Exception:
+            except Exception as nav_err:
+                # NAME THE CAUSE. Chromium collapses an HTTP error carrying an
+                # empty body into net::ERR_HTTP_RESPONSE_CODE_FAILURE, which
+                # `page.goto` raises as an exception with no status on it --
+                # so a refusal and a dead network looked identical, and both
+                # were reported as the bare note "navigation failed".
+                #
+                # Measured live (2026-09-08, logged out): TikTok answers the
+                # homepage 200 and /search/user 200, and returns 403 with a
+                # ZERO-BYTE body for every /@handle -- its own @tiktok
+                # account included. That is a policy on the endpoint, not a
+                # problem with the profile, and the only thing that changes
+                # it is arriving with a session. An analyst reading
+                # "navigation failed" has no way to know that; one reading
+                # "refused 403" does.
+                #
+                # The status probe runs ONLY on the failure path, so the
+                # normal case costs nothing.
+                status = None
+                try:
+                    probe = await self.ctx.request.get(url, timeout=15000)
+                    status = probe.status
+                except Exception:
+                    pass
+                # REFUSED IS NOT THE END. The profile page is one source, not
+                # the only one: TikTok's user search answers 200 while
+                # /@handle answers 403, and its cards carry most of what this
+                # scraper reads anyway -- name, bio, followers, following,
+                # avatar, verified, private. Falling back to it turns a row
+                # that reported nothing into one that reports nearly
+                # everything, with the two genuinely page-only fields left
+                # honestly blank.
+                if await self._recover_via_search(row, page, status):
+                    return row
                 row.status = "ERROR"
-                row.note("navigation failed")
+                if status == 403:
+                    row.note(
+                        "refused (HTTP 403) -- TikTok is not serving profile pages to this "
+                        "browser, and the account was not found in user search either. "
+                        "Add a TikTok session under Sessions."
+                    )
+                elif status and status >= 400:
+                    row.note(f"navigation failed -- TikTok answered HTTP {status}")
+                else:
+                    row.note(f"navigation failed -- {type(nav_err).__name__}")
                 return row
 
             # give the hydration script (and, on a suspicious-traffic
@@ -417,6 +460,16 @@ class Scraper:
             row.posts_seen = "yes" if u.video_count > 0 else "no"
             row.mark("posts", "hydration")
         if u.bio:
+            # INTO THE FIELD, not only a note. Row.bio is what the export,
+            # the incident row and the analysis table all read; TikTok was
+            # the only platform that never set it (Twitter, Instagram and
+            # Telegram all assign row.bio directly), so a TikTok row's bio
+            # column was permanently blank while the text sat in a note that
+            # nothing renders as a bio. The note is kept as well -- it is
+            # what an analyst reading this row's history already sees, and
+            # dropping it would quietly remove context from existing rows.
+            row.bio = u.bio
+            row.mark("bio", "hydration")
             row.note(f"bio: {u.bio[:120]}")
         if u.verified:
             row.verified = True
@@ -424,6 +477,75 @@ class Scraper:
         if u.private:
             row.note("private account -- some fields may be limited")
         row.note("creation date not exposed by TikTok")
+
+    async def _recover_via_search(self, row: Row, page, status: Optional[int]) -> bool:
+        """Rebuild this profile from TikTok's USER SEARCH when its own page
+        is refused. True when something usable was recovered.
+
+        WHY THIS WORKS AT ALL. Measured live 2026-09-08, logged out:
+        /@handle answers 403 with a zero-byte body -- TikTok's own @tiktok
+        account included -- while /search/user?q= answers 200 with 379KB.
+        The refusal is a policy on the profile endpoint, not a block on the
+        client, so the account's data is still reachable by another door.
+
+        A search card carries name, bio, followers, following, avatar,
+        verified, private and the numeric id: everything `fill()` maps,
+        which is why this reuses that mapper rather than a second one that
+        could drift from it. The two fields it cannot carry are location
+        (TikTok publishes none anywhere) and the last-post date -- and that
+        one is recovered separately by `newest_post_via_search`, the same
+        CAPTCHA-free route the engine already trusts.
+
+        PARTIAL, NOT OK. The row is real but assembled from a listing rather
+        than read at the source, and `analysis_status` is what decides
+        whether a profile is re-queued for another look (see
+        profile_repository.RETRYABLE_ANALYSIS_STATUSES). Marking this OK
+        would freeze a second-hand reading as final; PARTIAL keeps it in the
+        queue for when a session exists.
+        """
+        handle = (row.profile_id or "").strip()
+        if not handle:
+            return False
+        try:
+            found = (await search_users_in(self.ctx, [handle])).get(handle) or []
+        except Exception as e:
+            from backend.shared.logging import get_logger as _gl
+            _gl("tiktok").warning(
+                f"tiktok/{handle}: search fallback failed -- {type(e).__name__}: {e}")
+            return False
+
+        # EXACT handle only. Search ranks by relevance, so the first card is
+        # frequently a different, more popular account wearing a similar
+        # name -- writing that one's followers onto this row would be worse
+        # than reporting nothing.
+        match = next((u for u in found if (u.username or "").lower() == handle.lower()), None)
+        if match is None:
+            return False
+
+        self.fill(row, match)
+        row.status = "PARTIAL"
+        for field in ("name", "followers", "friends", "logo", "bio"):
+            row.mark(field, "search-card")
+
+        if not row.last_post_iso:
+            try:
+                if iso := await newest_post_via_search(self.ctx, handle):
+                    row.last_post_iso = iso
+                    row.posts_seen = "yes"
+                    row.mark("last_post", "search-card")
+            except Exception:
+                pass  # best effort; the row is already worth keeping
+
+        row.note(
+            f"profile page refused (HTTP {status or '?'}) -- rebuilt from TikTok user search. "
+            "Location is never published by TikTok"
+            + ("" if row.last_post_iso else "; last-post date could not be recovered")
+            + ". Add a TikTok session for a full read."
+        )
+        from backend.shared.logging import get_logger as _gl
+        _gl("tiktok").info(
+            f"tiktok/{handle}: profile refused, recovered {row.profile_name!r} from search")
+        return True
 
     @staticmethod
     def fill_from_dom(row: Row, dom: dict) -> None:
@@ -461,7 +583,23 @@ class Scraper:
         avatar = dom.get("avatar") or ""
         if avatar:
             row.profile_pic_url = avatar
-            row.has_custom_pic = True
+            # THE PICTURE IS RECORDED; WHETHER IT IS A REAL ONE IS NOT
+            # CLAIMED. TikTok's own "no custom avatar" signal is the
+            # hydration payload OMITTING the field (see TikTokUser.
+            # has_custom_pic in discovery_engine.py -- presence is the
+            # signal, which is why this platform needs no stock-URL regex).
+            # That signal does not survive into the DOM: the rendered header
+            # always carries an <img>, default avatar included, so a src
+            # being present here distinguishes nothing.
+            #
+            # This used to set has_custom_pic = True regardless, which
+            # asserted a real profile picture from evidence that cannot tell
+            # -- on exactly the tier that runs when the reliable source was
+            # unavailable. Leaving it unset means Row.logo_yes reports "No"
+            # (it answers Yes only to a confirmed True), which is the honest
+            # reading: we did not establish one. Same rule this method
+            # already applies to last-post two fields above, which "stays
+            # blank rather than guessed".
             row.mark("logo", "dom-header")
 
         if dom.get("verified"):

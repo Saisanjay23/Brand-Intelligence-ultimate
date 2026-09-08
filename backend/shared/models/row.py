@@ -71,9 +71,36 @@ class Row:
 
     @property
     def logo_yes(self) -> str:
-        if self.has_custom_pic is False:
-            return "No"
-        return "Yes"
+        """"Yes" ONLY when a real, account-chosen picture was confirmed.
+
+        A platform's own stock avatar -- the grey silhouette, the letter
+        tile, the default egg -- is not a logo, and neither is a picture we
+        never managed to look at. Both are "No".
+
+        THIS USED TO READ `if has_custom_pic is False: "No"` else "Yes",
+        which made UNKNOWN mean Yes. `has_custom_pic` is deliberately
+        tri-state (see its own declaration): True = a real upload was seen,
+        False = the platform's placeholder was recognised, None = the engine
+        never got an avatar to judge. Folding None in with True asserted a
+        custom profile picture on every profile the scraper failed to read.
+
+        That was not a cosmetic default. `risk` and `priority` below are
+        both computed from this string, and both are export columns, so an
+        unread profile was leaving the tool as "Logo: Yes, Risk 6, High" --
+        a verdict about an account nobody had actually seen.
+
+        Each platform decides False for itself, and they do not agree on how
+        because the platforms do not behave the same way:
+            facebook/instagram/twitter  known stock-avatar URL markers
+            youtube                     generated-avatar prefix plus a
+                                        two-colour flatness test, which is
+                                        what catches the letter tiles
+            telegram                    Telethon's own PhotoEmpty check
+            tiktok                      presence itself -- TikTok omits the
+                                        avatar entirely for a default account
+                                        rather than serving a stock URL
+        """
+        return "Yes" if self.has_custom_pic is True else "No"
 
     @property
     def active_yes(self) -> str:

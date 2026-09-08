@@ -4,30 +4,35 @@ WHAT THIS IS. Analysis is a standalone tool with one input box and one
 Scrape button. It takes profile URLs directly from an analyst, visits each
 one, and returns the fields the legacy export expects plus an evidence
 screenshot. It does not read a client record, a keyword list, or anything
-discovery produced, and it never writes to MongoDB.
+discovery produced. Discovery and analysis remain independent passes with
+no shared state in either direction; analysis exists to read exactly what a
+search sweep cannot -- follower/member counts, bio, location, last-post
+date, and a screenshot, all of which need a real profile visit.
 
-    discovery -> MongoDB   (keyword sweeps, candidate profiles, persisted)
-    analysis  -> memory    (pasted URLs, scored rows, this module)
+TWO LIFETIMES, AND THEY ARE NOT THE SAME THING:
 
-Those two are independent passes with no shared state in either direction
-(see shared/analysis_store.py for the full split). Analysis exists to read
-exactly what a search sweep cannot: follower/member counts, bio, location,
-last-post date, and a screenshot -- all of which need a real profile visit.
+    a JOB     live progress -- in memory, here, bounded by MAX_JOBS /
+              JOB_TTL_SECONDS, gone on restart. It is a view of work in
+              flight, not a record of it.
 
-MEMORY ONLY, AND WHAT THAT COSTS. Every job, scored row and screenshot here
-lives in this process and nowhere else. A restart loses all of it; so does
-the TTL lapsing, or the store evicting under pressure. Nothing here can be
-queried tomorrow, so an analyst who wants to keep a result must export it
-(XLSX/CSV) while the job is still live.
+    a RESULT  the reading itself -- written to MongoDB as each item settles
+              and deleted 24 hours later by a TTL index. See
+              database/repositories/analysis_result_repository.py.
 
-ROBUSTNESS. Jobs are bounded and TTL'd (`MAX_JOBS`, `JOB_TTL_SECONDS`) so a
-long-running process cannot accumulate them forever. Screenshots -- by far
-the largest thing here, hundreds of KB to low MB each -- are held in
-`shared/analysis_store.py`, which budgets real bytes and evicts oldest-first
-rather than trusting an entry count. One session is taken per platform per
-job, not per URL, so a 40-URL paste does not open 40 browser sessions. A URL
-that fails is recorded as an errored item and never sinks the rest of the
-batch. Cancellation is checked between every profile.
+That second half is new. Analysis output used to be memory-only, which
+meant a reload or a restart cost the analyst the whole batch and the pages
+had to be scraped again -- real page loads under a live session, spent on
+work already done. `_settle` is the one place an item becomes final, and it
+is what writes the result; both terminal paths (scored and failed) go
+through it, so "every result is saved" is a property of the shape rather
+than a rule six call sites have to remember.
+
+ROBUSTNESS. One session is taken per platform per job, not per URL, so a
+40-URL paste does not open 40 browser sessions. A URL that fails is recorded
+as an errored item, saved like any other result, and never sinks the rest of
+the batch. Cancellation is checked between every profile, and a cancelled
+job keeps whatever it had already read. Persisting can never fail a job: a
+storage error costs the row its durability and is logged, nothing more.
 """
 
 from __future__ import annotations
@@ -45,7 +50,7 @@ from backend.config.settings import settings
 from backend.platforms import registry
 from backend.platforms.scan_options import ScanOptions
 from backend.sessions import manager as sessions_engine
-from backend.shared.analysis_store import analysis_store
+from backend.database.repositories import analysis_result_repository as results_db
 from backend.shared.job_store import JobStore
 from backend.shared.logging import get_logger
 from backend.shared.models.row import Row
@@ -231,6 +236,11 @@ class AnalysisItem:
     def to_dict(self) -> dict:
         return {
             "id": self.id, "url": self.url, "platform": self.platform,
+            # Stable across runs and across storage, unlike `id` (a fresh
+            # uuid per job). It is what lets the UI lay a running job's rows
+            # over the saved set without showing the same profile twice, and
+            # what addresses a saved row's screenshot once its job is gone.
+            "result_id": results_db.result_id(self.platform, self.url),
             "platform_name": registry.display_name(self.platform),
             "entity_id": self.entity_id, "status": self.status,
             "error": self.error, "analysed_at": self.analysed_at,
@@ -453,7 +463,7 @@ class AnalysisRunner:
                     job.platform_progress[pid]["status"] = "failed"
                     for it in items:
                         if it.status in ("pending", "running"):
-                            self._fail_item(job, it, f"{type(result).__name__}: {result}")
+                            await self._fail_item(job, it, f"{type(result).__name__}: {result}")
                             job.completed += 1
                             job.platform_progress[pid]["completed"] += 1
 
@@ -565,7 +575,7 @@ class AnalysisRunner:
                 detail = "session failed mid-run -- see the earlier failed item(s) on this platform for why"
                 for it in items:
                     if it.status in ("pending", "running"):
-                        self._fail_item(job, it, detail)
+                        await self._fail_item(job, it, detail)
                         job.completed += 1
                         progress["completed"] += 1
                 progress["status"] = "failed"
@@ -577,7 +587,7 @@ class AnalysisRunner:
             log.error(f"analysis job {job.id}: {platform_id} failed -- {detail}")
             for it in items:
                 if it.status in ("pending", "running"):
-                    self._fail_item(job, it, detail)
+                    await self._fail_item(job, it, detail)
                     job.completed += 1
                     progress["completed"] += 1
         finally:
@@ -614,7 +624,7 @@ class AnalysisRunner:
             log.error(f"analysis job {job.id}: youtube batch failed -- {detail}")
             for it in items:
                 it.duration_seconds = round(dur / max(1, len(items)), 2)
-                self._fail_item(job, it, detail)
+                await self._fail_item(job, it, detail)
                 job.completed += 1
                 progress["completed"] += 1
             progress["status"] = "failed"
@@ -638,7 +648,7 @@ class AnalysisRunner:
 
         for it in items[len(rows):]:
             it.duration_seconds = 0.0
-            self._fail_item(job, it, "youtube quota exhausted mid-batch -- not attempted")
+            await self._fail_item(job, it, "youtube quota exhausted mid-batch -- not attempted")
             job.completed += 1
             progress["completed"] += 1
 
@@ -663,9 +673,18 @@ class AnalysisRunner:
             row = await scraper.one(it.url, job.target_name, job.official_feed, known=known)
             it.duration_seconds = round(time.time() - t0, 2)
             await self._populate(job, it, row, known)
+            # SAVED HERE, NOT INSIDE _populate. `_populate` is a pure
+            # mapping step -- row in, item fields out -- and is called
+            # directly by tests that only care about how a row scores.
+            # Persisting from inside it made those tests write to whatever
+            # MongoDB the machine happened to be pointing at, which is both
+            # a surprise and a real pollution of an operator's data. The
+            # job's own lifecycle is what owns durability, so the write
+            # belongs at this level.
+            await self._settle(job, it, screenshot=row.screenshot_bytes)
         except Exception as e:
             it.duration_seconds = round(time.time() - t0, 2)
-            self._fail_item(job, it, f"{type(e).__name__}: {e}")
+            await self._fail_item(job, it, f"{type(e).__name__}: {e}")
             if reason := classify_failure(e):
                 await sessions_engine.mark_session_failed(
                     platform_id, session_item.get("id", ""), reason, detail=str(e))
@@ -787,18 +806,50 @@ class AnalysisRunner:
                 self._screenshots[f"{job.id}:{it.id}"] = row.screenshot_bytes
             it.has_screenshot = True
 
-        # The scored row itself lands in the shared memory-only store, which
-        # is what budgets the screenshot bytes and ages results out.
-        await analysis_store.put("__analysis__", it.platform, row)
-
         self._build_rows(job, it)
 
-    def _fail_item(self, job: AnalysisJob, it: AnalysisItem, error: str) -> None:
+    async def _fail_item(self, job: AnalysisJob, it: AnalysisItem, error: str) -> None:
+        """A URL that could not be read. SAVED LIKE ANY OTHER RESULT, not
+        dropped: "we tried this profile and could not reach it" is a finding
+        an analyst needs to still be there after a refresh, and losing it
+        silently is how the same dead URL gets pasted in again tomorrow."""
         it.status = "error"
         it.error = error
         it.analysed_at = datetime.now(timezone.utc).isoformat()
         it.comments = error
+        await self._settle(job, it)
+
+    async def _settle(
+        self, job: AnalysisJob, it: AnalysisItem, *, screenshot: Optional[bytes] = None,
+    ) -> None:
+        """The one point an item becomes final -- build its export rows, then
+        persist it for 24 hours.
+
+        BOTH TERMINAL PATHS COME THROUGH HERE, the scored one and the failed
+        one, which is what makes "every result is saved" a property of the
+        code shape rather than a rule six call sites have to remember.
+
+        `_build_rows` is safe to run twice (it rebuilds both export layouts
+        from the item's current fields), so the success path having already
+        called it inside `_populate` costs a rebuild and nothing else.
+
+        PERSISTENCE CAN NEVER FAIL THE JOB. A Mongo hiccup must not turn a
+        profile that was successfully scraped into an errored item -- the
+        reading already exists in memory and is already on its way to the
+        analyst's screen through the poll. Same reasoning as
+        incident_repository.record(): the bookkeeping is not allowed to be
+        the reason the work fails.
+        """
         self._build_rows(job, it)
+        try:
+            await results_db.save(
+                it.to_dict(), job_id=job.id, org_id=job.org_id, screenshot=screenshot,
+            )
+        except Exception as e:
+            log.warning(
+                f"analysis result for {it.url} could not be saved ({type(e).__name__}: {e}) -- "
+                "it is still readable on this job, but will not survive a reload"
+            )
 
     def _build_rows(self, job: AnalysisJob, it: AnalysisItem) -> None:
         """Both export layouts, built from what was ACTUALLY scraped.
@@ -813,7 +864,8 @@ class AnalysisRunner:
         likewise filled from what the analyst typed instead of left blank.
         """
         platform_name = registry.display_name(it.platform)
-        yes_no = lambda v: "Yes" if v is True else "No" if v is False else ""
+        def yes_no(v):
+            return "Yes" if v is True else "No" if v is False else ""
 
         # Incident / takedown-report layout (frontend: incidentExport.ts)
         it.incident_row = {

@@ -37,6 +37,16 @@ export const clientsApi = {
   deleteClient: (clientId: string) =>
     fetch(url(`/clients/${encodeURIComponent(clientId)}`), { method: "DELETE" }).then(json<Client>),
 
+  // What the Scheduler runs for this client. A NARROW write: it cannot
+  // disturb keywords or caps, and saving the client from the Clients form
+  // cannot reset it.
+  setSchedulerPrefs: (
+    clientId: string,
+    prefs: { platforms?: string[]; keyword_scope?: string },
+  ) =>
+    fetch(url(`/clients/${encodeURIComponent(clientId)}/scheduler-prefs`),
+          jsonInit("PUT", prefs)).then(json<Client>),
+
   // The full desired order, front to back.
   reorderClients: (clientIds: string[]) =>
     fetch(url("/clients/reorder"), jsonInit("PUT", { client_ids: clientIds })).then(

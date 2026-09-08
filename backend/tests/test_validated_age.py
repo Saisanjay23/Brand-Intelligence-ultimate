@@ -32,9 +32,17 @@ from backend.database.repositories.profile_repository import (
 def _matches(clause: dict, doc: dict) -> bool:
     """Evaluate the small subset of Mongo this clause uses, so the rule can
     be tested without a database. Supports `$gte`/`$lt`/`$exists`/None on one
-    field, and a top-level `$or` of those."""
+    field, a top-level `$or` of those, and a top-level `$and` of those."""
     if "$or" in clause:
         return any(_matches(c, doc) for c in clause["$or"])
+    # `_age_clause("old")` is an $and of two $or legs since first_seen stopped
+    # being the only thing that makes a profile new (an avatar swap does too).
+    # Without this the helper walked into the list and raised AttributeError,
+    # which reads as a broken rule rather than a helper that had not kept up.
+    if "$and" in clause:
+        return all(_matches(c, doc) for c in clause["$and"])
+    if "$and" in clause:
+        return all(_matches(c, doc) for c in clause["$and"])
     for field, cond in clause.items():
         value = doc.get(field, None)
         if cond is None:
@@ -133,3 +141,60 @@ class TestItIsNotTheDiscoveryAgeSplit:
         doc = {"first_seen": _ago(1)}
         assert _matches(_age_clause("new"), doc)
         assert _matches(_validated_age_clause("old"), doc)
+
+
+class TestAvatarChangedAtPromotesToNew:
+    """A profile discovered long ago that changes its picture within the 24h
+    window must land in the New tab, not Old -- the whole point of the
+    avatar_changed_at feature."""
+
+    def test_old_discovery_recent_dp_change_is_new(self):
+        doc = {"first_seen": _ago(24 * 30), "avatar_changed_at": _ago(2)}
+        assert _matches(_age_clause("new"), doc)
+        assert not _matches(_age_clause("old"), doc)
+
+    def test_old_discovery_old_dp_change_is_old(self):
+        doc = {"first_seen": _ago(24 * 30), "avatar_changed_at": _ago(48)}
+        assert _matches(_age_clause("old"), doc)
+        assert not _matches(_age_clause("new"), doc)
+
+    def test_new_discovery_no_dp_change_is_still_new(self):
+        doc = {"first_seen": _ago(1)}
+        assert _matches(_age_clause("new"), doc)
+
+    def test_no_first_seen_recent_dp_change_is_new(self):
+        doc = {"avatar_changed_at": _ago(1)}
+        assert _matches(_age_clause("new"), doc)
+        assert not _matches(_age_clause("old"), doc)
+
+    def test_no_first_seen_no_dp_change_is_old(self):
+        doc = {}
+        assert _matches(_age_clause("old"), doc)
+        assert not _matches(_age_clause("new"), doc)
+
+    def test_avatar_changed_boundary(self):
+        just_inside = {"first_seen": _ago(24 * 90),
+                       "avatar_changed_at": _ago(NEW_WINDOW_HOURS - 0.5)}
+        just_outside = {"first_seen": _ago(24 * 90),
+                        "avatar_changed_at": _ago(NEW_WINDOW_HOURS + 0.5)}
+        assert _matches(_age_clause("new"), just_inside)
+        assert _matches(_age_clause("old"), just_outside)
+
+    def test_partition_with_avatar_changed_at(self):
+        """Every document must land in exactly one of the two buckets."""
+        docs = [
+            {"first_seen": _ago(0)},
+            {"first_seen": _ago(1), "avatar_changed_at": _ago(0.5)},
+            {"first_seen": _ago(24 * 90), "avatar_changed_at": _ago(1)},
+            {"first_seen": _ago(24 * 90), "avatar_changed_at": _ago(48)},
+            {"first_seen": _ago(24 * 90)},
+            {"avatar_changed_at": _ago(1)},
+            {"avatar_changed_at": _ago(48)},
+            {},
+            {"first_seen": None},
+            {"first_seen": None, "avatar_changed_at": None},
+        ]
+        for doc in docs:
+            in_new = _matches(_age_clause("new"), doc)
+            in_old = _matches(_age_clause("old"), doc)
+            assert in_new != in_old, f"partition violated for {doc}"

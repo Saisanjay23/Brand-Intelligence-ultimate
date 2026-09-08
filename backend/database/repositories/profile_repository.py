@@ -66,6 +66,10 @@ DISCOVERY_FIELDS = (
     "logo_similarity", "logo_ref_id", "logo_match_tier",
     "name_score",
     "name_exact_run", "followers", "friends", "location", "bio", "created_at",
+    # Set when a repeat sweep detects a genuinely different profile picture
+    # (asset path changed, not just expired CDN signatures). Surfaces the
+    # profile in the "New" triage tab so analysts catch impersonation pivots.
+    "avatar_changed_at", "avatar_previous_url", "avatar_previous_sha",
 )
 
 # NOTE: `entity_id` is deliberately NOT here. It is the dedup key, and
@@ -257,6 +261,17 @@ EDITABLE = {
     # (see the special-casing in patch() below), so editing one field never
     # clobbers another already-saved override.
     "incident_overrides",
+    # THE GENUINE ACCOUNT, marked by an analyst -- the real brand or person,
+    # not an impersonation of them. A sweep for "Gautam Adani" finds the real
+    # Gautam Adani too, and without this it comes back as an unresolved
+    # candidate on every future sweep for the rest of the client's life.
+    #
+    # DELIBERATELY ABSENT FROM DISCOVERY_FIELDS. `save()` writes only the
+    # fields the running phase owns, so leaving this out of that list is
+    # precisely what makes the mark permanent: no re-discovery, however many
+    # times the profile is found again, can clear it. Nothing but an analyst
+    # calling patch() with `is_original` ever changes it.
+    "is_original",
 }
 
 
@@ -289,8 +304,8 @@ def _stamp_utc_for_api(doc: dict) -> dict:
     """Mongo hands every datetime back naive-but-UTC-VALUED (motor isn't
     tz_aware); stamp UTC explicitly on the way out so a JSON client doesn't
     read the unmarked ISO string as local time."""
-    for f in ("first_seen", "last_seen", "changed_at", "publish_hold_until",
-              "rejected_at", "screenshot_at", "analysed_at"):
+    for f in ("first_seen", "last_seen", "changed_at", "avatar_changed_at",
+              "publish_hold_until", "rejected_at", "screenshot_at", "analysed_at"):
         v = doc.get(f)
         if isinstance(v, datetime) and v.tzinfo is None:
             doc[f] = v.replace(tzinfo=timezone.utc)
@@ -312,17 +327,63 @@ def _new_cutoff() -> datetime:
 
 
 def _age_clause(age: str) -> dict:
-    """A profile is "old" when its first_seen is outside the window OR it has
-    none at all -- matching the frontend's isProfileNew, which reads a
-    missing timestamp as not-new rather than as brand new."""
+    """A profile is "new" when it was first seen within the window OR its
+    avatar changed within the window (a repeat sweep detected a genuine DP
+    swap -- see `is_same_avatar_asset`).  "old" is the exact complement.
+
+    The avatar_changed_at leg exists to catch the "sleeper impersonation"
+    pivot: an account discovered months ago that changes its picture to the
+    client's brand logo today must surface in the New tab immediately, not
+    stay buried in Old where no analyst would see it."""
     cutoff = _new_cutoff()
     if age == "new":
-        return {"first_seen": {"$gte": cutoff}}
-    return {"$or": [
-        {"first_seen": {"$lt": cutoff}},
-        {"first_seen": None},
-        {"first_seen": {"$exists": False}},
+        return {"$or": [
+            {"first_seen": {"$gte": cutoff}},
+            {"avatar_changed_at": {"$gte": cutoff}},
+        ]}
+    # "old" is the complement: first_seen is outside the window (or absent)
+    # AND avatar_changed_at is outside the window (or absent).
+    return {"$and": [
+        {"$or": [
+            {"first_seen": {"$lt": cutoff}},
+            {"first_seen": None},
+            {"first_seen": {"$exists": False}},
+        ]},
+        {"$or": [
+            {"avatar_changed_at": {"$lt": cutoff}},
+            {"avatar_changed_at": None},
+            {"avatar_changed_at": {"$exists": False}},
+        ]},
     ]}
+
+
+def _first_seen_range_clause(
+    start: Optional[datetime], end: Optional[datetime],
+) -> dict:
+    """Profiles first discovered inside an explicit date range.
+
+    HALF-OPEN, [start, end). The caller passes the instant the range ends,
+    not the last instant inside it -- a closed `$lte` on a date boundary
+    either drops the final day's profiles (when the caller passes that day's
+    midnight) or needs a "23:59:59.999" sentinel that is wrong by a
+    millisecond for anything sub-second. The API layer turns "to 6 Sep" into
+    "before 7 Sep 00:00", so the whole of the 6th is inside the range and no
+    row can fall between two adjacent ranges.
+
+    A PROFILE WITH NO `first_seen` IS EXCLUDED, which Mongo does on its own:
+    a range predicate never matches a missing field. That is the opposite of
+    `_age_clause`, where a missing timestamp counts as "old" -- and
+    deliberately so. There, every pending profile has to land in exactly one
+    of two tabs that together are the whole set, so an unknown age needs a
+    home. Here the analyst has asked a question about a specific window, and
+    a row whose discovery date is unknown is not an answer to it.
+    """
+    rng: dict[str, datetime] = {}
+    if start:
+        rng["$gte"] = start
+    if end:
+        rng["$lt"] = end
+    return {"first_seen": rng}
 
 
 def _validated_age_clause(age: str) -> dict:
@@ -435,11 +496,17 @@ async def save(
     bounded by `_COMPLETENESS_PASSES`; this counter bounds the job, so
     only the job's final word on a URL spends from it.
     """
-    # ANALYSIS RESULTS ARE MEMORY-ONLY -- enforced here, at the one write
-    # boundary, rather than left as a convention every future caller has to
-    # remember. Analysis output belongs in shared/analysis_store.py; only
-    # discovery persists (see that module's docstring for the full split
-    # and what memory-only costs). Raising is deliberate: a silent no-op
+    # ANALYSIS RESULTS DO NOT BELONG IN THIS COLLECTION -- enforced here, at
+    # the one write boundary, rather than left as a convention every future
+    # caller has to remember. They go to
+    # database/repositories/analysis_result_repository.py, which holds them
+    # for 24 hours and then lets MongoDB delete them.
+    #
+    # The two are separated by LIFETIME, which is the point. A profile
+    # document is durable and carries an analyst's triage decision that no
+    # sweep may overwrite; an analysis result is a reading with an expiry on
+    # it. Letting a TTL'd write land here would put an expiring field next
+    # to data that must never expire. Raising is deliberate: a silent no-op
     # would look exactly like a successful save to the caller, and the
     # result would be gone with nothing to explain where.
     if phase == PHASE_ANALYSIS:
@@ -464,7 +531,8 @@ async def save(
         keys.append({"urls": canonical_yt})
     existing = await coll.find_one(
         {**match, "$or": keys},
-        {"_id": 1, "url": 1, "status": 1, "entity_id": 1, "analysis_attempts": 1}
+        {"_id": 1, "url": 1, "status": 1, "entity_id": 1, "analysis_attempts": 1,
+         "profile_image_url": 1, "avatar_sha": 1}
     )
 
     owned = ANALYSIS_FIELDS if phase == PHASE_ANALYSIS else DISCOVERY_FIELDS
@@ -526,6 +594,39 @@ async def save(
             update["$set"]["entity_id"] = eid
         if initial_status != "pending" and existing.get("status") == "pending":
             update["$set"]["status"] = initial_status
+
+        # --- Avatar change detection ---
+        # A repeat sweep delivering a genuinely different profile picture
+        # (asset path changed, not just an expired CDN signature) means the
+        # account's visual identity has pivoted. Record the change so the
+        # profile surfaces in the "New" triage tab, and invalidate cached
+        # hashes / logo match so avatar_cache re-downloads and re-evaluates.
+        old_img = (existing.get("profile_image_url") or "").strip()
+        new_img = (fields.get("profile_image_url") or "").strip()
+        if old_img and new_img and phase == PHASE_DISCOVERY:
+            # Lazy import to avoid circular dependency (avatar_cache imports
+            # profile_repository; we only need one pure function from it).
+            from backend.services.avatar_cache import is_same_avatar_asset
+
+            if not is_same_avatar_asset(old_img, new_img):
+                update["$set"]["avatar_changed_at"] = now
+                update["$set"]["avatar_previous_url"] = old_img
+                old_sha = (existing.get("avatar_sha") or "").strip()
+                if old_sha:
+                    update["$set"]["avatar_previous_sha"] = old_sha
+                # Invalidate stale fingerprints and logo match so the fresh
+                # picture is fetched, hashed and compared from scratch.
+                update.setdefault("$unset", {})
+                for stale in ("avatar_sha", "avatar_phash", "avatar_dhash",
+                              "avatar_embedding", "logo_similarity",
+                              "logo_ref_id", "logo_match_tier"):
+                    update["$unset"][stale] = ""
+                    update["$set"].pop(stale, None)
+                log.info(
+                    f"{platform}/{client_id}: avatar changed for {url} "
+                    f"(old path …{old_img[-40:]}, new path …{new_img[-40:]})"
+                )
+
         await coll.update_one({"_id": existing["_id"]}, update)
         return False
 
@@ -650,12 +751,12 @@ async def set_avatar_fingerprint(
     return res.matched_count > 0
 
 
-async def existing_avatar_shas(client_id: str, platform: str, urls: list[str]) -> set[str]:
-    """Returns the subset of URLs from `urls` that already have a non-empty
-    `avatar_sha` stored in this client's profile records. Used by avatar_cache
-    to skip re-downloading image bytes on repeat sweeps."""
+async def existing_avatar_urls(client_id: str, platform: str, urls: list[str]) -> dict[str, str]:
+    """Returns a mapping {url: profile_image_url} for profiles that already have
+    a non-empty `avatar_sha` stored. Used by avatar_cache to check whether an
+    account's display picture has changed before deciding whether to skip re-download."""
     if not urls or not client_id or not platform:
-        return set()
+        return {}
     cur = db()[PROFILES].find(
         {
             "client_id": client_id,
@@ -663,9 +764,16 @@ async def existing_avatar_shas(client_id: str, platform: str, urls: list[str]) -
             "url": {"$in": urls},
             "avatar_sha": {"$exists": True, "$ne": ""},
         },
-        {"url": 1},
+        {"url": 1, "profile_image_url": 1},
     )
-    return {doc["url"] async for doc in cur if doc.get("url")}
+    return {doc["url"]: (doc.get("profile_image_url") or "") async for doc in cur if doc.get("url")}
+
+
+async def existing_avatar_shas(client_id: str, platform: str, urls: list[str]) -> set[str]:
+    """Returns the subset of URLs from `urls` that already have a non-empty
+    `avatar_sha` stored in this client's profile records."""
+    res = await existing_avatar_urls(client_id, platform, urls)
+    return set(res.keys())
 
 
 async def save_many(
@@ -732,7 +840,8 @@ def _build_query(
     search: Optional[str] = None, client_keywords: Optional[dict] = None,
     published: Optional[bool] = None, data_quality: Optional[str] = None,
     age: Optional[str] = None, validated_age: Optional[str] = None,
-    logo_matched: bool = False,
+    logo_matched: bool = False, is_original: Optional[bool] = None,
+    first_seen_from: Optional[datetime] = None, first_seen_to: Optional[datetime] = None,
 ) -> dict[str, Any]:
     """The filter `find()` queries with, factored out so `delete_matching()`
     (the "Delete Platform Data" button) can delete EXACTLY the set of
@@ -834,6 +943,18 @@ def _build_query(
         clauses.append(_age_clause(age))
     if validated_age in ("new", "old"):
         clauses.append(_validated_age_clause(validated_age))
+    if first_seen_from or first_seen_to:
+        # Composes with `age` rather than replacing it: both read first_seen,
+        # so New + a range means "found in the last 24h AND inside the window"
+        # -- an intersection, which is what an analyst who set both asked for.
+        clauses.append(_first_seen_range_clause(first_seen_from, first_seen_to))
+    if is_original is True:
+        clauses.append({"is_original": True})
+    elif is_original is False:
+        # "hide the genuine accounts" -- a profile that has never been marked
+        # has no field at all, so absence counts as not-original.
+        clauses.append({"$or": [{"is_original": {"$ne": True}},
+                                {"is_original": {"$exists": False}}]})
     if logo_matched:
         # Only profiles whose cached avatar matched one of the client's
         # reference logos. `logo_similarity` is written solely by
@@ -881,7 +1002,8 @@ async def find(
     search: Optional[str] = None, client_keywords: Optional[dict] = None,
     published: Optional[bool] = None, data_quality: Optional[str] = None,
     age: Optional[str] = None, validated_age: Optional[str] = None,
-    logo_matched: bool = False,
+    logo_matched: bool = False, is_original: Optional[bool] = None,
+    first_seen_from: Optional[datetime] = None, first_seen_to: Optional[datetime] = None,
 ) -> tuple[list[dict], int, dict]:
     """`include_held=False` (the default, used by any caller that doesn't
     explicitly ask otherwise, i.e. the SaaS backend's normal poll) hides a
@@ -903,6 +1025,8 @@ async def find(
         keyword_match_type=keyword_match_type, search=search, client_keywords=client_keywords,
         published=published, data_quality=data_quality, age=age,
         validated_age=validated_age, logo_matched=logo_matched,
+        is_original=is_original,
+        first_seen_from=first_seen_from, first_seen_to=first_seen_to,
     )
 
     coll = db()[PROFILES]
@@ -949,8 +1073,26 @@ async def find(
     if not (phase == PHASE_DISCOVERY and status == "rejected"):
         sort_spec = [("logo_similarity", -1), (sort_field, sort_dir)]
 
+    # ALLOW DISK USE FOR THE SORT -- the difference between a slow page and
+    # a broken one.
+    #
+    # `logo_similarity` leads the sort and no index covers it, so Mongo runs
+    # a blocking in-memory SORT over every matching document before it can
+    # take the page. That has a hard 32MB ceiling, and past it the query does
+    # not degrade -- it FAILS, with QueryExceededMemoryLimitNoDiskUseAllowed,
+    # and the grid shows an error instead of profiles.
+    #
+    # Measured on the live database: the largest client's discovery set is
+    # 4,063 documents / 12.3MB, which is 38% of that budget already. Roughly
+    # two and a half times the current data and the Discovery tab stops
+    # working for that client -- for a tool whose entire job is to accumulate
+    # profiles over time, that is a deadline, not a risk.
+    #
+    # Spilling to disk removes the ceiling outright. The compound index added
+    # in ensure_indexes() is what keeps it from being needed in the common
+    # case; this is the guarantee that the page still renders when it is.
     rows = []
-    async for doc in coll.find(q).sort(sort_spec).skip(offset).limit(limit):
+    async for doc in coll.find(q).sort(sort_spec).allow_disk_use(True).skip(offset).limit(limit):
         doc["id"] = str(doc.pop("_id"))
         rows.append(_stamp_utc_for_api(doc))
 
@@ -991,9 +1133,24 @@ async def find(
             keyword_match_type=keyword_match_type, search=search,
             client_keywords=client_keywords, published=published,
             data_quality=data_quality,
+            # The date range is NOT dropped here -- only `age` is. This
+            # aggregate answers "how big is each age tab given everything
+            # else the analyst has narrowed to", and the range is one of
+            # those narrowings; dropping it would print a badge of 300 over
+            # a tab that renders 12.
+            first_seen_from=first_seen_from, first_seen_to=first_seen_to,
+            logo_matched=logo_matched, is_original=is_original,
         )},
         {"$group": {
-            "_id": {"$cond": [{"$gte": ["$first_seen", cutoff]}, "new", "old"]},
+            # A profile is "new" if first_seen OR avatar_changed_at is within
+            # the window -- matching _age_clause exactly.
+            "_id": {"$cond": [
+                {"$or": [
+                    {"$gte": ["$first_seen", cutoff]},
+                    {"$gte": ["$avatar_changed_at", cutoff]},
+                ]},
+                "new", "old",
+            ]},
             "count": {"$sum": 1},
         }},
     ]):
@@ -1014,6 +1171,8 @@ async def find(
             keyword_match_type=keyword_match_type, search=search,
             client_keywords=client_keywords, published=published,
             data_quality=data_quality, age=age,
+            first_seen_from=first_seen_from, first_seen_to=first_seen_to,
+            logo_matched=logo_matched, is_original=is_original,
         )},
         {"$group": {
             # `$gte` against a missing field is false in Mongo, so a profile
@@ -1661,6 +1820,25 @@ async def ensure_indexes() -> None:
             )
 
     for keys, name in (
+        # The discovery grid's own sort. `find()` orders by logo_similarity
+        # first (so a profile wearing the client's logo floats to the top),
+        # then by _id -- and with nothing covering that, every listing was a
+        # blocking in-memory sort of the client's whole filtered set. Leading
+        # with the equality fields the query always carries lets Mongo walk
+        # this index in order and take the page directly.
+        ([("client_id", 1), ("status", 1), ("logo_similarity", -1), ("_id", 1)],
+         "client_status_logo_id"),
+        # The same, for the analysis views, which sort by last_seen instead.
+        ([("client_id", 1), ("phase", 1), ("logo_similarity", -1), ("last_seen", -1)],
+         "client_phase_logo_seen"),
+        # first_seen carries the New/Old split AND the first-seen date
+        # window, both of which run on every discovery listing and neither of
+        # which had an index.
+        ([("client_id", 1), ("first_seen", -1)], "client_first_seen"),
+        # avatar_changed_at drives the DP-changed "promote to New" feature.
+        ([("client_id", 1), ("avatar_changed_at", -1)], "client_avatar_changed_at"),
+        # validated_at drives the Validated tab's own New/Older split.
+        ([("client_id", 1), ("validated_at", -1)], "client_validated_at"),
         ([("client_id", 1), ("platform", 1), ("urls", 1)], "client_platform_urls"),
         ([("client_id", 1), ("status", 1), ("last_seen", -1)], "client_status_seen"),
         ([("client_id", 1), ("priority", 1)], "client_priority"),

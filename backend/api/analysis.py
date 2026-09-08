@@ -6,15 +6,26 @@
     GET    /analysis/jobs/{job_id}/items/{item_id}/screenshot
     POST   /analysis/export/xlsx                       rows -> .xlsx bytes
 
+    GET    /analysis/results                           results saved in the last 24h
+    GET    /analysis/results/{result_id}/screenshot
+    POST   /analysis/results/delete                    delete selected, or all
+
 Analysis takes URLs and nothing else. It reads no client record and
 nothing discovery produced, so a caller can analyse a URL that discovery
 has never seen, and the two can be driven independently.
 
-RESULTS ARE HELD IN MEMORY ONLY and are never persisted. They are lost on
-restart, when the job's TTL lapses, or when the store evicts under
-pressure. Read what you need while the job is alive -- there is no
-"fetch yesterday's analysis" call, by design. `GET /stats` shows how close
-the store is to evicting.
+RESULTS ARE SAVED FOR 24 HOURS AND THEN DELETED BY MONGODB ITSELF. Each
+scored profile (and each URL that failed) is written to `analysis_results`
+as it settles, so a reload, a tab switch or a restart no longer costs an
+analyst the batch -- and 24 hours later it is gone without anyone running
+anything. See database/repositories/analysis_result_repository.py for how
+that expiry is enforced twice over, and why once is not enough.
+
+THE JOB AND THE SAVED RESULT ARE DIFFERENT LIFETIMES, deliberately. A job
+(`/analysis/jobs/{id}`) is live progress: in memory, bounded, gone on
+restart. A saved result is the reading itself. `result_id` on every item is
+the same value in both, so a caller can lay a running job over the saved
+set without showing one profile twice.
 """
 
 from __future__ import annotations
@@ -23,11 +34,12 @@ import re
 from io import BytesIO
 from typing import Any, Optional
 
-from fastapi import APIRouter, Path, Response, status
+from fastapi import APIRouter, Path, Query, Response, status
 from pydantic import BaseModel, Field
 
 from backend.analysis.runner import analysis_runner
 from backend.api.models import CancelResult, JobAccepted, JobStatus, SkippedInput
+from backend.database.repositories import analysis_result_repository as results_db
 from backend.shared.errors import NotFoundError, ValidationError
 
 router = APIRouter(prefix="/analysis", tags=["analysis"])
@@ -82,6 +94,12 @@ class AnalysedProfile(BaseModel):
     Treat null as unknown rather than coercing it."""
 
     id: str
+    result_id: str = Field(
+        "", description="Stable id for this profile's SAVED result, derived from "
+                        "(platform, url). Unlike `id` -- a fresh uuid per job -- it "
+                        "is the same value across runs and in GET /analysis/results, "
+                        "so a live job's rows and the saved set can be matched up. "
+                        "Also what addresses the saved screenshot.")
     url: str
     platform: str
     platform_name: str
@@ -242,6 +260,103 @@ async def screenshot(job_id: str, item_id: str, download: bool = False):
             "Cache-Control": "private, max-age=60",
         },
     )
+
+
+# ------------------------------------------------------- saved results (24h)
+
+class SavedResultPage(BaseModel):
+    items: list[AnalysedProfile]
+    total: int = Field(..., description="Saved results in total, not just this page.")
+    retention_hours: int = Field(..., description="How long a result is kept.")
+
+
+class DeleteResults(BaseModel):
+    ids: list[str] = Field(
+        default_factory=list, max_length=1000,
+        description="`result_id`s to delete. Ignored when `all` is true.")
+    all: bool = Field(
+        False,
+        description="Delete EVERY saved result instead of a named set. Cannot be "
+                    "undone -- the caller's own confirmation is what stands in "
+                    "front of it.")
+    org_id: str = Field(
+        "", max_length=128,
+        description="With `all`, narrows the delete to one client's results. "
+                    "Omit to clear everything.")
+
+
+class DeleteResultsOutcome(BaseModel):
+    deleted: int
+
+
+@router.get("/results", response_model=SavedResultPage,
+            summary="Analysis results saved in the last 24 hours")
+async def list_results(
+    org_id: str = Query("", max_length=128,
+                        description="Only results from this client's batches. Pasted-URL "
+                                    "runs have no client and carry an empty org_id."),
+    platform: Optional[str] = Query(None, max_length=40),
+    limit: int = Query(500, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> SavedResultPage:
+    """Every profile analysed in the retention window, newest first.
+
+    Survives a reload and a restart, which the job endpoint does not. A
+    result that has passed its expiry is never returned even if MongoDB's
+    TTL monitor has not physically removed it yet -- see the repository's
+    own note on why the index alone is not enough.
+    """
+    docs, total = await results_db.find(
+        org_id=org_id.strip(), platform=(platform or "").strip(),
+        limit=limit, offset=offset,
+    )
+    return SavedResultPage(
+        items=[AnalysedProfile(**{k: v for k, v in d.items()
+                                  if k in AnalysedProfile.model_fields})
+               for d in docs],
+        total=total, retention_hours=results_db.RETENTION_HOURS,
+    )
+
+
+@router.get("/results/{result_id}/screenshot", response_class=Response,
+            responses={200: {"content": {"image/png": {}}, "description": "PNG evidence capture"}},
+            summary="Evidence screenshot for one saved result")
+async def saved_screenshot(result_id: str, download: bool = False):
+    """The same capture the job endpoint serves, addressed by `result_id`
+    and read from storage rather than from the job's memory -- so it is
+    still there after a restart, for as long as the result is."""
+    data = await results_db.get_screenshot(result_id)
+    if data is None:
+        raise NotFoundError(
+            f"no saved screenshot for result {result_id!r} -- it may have passed its "
+            f"{results_db.RETENTION_HOURS}h retention, been deleted, or that URL was "
+            "never successfully reached"
+        )
+    disposition = "attachment" if download else "inline"
+    return Response(
+        content=data, media_type="image/png",
+        headers={
+            "Content-Disposition": f'{disposition}; filename="{result_id}.png"',
+            "Cache-Control": "private, max-age=60",
+        },
+    )
+
+
+@router.post("/results/delete", response_model=DeleteResultsOutcome,
+             summary="Delete saved results -- a selection, or all of them")
+async def delete_results(body: DeleteResults) -> DeleteResultsOutcome:
+    """Irreversible. Each result's evidence screenshot goes with it, so
+    nothing is left holding storage that no row points at any more.
+
+    Deleting is only ever early: everything here expires on its own within
+    the retention window regardless. This exists for the analyst who has
+    finished with a batch and does not want to look at it for the rest of
+    the day."""
+    if body.all:
+        return DeleteResultsOutcome(deleted=await results_db.delete_all(org_id=body.org_id.strip()))
+    if not body.ids:
+        raise ValidationError("pass `ids` to delete a selection, or `all: true` to delete everything")
+    return DeleteResultsOutcome(deleted=await results_db.delete_many(body.ids))
 
 
 @router.post("/export/xlsx", response_class=Response,

@@ -92,9 +92,80 @@ function matchLevelOf(p: { name_score: number | null; name_exact_run: boolean | 
   return "low";
 }
 
+// ---- First-seen window -----------------------------------------------
+//
+// A named window that always ends NOW -- "the last N days" -- rather than an
+// arbitrary pair of dates. Only the lower bound is ever sent; there is no
+// upper one to get wrong.
+//
+// THE WINDOW STARTS AT LOCAL MIDNIGHT, not N*24h before this instant, and
+// that is what makes it usable. A cutoff measured from "now" slides with
+// every passing second, so the same filter answers differently at 09:00 and
+// 17:00 and the list quietly reshuffles under an analyst mid-triage. Anchored
+// to midnight it is one fixed window for the whole day, and it rolls over on
+// its own (the minute tick further down re-renders, and these helpers read
+// the clock fresh).
+//
+// Midnight LOCAL, specifically: `first_seen` is stored in UTC, and the
+// analyst is in IST. Resolving the boundary in the browser is what makes
+// "the last 2 days" mean two days as they are lived here rather than two
+// days offset by 5.5 hours -- at IST that gap is a whole evening's sweeps
+// landing in the wrong window.
+
+function pad(n: number): string {
+  return String(n).padStart(2, "0");
+}
+
+/** `YYYY-MM-DD` for a Date, read in the browser's own timezone. */
+function toDayInput(d: Date): string {
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+/** Midnight LOCAL at the start of `day`, as the UTC instant the API takes. */
+function dayStartIso(day: string): string | undefined {
+  const [y, m, d] = day.split("-").map(Number);
+  if (!y || !m || !d) return undefined;
+  return new Date(y, m - 1, d).toISOString();
+}
+
+/** `YYYY-MM-DD` for `n` days before today, local. 0 is today. Passing the
+    subtraction to setDate is deliberate -- it rolls month and year ends on
+    its own, so a 90-day window spanning New Year needs no special case. */
+function daysAgoInput(n: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  return toDayInput(d);
+}
+
+// The windows the dropdown offers. `days` COUNTS TODAY as one of them, so
+// "2 Days" is today and yesterday, not today and the two before it -- the
+// reading an analyst means by "the last two days". Months are 30/60/90 days
+// rather than calendar months: a calendar month back from the 31st has no
+// answer everyone agrees on, and 30 days is what a report of "the last
+// month" is understood to cover anyway.
+const DATE_WINDOWS: { days: number; label: string }[] = [
+  { days: 1, label: "Last 1 Day" },
+  { days: 2, label: "Last 2 Days" },
+  { days: 5, label: "Last 5 Days" },
+  { days: 7, label: "Last 1 Week" },
+  { days: 30, label: "Last 1 Month" },
+  { days: 60, label: "Last 2 Months" },
+  { days: 90, label: "Last 3 Months" },
+];
+
 function isProfileNew(p: DiscoveredProfile): boolean {
-  if (!p.first_seen) return false;
-  const t = new Date(p.first_seen).getTime();
+  const tSeen = p.first_seen ? new Date(p.first_seen).getTime() : NaN;
+  const tAvatar = p.avatar_changed_at ? new Date(p.avatar_changed_at).getTime() : NaN;
+  const seenNew = !isNaN(tSeen) && Date.now() - tSeen < NEW_WINDOW_MS;
+  const avatarNew = !isNaN(tAvatar) && Date.now() - tAvatar < NEW_WINDOW_MS;
+  return seenNew || avatarNew;
+}
+
+// True when the profile's display picture was changed recently enough to
+// warrant a visual indicator — the same 24h window the New/Old split uses.
+function isAvatarChangedRecent(p: DiscoveredProfile): boolean {
+  if (!p.avatar_changed_at) return false;
+  const t = new Date(p.avatar_changed_at).getTime();
   return !isNaN(t) && Date.now() - t < NEW_WINDOW_MS;
 }
 
@@ -102,8 +173,9 @@ function isProfileNew(p: DiscoveredProfile): boolean {
 // that's still inside its 24h window reads "validated + new", not just
 // "validated".
 function statusLabel(p: DiscoveredProfile): string {
-  if (p.status === "validated") return isProfileNew(p) ? "validated + new" : "validated";
-  return isProfileNew(p) ? "new" : "old";
+  const dpTag = isAvatarChangedRecent(p) ? " (DP changed)" : "";
+  if (p.status === "validated") return isProfileNew(p) ? `validated + new${dpTag}` : "validated";
+  return isProfileNew(p) ? `new${dpTag}` : "old";
 }
 
 function exportRow(p: DiscoveredProfile): Record<string, unknown> {
@@ -112,12 +184,13 @@ function exportRow(p: DiscoveredProfile): Record<string, unknown> {
     "Display Name": p.display_name,
     Username: p.username,
     URL: p.url,
-    Status: p.status,
+    Status: statusLabel(p),
     Verified: p.verified ? "Yes" : "No",
     Followers: p.followers ?? "",
     "Match Score": p.name_score ?? "",
     Keywords: p.keywords.join("; "),
     "First Seen": p.first_seen ?? "",
+    "Avatar Changed": p.avatar_changed_at ?? "",
   };
 }
 
@@ -170,6 +243,27 @@ function LogoMatchBadge({ p }: { p: DiscoveredProfile }) {
   );
 }
 
+// The genuine account. Deliberately the calmest badge on the card: a real
+// brand account is the one thing here that is NOT a threat, so it should
+// read as "resolved", not as another alarm competing with the risk chips.
+function OriginalBadge({ p }: { p: DiscoveredProfile }) {
+  if (!p.is_original) return null;
+  return (
+    <span
+      title="Marked as the genuine account -- the real brand or person, not an impersonation. Permanent: re-discovery never clears it."
+      style={{
+        display: "inline-flex", alignItems: "center", gap: "4px",
+        padding: "2px 7px", borderRadius: "10px", fontSize: "9px", fontWeight: 800,
+        letterSpacing: "0.3px", whiteSpace: "nowrap",
+        background: "rgba(54,181,160,0.16)", color: "var(--success, #36B5A0)",
+        border: "1px solid rgba(54,181,160,0.45)",
+      }}
+    >
+      ✓ ORIGINAL
+    </span>
+  );
+}
+
 function Avatar({ p }: { p: DiscoveredProfile }) {
   const label = p.display_name || p.username || "?";
   return (
@@ -187,13 +281,14 @@ function Avatar({ p }: { p: DiscoveredProfile }) {
 }
 
 function ProfileCard({
-  p, selected, onToggleSelected, onValidate, onUnvalidate, busy,
+  p, selected, onToggleSelected, onValidate, onUnvalidate, onToggleOriginal, busy,
 }: {
   p: DiscoveredProfile;
   selected: boolean;
   onToggleSelected: (id: string) => void;
   onValidate?: (id: string) => void;
   onUnvalidate?: (id: string) => void;
+  onToggleOriginal?: (id: string, next: boolean) => void;
   busy?: boolean;
 }) {
   // Clicking anywhere on the card selects it -- the avatar/name/platform
@@ -233,6 +328,24 @@ function ProfileCard({
             </span>
           )}
           <LogoMatchBadge p={p} />
+          <OriginalBadge p={p} />
+          {isAvatarChangedRecent(p) && (
+            <span
+              className="card-badge-top-left"
+              title={`Profile picture changed: ${new Date(p.avatar_changed_at!).toLocaleString()}`}
+              style={{
+                position: "static",
+                background: "linear-gradient(135deg, #ff6b6b 0%, #ee5253 100%)",
+                color: "#fff",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "4px",
+                boxShadow: "0 2px 6px rgba(238, 82, 83, 0.4)",
+              }}
+            >
+              <span style={{ fontSize: "10px" }}>🔄</span> DP Changed
+            </span>
+          )}
         </div>
         {p.name_score != null && (() => {
           const level = matchLevelOf(p);
@@ -283,6 +396,25 @@ function ProfileCard({
             >
               ↩ Move to Old
             </button>
+            {onToggleOriginal && (
+              <button
+                disabled={busy}
+                title={p.is_original
+                  ? "Un-mark: this is not the genuine account after all"
+                  : "This is the REAL brand/person, not an impersonation. Permanent -- "
+                    + "re-discovery will never flag it as an unresolved candidate again."}
+                onClick={(e) => { stop(e); onToggleOriginal(p.id, !p.is_original); }}
+                style={{
+                  padding: "5px 12px", borderRadius: "8px", cursor: "pointer",
+                  fontSize: "12px", fontWeight: 600,
+                  border: `1px solid ${p.is_original ? "var(--success, #36B5A0)" : "var(--border-color)"}`,
+                  background: p.is_original ? "rgba(54,181,160,0.14)" : "transparent",
+                  color: p.is_original ? "var(--success, #36B5A0)" : "var(--text-muted)",
+                }}
+              >
+                {p.is_original ? "✓ Original" : "Mark as Original"}
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -373,6 +505,12 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
   // logos. Server-side, so it survives pagination; inert for a client that
   // has uploaded none.
   const [logoOnly, setLogoOnly] = useState(false);
+  // null = show everything, true = only the genuine accounts, false = hide
+  // them. Hiding is the one most analysts want day to day: the real account
+  // is resolved, and leaving it in the list is a row they re-read forever.
+  const [originalFilter, setOriginalFilter] = useState<boolean | null>(null);
+  // How far back to look, in days counting today. 0 = every date.
+  const [windowDays, setWindowDays] = useState(0);
   const [pendingItems, setPendingItems] = useState<DiscoveredProfile[] | null>(null);
   // True totals for both age tabs, from the server, independent of which one
   // is open and of how the current page happens to be filled.
@@ -437,10 +575,18 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
     return () => clearTimeout(t);
   }, [searchInput]);
 
+  // The window's lower bound, resolved to an instant (see the helpers up
+  // top). A plain string on purpose so it can go straight into a dependency
+  // array -- a Date would be a new identity on every render and would re-fire
+  // both fetches forever. It is stable for the whole local day, so selecting
+  // a window costs exactly one refetch rather than one per render.
+  const seenFrom = windowDays ? dayStartIso(daysAgoInput(windowDays - 1)) : undefined;
+  const activeWindow = DATE_WINDOWS.find((w) => w.days === windowDays);
+
   // Any filter (or tab) changing resets to page 1.
   useEffect(() => {
     setOffset(0);
-  }, [tab, validatedAge, logoOnly, keywordFilter, search, pageSize, platform]);
+  }, [tab, validatedAge, logoOnly, originalFilter, seenFrom, keywordFilter, search, pageSize, platform]);
 
   const loadPending = useCallback(async () => {
     setLoadingPending(true);
@@ -453,6 +599,8 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
         // badges truthful, so it asks for one row and reads `counts`.
         age: tab === "validated" ? undefined : tab,
         logo_matched: logoOnly || undefined,
+        is_original: originalFilter ?? undefined,
+        first_seen_from: seenFrom,
         limit: tab === "validated" ? 1 : pageSize,
         offset: tab === "validated" ? 0 : offset,
       });
@@ -464,7 +612,7 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
     } finally {
       setLoadingPending(false);
     }
-  }, [groupId, platform, keywordFilter, search, matchLevel, entityType, tab, pageSize, offset, logoOnly]);
+  }, [groupId, platform, keywordFilter, search, matchLevel, entityType, tab, pageSize, offset, logoOnly, originalFilter, seenFrom]);
 
   const loadValidated = useCallback(async () => {
     setLoadingValidated(true);
@@ -477,6 +625,13 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
         // analyst is not looking at is still the true total.
         validated_age: validatedAge,
         logo_matched: logoOnly || undefined,
+        is_original: originalFilter ?? undefined,
+        // Deliberately applied here too, on a tab whose OWN split reads
+        // validated_at: the two answer different questions ("when did we
+        // find it" vs "when did we decide"), and an analyst reporting on a
+        // sweep wants the profiles that sweep discovered, whenever they
+        // happened to get triaged.
+        first_seen_from: seenFrom,
         limit: pageSize, offset,
       });
       setValidatedPage(res);
@@ -489,7 +644,7 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
     } finally {
       setLoadingValidated(false);
     }
-  }, [groupId, platform, keywordFilter, search, pageSize, offset, validatedAge, logoOnly]);
+  }, [groupId, platform, keywordFilter, search, pageSize, offset, validatedAge, logoOnly, originalFilter, seenFrom]);
 
   // Imperative use only (e.g. after a bulk delete) -- NOT an effect
   // dependency anywhere, see the two load effects below for why: bundling
@@ -539,7 +694,7 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
   useEffect(() => {
     setSelected(new Set());
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [groupId, platform, keywordFilter, search, tab, refreshKey]);
+  }, [groupId, platform, keywordFilter, search, tab, refreshKey, seenFrom]);
 
   // Individual/Domain classification, from this client's OWN record in
   // the database -- its two curated keyword lists, matched against each
@@ -702,6 +857,24 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
     }
   };
 
+  // Marking is independent of triage, so it does NOT move the profile out of
+  // whatever tab it is in -- it stays put and gains a badge. The list is
+  // reloaded rather than patched locally because an "originals" filter may
+  // be active, in which case the row genuinely belongs somewhere else now.
+  const onToggleOriginal = async (id: string, next: boolean) => {
+    setBusyId(id);
+    try {
+      await discoveryApi.setProfileOriginal([id], next);
+      toast.success(next ? "Marked as the genuine account" : "No longer marked as original");
+      await loadValidated();
+      await loadPending();
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setBusyId("");
+    }
+  };
+
   const onUnvalidateOne = async (id: string) => {
     setBusyId(id);
     try {
@@ -763,6 +936,14 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
       const res = await discoveryApi.listProfiles({
         group_id: groupId, platform: platform || undefined, status: "validated",
         keyword: keywordFilter || undefined, search: search || undefined,
+        // "All" means everything matching the CURRENT filters, so the date
+        // window belongs here as much as the keyword does -- copying a wider
+        // set than the screen shows is the specific way this button betrays
+        // an analyst who thinks they scoped it.
+        first_seen_from: seenFrom,
+        logo_matched: logoOnly || undefined,
+        is_original: originalFilter ?? undefined,
+        validated_age: validatedAge,
         limit: BULK_FETCH_CAP,
       });
       await copyUrls(res.items.map((p) => p.url), "validated");
@@ -847,7 +1028,22 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
       // as "no client behind this batch" -- same fallback as a pasted-URL
       // analysis job.
       const client = findClient(groupId);
-      const res = await discoveryApi.analyseValidated({ group_id: groupId, ids, domain: client?.domain });
+      const res = await discoveryApi.analyseValidated({
+        group_id: groupId, ids, domain: client?.domain,
+        // SCOPED TO THE PLATFORM RAIL'S SELECTION. Omitted, the backend
+        // analyses every platform's validated profiles -- while the button
+        // sits under a count that IS platform-scoped, so picking Facebook
+        // and pressing it showed "12" and then scraped Twitter, Instagram,
+        // YouTube and Telegram as well. An unbounded scrape nobody asked
+        // for, under live sessions, on every platform at once.
+        //
+        // Empty means the rail is on All Platforms, and undefined is how
+        // the API spells "every platform" -- so that case is unchanged.
+        // Only ever applied to `mode === "all"`: an explicit `ids` list is
+        // already exactly what the analyst ticked, and narrowing it again
+        // by platform could silently drop rows they had selected.
+        platform: mode === "all" ? (platform || undefined) : undefined,
+      });
       toast.success(`Analysis started: ${res.accepted} profile(s)`);
       onAnalyseStarted(res.job_id);
     } catch (e) {
@@ -886,135 +1082,11 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
 
   return (
     <div style={{ marginTop: "24px" }}>
-      {/* Tabs -- New Profiles / Old Profiles / Validated Profiles. New and
-          Old are the same `pending` status, split client-side by
-          first_seen age (24h); nothing moves them, that split is just
-          re-evaluated live every time this loads. */}
-      <div className="status-summary-row" style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-        {([
-          ["new", "🆕 New Profiles", "var(--cyan-bright, var(--cyan))", ageCounts.new],
-          ["old", "🕓 Old Profiles", "var(--purple)", ageCounts.old],
-          // The PARENT badge is both halves, not the open one. `validatedPage.total`
-          // is scoped to the active sub-tab now that the split is a server
-          // filter, so using it here read "Validated Profiles 3" while six
-          // profiles were validated -- the tab under-reporting its own size.
-          ["validated", "✅ Validated Profiles", "var(--success, #12B76A)",
-            validatedAgeCounts.new + validatedAgeCounts.old],
-        ] as const).map(([t, label, color, count]) => (
-          <button
-            key={t}
-            className={`status-chip ${tab === t ? "on" : ""}`}
-            onClick={() => setTab(t)}
-            style={{
-              display: "flex", alignItems: "center", gap: "8px", padding: "6px 14px", borderRadius: "20px",
-              border: `1px solid ${tab === t ? color : "var(--border-color)"}`,
-              background: tab === t ? "var(--bg-surface)" : "transparent",
-              cursor: "pointer", fontSize: "12px", fontWeight: 600,
-              color: tab === t ? color : "var(--text-muted)",
-            }}
-          >
-            <span>{label}</span>
-            <span style={{ background: tab === t ? color : "var(--bg-inner)", color: tab === t ? "#fff" : "var(--text-dim)", padding: "2px 8px", borderRadius: "12px", fontSize: "11px", fontWeight: 700 }}>
-              {count}
-            </span>
-          </button>
-        ))}
-      </div>
-
-      {/* Logo match filter. Applies to whichever tab is open, and is
-          server-side so it survives paging. Rendered unconditionally --
-          a client with no reference logos simply gets an empty result and
-          the analyst learns the feature exists. */}
-      <div style={{ marginTop: "10px" }}>
-        <button
-          type="button"
-          className={`status-chip ${logoOnly ? "on" : ""}`}
-          onClick={() => setLogoOnly((v) => !v)}
-          title={
-            "Show only profiles whose picture matches one of this client's "
-            + "reference logos. Attach logos to keywords on the Clients page."
-          }
-          style={{
-            display: "inline-flex", alignItems: "center", gap: "8px",
-            padding: "5px 12px", borderRadius: "20px", cursor: "pointer",
-            fontSize: "11px", fontWeight: 600,
-            border: `1px solid ${logoOnly ? "var(--danger, #e95053)" : "var(--border-color)"}`,
-            background: logoOnly ? "var(--bg-surface)" : "transparent",
-            color: logoOnly ? "var(--danger, #e95053)" : "var(--text-muted)",
-          }}
-        >
-          <span>🎯 Logo match only</span>
-        </button>
-      </div>
-
-      {/* Validated's own two halves, split by WHEN IT WAS VALIDATED rather
-          than when it was discovered. Server-filtered (`validated_age`), so
-          unlike New/Old above this one survives pagination and needs no
-          client-side re-slicing. A profile crosses from New Validated to Old
-          Validated 24h after the decision, on its own. */}
-      {tab === "validated" && (
-        <div
-          className="status-summary-row"
-          style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginTop: "10px", paddingLeft: "4px" }}
-        >
-          {([
-            ["new", "🆕 New Validated", "var(--cyan-bright, var(--cyan))", validatedAgeCounts.new],
-            ["old", "🕓 Old Validated", "var(--purple)", validatedAgeCounts.old],
-          ] as const).map(([v, label, color, count]) => (
-            <button
-              key={v}
-              className={`status-chip ${validatedAge === v ? "on" : ""}`}
-              onClick={() => setValidatedAge(v)}
-              title={
-                v === "new"
-                  ? "Validated in the last 24 hours"
-                  : "Validated more than 24 hours ago (and anything validated before this was tracked)"
-              }
-              style={{
-                display: "flex", alignItems: "center", gap: "8px", padding: "5px 12px", borderRadius: "20px",
-                border: `1px solid ${validatedAge === v ? color : "var(--border-color)"}`,
-                background: validatedAge === v ? "var(--bg-surface)" : "transparent",
-                cursor: "pointer", fontSize: "11px", fontWeight: 600,
-                color: validatedAge === v ? color : "var(--text-muted)",
-              }}
-            >
-              <span>{label}</span>
-              <span style={{
-                background: validatedAge === v ? color : "var(--bg-inner)",
-                color: validatedAge === v ? "#fff" : "var(--text-dim)",
-                padding: "2px 7px", borderRadius: "12px", fontSize: "10px", fontWeight: 700,
-              }}>
-                {count}
-              </span>
-            </button>
-          ))}
-        </div>
-      )}
-
-      {/* Click a card/row to select it; validate whatever's selected.
-          New/Old only -- Validated already has its own selected-scoped
-          actions (Analyse Selected, Copy, Export) below. */}
-      {tab !== "validated" && selected.size > 0 && (
-        <div style={{ marginTop: "12px" }}>
-          <button className="btn-accept" style={{ flex: "none", padding: "8px 16px" }} disabled={bulkBusy} onClick={() => bulkValidate([...selected])}>
-            {bulkBusy ? "…" : `✅ Validate Selected (${selected.size})`}
-          </button>
-        </div>
-      )}
-
-      {/* The undo for a batch of accidental Validates -- moves the
-          selection back to pending, which reappears under New or Old on
-          its own (see unvalidate()'s comment). */}
-      {tab === "validated" && selected.size > 0 && (
-        <div style={{ marginTop: "12px" }}>
-          <button className="btn-reject" style={{ flex: "none", padding: "8px 16px" }} disabled={bulkBusy} onClick={() => bulkUnvalidate([...selected])}>
-            {bulkBusy ? "…" : `↩ Move Selected to Old (${selected.size})`}
-          </button>
-        </div>
-      )}
-
-      {/* Filter toolbar */}
-      <div style={{ display: "flex", gap: "8px", marginTop: "12px", flexWrap: "wrap", alignItems: "center" }}>
+      {/* ── Filter Toolbar (top row) ───────────────────────────────── */}
+      {/* All filters sit together: Keywords, Match Type, Match Level,
+          Entity Type, Logo Match toggle, Search, and view mode toggles.
+          Logo Match moved here from its former solo row. */}
+      <div className="discovery-filter-toolbar">
         <select value={keywordFilter} onChange={(e) => setKeywordFilter(e.target.value)} className="select-filter" title="Only show profiles found by this exact keyword">
           <option value="">All Keywords</option>
           {keywordOptions.map(([kw, n]) => (
@@ -1045,6 +1117,63 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
             <option value="group">Groups Only</option>
           </select>
         )}
+
+        {/* How far back to look, by when each profile was FIRST DISCOVERED.
+            A dropdown of named windows rather than a pair of date pickers:
+            an analyst asks "what came in this week", not "what came in
+            between the 1st and the 7th", and a dropdown states the current
+            answer in one glance the way the filters either side of it do.
+            Applies to all three tabs -- first_seen is on every profile
+            whatever its triage status -- and it is a server filter, so it
+            survives pagination and the tab badges are counted against it. */}
+        <select
+          value={windowDays}
+          onChange={(e) => setWindowDays(Number(e.target.value))}
+          className="select-filter"
+          title="Show only profiles first discovered inside this window. Each window counts today as its first day and is measured from midnight, so it does not shift under you as the day goes on."
+        >
+          <option value={0}>All Dates</option>
+          {DATE_WINDOWS.map((w) => (
+            <option key={w.days} value={w.days}>{w.label}</option>
+          ))}
+        </select>
+
+        {/* Logo match filter -- moved from its old standalone row into
+            the filter toolbar where it logically belongs. Still applies
+            to whichever tab is open, still server-side. */}
+        <button
+          type="button"
+          className={`logo-toggle-chip ${logoOnly ? "active" : ""}`}
+          onClick={() => setLogoOnly((v) => !v)}
+          title={
+            "Show only profiles whose picture matches one of this client's "
+            + "reference logos. Attach logos to keywords on the Clients page."
+          }
+        >
+          <span>🎯 Logo Match</span>
+        </button>
+
+        {/* Three states rather than a checkbox: an analyst either wants the
+            genuine accounts out of the way, or wants to see exactly which
+            ones are marked. Both are one click. */}
+        {([[null, "All"], [true, "✓ Originals"], [false, "Hide Originals"]] as const).map(
+          ([v, label]) => (
+            <button
+              key={label}
+              type="button"
+              className={`logo-toggle-chip ${originalFilter === v ? "active" : ""}`}
+              onClick={() => setOriginalFilter(v)}
+              title={
+                v === null ? "Show every profile"
+                : v ? "Only profiles marked as the genuine account"
+                : "Hide the genuine accounts -- they are resolved, not threats"
+              }
+            >
+              <span>{label}</span>
+            </button>
+          ),
+        )}
+
         <div style={{ position: "relative", flex: 1, minWidth: "160px" }}>
           <input
             value={searchInput}
@@ -1175,6 +1304,77 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
         </button>
       </div>
 
+      {/* ── Sliding Underline Tab Bar ──────────────────────────────── */}
+      {/* Clean tab strip with colored underline indicator per tab.
+          Same three tabs: New Profiles / Old Profiles / Validated Profiles.
+          When Validated is active, sub-pills (New Validated / Old Validated)
+          dock inline beside it with a subtle vertical separator. */}
+      <div className="discovery-tab-bar">
+        {([
+          ["new", "New Profiles", "var(--cyan-bright, var(--cyan))", ageCounts.new],
+          ["old", "Old Profiles", "var(--purple)", ageCounts.old],
+          ["validated", "Validated Profiles", "var(--success, #12B76A)",
+            validatedAgeCounts.new + validatedAgeCounts.old],
+        ] as const).map(([t, label, dotColor, count]) => (
+          <button
+            key={t}
+            className={`discovery-tab-item ${tab === t ? "active" : ""}`}
+            data-tab={t}
+            onClick={() => setTab(t)}
+          >
+            <span className="discovery-tab-dot" style={{ background: dotColor }} />
+            <span>{label}</span>
+            <span className="discovery-tab-badge">{count}</span>
+          </button>
+        ))}
+
+        {/* Validated sub-tabs: docked inline, separated by a thin border */}
+        {tab === "validated" && (
+          <div className="discovery-sub-tabs">
+            {([
+              ["new", "🆕 New", validatedAgeCounts.new],
+              ["old", "🕓 Older", validatedAgeCounts.old],
+            ] as const).map(([v, label, count]) => (
+              <button
+                key={v}
+                className={`discovery-sub-tab ${validatedAge === v ? "active" : ""}`}
+                onClick={() => setValidatedAge(v)}
+                title={
+                  v === "new"
+                    ? "Validated in the last 24 hours"
+                    : "Validated more than 24 hours ago (and anything validated before this was tracked)"
+                }
+              >
+                <span>{label}</span>
+                <span className="discovery-tab-badge">{count}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Click a card/row to select it; validate whatever's selected.
+          New/Old only -- Validated already has its own selected-scoped
+          actions (Analyse Selected, Copy, Export) below. */}
+      {tab !== "validated" && selected.size > 0 && (
+        <div style={{ marginTop: "12px" }}>
+          <button className="btn-accept" style={{ flex: "none", padding: "8px 16px" }} disabled={bulkBusy} onClick={() => bulkValidate([...selected])}>
+            {bulkBusy ? "…" : `✅ Validate Selected (${selected.size})`}
+          </button>
+        </div>
+      )}
+
+      {/* The undo for a batch of accidental Validates -- moves the
+          selection back to pending, which reappears under New or Old on
+          its own (see unvalidate()'s comment). */}
+      {tab === "validated" && selected.size > 0 && (
+        <div style={{ marginTop: "12px" }}>
+          <button className="btn-reject" style={{ flex: "none", padding: "8px 16px" }} disabled={bulkBusy} onClick={() => bulkUnvalidate([...selected])}>
+            {bulkBusy ? "…" : `↩ Move Selected to Old (${selected.size})`}
+          </button>
+        </div>
+      )}
+
       {tab === "validated" && (
         <div style={{ display: "flex", gap: "10px", marginTop: "14px", flexWrap: "wrap" }}>
           <button
@@ -1182,8 +1382,13 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
             style={{ width: "auto", margin: 0, padding: "10px 18px" }}
             disabled={analysing !== null || !total}
             onClick={() => analyse("all")}
+            title={platform
+              ? `Analyse every validated ${platform} profile for this client`
+              : "Analyse every validated profile for this client, on every platform"}
           >
-            <ZapIcon size={14} /> {analysing === "all" ? "Starting…" : "Analyse All Validated"}
+            <ZapIcon size={14} /> {analysing === "all"
+              ? "Starting…"
+              : platform ? `Analyse All Validated (${platform})` : "Analyse All Validated"}
           </button>
           <button
             className="btn-cyber-primary"
@@ -1216,13 +1421,27 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, onAnalyseS
       {!loading && !displayed.length && (
         <div style={{ padding: "40px", textAlign: "center", color: "var(--text-dim)" }}>
           No {tab === "new" ? "new" : tab === "old" ? "old" : "validated"} profiles match these filters.
+          {/* Named explicitly because the date window is the one filter that
+              can be empty for a reason that is not about the data, and
+              without saying so an empty list reads as "the sweep found
+              nothing". The Old tab is the sharp case: it means "first seen
+              more than 24h ago", which a one-day window cannot contain by
+              definition. */}
+          {activeWindow && (
+            <div style={{ marginTop: "8px", fontSize: "12px" }}>
+              Showing {activeWindow.label.toLowerCase()} only
+              {tab === "old" && windowDays <= 1
+                && " — and the Old tab means first seen more than 24 hours ago, which a one-day window cannot contain"}
+              .
+            </div>
+          )}
         </div>
       )}
 
       {viewMode === "cards" ? (
         <div className="profile-grid-container" style={{ marginTop: "16px" }}>
           {displayed.map((p) => (
-            <ProfileCard key={p.id} p={p} selected={selected.has(p.id)} onToggleSelected={toggle} onValidate={onValidateHandler} onUnvalidate={onUnvalidateHandler} busy={busyId === p.id} />
+            <ProfileCard key={p.id} p={p} selected={selected.has(p.id)} onToggleSelected={toggle} onValidate={onValidateHandler} onUnvalidate={onUnvalidateHandler} onToggleOriginal={tab === "validated" ? onToggleOriginal : undefined} busy={busyId === p.id} />
           ))}
         </div>
       ) : (

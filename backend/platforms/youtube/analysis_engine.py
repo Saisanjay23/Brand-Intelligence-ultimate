@@ -20,6 +20,7 @@ from typing import Optional
 from urllib.parse import unquote, urlparse
 
 from backend.shared.avatars import (YOUTUBE_GENERATED_PREFIX,
+                                    hd_picture_url,
                                     is_generated_avatar)
 from backend.shared.models.row import Row
 from backend.shared.text import name_score, normalized_host, parse_normalized_url
@@ -251,7 +252,7 @@ class Scraper:
         thumbs = snip.get("thumbnails") or {}
         best = thumbs.get("high") or thumbs.get("medium") or thumbs.get("default") or {}
         if uri := best.get("url"):
-            row.profile_pic_url = uri
+            row.profile_pic_url = hd_picture_url(uri)
             row.has_custom_pic = not bool(RE_DEFAULT_PIC.search(uri))
             row.mark("logo", "api")
 

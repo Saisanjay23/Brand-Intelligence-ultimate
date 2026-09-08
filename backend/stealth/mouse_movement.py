@@ -159,3 +159,52 @@ async def natural_scroll_down(page, distance: int = 800, to_bottom: bool = False
         except Exception:
             pass
 
+
+async def hover_element_safely(page, selector: str) -> bool:
+    """Dispatches a smooth Bezier mouse movement to a visible element matching selector.
+
+    Satisfies hover and pointerenter/pointerover event heuristics on single-page apps
+    (such as Twitter/X tweet cards or user cells) without clicking.
+    """
+    if not page:
+        return False
+    try:
+        if hasattr(page, "is_closed") and page.is_closed():
+            return False
+    except Exception:
+        pass
+
+    try:
+        el = await page.query_selector(selector)
+        if not el:
+            return False
+        box = await el.bounding_box()
+        if not box or box["width"] <= 0 or box["height"] <= 0:
+            return False
+
+        target_x = box["x"] + box["width"] * random.uniform(0.2, 0.8)
+        target_y = box["y"] + box["height"] * random.uniform(0.2, 0.8)
+
+        # Move mouse using Bezier curves if page.mouse exists
+        if hasattr(page, "mouse") and hasattr(page.mouse, "move"):
+            curr_x, curr_y = random.randint(200, 500), random.randint(200, 500)
+            cp1_x = curr_x + (target_x - curr_x) * random.uniform(0.2, 0.5) + random.uniform(-40, 40)
+            cp1_y = curr_y + (target_y - curr_y) * random.uniform(0.2, 0.5) + random.uniform(-40, 40)
+            cp2_x = curr_x + (target_x - curr_x) * random.uniform(0.6, 0.8) + random.uniform(-40, 40)
+            cp2_y = curr_y + (target_y - curr_y) * random.uniform(0.6, 0.8) + random.uniform(-40, 40)
+            steps = random.randint(10, 20)
+            for i in range(1, steps + 1):
+                t = i / steps
+                eased_t = math.sin(t * math.pi / 2)
+                x = cubic_bezier(eased_t, curr_x, cp1_x, cp2_x, target_x)
+                y = cubic_bezier(eased_t, curr_y, cp1_y, cp2_y, target_y)
+                await page.mouse.move(x, y)
+                await asyncio.sleep(random.uniform(0.005, 0.015))
+            # Dwell briefly over the hovered element
+            await asyncio.sleep(random.uniform(0.1, 0.25))
+            return True
+    except Exception:
+        pass
+    return False
+
+

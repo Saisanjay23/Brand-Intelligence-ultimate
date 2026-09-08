@@ -1,6 +1,22 @@
 """In-memory store for analysis results. RAM only -- nothing here is ever
 written to MongoDB.
 
+    UNUSED AS OF THE 24-HOUR RESULT STORE. Nothing imports this module any
+    more. Analysis results are persisted to MongoDB with a TTL now, see
+    database/repositories/analysis_result_repository.py, which took over the
+    ageing-out job this was doing.
+
+    It is worth knowing WHY this is safe to delete rather than something to
+    reconnect: even before that change, this store was WRITE-ONLY. The
+    runner put every scored row into it and no code path ever read one back,
+    so it held a second copy of every evidence screenshot -- the largest
+    thing analysis produces -- purely as ballast, under a 512 MB budget.
+    Nothing observable is lost by removing it; the file is left in place
+    only because deleting a module is the caller's decision, not a side
+    effect of adding a feature.
+
+    Everything below describes the design that used to be true.
+
 THE STORAGE SPLIT THIS ENFORCES
     discovery -> MongoDB  (database/repositories/profile_repository.py,
                            phase=PHASE_DISCOVERY, DISCOVERY_FIELDS)

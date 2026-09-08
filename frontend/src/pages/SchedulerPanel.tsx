@@ -18,7 +18,7 @@
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { toast } from "react-hot-toast";
 
-import type { Client } from "../api/types";
+import type { Client, PlatformState } from "../api/types";
 import { refresh as refreshDirectory, useClientDirectory } from "../services/clientDirectory";
 import {
   clearQueue,
@@ -39,6 +39,7 @@ import {
 } from "../services/scheduleRunner";
 import { PlayIcon, StopIcon, SearchIcon, AlertTriangleIcon } from "../components/AppIcons";
 import { PlatformIcon } from "../components/PlatformIcon";
+import { SchedulerRunScope } from "../components/SchedulerRunScope";
 
 // Drag payloads are prefixed so one drop handler can tell "a new client from
 // the left pane" from "an entry being reordered within the queue".
@@ -124,7 +125,7 @@ function useNowTick(active: boolean): number {
   return now;
 }
 
-export function SchedulerPanel() {
+export function SchedulerPanel({ platforms }: { platforms: PlatformState[] }) {
   const state = useSyncExternalStore(subscribe, getSnapshot);
   // Subscribed, not copied: a one-time copy taken on mount goes stale the
   // moment a client is created anywhere else, and never catches up.
@@ -415,6 +416,8 @@ export function SchedulerPanel() {
                   stopping={state.stopping}
                   now={now}
                   onDrop={onQueueDrop}
+                  platforms={platforms}
+                  client={clients.find((c) => c.client_id === entry.client_id)}
                 />
               ))}
             </div>
@@ -535,6 +538,8 @@ function QueueRow({
   stopping,
   now,
   onDrop,
+  platforms,
+  client,
 }: {
   entry: ScheduleEntry;
   index: number;
@@ -542,6 +547,10 @@ function QueueRow({
   stopping: boolean;
   now: number;
   onDrop: (e: React.DragEvent, targetEntryId?: string) => void;
+  platforms: PlatformState[];
+  // undefined when the client was deleted from the directory after being
+  // queued -- the row still renders, it just has no scope to configure.
+  client?: Client;
 }) {
   const [over, setOver] = useState(false);
   // A cancel is only honoured BETWEEN sweeps server-side (see
@@ -601,6 +610,22 @@ function QueueRow({
           )}
         </div>
         <PlatformChips entry={entry} />
+
+        {/* What this client will actually sweep. Editable while it sits in
+            the queue AND while a run is in progress -- a change lands on the
+            client record, and the runner re-reads that record when the
+            client's turn comes up, so an edit made mid-queue still applies.
+            Disabled only for the entry being swept right now, whose request
+            has already gone. */}
+        {client && (
+          <div style={{ marginTop: "8px" }}>
+            <SchedulerRunScope
+              client={client}
+              platforms={platforms}
+              disabled={isCurrent}
+            />
+          </div>
+        )}
       </span>
 
       {elapsed && (

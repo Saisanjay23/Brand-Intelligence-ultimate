@@ -7,14 +7,25 @@
  * no separate "quick" analysis: analysis IS the paste-URLs tool, and it is
  * independent of discovery in both directions.
  *
- * Results are held in the backend's memory only and are never persisted,
- * so a job that has aged out (or a backend restart) returns 404 and the
- * scrape has to be re-run. Export what you need while the job is live.
+ * TWO LIFETIMES, and they are different on purpose:
+ *
+ *   a JOB    live progress. In memory on the backend, bounded, gone on
+ *            restart -- getJob returns 404 once it has aged out.
+ *   a RESULT the reading itself. Saved for 24 hours and then deleted by
+ *            MongoDB's own TTL, so it survives a reload and a restart.
+ *            listResults is what the workspace repopulates from.
+ *
+ * `result_id` is the same value in both, so a running job's rows can be
+ * laid over the saved set without a profile appearing twice.
  */
 import { blob, json, post, url } from "./httpClient";
 
 export interface AnalysisItemData {
   id: string;
+  // Stable across runs and across storage, unlike `id` (a fresh uuid per
+  // job). Identity for merging live rows with saved ones, and the address
+  // of a saved row's screenshot once its job no longer exists.
+  result_id?: string;
   url: string;
   platform: string;
   platform_name: string;
@@ -81,6 +92,12 @@ export interface AnalysisStartResponse {
   skipped: Array<{ value: string; reason: string }>;
 }
 
+export interface SavedResultPage {
+  items: AnalysisItemData[];
+  total: number;
+  retention_hours: number;
+}
+
 export const analysisApi = {
   start: async (urls: string[], targetName?: string, officialFeed?: string): Promise<AnalysisStartResponse> => {
     const res = await post("/analysis/jobs", {
@@ -103,6 +120,29 @@ export const analysisApi = {
 
   getScreenshotUrl: (jobId: string, itemId: string): string => {
     return url(`/analysis/jobs/${jobId}/items/${itemId}/screenshot`);
+  },
+
+  // Everything analysed inside the retention window, newest first. What the
+  // workspace loads on mount, so a reload no longer costs the batch.
+  listResults: async (): Promise<SavedResultPage> => {
+    const res = await fetch(url("/analysis/results?limit=1000"));
+    return json<SavedResultPage>(res);
+  },
+
+  // Addressed by result_id and served from storage, so it still resolves
+  // after the job that captured it is gone -- which is the whole reason a
+  // saved row can show its evidence at all.
+  getSavedScreenshotUrl: (resultId: string): string =>
+    url(`/analysis/results/${resultId}/screenshot`),
+
+  deleteResults: async (ids: string[]): Promise<{ deleted: number }> => {
+    const res = await post("/analysis/results/delete", { ids });
+    return json<{ deleted: number }>(res);
+  },
+
+  deleteAllResults: async (): Promise<{ deleted: number }> => {
+    const res = await post("/analysis/results/delete", { all: true });
+    return json<{ deleted: number }>(res);
   },
 
   exportXlsx: async (filename: string, rows: Record<string, any>[]): Promise<Blob> => {

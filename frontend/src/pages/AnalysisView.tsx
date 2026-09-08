@@ -20,8 +20,15 @@ import {
   clearSession,
   startAnalysis,
   useAnalysisField,
+  loadSaved,
+  mergedItems,
+  getSnapshot,
+  deleteSaved,
+  toggleSelected,
+  setSelected,
   watchJob,
 } from "../services/analysisSession";
+import { confirmAction } from "../utils/confirmAction";
 import { download, downloadBlob, rowsToCsv, rowsToTsv } from "../utils/download";
 import { formatElapsed, formatSeconds, useLiveTimer } from "../utils/timeFormat";
 
@@ -432,6 +439,36 @@ export function AnalysisView({ resumeJobId }: Props = {}) {
   // Inline edits state
   const [edits, setEdits] = useAnalysisField("edits");
 
+  // The 24h store: results the server is keeping, including batches run
+  // before this page was loaded.
+  const [saved] = useAnalysisField("saved");
+  const [savedLoading] = useAnalysisField("savedLoading");
+  const [retentionHours] = useAnalysisField("retentionHours");
+  const [selected] = useAnalysisField("selected");
+  const [deleting] = useAnalysisField("deleting");
+
+  // Everything on screen: the saved set with the live job laid over it.
+  // Recomputed from both, so a poll landing mid-job updates rows in place
+  // rather than appending duplicates of profiles already saved.
+  const allItems = useMemo(
+    () => mergedItems(getSnapshot()),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [saved, jobData],
+  );
+
+  // Pull the saved set on mount. This is what makes a reload no longer cost
+  // the day's work -- the one thing the in-memory session could never do.
+  useEffect(() => {
+    void loadSaved();
+  }, []);
+
+  // Only SETTLED rows can be ticked. A row still pending or running has a
+  // result_id but nothing saved under it yet, so deleting it would report
+  // "deleted 0" and leave it on screen -- a checkbox that does nothing is
+  // worse than one that is not offered.
+  const selectable = (it: { result_id?: string; status: string }) =>
+    Boolean(it.result_id) && (it.status === "done" || it.status === "error");
+
   const handleEdit = (itemId: string, field: string, value: string) => {
     setEdits((prev) => {
       const itemEdits = { ...(prev[itemId] || {}) };
@@ -510,7 +547,26 @@ export function AnalysisView({ resumeJobId }: Props = {}) {
 
   const handleClear = () => {
     clearSession();
-    toast.success("Workspace reset");
+    // Says what it did AND what it did not: the saved rows are still there
+    // (and still on screen), which without a word looks like Clear failed.
+    toast.success("Workspace reset — saved results kept");
+  };
+
+  const handleDelete = async (mode: "selected" | "all") => {
+    const n = mode === "all" ? allItems.length : selected.length;
+    if (!n) return;
+    const what = mode === "all"
+      ? `all ${n} saved result${n === 1 ? "" : "s"}`
+      : `${n} selected result${n === 1 ? "" : "s"}`;
+    if (!(await confirmAction(
+      `Permanently delete ${what}, evidence screenshots included?
+
+`
+      + `They would expire on their own within ${retentionHours} hours anyway. `
+      + "This cannot be undone."
+    ))) return;
+    const deleted = await deleteSaved(mode);
+    if (deleted) toast.success(`Deleted ${deleted} result${deleted === 1 ? "" : "s"}`);
   };
 
   // Filtered rows for the table -- grouped one platform after another (in
@@ -519,13 +575,13 @@ export function AnalysisView({ resumeJobId }: Props = {}) {
   // happened to finish an item in. Array.prototype.sort is stable, so
   // items within one platform keep their original relative order.
   const filteredItems = useMemo(() => {
-    if (!jobData?.items) return [];
-    const platformOrder = Object.keys(jobData.platform_progress || {});
+    if (!allItems.length) return [];
+    const platformOrder = Object.keys(jobData?.platform_progress || {});
     const orderIndex = (p: string) => {
       const i = platformOrder.indexOf(p);
       return i === -1 ? platformOrder.length : i;
     };
-    const filtered = jobData.items.filter((it) => {
+    const filtered = allItems.filter((it) => {
       // Platform filter
       if (platformFilter !== "all" && it.platform !== platformFilter) return false;
 
@@ -546,11 +602,19 @@ export function AnalysisView({ resumeJobId }: Props = {}) {
       return true;
     });
     return filtered.sort((a, b) => orderIndex(a.platform) - orderIndex(b.platform));
-  }, [jobData?.items, jobData?.platform_progress, platformFilter, riskFilter, searchQuery]);
+  }, [allItems, jobData?.platform_progress, platformFilter, riskFilter, searchQuery]);
+
+  // Scoped to what the current filters actually show -- see the Select-all
+  // checkbox's own note on why that matters.
+  const selectableIds = useMemo(
+    () => filteredItems.filter(selectable).map((it) => it.result_id as string),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [filteredItems],
+  );
 
   // Export handlers
   const handleExport = async (fmt: "xlsx" | "csv" | "json" | "tsv") => {
-    if (!jobData || !filteredItems.length) {
+    if (!filteredItems.length) {
       toast.error("No analyzed items to export");
       return;
     }
@@ -1006,7 +1070,10 @@ export function AnalysisView({ resumeJobId }: Props = {}) {
       )}
 
       {/* ─── Dual-Format Results & Export Section ─── */}
-      {jobData && jobData.items.length > 0 && (
+      {/* Gated on the MERGED set, not on a live job. That single change is
+          what makes the table survive a reload: with nothing running, the
+          saved rows are all there is, and the old gate hid them. */}
+      {allItems.length > 0 && (
         <div
           className="home-card"
           style={{
@@ -1219,8 +1286,73 @@ export function AnalysisView({ resumeJobId }: Props = {}) {
             </select>
 
             <span style={{ fontSize: "12px", color: "var(--text-muted)", marginLeft: "auto" }}>
-              Showing {filteredItems.length} of {jobData.items.length} items
+              Showing {filteredItems.length} of {allItems.length} items
+              {savedLoading && " · loading saved…"}
             </span>
+          </div>
+
+          {/* ── Retention + delete controls ───────────────────────────
+              Says how long these rows live, because a table that empties
+              itself overnight with no warning reads as data loss. The two
+              deletes are the escape hatch for an analyst who is finished
+              with a batch and does not want to look at it all day. */}
+          <div style={{
+            display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap",
+            marginBottom: "12px", padding: "8px 12px", borderRadius: "8px",
+            background: "var(--bg-inner, #0F1729)",
+            border: "1px solid var(--border-subtle, rgba(255,255,255,0.06))",
+          }}>
+            <span style={{ fontSize: "11px", color: "var(--text-dim)" }}>
+              🕒 Saved for {retentionHours}h, then deleted automatically
+              {saved.length > 0 && ` · ${saved.length} stored`}
+            </span>
+
+            <label style={{
+              display: "inline-flex", alignItems: "center", gap: "6px",
+              fontSize: "11px", color: "var(--text-muted)", cursor: "pointer",
+              marginLeft: "auto",
+            }}>
+              <input
+                type="checkbox"
+                // Ticks exactly what is on screen, not the whole store --
+                // "select all" under an active filter meaning "and the rows
+                // you filtered out too" is how people delete things they
+                // meant to keep.
+                checked={selectableIds.length > 0 && selectableIds.every((id) => selected.includes(id))}
+                onChange={(e) => setSelected(e.target.checked ? selectableIds : [])}
+              />
+              Select all shown ({selectableIds.length})
+            </label>
+
+            <button
+              onClick={() => void handleDelete("selected")}
+              disabled={deleting || !selected.length}
+              title="Delete the ticked results, and their screenshots"
+              style={{
+                padding: "6px 12px", borderRadius: "8px", fontSize: "11px", fontWeight: 700,
+                border: "1px solid var(--danger, #e95053)",
+                background: selected.length ? "rgba(233, 80, 83, 0.12)" : "transparent",
+                color: "var(--danger, #e95053)",
+                cursor: selected.length && !deleting ? "pointer" : "not-allowed",
+                opacity: selected.length ? 1 : 0.45,
+              }}
+            >
+              {deleting ? "Deleting…" : `Delete Selected (${selected.length})`}
+            </button>
+
+            <button
+              onClick={() => void handleDelete("all")}
+              disabled={deleting || !allItems.length}
+              title="Delete every saved analysis result"
+              style={{
+                padding: "6px 12px", borderRadius: "8px", fontSize: "11px", fontWeight: 700,
+                border: "1px solid var(--border-color, #344054)",
+                background: "transparent", color: "var(--text-muted)",
+                cursor: deleting ? "not-allowed" : "pointer",
+              }}
+            >
+              Delete All
+            </button>
           </div>
 
           {/* ─── Interactive Table View ─── */}
@@ -1237,6 +1369,7 @@ export function AnalysisView({ resumeJobId }: Props = {}) {
             <table style={{ width: "max-content", minWidth: "100%", borderCollapse: "collapse", fontSize: "12.5px", textAlign: "left" }}>
               <thead>
                 <tr style={{ background: "var(--bg-primary, #080F1E)", color: "var(--text-dim, #98a2b3)", borderBottom: "2px solid var(--border-color, #344054)" }}>
+                  <th style={{ padding: "12px 10px", width: "34px", textAlign: "center" }} title="Select rows to delete" />
                   <th style={{ padding: "12px 14px", fontWeight: 700, fontSize: "10.5px", letterSpacing: "0.06em", textTransform: "uppercase", textAlign: "center" }}>Screenshot</th>
                   {formatMode === "incident" ? (
                     <>
@@ -1275,7 +1408,7 @@ export function AnalysisView({ resumeJobId }: Props = {}) {
               <tbody>
                 {!filteredItems.length ? (
                   <tr>
-                    <td colSpan={12} style={{ padding: "32px", textAlign: "center", color: "var(--text-muted)" }}>
+                    <td colSpan={16} style={{ padding: "32px", textAlign: "center", color: "var(--text-muted)" }}>
                       No matching records found.
                     </td>
                   </tr>
@@ -1283,7 +1416,14 @@ export function AnalysisView({ resumeJobId }: Props = {}) {
                   filteredItems.map((it) => {
                     const originalRow = formatMode === "incident" ? it.incident_row : it.legacy_row;
                     const row = { ...originalRow, ...(edits[it.id] || {}) };
-                    const screenshotUrl = it.has_screenshot ? analysisApi.getScreenshotUrl(jobData.job_id, it.id) : null;
+                    // Addressed by result_id wherever there is one, so the
+                    // thumbnail still resolves after the job that captured
+                    // it has aged out. The job endpoint is the fallback for
+                    // a row that is mid-run and not yet saved.
+                    const screenshotUrl = !it.has_screenshot ? null
+                      : it.result_id ? analysisApi.getSavedScreenshotUrl(it.result_id)
+                      : jobData ? analysisApi.getScreenshotUrl(jobData.job_id, it.id)
+                      : null;
                     return (
                       <tr
                         key={it.id}
@@ -1295,6 +1435,20 @@ export function AnalysisView({ resumeJobId }: Props = {}) {
                         onMouseEnter={(e) => { if (it.status !== "error") e.currentTarget.style.background = "rgba(0, 229, 255, 0.03)"; }}
                         onMouseLeave={(e) => { if (it.status !== "error") e.currentTarget.style.background = "transparent"; }}
                       >
+                        {/* Row selection. Disabled until the row has
+                            settled -- there is nothing saved to delete
+                            before then (see `selectable`). */}
+                        <td style={{ padding: "10px", textAlign: "center", verticalAlign: "middle" }}>
+                          <input
+                            type="checkbox"
+                            checked={!!it.result_id && selected.includes(it.result_id)}
+                            disabled={!selectable(it)}
+                            onChange={() => it.result_id && toggleSelected(it.result_id)}
+                            title={selectable(it) ? "Select for deletion" : "Still running — nothing saved yet"}
+                            style={{ cursor: selectable(it) ? "pointer" : "not-allowed" }}
+                          />
+                        </td>
+
                         {/* Screenshot -- a large enough thumbnail to actually
                             read at a glance, full-size preview on hover
                             (click also works, for touch devices). */}

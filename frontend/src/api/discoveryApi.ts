@@ -124,6 +124,9 @@ export interface DiscoveredProfile {
   logo_ref_id?: string;
   // "exact" (the identical file re-uploaded) or "phash" (near-identical).
   logo_match_tier?: string;
+  // An analyst marked this as the GENUINE account -- the real brand or
+  // person, not an impersonation. Permanent: no re-discovery clears it.
+  is_original?: boolean;
   has_logo: boolean | null;
   verified: boolean | null;
   followers: number | null;
@@ -142,6 +145,9 @@ export interface DiscoveredProfile {
   source: string;
   first_seen: string | null;
   last_seen: string | null;
+  // UTC ISO timestamp of when a repeat sweep detected a genuinely different
+  // profile picture. Absent until a change is observed.
+  avatar_changed_at?: string | null;
 }
 
 export interface DiscoveredProfilePage {
@@ -183,8 +189,18 @@ export interface ListProfilesQuery {
   // anything validated before the timestamp existed. Splits the Validated tab
   // by the analyst's decision time rather than by discovery time.
   validated_age?: "new" | "old";
+  // First-seen date range, as ISO-8601 instants. The UI resolves the
+  // analyst's picked calendar dates against the BROWSER's timezone before
+  // sending, so "6 Sep" means 6 Sep where they are sitting rather than in
+  // UTC -- for IST that is a 5.5h shift, enough to move a whole evening's
+  // discoveries into the wrong day. `to` is exclusive: the UI sends the
+  // start of the day AFTER the one selected.
+  first_seen_from?: string;
+  first_seen_to?: string;
   // Only profiles whose picture matched a reference logo.
   logo_matched?: boolean;
+  // true = only genuine accounts, false = everything except them.
+  is_original?: boolean;
   match_level?: "high" | "medium" | "low";
   entity_type?: string;
   limit?: number;
@@ -238,7 +254,10 @@ export const discoveryApi = {
     if (q.search) p.set("search", q.search);
     if (q.age) p.set("age", q.age);
     if (q.validated_age) p.set("validated_age", q.validated_age);
+    if (q.first_seen_from) p.set("first_seen_from", q.first_seen_from);
+    if (q.first_seen_to) p.set("first_seen_to", q.first_seen_to);
     if (q.logo_matched) p.set("logo_matched", "true");
+    if (q.is_original !== undefined) p.set("is_original", String(q.is_original));
     if (q.match_level) p.set("match_level", q.match_level);
     if (q.entity_type) p.set("entity_type", q.entity_type);
     if (q.limit) p.set("limit", String(q.limit));
@@ -248,6 +267,12 @@ export const discoveryApi = {
 
   setProfileStatus: (ids: string[], status: ProfileStatus) =>
     post("/discovery/profiles/status", { ids, status }).then(json<SetProfileStatusResult>),
+
+  // Mark profiles as the genuine account (or un-mark them). Independent of
+  // triage status: it answers "is this us?", not "have we looked at it?"
+  setProfileOriginal: (ids: string[], isOriginal: boolean) =>
+    post("/discovery/profiles/original", { ids, is_original: isOriginal })
+      .then(json<SetProfileStatusResult>),
 
   analyseValidated: (body: AnalyseValidatedBody) =>
     post("/discovery/profiles/analyse", body).then(json<AnalyseValidatedAccepted>),

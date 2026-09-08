@@ -22,7 +22,10 @@ construction.
 from __future__ import annotations
 
 import asyncio
+import base64
+import re
 from typing import Iterable, Optional
+from urllib.parse import urlparse
 
 from backend.database.repositories import avatar_repository as avatars_db
 from backend.database.repositories import profile_repository as profiles_db
@@ -49,6 +52,74 @@ CONCURRENCY = 4
 # initial-letter circle, both of which already work.
 PER_IMAGE_TIMEOUT_SEC = 20.0
 BATCH_TIMEOUT_SEC = 180.0
+MAX_BYTES = 8 * 1024 * 1024  # Size cap matching imagefetch.MAX_BYTES
+
+
+# Matches data:image/<type>;base64,<payload> -- the format Telegram's MTProto
+# engine produces when it downloads a profile photo via download_profile_photo().
+_DATA_URI_RE = re.compile(
+    r"^data:(?P<mime>image/[a-zA-Z0-9.+-]+);base64,(?P<b64>.+)$", re.DOTALL,
+)
+
+
+async def _cache_data_uri(
+    url: str, *, want_embedding: bool = False,
+) -> tuple[Optional[str], Optional[dict], Optional[list]]:
+    """Decode a base64 `data:` URI and persist it directly to GridFS.
+
+    Telegram's MTProto engine stores profile photos as inline base64 rather
+    than a remote URL. Before this handler, these avatars were **skipped** by
+    both `cache_one()` (rejected by the allowlist) and `cache_for_profiles()`
+    (explicit `startswith("data:")` guard), so Telegram profiles never
+    received an `avatar_sha`, their cards showed only the ephemeral base64
+    blob, and logo matching was impossible.
+    """
+    m = _DATA_URI_RE.match(url)
+    if not m:
+        return None, None, None
+    try:
+        raw = base64.b64decode(m.group("b64"))
+    except Exception:  # noqa: BLE001 - malformed base64
+        log.warning("data: URI base64 decode failed")
+        return None, None, None
+    if not raw or len(raw) > MAX_BYTES:
+        return None, None, None
+    mime = m.group("mime").lower()
+    try:
+        sha = await avatars_db.store(raw, mime)
+    except Exception as e:  # noqa: BLE001 - never fatal
+        log.warning(f"data: URI store error: {type(e).__name__}: {e}")
+        return None, None, None
+    fp = None
+    try:
+        fp = await asyncio.to_thread(fingerprint, raw)
+    except Exception as e:  # noqa: BLE001 - never fatal
+        log.warning(f"avatar fingerprint error: {type(e).__name__}: {e}")
+    vec = None
+    if want_embedding:
+        try:
+            vec = await asyncio.to_thread(embed, raw)
+        except Exception as e:  # noqa: BLE001 - never fatal
+            log.warning(f"avatar embed error: {type(e).__name__}: {e}")
+    return sha, (fp.to_dict() if fp else None), vec
+
+
+def is_same_avatar_asset(old_url: str, new_url: str) -> bool:
+    """Returns True if two avatar URLs represent the exact same underlying image asset.
+    Ignores ephemeral query parameters (e.g. Meta's oh= and oe= signatures), but detects
+    genuine DP changes where the asset filename or path differs."""
+    if old_url == new_url:
+        return True
+    if not old_url or not new_url:
+        return False
+    if old_url.startswith("data:") or new_url.startswith("data:"):
+        return old_url == new_url
+    try:
+        p_old = urlparse(old_url).path
+        p_new = urlparse(new_url).path
+        return bool(p_old and p_old == p_new)
+    except Exception:
+        return False
 
 
 async def cache_one(url: str, retries: int = 1, *, want_embedding: bool = False
@@ -61,6 +132,9 @@ async def cache_one(url: str, retries: int = 1, *, want_embedding: bool = False
 
     Includes a bounded retry for transient network / CDN blips (502/503/timeout).
 
+    Supports `data:` URIs (Telegram's inline base64 avatars) in addition to
+    regular HTTPS URLs.
+
     THE FINGERPRINT IS COMPUTED IN A THREAD, NOT ON THE EVENT LOOP. Decoding
     is CPU-bound and does not yield, and this task shares its loop with the
     running sweep -- Playwright's response handlers, the poll loop,
@@ -69,7 +143,12 @@ async def cache_one(url: str, retries: int = 1, *, want_embedding: bool = False
     discovery itself; through `to_thread` the lag is ~5ms AND the work
     finishes 5.6x faster, because Pillow releases the GIL while decoding.
     """
-    if not url or not allowed(url):
+    if not url:
+        return None, None, None
+    # Telegram's MTProto avatars arrive as data: URIs, not HTTP links.
+    if url.startswith("data:"):
+        return await _cache_data_uri(url, want_embedding=want_embedding)
+    if not allowed(url):
         return None, None, None
     for attempt in range(retries + 1):
         try:
@@ -122,7 +201,7 @@ async def cache_for_profiles(
     for it in items:
         img = (it.get("profile_image_url") or "").strip()
         url = (it.get("url") or "").strip()
-        if not img or not url or img.startswith("data:"):
+        if not img or not url:
             continue
         # A platform's own silhouette is not worth a fetch or a GridFS
         # object, and storing one would make "has no picture" indistinguishable
@@ -138,14 +217,16 @@ async def cache_for_profiles(
     if not targets:
         return 0
 
-    # Avoid re-fetching avatars for profiles that already have their picture
-    # cached in MongoDB (e.g. from an earlier keyword or previous sweep).
+    # Avoid re-fetching avatars for profiles that already have this EXACT picture
+    # cached in MongoDB (e.g. from an earlier keyword or previous sweep). If the
+    # account changed its profile picture, the asset path differs, so we re-fetch,
+    # re-hash, and re-evaluate logo similarity.
     try:
-        cached_urls = await profiles_db.existing_avatar_shas(
+        cached_map = await profiles_db.existing_avatar_urls(
             client_id, platform, [t[0] for t in targets],
         )
-        if cached_urls:
-            targets = [t for t in targets if t[0] not in cached_urls]
+        if cached_map:
+            targets = [t for t in targets if not is_same_avatar_asset(cached_map.get(t[0], ""), t[2])]
     except Exception as e:
         log.warning(f"avatar cache lookup error: {type(e).__name__}: {e}")
 

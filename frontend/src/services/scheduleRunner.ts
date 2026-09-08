@@ -378,6 +378,13 @@ async function liveClientFor(entry: ScheduleEntry): Promise<Client | undefined> 
   }
 }
 
+// The scope this entry will run under, from the cached directory. Only used
+// for the up-front "would this sweep nothing?" check -- the run itself reads
+// the client fresh, see runEntry.
+function liveScopeFor(entry: ScheduleEntry): string {
+  return findClient(entry.client_id)?.scheduler_keyword_scope || "";
+}
+
 async function runEntry(entry: ScheduleEntry): Promise<void> {
   const client = await liveClientFor(entry);
   const individual = client ? dedupe(client.name_keywords || []) : entry.individual_keywords;
@@ -388,6 +395,28 @@ async function runEntry(entry: ScheduleEntry): Promise<void> {
       message: "no keywords configured -- add some on the Clients page",
       resume: false,
       finished_at: Date.now(),
+    });
+    return;
+  }
+
+  // A keyword scope that excludes everything this client actually has would
+  // POST an empty sweep, which settles as `done, 0 found` -- indistinguishable
+  // in the queue from a real sweep that genuinely found nothing. It is a
+  // configuration mistake, and it says so.
+  const chosenScope = liveScopeFor(entry);
+  if (chosenScope === "individual" && !individual.length) {
+    patchEntry(entry.client_id, {
+      status: "skipped",
+      message: "set to individual keywords only, but this client has none",
+      resume: false, finished_at: Date.now(),
+    });
+    return;
+  }
+  if (chosenScope === "domain" && !domain.length) {
+    patchEntry(entry.client_id, {
+      status: "skipped",
+      message: "set to domain keywords only, but this client has none",
+      resume: false, finished_at: Date.now(),
     });
     return;
   }
@@ -417,14 +446,26 @@ async function runEntry(entry: ScheduleEntry): Promise<void> {
 
   if (!jobId) {
     try {
-      // No `platforms`: omitting it sweeps every platform that is ready
-      // right now, which is what an unattended scheduled run should do.
-      // Caps come from the live client (undefined -- and so uncapped --
-      // when it was deleted after being queued; see liveClientFor).
+      // WHAT THIS CLIENT ASKED FOR, read from the client record at the
+      // moment its turn comes up -- not from the queue entry -- so a change
+      // made in the Scheduler after queueing still takes effect, and the
+      // choice survives the queue being cleared or the browser closed.
+      //
+      // An empty `scheduler_platforms` means every ready platform, which is
+      // exactly what omitting `platforms` means to the API: one spelling of
+      // "all", so a never-configured client and a deliberately-all one
+      // behave identically.
+      const wanted = client?.scheduler_platforms || [];
+      const scope = client?.scheduler_keyword_scope || "";
+      // Narrowed by sending an EMPTY list for the excluded type rather than
+      // filtering afterwards, so the per-type caps below only ever apply to
+      // keywords genuinely part of this sweep -- the same thing the Clients
+      // page's own runner does.
       const res = await discoveryApi.startDiscovery({
         group_id: entry.client_id,
-        individual_keywords: individual,
-        domain_keywords: domain,
+        individual_keywords: scope === "domain" ? [] : individual,
+        domain_keywords: scope === "individual" ? [] : domain,
+        platforms: wanted.length ? wanted : undefined,
         platform_limits_individual: client?.platform_limits_individual,
         platform_limits_domain: client?.platform_limits_domain,
         platform_tab_limits: client?.platform_tab_limits,

@@ -25,13 +25,16 @@ timeline instead of waiting longer or re-requesting.
 from __future__ import annotations
 
 import asyncio
+import random
 import re
 from typing import Optional
 from urllib.parse import urlparse
 
 from backend.shared.models.row import Row
+from backend.shared.avatars import hd_picture_url
 from backend.platforms.scan_options import captures_screenshot
 from backend.shared.text import name_score, normalized_host, parse_normalized_url
+from backend.stealth.mouse_movement import humanize_interaction
 from backend.platforms.twitter.discovery_engine import (ABOUT_QUERY,
                                                          RE_CHECKPOINT,
                                                          RE_GONE, RE_LOGIN,
@@ -193,6 +196,12 @@ class Scraper:
         """Is this cookie set still logged in and unchallenged?"""
         return await self.session.check_session()
 
+    async def sync_cookies(self) -> None:
+        """Persists the live context cookie jar mid-session to save rotated tokens."""
+        if hasattr(self.session, "sync_cookies"):
+            await self.session.sync_cookies()
+
+
     # ───────────────────────────── per URL ────────────────────────────── #
 
     async def process(
@@ -248,6 +257,7 @@ class Scraper:
         posts: list[str] = []
         got = asyncio.Event()
         wanted = row.profile_id.lower()
+        rate_limited = False
 
         async def on_response(resp):
             """Captures the profile visit's GraphQL payloads. Watches BOTH
@@ -256,14 +266,23 @@ class Scraper:
             both and missing either costs a whole column. Silent on
             failure -- an unreadable response costs one tier of one field,
             never the visit."""
+            nonlocal rate_limited
             try:
                 is_user = any(q in resp.url for q in USER_QUERIES)
                 is_tweets = any(q in resp.url for q in TWEETS_QUERIES)
                 if not (is_user or is_tweets):
                     return
+                if getattr(resp, "status", 200) == 429:
+                    rate_limited = True
+                    return
                 text = await resp.text()
             except Exception:
                 return
+
+            if "Rate limit exceeded" in text or '"code":88' in text:
+                rate_limited = True
+                return
+
             for blob in parse_lines(text):
                 if is_user:
                     for u in iter_users(blob):
@@ -293,6 +312,12 @@ class Scraper:
                 row.note("navigation failed")
                 return row
 
+            # Register natural pointer telemetry on profile landing
+            try:
+                await humanize_interaction(page, scroll=False, moves=random.randint(1, 2))
+            except Exception:
+                pass
+
             # the profile query fires within a second of the document loading
             try:
                 await asyncio.wait_for(got.wait(), timeout=self.a.settle)
@@ -306,7 +331,10 @@ class Scraper:
                 pass
 
             if not found:
-                if RE_CHECKPOINT.search(body):
+                if rate_limited or "rate limit" in body.lower():
+                    row.status = "CHECKPOINT"
+                    row.note("rate limited by X -- cooling down")
+                elif RE_CHECKPOINT.search(body):
                     row.status = "CHECKPOINT"
                     row.note("session checkpointed")
                 elif (
@@ -456,7 +484,7 @@ class Scraper:
             row.bio = u.description
             row.mark("bio", "graphql")
         if u.avatar:
-            row.profile_pic_url = u.avatar
+            row.profile_pic_url = hd_picture_url(u.avatar)
             row.has_custom_pic = u.has_custom_pic
             row.mark("logo", "graphql")
         if u.verified:
@@ -529,6 +557,10 @@ class Scraper:
                 timeout=self.a.timeout * 1000,
             )
             try:
+                await humanize_interaction(page, scroll=False, moves=1)
+            except Exception:
+                pass
+            try:
                 await asyncio.wait_for(landed.wait(), timeout=self.a.settle)
             except asyncio.TimeoutError:
                 pass
@@ -599,9 +631,14 @@ class Scraper:
                 timeout=self.a.timeout * 1000,
             )
             try:
+                await humanize_interaction(page, scroll=False, moves=1)
+            except Exception:
+                pass
+            try:
                 await asyncio.wait_for(landed.wait(), timeout=self.a.settle)
             except asyncio.TimeoutError:
                 pass
+
             if found:
                 return max(found)
             # the payload missed its window; the same information is on the

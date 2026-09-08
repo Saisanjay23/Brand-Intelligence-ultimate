@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from backend.shared.avatars import hd_picture_url
 from backend.shared.logging import get_logger
 from backend.shared.models.row import Row
 
@@ -224,7 +225,7 @@ def entity_from(obj: Any) -> Optional[TelegramEntity]:
         restricted=bool(getattr(obj, "restricted", False)),
         fake=bool(getattr(obj, "fake", False)),
         premium=bool(getattr(obj, "premium", False)),
-        avatar=f"https://t.me/i/userpic/320/{username}.jpg" if username and has_photo else "",
+        avatar=hd_picture_url(f"https://t.me/i/userpic/320/{username}.jpg") if username and has_photo else "",
         has_photo=has_photo,
     )
 

@@ -234,8 +234,10 @@ def write_env(key: str, value: str) -> None:
 def _env_file_for(env: str) -> Optional[Path]:
     if env != "development":
         return None
-    candidate = ROOT / ".env"
-    return candidate if candidate.exists() else None
+    for candidate in (ROOT / ".env", ROOT / "backend" / ".env"):
+        if candidate.exists():
+            return candidate
+    return None
 
 
 @lru_cache

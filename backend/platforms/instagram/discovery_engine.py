@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterator, Optional
 from urllib.parse import quote
 
+from backend.shared.avatars import extract_instagram_hd_avatar, looks_like_placeholder
 from backend.shared.extraction import ExtractionResult, run_strategies
 from backend.shared.models.row import Row
 from backend.shared.text import iter_dicts
@@ -141,11 +142,6 @@ PROFILE_ENDPOINTS = (
 # hold on its own -- Instagram rotated the asset, so checking only the old
 # id silently stopped detecting anything and every account with no picture
 # was recorded as having a real one.
-from backend.shared.avatars import (
-    extract_instagram_hd_avatar,
-    hd_picture_url,
-    looks_like_placeholder,
-)
 
 
 @dataclass

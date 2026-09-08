@@ -27,6 +27,7 @@ WHAT THESE GUARD
 """
 
 import io
+import os
 
 import pytest
 from PIL import Image, ImageDraw
@@ -185,7 +186,8 @@ class TestFingerprinting:
         other."""
         opaque = enc(mark())
         rgba = mark().convert("RGBA")
-        b = io.BytesIO(); rgba.save(b, "PNG")
+        b = io.BytesIO()
+        rgba.save(b, "PNG")
         cmp = compare(fingerprint(opaque), fingerprint(b.getvalue()))
         assert cmp is not None and cmp.is_match
 
@@ -205,8 +207,6 @@ class TestFingerprinting:
 # The tier itself is designed to be absent -- `available()` returning False
 # degrades every caller to the hash tiers -- so a skipped run here is not a
 # gap in coverage of the shipped default behaviour.
-
-import os
 
 _EMBED_TESTS = os.environ.get("BI_TEST_EMBEDDING") == "1"
 

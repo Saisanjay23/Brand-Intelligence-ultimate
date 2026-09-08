@@ -102,11 +102,6 @@ def pool_summary_of(items: list[dict], now: float) -> dict:
     }
 
 
-async def pool_summary(platform_id: str) -> dict:
-    items = await sessions_db.list_pool(platform_id)
-    return pool_summary_of(items, _now())
-
-
 
 def _get_platform(platform_id: str):
     from backend.platforms import registry
@@ -476,14 +471,25 @@ async def session_for_job(platform_id: str) -> tuple[object, dict]:
         item = await get_healthy_session(platform_id)
         if item is None:
             raise ConflictError(f"{platform_id}: no healthy accounts available -- please add more accounts or check credentials")
-        import os
-        os.environ["TELEGRAM_API_ID"] = str(item.get("api_id", ""))
-        os.environ["TELEGRAM_API_HASH"] = str(item.get("api_hash", ""))
-        if item.get("phone"):
-            os.environ["TELEGRAM_PHONE"] = str(item.get("phone", ""))
-        if item.get("session_blob"):
-            settings.session_blob_path.mkdir(parents=True, exist_ok=True)
-            (settings.session_blob_path / "telegram.session").write_bytes(item["session_blob"])
+        # RELEASE THE CLAIM IF SETUP FAILS. `get_healthy_session` has already
+        # marked this session in-use; everything below can still raise (the
+        # session-blob write touches the filesystem, so a full or read-only
+        # disk is enough). If it does, the caller never receives a
+        # `session_item` and so never reaches its `finally` to release --
+        # leaving the account claimed for the life of the process, invisible
+        # to every future job and reported as "in use" by the sessions API.
+        try:
+            import os
+            os.environ["TELEGRAM_API_ID"] = str(item.get("api_id", ""))
+            os.environ["TELEGRAM_API_HASH"] = str(item.get("api_hash", ""))
+            if item.get("phone"):
+                os.environ["TELEGRAM_PHONE"] = str(item.get("phone", ""))
+            if item.get("session_blob"):
+                settings.session_blob_path.mkdir(parents=True, exist_ok=True)
+                (settings.session_blob_path / "telegram.session").write_bytes(item["session_blob"])
+        except Exception:
+            release_claim(platform_id, item["id"])
+            raise
         return plat, {"id": item["id"], "identifier": item["identifier"]}
     if plat.uses_api_key:
         item = await get_healthy_session(platform_id)
@@ -494,8 +500,12 @@ async def session_for_job(platform_id: str) -> tuple[object, dict]:
                 if os.environ.get(plat.api_key_env):
                     return plat, {"id": "", "identifier": "env", "api_key": os.environ[plat.api_key_env]}
             raise ConflictError(f"{platform_id}: no healthy API keys available -- please add more keys or check quotas")
-        import os
-        os.environ[plat.api_key_env] = str(item.get("api_key", ""))
+        try:
+            import os
+            os.environ[plat.api_key_env] = str(item.get("api_key", ""))
+        except Exception:
+            release_claim(platform_id, item["id"])
+            raise
         return plat, {"id": item["id"], "identifier": item["identifier"], "api_key": item["api_key"]}
     item = await get_healthy_session(platform_id)
     if item is None:

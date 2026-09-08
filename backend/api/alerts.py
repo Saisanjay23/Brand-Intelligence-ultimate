@@ -36,6 +36,8 @@ class AlertSettingsIn(BaseModel):
     alert_on_session_expiring: bool = True
     alert_on_critical_incident: bool = True
     session_expiry_warning_hours: int = 24
+    report_on_sweep_complete: bool = False
+    report_emails: list[str] = Field(default_factory=list)
 
 
 class TestEmailIn(BaseModel):
@@ -65,7 +67,22 @@ async def get_alert_settings() -> dict[str, Any]:
 
 @router.put("/settings", summary="Update alert and notification settings")
 async def update_alert_settings(body: AlertSettingsIn) -> dict[str, Any]:
-    saved = await alert_settings_db.save_settings(body.model_dump())
+    """Updates only the fields the caller actually sent.
+
+    `exclude_unset=True` is doing real work here. Every field on
+    AlertSettingsIn has a default, so a plain `model_dump()` returns a
+    COMPLETE settings object no matter how little the caller sent -- and
+    save_settings `$set`s all of it. A request carrying just
+    `{"report_on_sweep_complete": true}` therefore reset alert_emails to
+    empty, smtp_host to "", the port to 1025 and every toggle to its default,
+    silently and with a 200.
+
+    The UI happens to avoid it by sending the whole object back, but that
+    only moves the problem: two operators (or two tabs) both load the
+    settings, one changes the recipients, the other flips a toggle, and the
+    second save puts the stale recipients back. Writing only what was sent
+    makes both edits survive, and makes a partial PUT mean what it says."""
+    saved = await alert_settings_db.save_settings(body.model_dump(exclude_unset=True))
     res = dict(saved)
     if res.get("smtp_pass"):
         res["smtp_pass"] = "••••••••"
@@ -108,15 +125,25 @@ async def clear_all_incidents() -> dict[str, Any]:
     return {"ok": True, "cleared": cleared}
 
 
-@router.post("/canary/run", summary="Run on-demand session canary health check")
-async def run_canary_now() -> dict[str, Any]:
-    return await session_canary_service.run_canary_sweep()
-
-
-@router.get("/canary/status", summary="Get latest canary health overview")
+@router.get("/canary/status", summary="Session pool health overview")
 async def get_canary_status() -> dict[str, Any]:
-    report = session_canary_service.get_latest_canary_report()
-    if not report.get("last_run"):
-        # First run on-demand if no background report exists yet
-        report = await session_canary_service.run_canary_sweep()
-    return report
+    """Built from stored session state on every call -- a few database reads,
+    free to poll, and never a login.
+
+    THERE IS NO LONGER A `POST /canary/run`. It ran `check_all_once()`, the
+    same function the 30-minute session monitor already runs, so it only ever
+    duplicated work that was happening anyway -- with a second set of
+    authenticated page loads on real accounts, at an unjittered moment of
+    someone's choosing. This endpoint used to trigger it too, which meant
+    opening the Alerts tab logged into six platforms.
+
+    Session state is kept current without any of that: every job updates the
+    sessions it touches the moment it succeeds or fails, and the monitor
+    covers the idle ones every 30 minutes. To force a check on one account,
+    use the Sessions page -- `POST /sessions/{platform}/check` and
+    `POST /sessions/{platform}/{session_id}/check` both refuse while a job
+    holds that session, which the canary sweep never did.
+
+    `last_run` is when the underlying checks actually happened, not when this
+    was called."""
+    return await session_canary_service.build_canary_report()

@@ -35,9 +35,13 @@ ALLOWED_HOST_SUFFIXES = (
     ".twimg.com",           # twitter/X -- pbs.twimg.com, abs.twimg.com
     ".ggpht.com",           # youtube channel avatars -- yt3.ggpht.com
     ".googleusercontent.com",   # youtube's other avatar host
+    ".ytimg.com",           # youtube -- i.ytimg.com, yt3.ytimg.com
     ".licdn.com",           # linkedin
     ".tiktokcdn.com",       # tiktok
     ".tiktokcdn-us.com",
+    ".t.me",                # telegram web userpics (t.me/i/userpic/…)
+    ".telegram.org",        # telegram CDN
+    ".telesco.pe",          # telegram CDN mirror
 )
 
 # Avatars are thumbnails -- Instagram's measure 5-9 KB, and a full-resolution

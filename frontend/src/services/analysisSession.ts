@@ -16,15 +16,23 @@
 // its results. Now the poll outlives the view: leave, come back, and the
 // table has filled in while you were gone.
 //
-// WHAT IT DOES NOT SURVIVE, BY DESIGN: a page reload. This is in RAM only,
-// deliberately -- a job's full item set (bios, per-item rows, screenshot
-// pointers) is far too big for localStorage, and the requirement is only
-// that results last until the analyst refreshes. `resumeJobId` already
-// covers picking a job back up after a reload.
+// A RELOAD USED TO EMPTY THE TABLE, and no longer does. Results are now
+// saved server-side for 24 hours (see backend/database/repositories/
+// analysis_result_repository.py), so `saved` below is repopulated from the
+// server on mount and the workspace comes back with the day's work in it.
+// What is still RAM-only is everything that is not a result: the URL box,
+// the filters, and `edits` -- an analyst's uncommitted inline corrections,
+// which have nowhere durable to go because nothing has accepted them yet.
+//
+// `saved` and `jobData.items` OVERLAP, on purpose, and are merged by
+// `result_id` rather than concatenated (see mergedItems). A running job's
+// row is the fresher copy of a profile that may already be in `saved` from
+// an earlier run, so it has to win -- appending both would show the same
+// profile twice with different numbers.
 
 import { useCallback, useSyncExternalStore } from "react";
 import toast from "react-hot-toast";
-import { analysisApi, type AnalysisJobResponse } from "../api/analysisApi";
+import { analysisApi, type AnalysisItemData, type AnalysisJobResponse } from "../api/analysisApi";
 
 const POLL_MS = 1500;
 
@@ -42,6 +50,17 @@ export interface AnalysisSession {
   // Inline cell edits, keyed by analysis item id. Analyst-typed work, so
   // this is the state it would hurt most to lose on a tab switch.
   edits: Record<string, Record<string, string>>;
+  // Results the server is holding for 24h -- the day's work, including
+  // batches from before this page was loaded.
+  saved: AnalysisItemData[];
+  savedLoading: boolean;
+  retentionHours: number;
+  // Which rows the analyst has ticked, by result_id. Lives here rather than
+  // in the view for the same reason everything else does: a tab switch
+  // unmounts the view, and losing a 40-row selection to that is the kind of
+  // thing that makes someone stop trusting the checkboxes.
+  selected: string[];
+  deleting: boolean;
 }
 
 function emptySession(): AnalysisSession {
@@ -57,6 +76,11 @@ function emptySession(): AnalysisSession {
     platformFilter: "all",
     riskFilter: "all",
     edits: {},
+    saved: [],
+    savedLoading: false,
+    retentionHours: 24,
+    selected: [],
+    deleting: false,
   };
 }
 
@@ -157,6 +181,11 @@ async function pollJob(id: string, gen: number): Promise<boolean> {
     if (data.status === "done" || data.status === "cancelled" || data.status === "failed") {
       stopPolling();
       patch({ loading: false, cancelling: false });
+      // The job wrote each row to the 24h store as it settled; pull the
+      // authoritative set back so what is on screen is what would survive a
+      // reload. Also picks up a CANCELLED job's partial work, which is real
+      // and saved even though the batch did not finish.
+      void loadSaved();
       if (data.status === "done") {
         toast.success(`Analysis completed for ${data.completed}/${data.total} URLs`);
       } else if (data.status === "cancelled") {
@@ -205,6 +234,91 @@ export function watchJob(id: string): void {
   })();
 }
 
+/** Repopulate `saved` from the server. Safe to call at any time. */
+export async function loadSaved(): Promise<void> {
+  patch({ savedLoading: true });
+  try {
+    const res = await analysisApi.listResults();
+    patch({
+      saved: res.items,
+      retentionHours: res.retention_hours,
+      savedLoading: false,
+      // Drop ticks for rows that are no longer there (expired, or deleted
+      // from another tab). A selection that outlives its rows would make
+      // "Delete Selected (3)" act on one.
+      selected: state.selected.filter((id) => res.items.some((i) => i.result_id === id)),
+    });
+  } catch (e) {
+    patch({ savedLoading: false });
+    toast.error((e as Error).message || "Could not load saved results");
+  }
+}
+
+/** Every row on screen: the saved set, with a live job's rows laid over it.
+ *
+ *  Merged by `result_id`, which is stable across runs, so re-analysing a
+ *  URL updates its row in place instead of adding a second one that
+ *  disagrees with the first. The live copy wins because it is the newer
+ *  reading -- and because a row still `running` has no saved counterpart
+ *  yet and must appear anyway, or the table would look frozen mid-job.
+ *
+ *  Job rows keep their job order at the top (that is the batch the analyst
+ *  is watching); everything else follows, newest first.
+ */
+export function mergedItems(session: AnalysisSession): AnalysisItemData[] {
+  const jobItems = session.jobData?.items ?? [];
+  const inJob = new Set(jobItems.map((i) => i.result_id).filter(Boolean));
+  const rest = session.saved
+    .filter((r) => !r.result_id || !inJob.has(r.result_id))
+    .sort((a, b) => String(b.analysed_at ?? "").localeCompare(String(a.analysed_at ?? "")));
+  return [...jobItems, ...rest];
+}
+
+export function toggleSelected(resultId: string): void {
+  setField("selected", (prev) =>
+    prev.includes(resultId) ? prev.filter((i) => i !== resultId) : [...prev, resultId]);
+}
+
+export function setSelected(ids: string[]): void {
+  setField("selected", ids);
+}
+
+/** Delete the ticked rows, or every saved row. Returns how many went.
+ *
+ *  The live job's copy is dropped along with them: deleting a row that is
+ *  still listed on `jobData` would put it straight back on screen at the
+ *  next poll, which reads as the delete having failed. */
+export async function deleteSaved(mode: "selected" | "all"): Promise<number> {
+  const ids = state.selected;
+  if (mode === "selected" && !ids.length) return 0;
+  patch({ deleting: true });
+  try {
+    const res = mode === "all"
+      ? await analysisApi.deleteAllResults()
+      : await analysisApi.deleteResults(ids);
+    const gone = new Set(mode === "all" ? [] : ids);
+    const job = state.jobData;
+    patch({
+      deleting: false,
+      selected: [],
+      saved: mode === "all" ? [] : state.saved.filter((r) => !gone.has(r.result_id ?? "")),
+      jobData: job
+        ? {
+            ...job,
+            items: mode === "all"
+              ? []
+              : job.items.filter((i) => !gone.has(i.result_id ?? "")),
+          }
+        : job,
+    });
+    return res.deleted;
+  } catch (e) {
+    patch({ deleting: false });
+    toast.error((e as Error).message || "Could not delete results");
+    return 0;
+  }
+}
+
 export async function startAnalysis(urls: string[]): Promise<void> {
   const gen = ++generation;
   stopPolling();
@@ -246,6 +360,10 @@ export async function cancelAnalysis(): Promise<void> {
 // behind here, which was invisible while the whole component was thrown
 // away on every tab switch; now that the session persists, orphaned edits
 // would accumulate for the life of the page.
+// Clears the WORKSPACE -- the URL box, the current job, the filters and the
+// edits keyed to them. It deliberately does NOT touch `saved`: those rows
+// are on the server for 24 hours and Clear is not a delete. An analyst who
+// wants them gone uses Delete Selected / Delete All, which say so.
 export function clearSession(): void {
   // Bumping the generation is what makes Clear beat a start or poll that is
   // still in flight -- see `generation`.

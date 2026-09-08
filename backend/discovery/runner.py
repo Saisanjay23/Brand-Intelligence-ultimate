@@ -449,6 +449,35 @@ class DiscoveryRunner:
             job.finished_at = datetime.now(timezone.utc).isoformat()
             job.finished_at_ts = time.time()
             await self._settle_avatars(job)
+            await self._maybe_report(job)
+
+    async def _maybe_report(self, job: DiscoveryJob) -> None:
+        """Email this client's sweep report, if an operator asked for it.
+
+        OFF UNLESS ENABLED. `report_on_sweep_complete` defaults to False, so
+        an upgrade never starts mailing on its own -- a sweep finishing is a
+        routine, frequent event, and the difference between a useful report
+        and a mail flood is entirely whether somebody chose it.
+
+        Runs AFTER the job is already marked finished and reported, and
+        cannot fail it: a job that found profiles must not read as failed
+        because an SMTP server was down.
+        """
+        if job.cancel.is_set():
+            # A cancelled sweep has nothing worth reporting on, and mailing
+            # about one would train the reader to ignore the reports.
+            return
+        try:
+            from backend.database.repositories import alert_settings_repository as alert_db
+            cfg = await alert_db.get_settings()
+            if not cfg.get("report_on_sweep_complete"):
+                return
+            from backend.services import report_service
+            task = report_service.spawn_client_report(job.group_id)
+            if task is not None:
+                await task
+        except Exception as e:                       # noqa: BLE001 - never fatal
+            log.warning(f"sweep report skipped for job {job.id}: {type(e).__name__}: {e}")
 
     async def _settle_avatars(self, job: DiscoveryJob) -> None:
         """Let the behind-the-sweep avatar caching finish (or stop it).
@@ -482,7 +511,7 @@ class DiscoveryRunner:
         prog = job.platforms[platform_id]
         prog.status = "running"
         prog.started_at_ts = time.time()
-        plat = registry.get(platform_id)
+        registry.get(platform_id)
         tabs = PLATFORM_TABS.get(platform_id, ["people"])
         platform_limits = {"individual": platform_limits_individual, "domain": platform_limits_domain}
         options = DiscoveryOptions(
@@ -547,6 +576,8 @@ class DiscoveryRunner:
                 discoverer = plat_obj.discoverer()(options, session.ctx)
 
             incomplete = 0
+
+            sweep_errors: list[str] = []
             stop_platform = False
             for keyword, kw_type in job.keyword_plan:
                 if stop_platform:
@@ -625,6 +656,20 @@ class DiscoveryRunner:
                     sweep_complete = bool(getattr(sweep, "complete", True))
                     if not sweep_complete:
                         incomplete += 1
+                        # KEEP THE REASON, not just the count. Engines report
+                        # a diagnosed failure on `error` rather than raising
+                        # (a geo-block, a CAPTCHA, an auth wall found
+                        # mid-page), and the note built below used to replace
+                        # all of it with "N sweep(s) did not run to
+                        # completion" -- so TikTok telling us verbatim
+                        # "blocked for this IP, route through a proxy in a
+                        # region where TikTok is available" reached the log
+                        # and never the analyst, who saw a generic count and
+                        # no way to act on it. Deduplicated because one cause
+                        # usually stops every keyword on that platform.
+                        if reason := str(getattr(sweep, "error", "") or "").strip():
+                            if reason not in sweep_errors:
+                                sweep_errors.append(reason)
                     prog.keywords_done += 1
                     # getattr throughout: `Sweep` is each platform engine's
                     # own dataclass, and only some of them carry these.
@@ -682,7 +727,13 @@ class DiscoveryRunner:
 
             if incomplete:
                 prog.status = "partial"
-                prog.note = f"{incomplete} sweep(s) did not run to completion"
+                if sweep_errors:
+                    # The diagnosis first, the count second -- the count is
+                    # the part an analyst can do nothing with.
+                    detail = " | ".join(sweep_errors[:2])
+                    prog.note = f"{detail} ({incomplete} sweep(s) incomplete)"
+                else:
+                    prog.note = f"{incomplete} sweep(s) did not run to completion"
             else:
                 prog.status = "done"
         except Exception as e:

@@ -202,14 +202,22 @@ class TestAgeFilterPartitions:
         them, which is the whole point of moving this off the client."""
         new_q = _build_query("c1", status="pending", age="new")
         old_q = _build_query("c1", status="pending", age="old")
-        new_clause = next(c for c in new_q["$and"] if "first_seen" in c)
-        old_clause = next(c for c in old_q["$and"] if "$or" in c)
-        assert "$gte" in new_clause["first_seen"]
-        # "old" must also claim rows with NO first_seen, matching the
-        # frontend's isProfileNew, which reads a missing timestamp as not-new
-        branches = old_clause["$or"]
-        assert {"first_seen": None} in branches
-        assert {"first_seen": {"$exists": False}} in branches
+        # "new" is now an $or: first_seen >= cutoff OR avatar_changed_at >= cutoff
+        new_clause = next(c for c in new_q["$and"] if "$or" in c)
+        new_branches = new_clause["$or"]
+        assert any("first_seen" in b and "$gte" in b["first_seen"] for b in new_branches)
+        assert any("avatar_changed_at" in b and "$gte" in b["avatar_changed_at"] for b in new_branches)
+        # "old" is an $and of two $or groups (first_seen outside window AND
+        # avatar_changed_at outside window), so it also claims rows with
+        # NO first_seen and NO avatar_changed_at.
+        old_clause = next(c for c in old_q["$and"] if "$and" in c)
+        old_groups = old_clause["$and"]
+        fs_group = next(g for g in old_groups if any("first_seen" in b for b in g["$or"]))
+        assert {"first_seen": None} in fs_group["$or"]
+        assert {"first_seen": {"$exists": False}} in fs_group["$or"]
+        ac_group = next(g for g in old_groups if any("avatar_changed_at" in b for b in g["$or"]))
+        assert {"avatar_changed_at": None} in ac_group["$or"]
+        assert {"avatar_changed_at": {"$exists": False}} in ac_group["$or"]
 
     def test_no_age_filter_leaves_first_seen_alone(self):
         q = _build_query("c1", status="pending")

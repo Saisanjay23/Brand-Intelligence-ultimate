@@ -15,7 +15,7 @@ import {
   AlertTriangleIcon,
 } from "../components/AppIcons";
 
-type SubTab = "incidents" | "canary" | "settings" | "guide";
+type SubTab = "incidents" | "canary" | "settings";
 
 const SMTP_PRESETS: {
   name: string;
@@ -69,7 +69,6 @@ export function AlertsIncidentsPanel() {
   const [settings, setSettings] = useState<AlertSettings | null>(null);
 
   const [loading, setLoading] = useState(false);
-  const [runningCanary, setRunningCanary] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
   const [sendingTest, setSendingTest] = useState(false);
 
@@ -102,25 +101,6 @@ export function AlertsIncidentsPanel() {
     void refreshAll();
   }, [refreshAll]);
 
-  const handleRunCanary = async () => {
-    setRunningCanary(true);
-    try {
-      const rep = await alertsApi.runCanarySweep();
-      setCanary(rep);
-      const incRes = await alertsApi.getIncidents({ severity: severityFilter });
-      setIncidents(incRes.incidents);
-      setCounts(incRes.counts);
-      if (rep.overall_healthy) {
-        toast.success("Canary sweep complete: all pooled platforms are healthy.");
-      } else {
-        toast.error(`Canary sweep: ${rep.errors.length} platform issue(s) detected.`);
-      }
-    } catch (err: any) {
-      toast.error(`Canary check failed: ${err.message}`);
-    } finally {
-      setRunningCanary(false);
-    }
-  };
 
   const handleDismissIncident = async (id: string) => {
     try {
@@ -287,14 +267,22 @@ export function AlertsIncidentsPanel() {
                   textTransform: "uppercase",
                   padding: "3px 10px",
                   borderRadius: "20px",
-                  background: canary?.overall_healthy
-                    ? "rgba(0, 193, 77, 0.12)"
+                  background: !canary?.last_run ? "rgba(148, 163, 184, 0.12)"
+                    : canary.overall_healthy ? "rgba(0, 193, 77, 0.12)"
                     : "rgba(221, 56, 59, 0.12)",
-                  color: canary?.overall_healthy ? "var(--success-color, #00C14D)" : "var(--alert-color, #DD383B)",
-                  border: `1px solid ${canary?.overall_healthy ? "rgba(0, 193, 77, 0.35)" : "rgba(221, 56, 59, 0.35)"}`,
+                  color: !canary?.last_run ? "var(--text-dim, #98A2B3)"
+                    : canary.overall_healthy ? "var(--success-color, #00C14D)" : "var(--alert-color, #DD383B)",
+                  border: `1px solid ${!canary?.last_run ? "rgba(148, 163, 184, 0.3)"
+                    : canary.overall_healthy ? "rgba(0, 193, 77, 0.35)" : "rgba(221, 56, 59, 0.35)"}`,
                 }}
               >
-                {canary?.overall_healthy ? "ALL POOLS OPERATIONAL" : "ACTION REQUIRED"}
+                {/* `overall_healthy` defaults to true on a report that has
+                    never been produced, so without the last_run check this
+                    badge said ALL POOLS OPERATIONAL having checked nothing.
+                    A green light for an unmeasured system is worse than no
+                    light: it is the state an operator would act on. */}
+                {!canary?.last_run ? "NOT CHECKED YET"
+                  : canary.overall_healthy ? "ALL POOLS OPERATIONAL" : "ACTION REQUIRED"}
               </span>
             </div>
 
@@ -303,7 +291,18 @@ export function AlertsIncidentsPanel() {
                 ? `Proactive canary check ran at ${new Date(canary.last_run).toLocaleTimeString()} • ${
                     canary.warnings.length
                   } expiration warning(s) • ${settings?.alert_emails.length || 0} active email recipient(s)`
-                : "Continuous 30m heartbeat monitoring active across Facebook, Instagram, Twitter, Telegram, TikTok & YouTube."}
+                // Nothing runs the canary on a schedule -- run_canary_sweep
+                // has exactly two callers, both API routes. The old copy
+                // here claimed "continuous 30m heartbeat monitoring", which
+                // is the SESSION monitor (a different thing), and left an
+                // operator believing platform pools were being verified
+                // when nothing had verified them.
+                // Session state is kept current by the jobs themselves and by
+                // the 30-minute monitor; nothing here needs to trigger a check.
+                // To force one on a single account, the Sessions page has a
+                // per-platform and per-session Check that refuses while a job
+                // holds that session.
+                : "Waiting for the session monitor's first sweep. Pool health updates as jobs run, and every 30 minutes for idle sessions."}
             </div>
           </div>
         </div>
@@ -320,22 +319,6 @@ export function AlertsIncidentsPanel() {
             <span>Refresh</span>
           </button>
 
-          <button
-            className="btn btn-primary"
-            onClick={handleRunCanary}
-            disabled={runningCanary}
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: "8px",
-              padding: "9px 18px",
-              fontSize: "13px",
-              fontWeight: 600,
-            }}
-          >
-            <ZapIcon size={14} color="#FFFFFF" />
-            <span>{runningCanary ? "Checking Sessions…" : "Run Canary Sweep Now"}</span>
-          </button>
         </div>
       </div>
 
@@ -436,28 +419,6 @@ export function AlertsIncidentsPanel() {
           <span>⚙️ Email Notifications & SMTP</span>
         </button>
 
-        <button
-          onClick={() => setSubTab("guide")}
-          style={{
-            flex: 1,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            gap: "8px",
-            padding: "9px 14px",
-            borderRadius: "6px",
-            fontSize: "13px",
-            fontWeight: 700,
-            cursor: "pointer",
-            border: subTab === "guide" ? "1px solid var(--primary, #8838DD)" : "1px solid transparent",
-            background: subTab === "guide" ? "linear-gradient(135deg, rgba(136, 56, 221, 0.22), rgba(154, 80, 233, 0.12))" : "transparent",
-            color: subTab === "guide" ? "var(--text-main, #FFFFFF)" : "var(--text-muted, #98A2B3)",
-            boxShadow: subTab === "guide" ? "0 2px 8px rgba(0, 0, 0, 0.2)" : "none",
-            transition: "all 0.15s ease",
-          }}
-        >
-          <span>📖 Setup Guide</span>
-        </button>
       </div>
 
       {/* ─── TAB 1: Live Incidents Feed ─────────────────────────────── */}
@@ -496,7 +457,7 @@ export function AlertsIncidentsPanel() {
             <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
               {incidents.length > 0 && (
                 <button
-                  className="btn btn-secondary"
+                  className="btn btn-danger"
                   onClick={handleClearAllIncidents}
                   style={{ fontSize: "12px", padding: "5px 12px" }}
                 >
@@ -1291,186 +1252,6 @@ export function AlertsIncidentsPanel() {
         </div>
       )}
 
-      {/* ─── TAB 4: Setup & Configuration Guide ─────────────────────── */}
-      {subTab === "guide" && (
-        <div
-          style={{
-            background: "var(--bg-card)",
-            border: "1px solid var(--border-subtle)",
-            borderRadius: "12px",
-            padding: "28px",
-            display: "flex",
-            flexDirection: "column",
-            gap: "24px",
-            maxWidth: "960px",
-            margin: "0 auto",
-            lineHeight: 1.6,
-          }}
-        >
-          <div>
-            <h2 style={{ fontSize: "20px", fontWeight: 700, color: "#FFFFFF", margin: "0 0 6px 0" }}>
-              How to Configure Alerts & SMTP Notifications
-            </h2>
-            <p style={{ fontSize: "13px", color: "var(--text-muted)", margin: 0 }}>
-              Follow these simple steps to set up automated operational alerts for session outages and token expiration deadlines.
-            </p>
-          </div>
-
-          <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
-            {/* Step 1 */}
-            <div
-              style={{
-                background: "var(--background-color-dark, #101828)",
-                border: "1px solid var(--border-color, #344054)",
-                borderRadius: "10px",
-                padding: "18px 20px",
-              }}
-            >
-              <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "8px" }}>
-                <span
-                  style={{
-                    width: "26px",
-                    height: "26px",
-                    borderRadius: "50%",
-                    background: "linear-gradient(135deg, rgba(136, 56, 221, 0.25), rgba(154, 80, 233, 0.15))",
-                    color: "var(--ext-link-color, #9A50E9)",
-                    border: "1px solid rgba(136, 56, 221, 0.4)",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    fontSize: "12px",
-                    fontWeight: 700,
-                  }}
-                >
-                  1
-                </span>
-                <span style={{ fontSize: "15px", fontWeight: 700, color: "var(--text-main, #FFFFFF)" }}>
-                  Add Your Recipient Email Address
-                </span>
-              </div>
-              <p style={{ fontSize: "13px", color: "var(--secondary-text-color-dark, #D8D8D8)", margin: "0 0 6px 36px" }}>
-                Go to the <strong>Email Notifications & SMTP</strong> tab, type your email (e.g. <code>security@yourcompany.com</code>) into the <strong>Alert Recipient Emails</strong> box, and click <strong>Add</strong>. You can add multiple team members.
-              </p>
-            </div>
-
-            {/* Step 2 */}
-            <div
-              style={{
-                background: "var(--background-color-dark, #101828)",
-                border: "1px solid var(--border-color, #344054)",
-                borderRadius: "10px",
-                padding: "18px 20px",
-              }}
-            >
-              <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "8px" }}>
-                <span
-                  style={{
-                    width: "26px",
-                    height: "26px",
-                    borderRadius: "50%",
-                    background: "linear-gradient(135deg, rgba(136, 56, 221, 0.25), rgba(154, 80, 233, 0.15))",
-                    color: "var(--ext-link-color, #9A50E9)",
-                    border: "1px solid rgba(136, 56, 221, 0.4)",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    fontSize: "12px",
-                    fontWeight: 700,
-                  }}
-                >
-                  2
-                </span>
-                <span style={{ fontSize: "15px", fontWeight: 700, color: "var(--text-main, #FFFFFF)" }}>
-                  Configure Your SMTP Mail Provider
-                </span>
-              </div>
-              <div style={{ fontSize: "13px", color: "var(--secondary-text-color-dark, #D8D8D8)", margin: "0 0 6px 36px", display: "flex", flexDirection: "column", gap: "8px" }}>
-                <div>
-                  <strong>Using Gmail:</strong> Click the <strong>Gmail</strong> preset button. In your Google Account (with 2FA on), visit <code>myaccount.google.com/apppasswords</code>, generate an App Password named "Brand Intelligence", and paste the 16-letter password into the Password box.
-                </div>
-                <div>
-                  <strong>Using Microsoft 365 / Outlook:</strong> Click <strong>Outlook</strong>. Enter your email and account App Password (port 587).
-                </div>
-                <div>
-                  <strong>Using SendGrid / AWS SES:</strong> Use your provider's SMTP host (e.g. <code>smtp.sendgrid.net</code>), port 587, and your API Key.
-                </div>
-              </div>
-            </div>
-
-            {/* Step 3 */}
-            <div
-              style={{
-                background: "var(--background-color-dark, #101828)",
-                border: "1px solid var(--border-color, #344054)",
-                borderRadius: "10px",
-                padding: "18px 20px",
-              }}
-            >
-              <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "8px" }}>
-                <span
-                  style={{
-                    width: "26px",
-                    height: "26px",
-                    borderRadius: "50%",
-                    background: "linear-gradient(135deg, rgba(136, 56, 221, 0.25), rgba(154, 80, 233, 0.15))",
-                    color: "var(--ext-link-color, #9A50E9)",
-                    border: "1px solid rgba(136, 56, 221, 0.4)",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    fontSize: "12px",
-                    fontWeight: 700,
-                  }}
-                >
-                  3
-                </span>
-                <span style={{ fontSize: "15px", fontWeight: 700, color: "var(--text-main, #FFFFFF)" }}>
-                  Verify with a Test Email
-                </span>
-              </div>
-              <p style={{ fontSize: "13px", color: "var(--secondary-text-color-dark, #D8D8D8)", margin: "0 0 6px 36px" }}>
-                Click <strong>Save SMTP Settings</strong>, then click <strong>Send Test Email</strong>. You will receive an immediate verification email confirming the connection is working.
-              </p>
-            </div>
-
-            {/* Step 4 */}
-            <div
-              style={{
-                background: "var(--background-color-dark, #101828)",
-                border: "1px solid var(--border-color, #344054)",
-                borderRadius: "10px",
-                padding: "18px 20px",
-              }}
-            >
-              <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "8px" }}>
-                <span
-                  style={{
-                    width: "26px",
-                    height: "26px",
-                    borderRadius: "50%",
-                    background: "linear-gradient(135deg, rgba(136, 56, 221, 0.25), rgba(154, 80, 233, 0.15))",
-                    color: "var(--ext-link-color, #9A50E9)",
-                    border: "1px solid rgba(136, 56, 221, 0.4)",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    fontSize: "12px",
-                    fontWeight: 700,
-                  }}
-                >
-                  4
-                </span>
-                <span style={{ fontSize: "15px", fontWeight: 700, color: "var(--text-main, #FFFFFF)" }}>
-                  How the Proactive Watchdog Works
-                </span>
-              </div>
-              <p style={{ fontSize: "13px", color: "var(--secondary-text-color-dark, #D8D8D8)", margin: "0 0 6px 36px" }}>
-                The canary automatically inspects cookie expiration deadlines in the background. If a session cookie for Facebook (<code>xs</code>, <code>c_user</code>), Instagram (<code>sessionid</code>), or Twitter (<code>auth_token</code>) has fewer than 24 hours remaining, an alert is sent automatically before sweeps fail.
-              </p>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

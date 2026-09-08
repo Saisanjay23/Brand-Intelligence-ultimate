@@ -205,7 +205,7 @@ export default function App() {
         />
       )}
 
-      {page === "admin" && <AdminPanel sessions={sessions} onChanged={refreshPlatformState} />}
+      {page === "admin" && <AdminPanel sessions={sessions} platforms={platforms} onChanged={refreshPlatformState} />}
       <Toaster
         position="bottom-right"
         toastOptions={{

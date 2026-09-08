@@ -336,7 +336,7 @@ def build_init_js() -> str:
     }} catch (e) {{}}
 
 }})();
-"""
+"""  # noqa: F541
 
 
 # Module-level convenience build. Nothing imports it today (browser.py calls

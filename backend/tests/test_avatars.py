@@ -28,6 +28,7 @@ import io
 import pytest
 
 from backend.shared.avatars import (FLAT_THRESHOLD, YOUTUBE_GENERATED_PREFIX,
+                                    hd_picture_url,
                                     is_generated_avatar,
                                     looks_like_placeholder)
 
@@ -148,3 +149,67 @@ class TestEngineProperties:
         from backend.platforms.twitter.discovery_engine import TwitterUser
         assert TwitterUser(avatar=TW_EGG).has_custom_pic is False
         assert TwitterUser(avatar="https://pbs.twimg.com/profile_images/1/r.jpg").has_custom_pic is True
+
+
+class TestHdPictureUrl:
+    """hd_picture_url must upgrade thumbnails for all four platform families
+    and leave non-matching URLs unchanged."""
+
+    # -- Twitter / X --
+    def test_twitter_normal_to_400x400(self):
+        url = "https://pbs.twimg.com/profile_images/123/photo_normal.jpg"
+        assert hd_picture_url(url) == "https://pbs.twimg.com/profile_images/123/photo_400x400.jpg"
+
+    def test_twitter_mini_to_400x400(self):
+        url = "https://pbs.twimg.com/profile_images/123/photo_mini.png"
+        assert hd_picture_url(url) == "https://pbs.twimg.com/profile_images/123/photo_400x400.png"
+
+    def test_twitter_bigger_to_400x400(self):
+        url = "https://pbs.twimg.com/profile_images/123/photo_bigger.jpg"
+        assert hd_picture_url(url) == "https://pbs.twimg.com/profile_images/123/photo_400x400.jpg"
+
+    def test_twitter_already_400x400_unchanged(self):
+        url = "https://pbs.twimg.com/profile_images/123/photo_400x400.jpg"
+        assert hd_picture_url(url) == url
+
+    # -- YouTube --
+    def test_youtube_ggpht_88_to_800(self):
+        url = "https://yt3.ggpht.com/a/ABC=s88-c-k-c0x00ffffff-no-rj"
+        assert hd_picture_url(url) == "https://yt3.ggpht.com/a/ABC=s800-c-k-c0x00ffffff-no-rj"
+
+    def test_youtube_googleusercontent_176_to_800(self):
+        url = "https://yt3.googleusercontent.com/ytc/AIdro_x=s176"
+        assert hd_picture_url(url) == "https://yt3.googleusercontent.com/ytc/AIdro_x=s800"
+
+    def test_youtube_ytimg_to_800(self):
+        url = "https://yt3.ytimg.com/ytc/AIdro_abc=s88"
+        assert hd_picture_url(url) == "https://yt3.ytimg.com/ytc/AIdro_abc=s800"
+
+    # -- Telegram --
+    def test_telegram_320_to_640(self):
+        url = "https://t.me/i/userpic/320/durov.jpg"
+        assert hd_picture_url(url) == "https://t.me/i/userpic/640/durov.jpg"
+
+    def test_telegram_160_to_640(self):
+        url = "https://t.me/i/userpic/160/someone.jpg"
+        assert hd_picture_url(url) == "https://t.me/i/userpic/640/someone.jpg"
+
+    # -- Meta (Facebook / Instagram) --
+    def test_meta_crop_rewrite_preserved(self):
+        url = ("https://scontent.fblr8-1.fna.fbcdn.net/v/t1.30497-1/"
+               "photo_n.jpg?stp=cp0_dst-jpg_e15_p50x50_q65&ctp=s50x50&cstp=mx1080x1080")
+        upgraded = hd_picture_url(url)
+        assert "ctp=s1080x1080" in upgraded
+        assert "s1080x1080" in upgraded
+
+    # -- Edge cases --
+    def test_empty_string_stays_empty(self):
+        assert hd_picture_url("") == ""
+
+    def test_non_matching_url_unchanged(self):
+        url = "https://example.com/photo.jpg"
+        assert hd_picture_url(url) == url
+
+    def test_data_uri_unchanged(self):
+        data = "data:image/jpeg;base64,/9j/4AA"
+        assert hd_picture_url(data) == data

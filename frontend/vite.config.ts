@@ -27,7 +27,7 @@ const BACKEND = process.env.BACKEND_ORIGIN || "http://127.0.0.1:8000";
 const proxy = Object.fromEntries(
   [
     "/discovery", "/analysis", "/sessions", "/health", "/media",
-    "/clients", "/jobs",
+    "/clients", "/jobs", "/reports", "/alerts",
     "/docs", "/redoc", "/openapi.json",
   ].map((path) => [path, { target: BACKEND, changeOrigin: true }]),
 );

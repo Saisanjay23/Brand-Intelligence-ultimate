@@ -6,9 +6,9 @@ straight through and used as-is, never regenerated).
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
-from backend.shared.errors import ConflictError, NotFoundError
+from backend.shared.errors import ConflictError, NotFoundError, ValidationError
 from backend.database.connection import db
 from backend.shared import keywords as _keywords
 
@@ -91,6 +91,17 @@ def _to_out(doc: dict) -> dict:
         # this is about the automatic rotation only. Absent means enabled,
         # so every client saved before this existed keeps running.
         "scheduler_enabled": doc.get("scheduler_enabled", True),
+        # WHAT THE SCHEDULER SHOULD RUN FOR THIS CLIENT, remembered between
+        # runs so an analyst sets it once rather than on every queueing.
+        #
+        # Empty list means EVERY ready platform, matching what omitting
+        # `platforms` already means to POST /discovery/jobs -- one canonical
+        # spelling of "all", so a client that has never been configured and
+        # one deliberately set to all behave identically.
+        "scheduler_platforms": doc.get("scheduler_platforms") or [],
+        # "" (all) | "individual" | "domain". Same convention as the Clients
+        # page's own keyword-scope chips.
+        "scheduler_keyword_scope": doc.get("scheduler_keyword_scope") or "",
     }
 
 
@@ -232,6 +243,46 @@ async def upsert(
     )
     doc = await db()[CLIENTS].find_one({"_id": client_id})
     return _to_out(doc)
+
+
+async def set_scheduler_prefs(
+    client_id: str, *, platforms: Optional[list[str]] = None,
+    keyword_scope: Optional[str] = None,
+) -> dict:
+    """What the Scheduler should sweep for this client, and with which
+    keywords. Persisted so the choice survives the queue being cleared, the
+    browser being closed, and the analyst moving to another machine.
+
+    NOT PART OF `_config_fields`, and that is the whole point. `upsert`
+    writes a fixed set of configuration keys; folding these in would mean
+    saving a client from the Clients form -- which knows nothing about
+    scheduler preferences and sends none -- silently reset them to empty.
+    That is the same shape of bug as the client-overwrite this repository
+    already had once, so this is a separate narrow `$set` that touches these
+    two fields and nothing else.
+
+    `platforms=[]` means every ready platform, which is exactly what
+    omitting `platforms` means to the discovery API. `keyword_scope=""`
+    means both keyword types.
+    """
+    fields: dict[str, Any] = {}
+    if platforms is not None:
+        fields["scheduler_platforms"] = [
+            p.strip().lower() for p in platforms if str(p).strip()
+        ]
+    if keyword_scope is not None:
+        scope = (keyword_scope or "").strip().lower()
+        if scope not in ("", "individual", "domain"):
+            raise ValidationError(
+                f"keyword_scope must be 'individual', 'domain' or empty, not {scope!r}")
+        fields["scheduler_keyword_scope"] = scope
+    if not fields:
+        return await get(client_id)
+
+    res = await db()[CLIENTS].update_one({"_id": client_id}, {"$set": fields})
+    if res.matched_count == 0:
+        raise NotFoundError(f"client {client_id!r} not found")
+    return await get(client_id)
 
 
 async def reorder(client_ids: list[str]) -> None:

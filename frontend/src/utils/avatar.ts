@@ -45,9 +45,13 @@ const PROXYABLE_HOST_SUFFIXES = [
   ".twimg.com",
   ".ggpht.com",
   ".googleusercontent.com",
+  ".ytimg.com",
   ".licdn.com",
   ".tiktokcdn.com",
   ".tiktokcdn-us.com",
+  ".t.me",
+  ".telegram.org",
+  ".telesco.pe",
 ];
 
 // Instagram specifically. Its avatars come off the shared Meta CDN under an
@@ -81,7 +85,10 @@ export function avatarSources(
   const stored = sha ? [url(`/media/avatar/${sha}`)] : [];
   if (!raw) return stored;
   // Telegram stores the picture itself rather than a link to one.
-  if (raw.startsWith("data:")) return [raw];
+  // When we have a stored copy (sha), prefer it over the inline blob so the
+  // card renders a permanent GridFS-backed URL and avoids the DOM overhead
+  // of a multi-kilobyte data: URI in every card element.
+  if (raw.startsWith("data:")) return [...stored, raw];
 
   let host: string;
   try {

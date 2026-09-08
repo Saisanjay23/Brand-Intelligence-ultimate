@@ -36,6 +36,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from backend.shared.avatars import hd_picture_url
 from backend.shared.logging import get_logger
 from backend.shared.models.hit import Hit, hit_to_row
 from backend.shared.models.row import Row
@@ -377,8 +378,10 @@ class Discovery:
                         continue
                     
                     thumbs = snip.get("thumbnails") or {}
-                    avatar = (thumbs.get("high") or thumbs.get("medium")
-                             or thumbs.get("default") or {}).get("url", "")
+                    avatar = hd_picture_url(
+                        (thumbs.get("high") or thumbs.get("medium")
+                         or thumbs.get("default") or {}).get("url", "")
+                    )
                     hit = Hit(
                         entity_id=cid,
                         name=(

@@ -24,7 +24,6 @@ image decoding.
 from __future__ import annotations
 
 import asyncio
-from typing import Optional
 
 from fastapi import APIRouter, File, Form, Path, Response, UploadFile, status
 from pydantic import BaseModel, Field

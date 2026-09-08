@@ -30,6 +30,8 @@ export interface AlertSettings {
   alert_on_session_expiring: boolean;
   alert_on_critical_incident: boolean;
   session_expiry_warning_hours: number;
+  report_on_sweep_complete?: boolean;
+  report_emails?: string[];
 }
 
 export interface Incident {
@@ -67,6 +69,9 @@ export interface PlatformCanarySummary {
 }
 
 export interface CanaryReport {
+  /** When the underlying session checks actually happened -- the newest
+   *  stored check, not when the status was requested. Null before the
+   *  session monitor's first sweep. Reading this never triggers a login. */
   last_run: string | null;
   overall_healthy: boolean;
   platforms: Record<string, PlatformCanarySummary>;
@@ -111,10 +116,6 @@ export const alertsApi = {
       json<{ ok: boolean; cleared: number }>
     ),
 
-  runCanarySweep: () =>
-    fetch(`${API_BASE}/alerts/canary/run`, { method: "POST" }).then(
-      json<CanaryReport>
-    ),
 
   getCanaryStatus: () =>
     fetch(`${API_BASE}/alerts/canary/status`).then(json<CanaryReport>),

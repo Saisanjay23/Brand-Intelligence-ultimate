@@ -69,6 +69,12 @@ export interface Client {
   order?: number;
   cron?: string | null;
   created_at?: string;
+  // What the SCHEDULER should run for this client, remembered between runs.
+  // Empty `scheduler_platforms` means every ready platform; empty
+  // `scheduler_keyword_scope` means both keyword types. Written only by
+  // PUT /clients/{id}/scheduler-prefs, never by the Clients form.
+  scheduler_platforms?: string[];
+  scheduler_keyword_scope?: string;
 }
 
 // What the Clients form produces for one client. Formerly the request body

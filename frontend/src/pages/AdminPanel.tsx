@@ -1,24 +1,29 @@
 import { useState } from "react";
-import type { SessionInfo } from "../api/types";
+import type { PlatformState, SessionInfo } from "../api/types";
 import { SchedulerPanel } from "./SchedulerPanel";
 import { SessionPanel } from "./SessionPanel";
 import { AlertsIncidentsPanel } from "./AlertsIncidentsPanel";
-import { SessionsKeyIcon, SchedulerClockIcon, AlertBellIcon } from "../components/AppIcons";
+import { ReportsPanel } from "./ReportsPanel";
+import { SessionsKeyIcon, SchedulerClockIcon, AlertBellIcon, DownloadIcon } from "../components/AppIcons";
 
 interface Props {
   sessions: SessionInfo[];
+  // Passed down rather than re-polled: App already keeps this live, and a
+  // second poller would double the traffic for the same data.
+  platforms: PlatformState[];
   onChanged: () => void;
 }
 
-type AdminTab = "sessions" | "alerts" | "scheduler";
+type AdminTab = "sessions" | "alerts" | "scheduler" | "reports";
 
 const TABS: { id: AdminTab; label: string; icon: (active: boolean) => React.ReactNode }[] = [
   { id: "sessions", label: "Sessions", icon: (a) => <SessionsKeyIcon size={15} color={a ? "#8838DD" : "currentColor"} /> },
   { id: "alerts", label: "Alerts & Incidents", icon: (a) => <AlertBellIcon size={15} color={a ? "#8838DD" : "currentColor"} /> },
   { id: "scheduler", label: "Scheduler", icon: (a) => <SchedulerClockIcon size={15} color={a ? "#8838DD" : "currentColor"} /> },
+  { id: "reports", label: "Reports", icon: (a) => <DownloadIcon size={15} color={a ? "#8838DD" : "currentColor"} /> },
 ];
 
-export function AdminPanel({ sessions, onChanged }: Props) {
+export function AdminPanel({ sessions, platforms, onChanged }: Props) {
   const [tab, setTab] = useState<AdminTab>("sessions");
 
   return (
@@ -38,7 +43,8 @@ export function AdminPanel({ sessions, onChanged }: Props) {
 
       {tab === "sessions" && <SessionPanel sessions={sessions} onChanged={onChanged} />}
       {tab === "alerts" && <AlertsIncidentsPanel />}
-      {tab === "scheduler" && <SchedulerPanel />}
+      {tab === "scheduler" && <SchedulerPanel platforms={platforms} />}
+      {tab === "reports" && <ReportsPanel />}
     </div>
   );
 }

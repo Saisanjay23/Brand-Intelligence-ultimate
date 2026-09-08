@@ -33,10 +33,11 @@ them. Any stable string works.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Literal, Optional
+from typing import Literal, Optional
 
-from fastapi import APIRouter, Path, Query, Response, status
+from fastapi import APIRouter, Path, Query, status
 from pydantic import BaseModel, Field
 
 from backend.analysis.runner import analysis_runner
@@ -248,6 +249,11 @@ class DiscoveredProfile(BaseModel):
         "", description="Id of the reference logo it matched. Its image is at "
                         "GET /clients/{client_id}/logos/{id}/image, for showing "
                         "side by side with the avatar.")
+    is_original: bool = Field(
+        False,
+        description="An analyst marked this as the GENUINE account -- the real "
+                    "brand or person, not an impersonation. Permanent: no "
+                    "re-discovery ever clears it.")
     logo_match_tier: str = Field(
         "", description="How it matched: `exact` (byte-identical file re-uploaded) "
                         "or `phash` (near-identical image -- re-encoded, resized).")
@@ -273,6 +279,12 @@ class DiscoveredProfile(BaseModel):
     source: str = ""
     first_seen: Optional[str] = None
     last_seen: Optional[str] = None
+    avatar_changed_at: Optional[str] = Field(
+        None,
+        description="UTC ISO timestamp of when a repeat discovery sweep detected a "
+                    "genuinely different profile picture (asset path changed, not just "
+                    "an expired CDN signature). Absent until a change is observed.",
+    )
 
 
 class ProfileCounts(BaseModel):
@@ -329,6 +341,7 @@ def _to_profile(doc: dict) -> DiscoveredProfile:
         logo_similarity=doc.get("logo_similarity"),
         logo_ref_id=doc.get("logo_ref_id", "") or "",
         logo_match_tier=doc.get("logo_match_tier", "") or "",
+        is_original=bool(doc.get("is_original")),
         has_logo=doc.get("has_logo"),
         verified=doc.get("verified"),
         followers=doc.get("followers"),
@@ -342,7 +355,51 @@ def _to_profile(doc: dict) -> DiscoveredProfile:
         source=doc.get("discovery_source", "") or "",
         first_seen=iso(doc.get("first_seen")),
         last_seen=iso(doc.get("last_seen")),
+        avatar_changed_at=iso(doc.get("avatar_changed_at")),
     )
+
+
+def _parse_when(value: Optional[str], *, field: str, end_of_day: bool = False) -> Optional[datetime]:
+    """A `first_seen_from`/`first_seen_to` query value -> a UTC instant.
+
+    ACCEPTS TWO SHAPES, and the difference matters more than it looks:
+
+      * a full ISO-8601 instant ("2026-09-06T18:30:00Z") -- used as given.
+        This is what the UI sends, because a calendar date only means
+        something in a timezone: an analyst in IST who picks "6 Sep" means
+        6 Sep in Delhi, and the profile they found at 01:00 that morning is
+        stored as 5 Sep 19:30 UTC. The browser knows its own offset, so it
+        resolves the date to an instant and sends that; treating the bare
+        date as UTC here would have silently dropped that profile out of
+        the range an analyst could see on screen.
+
+      * a bare date ("2026-09-06") -- read as UTC, for a caller hitting the
+        API directly with no timezone in mind. `end_of_day` then advances it
+        to the NEXT midnight, so `to=2026-09-06` includes all of the 6th
+        against the half-open range the repository applies.
+
+    A naive datetime is read as UTC. Anything else is a 400 rather than a
+    silent no-op: a range the server could not parse and quietly ignored
+    would show the analyst an unfiltered list that looks filtered.
+    """
+    v = (value or "").strip()
+    if not v:
+        return None
+    if len(v) == 10 and v[4] == "-" and v[7] == "-":
+        try:
+            day = datetime.strptime(v, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            raise ValidationError(f"{field}: {v!r} is not a valid date (expected YYYY-MM-DD)")
+        return day + timedelta(days=1) if end_of_day else day
+    try:
+        # fromisoformat only learned "Z" in 3.11; normalise so this does not
+        # depend on which interpreter the service happens to run under.
+        dt = datetime.fromisoformat(v.replace("Z", "+00:00").replace("z", "+00:00"))
+    except ValueError:
+        raise ValidationError(
+            f"{field}: {v!r} is not a date (YYYY-MM-DD) or an ISO-8601 timestamp"
+        )
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
 
 # ----------------------------------------------------------------- routes
@@ -468,6 +525,29 @@ async def list_profiles(
                     "`old`. Meaningful with `status=validated`; distinct from "
                     "`age`, which splits by first discovery instead.",
     ),
+    is_original: Optional[bool] = Query(
+        None,
+        description="true = only the genuine accounts an analyst has marked; "
+                    "false = everything except those; omit for both.",
+    ),
+    first_seen_from: Optional[str] = Query(
+        None, max_length=40,
+        description="Only profiles FIRST DISCOVERED at or after this point. "
+                    "`YYYY-MM-DD` (read as UTC) or a full ISO-8601 timestamp "
+                    "(use this to mean a calendar date in your own timezone). "
+                    "Applied server-side, so the range survives pagination.",
+        examples=["2026-09-01", "2026-08-31T18:30:00Z"],
+    ),
+    first_seen_to: Optional[str] = Query(
+        None, max_length=40,
+        description="Only profiles first discovered BEFORE this point. A bare "
+                    "`YYYY-MM-DD` includes the whole of that day (the range is "
+                    "half-open and the date is advanced to the next midnight), "
+                    "so from=to=one date is that single day. Profiles with no "
+                    "first_seen are excluded by any range -- unlike `age`, "
+                    "where a missing timestamp counts as `old`.",
+        examples=["2026-09-06"],
+    ),
     logo_matched: bool = Query(
         False,
         description="Only profiles whose picture matched one of the client's "
@@ -480,13 +560,24 @@ async def list_profiles(
 ) -> DiscoveredProfilePage:
     """Durable results, readable while the job that produced them is still
     running. Ordering is stable, so `limit`/`offset` paging is safe."""
+    seen_from = _parse_when(first_seen_from, field="first_seen_from")
+    seen_to = _parse_when(first_seen_to, field="first_seen_to", end_of_day=True)
+    if seen_from and seen_to and seen_from >= seen_to:
+        # An inverted range matches nothing, and an empty list is exactly what
+        # a range that found nothing looks like -- so say which it was rather
+        # than letting a typo read as "no results".
+        raise ValidationError(
+            f"first_seen_from ({first_seen_from}) is not before first_seen_to "
+            f"({first_seen_to}) -- that range cannot contain anything"
+        )
     docs, total, counts = await profiles_db.find(
         group_id, platform=platform.value if platform else None,
         status=_TO_DB_STATUS[status_.value] if status_ else None,
         phase=profiles_db.PHASE_DISCOVERY,
         keyword=keyword, search=search, limit=limit, offset=offset,
         include_held=True, age=age, validated_age=validated_age,
-        logo_matched=logo_matched,
+        logo_matched=logo_matched, is_original=is_original,
+        first_seen_from=seen_from, first_seen_to=seen_to,
         match_level=match_level, entity_type=entity_type,
     )
     return DiscoveredProfilePage(
@@ -532,6 +623,43 @@ async def set_profile_status(body: SetProfileStatus) -> ProfileStatusResult:
     for pid in body.ids:
         try:
             await profiles_db.patch(pid, {"status": db_status})
+            updated.append(pid)
+        except Exception as e:
+            failed.append(SkippedInput(value=pid, reason=str(e)))
+    return ProfileStatusResult(updated=updated, failed=failed)
+
+
+class SetProfileOriginal(BaseModel):
+    ids: list[str] = Field(..., min_length=1, max_length=1000,
+                           description="Profile ids from GET /discovery/profiles.")
+    is_original: bool = Field(
+        True, description="False un-marks it.")
+
+
+@router.post("/profiles/original", response_model=ProfileStatusResult,
+             summary="Mark profiles as the genuine account")
+async def set_profile_original(body: SetProfileOriginal) -> ProfileStatusResult:
+    """Marks a profile as the REAL brand or person rather than an
+    impersonation of them.
+
+    A sweep for a brand finds that brand's own official account too, and
+    without this it comes back as an unresolved candidate on every future
+    sweep forever. Marking it says "this one is us".
+
+    PERMANENT BY CONSTRUCTION. `is_original` is not among the fields a
+    discovery write owns, so no amount of re-discovery can clear it -- only
+    this endpoint, called again with `is_original: false`.
+
+    Deliberately independent of triage status: a genuine account can be
+    validated, pending or rejected, and marking it here changes none of
+    those. It answers a different question -- "is this us?" rather than
+    "have we looked at it?"
+    """
+    updated: list[str] = []
+    failed: list[SkippedInput] = []
+    for pid in body.ids:
+        try:
+            await profiles_db.patch(pid, {"is_original": body.is_original})
             updated.append(pid)
         except Exception as e:
             failed.append(SkippedInput(value=pid, reason=str(e)))

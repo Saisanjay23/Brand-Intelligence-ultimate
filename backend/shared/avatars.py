@@ -182,18 +182,55 @@ _CSTP = re.compile(r"cstp=mx(\d+)x(\d+)")
 _STP_SIZE = re.compile(r"([sp])\d+x\d+")
 
 
+_TWITTER_THUMB = re.compile(r"_(normal|mini|bigger)\.([a-zA-Z0-9]+)")
+_YOUTUBE_SIZE = re.compile(r"=s\d+")
+_TELEGRAM_USERPIC = re.compile(r"/userpic/(?:160|320)/")
+
+# Hostname fragments for quick matching without a full URL parse.
+_YOUTUBE_HOSTS = ("ggpht.com", "googleusercontent.com", "ytimg.com")
+_TELEGRAM_HOSTS = ("t.me", "telegram.org", "telesco.pe")
+
+
 def hd_picture_url(url: str) -> str:
-    """Rewrites a Meta CDN (Facebook/Instagram) photo URL to request the full
-    upload resolution instead of the default low-res thumbnail."""
+    """Rewrites a platform CDN photo URL to request the highest available
+    resolution instead of the default low-res thumbnail.
+
+    Supports Meta (Facebook / Instagram), Twitter / X, YouTube, and Telegram.
+    Each platform's rewrite is independent: Meta uses the signed crop
+    parameters already in the URL, the others are simple suffix / path
+    substitutions that the CDN accepts without a new signature.
+    """
     if not url:
         return url
+
+    # -- Meta (Facebook / Instagram) --
     cstp = _CSTP.search(url)
-    if not cstp:
+    if cstp:
+        w, h = cstp.group(1), cstp.group(2)
+        if _CTP.search(url):
+            url = _CTP.sub(f"ctp=s{w}x{h}", url)
+        url = _STP_SIZE.sub(lambda m: f"{m.group(1)}{w}x{h}", url)
         return url
-    w, h = cstp.group(1), cstp.group(2)
-    if _CTP.search(url):
-        url = _CTP.sub(f"ctp=s{w}x{h}", url)
-    url = _STP_SIZE.sub(lambda m: f"{m.group(1)}{w}x{h}", url)
+
+    # -- Twitter / X  (pbs.twimg.com) --
+    # Default search payloads and DOM images carry `_normal.jpg` (48×48).
+    # The CDN honours `_400x400` for the same asset id.
+    if _TWITTER_THUMB.search(url):
+        url = _TWITTER_THUMB.sub(r"_400x400.\2", url)
+        return url
+
+    # -- YouTube (yt3.ggpht.com / *.googleusercontent.com / *.ytimg.com) --
+    # API search thumbnails are =s88 (88×88); =s800 is the max the CDN serves.
+    if any(h in url for h in _YOUTUBE_HOSTS) and _YOUTUBE_SIZE.search(url):
+        url = _YOUTUBE_SIZE.sub("=s800", url)
+        return url
+
+    # -- Telegram (t.me/i/userpic/320/…) --
+    # Web avatar URLs default to 320×320; 640 is the largest available.
+    if any(h in url for h in _TELEGRAM_HOSTS) and _TELEGRAM_USERPIC.search(url):
+        url = _TELEGRAM_USERPIC.sub("/userpic/640/", url)
+        return url
+
     return url
 
 

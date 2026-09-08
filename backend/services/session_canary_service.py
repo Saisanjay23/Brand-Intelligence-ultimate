@@ -30,13 +30,10 @@ CRITICAL_COOKIES: dict[str, tuple[str, ...]] = {
 _recent_alerts: dict[str, float] = {}
 _ALERT_COOLDOWN_SEC = 12 * 3600  # Alert at most once every 12h per session for impending expiration
 
-_last_canary_report: dict[str, Any] = {
-    "last_run": None,
-    "overall_healthy": True,
-    "platforms": {},
-    "warnings": [],
-    "errors": [],
-}
+# No cached report and no lock any more. Both existed to manage a sweep that
+# opened browsers; the report is now four database reads, so building it per
+# request is cheaper than the bookkeeping needed to avoid doing so -- and a
+# cache cannot go stale if there isn't one.
 
 
 def _now() -> float:
@@ -121,19 +118,53 @@ async def check_token_expiries() -> list[dict[str, Any]]:
     return warnings
 
 
-async def run_canary_sweep() -> dict[str, Any]:
-    """Runs a complete proactive session canary check across all platforms and returns a report."""
-    global _last_canary_report
+async def build_canary_report() -> dict[str, Any]:
+    """The session-pool health overview -- BUILT ENTIRELY FROM STORED STATE.
+
+    NOTHING HERE LOGS IN. That is the whole design, and it is not a
+    compromise: every live check this used to perform is already being done,
+    continuously, by paths that own it properly.
+
+        rotation / use counts   `get_healthy_session`, as each job takes a
+                                session out of the pool
+        rotated cookies         `sync_cookies` -> `refresh_cookies`, on every
+                                session stop and at four explicit points in
+                                the two runners
+        dead / OK marking       `mark_session_failed` / `mark_session_ok`,
+                                from eight call sites across the runners --
+                                on EVERY job success and failure, immediately
+        idle sessions           `sessions/manager.py::_monitor_loop`, every
+                                30 minutes, jittered
+
+    So a session a job has touched is current to the second, and an idle one
+    is current to within half an hour. This function reads that and presents
+    it; it has nothing to add by logging in again.
+
+    WHY IT USED TO, AND WHY THAT WAS WRONG. It called `check_all_once()` --
+    the exact function the 30-minute monitor calls -- so every invocation
+    duplicated the monitor's work with a second set of authenticated page
+    loads on real accounts. Worse, it hung off a GET that the Alerts panel
+    calls on mount, so merely OPENING that tab started logins across six
+    platforms, and two tabs started two sets concurrently. It also defeated
+    the monitor's jitter, which exists precisely so probes do not land on a
+    predictable schedule.
+
+    An operator who wants a live check on demand has better tools already:
+    per-platform and per-session "check now" on the Sessions page, both of
+    which refuse while a job holds that session -- a guard this never had.
+    """
     from backend.platforms import registry
     from backend.sessions import manager as sessions_engine
 
     expiry_warnings = await check_token_expiries()
 
-    # Run check_all_once across monitored platforms
+    # What the monitor last recorded, per platform -- a database read, not a
+    # login. This is the same verdict `check_all_once` would produce, already
+    # computed and stored by whichever path last touched each session.
     try:
-        check_results = await sessions_engine.check_all_once()
+        check_results = await sessions_db.cached_health()
     except Exception as e:
-        log.error(f"canary sweep check_all_once failed: {e}")
+        log.error(f"canary: could not read stored session health: {e}")
         check_results = {}
 
     platform_summaries: dict[str, Any] = {}
@@ -170,17 +201,22 @@ async def run_canary_sweep() -> dict[str, Any]:
 
     overall_healthy = len(errors) == 0
 
-    report = {
-        "last_run": datetime.now(timezone.utc).isoformat(),
+    # WHEN THE UNDERLYING DATA WAS ACTUALLY GATHERED -- the newest stored
+    # check, not "now". Stamping the read time would make the page claim a
+    # verification happened the instant it was opened, which is the same lie
+    # this function was rewritten to stop telling. Null means nothing has
+    # checked yet (a process that has not reached its first monitor sweep).
+    checked = [v.get("checked_at") for v in check_results.values() if v.get("checked_at")]
+    newest = max(checked) if checked else None
+    if newest is not None and newest.tzinfo is None:
+        # Motor hands datetimes back naive-but-UTC; stamp it so the browser
+        # does not read the ISO string as local time.
+        newest = newest.replace(tzinfo=timezone.utc)
+
+    return {
+        "last_run": newest.isoformat() if newest else None,
         "overall_healthy": overall_healthy,
         "platforms": platform_summaries,
         "warnings": warnings_list,
         "errors": errors,
     }
-    _last_canary_report = report
-    return report
-
-
-def get_latest_canary_report() -> dict[str, Any]:
-    """Returns the cached latest canary status overview."""
-    return _last_canary_report

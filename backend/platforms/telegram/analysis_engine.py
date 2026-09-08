@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 
 from typing import Optional
 
+from backend.shared.avatars import hd_picture_url
 from backend.shared.models.row import Row
 from backend.shared.text import (name_score, normalized_host,
                                    parse_normalized_url)
@@ -190,7 +191,12 @@ class Scraper:
         elif e.kind == "profile":
             row.note("telegram exposes no creation date for user accounts")
         if e.avatar:
-            row.profile_pic_url = e.avatar
+            # data: URIs (MTProto base64) pass through unchanged;
+            # URL-based avatars (t.me/i/userpic/) get HD rewritten.
+            row.profile_pic_url = (
+                e.avatar if e.avatar.startswith("data:")
+                else hd_picture_url(e.avatar)
+            )
         # has_photo comes straight from Telethon's own PhotoEmpty check, not
         # a guess from whether the avatar URL happened to resolve
         row.has_custom_pic = e.has_photo

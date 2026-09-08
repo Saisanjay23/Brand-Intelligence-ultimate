@@ -7,7 +7,7 @@ variables in `backend.config.settings.Settings`.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 from datetime import datetime, timezone
 
 from backend.config.settings import settings
@@ -33,6 +33,14 @@ def _default_settings() -> dict[str, Any]:
         "alert_on_session_dead": True,
         "alert_on_session_expiring": True,
         "alert_on_critical_incident": True,
+        # OFF by default, deliberately. A sweep finishing is a routine event
+        # that happens many times a day; turning this on without the operator
+        # asking would turn a feature into a mail flood on the first sweep
+        # after an upgrade.
+        "report_on_sweep_complete": False,
+        # Falls back to `alert_emails` when empty, so reports can either
+        # share the alert recipients or go to a different list.
+        "report_emails": [],
         "session_expiry_warning_hours": 24,
         "updated_at": datetime.now(timezone.utc),
     }
@@ -56,6 +64,8 @@ async def get_settings() -> dict[str, Any]:
 async def save_settings(fields: dict[str, Any]) -> dict[str, Any]:
     """Update global alert settings in MongoDB."""
     allowed = {
+        "report_on_sweep_complete",
+        "report_emails",
         "alert_emails",
         "smtp_host",
         "smtp_port",
