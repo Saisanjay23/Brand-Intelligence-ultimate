@@ -108,6 +108,8 @@ export interface DiscoveryJobState {
   estimated_remaining_seconds?: number | null;
   platforms: PlatformSweepState[];
   history?: CompletedSweepTelemetry[];
+  // Opaque; echoed back as `rev` to long-poll for the next change.
+  rev?: string;
 }
 
 export interface DiscoveredProfile {
@@ -264,7 +266,21 @@ export const discoveryApi = {
   startDiscovery: (body: StartDiscoveryBody) =>
     post("/discovery/jobs", body).then(json<StartDiscoveryAccepted>),
 
-  getJob: (jobId: string) => fetch(url(`/discovery/jobs/${jobId}`)).then(json<DiscoveryJobState>),
+// LONG POLL, NOT A TICK. Passing the `rev` from the previous response plus
+// a `wait` makes the backend hold the request open until the job actually
+// moves, then answer at once -- so a saved profile reaches the screen about
+// a tenth of a second after it is written, instead of on the next interval,
+// and an idle job costs one request per wait window rather than one every
+// two seconds. Omit both and this is the plain immediate snapshot it has
+// always been. See backend/shared/live_poll.py.
+  getJob: (jobId: string, watch?: { rev?: string; wait?: number; signal?: AbortSignal }) => {
+    const p = new URLSearchParams();
+    if (watch?.rev) p.set("rev", watch.rev);
+    if (watch?.wait) p.set("wait", String(watch.wait));
+    const q = p.toString();
+    return fetch(url(`/discovery/jobs/${jobId}${q ? `?${q}` : ""}`), { signal: watch?.signal })
+      .then(json<DiscoveryJobState>);
+  },
 
   cancelJob: (jobId: string) =>
     post(`/discovery/jobs/${jobId}/cancel`, {}).then(json<{ cancelled: boolean }>),

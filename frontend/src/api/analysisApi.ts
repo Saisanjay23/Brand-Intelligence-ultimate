@@ -84,6 +84,8 @@ export interface AnalysisJobResponse {
   estimated_remaining_seconds?: number | null;
   platform_progress: Record<string, PlatformProgressData>;
   items: AnalysisItemData[];
+  // Opaque; echoed back as `rev` to long-poll for the next change.
+  rev?: string;
 }
 
 export interface AnalysisStartResponse {
@@ -121,8 +123,24 @@ export const analysisApi = {
     return json<AnalysisStartResponse>(res);
   },
 
-  getJob: async (jobId: string): Promise<AnalysisJobResponse> => {
-    const res = await fetch(url(`/analysis/jobs/${jobId}`));
+// LONG POLL, NOT A TICK. Passing the `rev` from the previous response plus
+// a `wait` makes the backend hold the request open until the job actually
+// moves, then answer at once -- so a completed scraped URL reaches the screen about
+// a tenth of a second after it is written, instead of on the next interval,
+// and an idle job costs one request per wait window rather than one every
+// two seconds. Omit both and this is the plain immediate snapshot it has
+// always been. See backend/shared/live_poll.py.
+  getJob: async (
+    jobId: string,
+    watch?: { rev?: string; wait?: number; signal?: AbortSignal },
+  ): Promise<AnalysisJobResponse> => {
+    const p = new URLSearchParams();
+    if (watch?.rev) p.set("rev", watch.rev);
+    if (watch?.wait) p.set("wait", String(watch.wait));
+    const q = p.toString();
+    const res = await fetch(url(`/analysis/jobs/${jobId}${q ? `?${q}` : ""}`), {
+      signal: watch?.signal,
+    });
     return json<AnalysisJobResponse>(res);
   },
 

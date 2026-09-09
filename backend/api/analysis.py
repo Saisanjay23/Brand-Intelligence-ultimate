@@ -37,9 +37,11 @@ from typing import Any, Optional
 from fastapi import APIRouter, Path, Query, Response, status
 from pydantic import BaseModel, Field
 
+from backend.analysis.runner import _TERMINAL as _TERMINAL_STATUSES
 from backend.analysis.runner import analysis_runner
 from backend.api.models import CancelResult, JobAccepted, JobStatus, SkippedInput
 from backend.database.repositories import analysis_result_repository as results_db
+from backend.shared import live_poll
 from backend.shared.errors import NotFoundError, ValidationError
 
 router = APIRouter(prefix="/analysis", tags=["analysis"])
@@ -173,6 +175,9 @@ class AnalysisJobState(BaseModel):
     estimated_remaining_seconds: Optional[float] = None
     platform_progress: dict[str, PlatformProgress]
     items: list[AnalysedProfile]
+    rev: str = Field(
+        "", description="Opaque id for this state. Send it back as `rev` "
+                        "with `wait` to be answered the moment it changes.")
 
 
 class StartAnalysisAccepted(JobAccepted):
@@ -205,20 +210,58 @@ async def start_analysis(body: StartAnalysis) -> StartAnalysisAccepted:
     )
 
 
+def _scrape_fingerprint(job) -> tuple:
+    """The parts of a scrape whose changing is worth waking a client for.
+
+    An item finishing always moves `completed` and its platform's counters
+    (see `_scrape_one`'s `finally`), so the per-item rows do not need to be
+    walked to notice one landed -- which matters, because this runs ten
+    times a second for as long as a request is held and a batch can carry
+    hundreds of items. Clock-derived fields are excluded on purpose: they
+    change on every read and would answer "changed" for ever.
+    """
+    return (
+        job.status, job.message, job.total, job.completed,
+        tuple(
+            (k, v.get("status"), v.get("total"), v.get("completed"),
+             v.get("current_url"), v.get("current_step"), v.get("workers"))
+            for k, v in sorted(job.platform_progress.items())
+        ),
+    )
+
+
 @router.get("/jobs/{job_id}", response_model=AnalysisJobState,
             summary="Poll a scrape")
-async def get_job(job_id: str = Path(..., description="From POST /analysis/jobs")) -> AnalysisJobState:
+async def get_job(
+    job_id: str = Path(..., description="From POST /analysis/jobs"),
+    rev: str = Query("", description="The `rev` from your previous response."),
+    wait: float = Query(
+        0.0, ge=0.0,
+        description="Seconds to hold this request open while `rev` is still "
+                    "current, so the answer arrives the moment a URL "
+                    "completes instead of on your next tick. 0 (the "
+                    "default) answers immediately."),
+) -> AnalysisJobState:
     """Stop polling once `status` is `done`, `cancelled` or `failed`.
     `items` fills in as URLs complete, so partial results are readable
-    while the job runs."""
+    while the job runs.
+
+    With `wait` and `rev` this is a long poll -- a completed URL shows up
+    about a tenth of a second after it is scraped rather than on the next
+    client tick. See backend/shared/live_poll.py."""
     job = await analysis_runner.get(job_id)
     if job is None:
         raise NotFoundError(
             f"no analysis job {job_id!r} -- results are memory-only and are not "
             "persisted, so a restart or the job ageing out loses them. Re-run the scrape."
         )
+    current = await live_poll.wait_for_change(
+        lambda: _scrape_fingerprint(job), rev=rev, wait_s=wait,
+        is_final=lambda: job.status in _TERMINAL_STATUSES,
+    )
     d = job.to_dict()
     return AnalysisJobState(
+        rev=current,
         job_id=d["id"], status=JobStatus(d["status"]),
         target_name=d["target_name"], official_feed=d["official_feed"],
         total=d["total"], completed=d["completed"], message=d["message"],

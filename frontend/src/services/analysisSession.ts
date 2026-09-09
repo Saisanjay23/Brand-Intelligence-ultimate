@@ -34,7 +34,36 @@ import { useCallback, useSyncExternalStore } from "react";
 import toast from "react-hot-toast";
 import { analysisApi, type AnalysisItemData, type AnalysisJobResponse } from "../api/analysisApi";
 
-const POLL_MS = 1500;
+// How long the backend is asked to hold each request open while nothing is
+// happening, under its own 25s ceiling so the server ends the wait and the
+// client never races it. There is no interval any more: on success the next
+// request goes straight back out and the waiting happens server-side, where
+// it can end the instant a URL completes. See backend/shared/live_poll.py.
+const WAIT_S = 20;
+
+// Only after a FAILED request, so a backend that is down or restarting is
+// retried rather than hammered by a loop with no delay in it.
+const RETRY_MS = 2000;
+
+// A BACKEND THAT DOES NOT SUPPORT THE LONG POLL MUST NOT BE HAMMERED.
+// `rev` is what makes the server hold the next request; a backend older
+// than that feature returns no `rev`, every request is then answered
+// instantly, and looping straight back out would turn this into an
+// unthrottled request flood against exactly the deployment least able to
+// absorb it. Missing `rev` therefore falls back to plain interval polling
+// -- the behaviour this replaced, which is the right thing to degrade to.
+const FALLBACK_POLL_MS = 1000;
+
+// Consecutive failures tolerated before the watch gives up and says so.
+//
+// It used to give up on the FIRST one, which was defensible when a request
+// lasted a moment; a request that is deliberately held open for twenty
+// seconds is far more exposed to a blip, a dev-server restart or a proxy
+// closing an idle connection, and losing the live view of a running batch
+// to one of those is a worse trade than waiting a few more seconds. Three
+// failures spaced by RETRY_MS is still under seven seconds before the
+// analyst is told something is actually wrong.
+const MAX_POLL_FAILURES = 3;
 
 export interface AnalysisSession {
   urlInput: string;
@@ -159,6 +188,13 @@ export function useAnalysisField<K extends keyof AnalysisSession>(
 
 let pollTimer: number | null = null;
 
+// The request currently being held open, so it can be cut short instead of
+// left to run out its window, and whether a watch loop is running at all --
+// which `watchJob` needs, because with no interval there is no longer a
+// live `pollTimer` to read that from.
+let pollAbort: AbortController | null = null;
+let pollActive = false;
+
 // Bumped by anything that makes an in-flight request irrelevant: Clear, or
 // a newer job superseding this one. Both `startAnalysis` and `watchJob`
 // await the network with the workspace still live underneath them, and
@@ -177,21 +213,40 @@ let savedGeneration = 0;
 
 export function stopPolling(): void {
   if (pollTimer !== null) {
-    clearInterval(pollTimer);
+    clearTimeout(pollTimer);
     pollTimer = null;
   }
+  // A request can now be held open for twenty seconds, so tearing the watch
+  // down has to CUT IT SHORT rather than just ignore what it returns --
+  // otherwise every Clear or client switch leaves a connection hanging
+  // around for the rest of its window.
+  pollAbort?.abort();
+  pollAbort = null;
+  pollActive = false;
 }
 
-// Returns true when this poll SETTLED the job -- terminal status, an error,
-// or a response that is no longer wanted. The caller uses it to decide
-// whether an interval is still needed: a job that was already finished on
-// its first poll must not get one.
-async function pollJob(id: string, gen: number): Promise<boolean> {
+// Returns whether this poll SETTLED the job -- terminal status, an error,
+// or a response that is no longer wanted -- along with the revision to wait
+// on next. The caller uses `settled` to decide whether to keep watching: a
+// job that was already finished on its first poll must not be.
+//
+// `rev`/`wait` turn this into a long poll. Passing neither (the first
+// request, which has nothing to wait for) is the plain immediate snapshot
+// it has always been.
+async function pollJob(
+  id: string,
+  gen: number,
+  opts: { rev?: string; wait?: number; quiet?: boolean } = {},
+): Promise<{ settled: boolean; rev: string; failed?: boolean }> {
+  const ac = new AbortController();
+  pollAbort = ac;
   try {
-    const data = await analysisApi.getJob(id);
+    const data = await analysisApi.getJob(id, {
+      rev: opts.rev, wait: opts.wait, signal: ac.signal,
+    });
     // A poll that lands after the analyst started a different job (or hit
     // Clear) must not overwrite the current one with a stale payload.
-    if (gen !== generation || state.jobId !== id) return true;
+    if (gen !== generation || state.jobId !== id) return { settled: true, rev: "" };
     patch({ jobData: data });
     if (data.status === "done" || data.status === "cancelled" || data.status === "failed") {
       stopPolling();
@@ -206,21 +261,65 @@ async function pollJob(id: string, gen: number): Promise<boolean> {
       } else if (data.status === "cancelled") {
         toast.error("Analysis stopped by user");
       }
-      return true;
+      return { settled: true, rev: data.rev || "" };
     }
-    return false;
+    return { settled: false, rev: data.rev || "" };
   } catch (e) {
-    if (gen !== generation || state.jobId !== id) return true;
+    if (gen !== generation || state.jobId !== id) return { settled: true, rev: "" };
+    // An abort is this watch being torn down, not a failure: reporting it
+    // would put an error toast on screen every time the analyst pressed
+    // Clear or switched client.
+    if ((e as Error)?.name === "AbortError") return { settled: true, rev: "" };
+    // `quiet` means a caller that intends to retry -- it decides when a run
+    // of failures is worth reporting, so this must not tear the watch down
+    // underneath it.
+    if (opts.quiet) return { settled: false, rev: opts.rev || "", failed: true };
     stopPolling();
     patch({ loading: false, cancelling: false });
     toast.error((e as Error).message || "Failed to update job status");
-    return true;
+    return { settled: true, rev: "" };
   }
 }
 
-function watch(id: string, gen: number): void {
+// A SELF-RESCHEDULING LOOP, NOT AN INTERVAL. A held request can outlast any
+// interval worth setting, and an interval would then stack a second request
+// on top of the one still waiting. Each pass starts only once the last has
+// answered, so exactly one request is ever in flight for a job.
+function watch(id: string, gen: number, rev: string): void {
   stopPolling();
-  pollTimer = window.setInterval(() => void pollJob(id, gen), POLL_MS);
+  pollActive = true;
+  let failures = 0;
+  const loop = async () => {
+    if (gen !== generation || state.jobId !== id) {
+      pollActive = false;
+      return;
+    }
+    const { settled, rev: next, failed } = await pollJob(id, gen, {
+      rev, wait: WAIT_S, quiet: failures + 1 < MAX_POLL_FAILURES,
+    });
+    if (settled) {
+      pollActive = false;
+      return;
+    }
+    if (gen !== generation || state.jobId !== id) {
+      pollActive = false;
+      return;
+    }
+    if (failed) {
+      failures += 1;
+      pollTimer = window.setTimeout(() => void loop(), RETRY_MS);
+      return;
+    }
+    failures = 0;
+    if (!next) {
+      rev = "";
+      pollTimer = window.setTimeout(() => void loop(), FALLBACK_POLL_MS);
+      return;
+    }
+    rev = next;
+    void loop();
+  };
+  void loop();
 }
 
 // ----------------------------------------------------------------- actions
@@ -240,12 +339,13 @@ function watch(id: string, gen: number): void {
 // is a first watch whose poll failed, and it should be retried, not left
 // showing an empty table forever.
 export function watchJob(id: string): void {
-  if (state.jobId === id && (state.jobData !== null || pollTimer !== null)) return;
+  if (state.jobId === id && (state.jobData !== null || pollActive)) return;
   const gen = ++generation;
   stopPolling();
   patch({ jobId: id, jobData: null, loading: true, edits: {} });
   void (async () => {
-    if (!(await pollJob(id, gen))) watch(id, gen);
+    const first = await pollJob(id, gen);
+    if (!first.settled) watch(id, gen, first.rev);
   })();
 }
 
@@ -375,7 +475,8 @@ export async function startAnalysis(urls: string[]): Promise<void> {
       toast(`Skipped ${res.skipped.length} invalid/duplicate URL(s)`, { icon: "ℹ️" });
     }
 
-    if (!(await pollJob(res.job_id, gen))) watch(res.job_id, gen);
+    const first = await pollJob(res.job_id, gen);
+    if (!first.settled) watch(res.job_id, gen, first.rev);
   } catch (e) {
     if (gen !== generation) return;
     patch({ loading: false });

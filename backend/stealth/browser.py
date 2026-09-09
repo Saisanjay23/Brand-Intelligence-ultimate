@@ -59,6 +59,7 @@ except ImportError:
         sys.exit("pip install patchright  (or: pip install playwright && playwright install chromium)")
 
 from backend.shared.logging import get_logger
+from backend.platforms.scan_options import cancelled
 from backend.stealth.human import BASE, Human
 from backend.stealth.fingerprint import (
     LAUNCH_ARGS,
@@ -150,7 +151,14 @@ class Session:
         self.timezone_id = timezone_id or DEFAULT_TIMEZONE_ID
         self.identity = get_identity(session_id)
         self.viewport = self.identity["viewport"]
-        self.human = Human()
+        # THE STOP SIGNAL, WIRED INTO THE PACING. Every platform's
+        # between-profile gap comes through `pause()` below, and those gaps
+        # (including `maybe_rest`'s 20-60s break) were flat sleeps nothing
+        # could interrupt. Since only one of the twelve engines checks
+        # `cancel` for itself, this is the single place that gives all of
+        # them a cooperative stop -- see human.py's own note for why the
+        # wait, rather than each engine, is what was taught to listen.
+        self.human = Human(stop=lambda: cancelled(self.o))
         self.ctx = self.browser = self._pw = None
 
     async def start(self):
@@ -297,6 +305,13 @@ class Session:
         human.py. Those shape the distribution; they do not move the median
         far, which is the point.)
         """
+        # A RUN BEING STOPPED HAS NOTHING LEFT TO PACE. Pacing exists to
+        # shape the gaps BETWEEN requests; once the job is cancelled there
+        # is no next request to space out, so waiting here only delays the
+        # stop. Checked up front as well as inside the sleep so the common
+        # case costs nothing at all.
+        if cancelled(self.o):
+            return
         configured = getattr(self.o, "delay", 0) or 0
         scale = (configured / BASE["between_profiles"]) if configured else 1.0
         await self.human.pause("between_profiles", scale * mult)

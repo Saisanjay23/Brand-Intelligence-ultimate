@@ -14,8 +14,9 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import weakref
 from datetime import datetime, timezone
-from typing import Optional
+from typing import NamedTuple, Optional
 from urllib.parse import urlparse
 
 from backend.config.settings import settings
@@ -128,7 +129,7 @@ def _session_in_use(platform_id: str, session_id: str) -> bool:
 
     ASKS BOTH RUNNERS. Discovery and analysis each own a SEPARATE JobStore
     with its own `_sessions_in_use` set (see get_healthy_session's note on
-    why the cross-runner claim lives in `_claimed` instead), so asking only
+    why the cross-runner claim lives in `_claims` instead), so asking only
     analysis reported every session a DISCOVERY sweep was holding as idle.
     A Facebook sweep holds its session for the whole run, and the monitor
     wakes every 30 minutes, so the two overlapped routinely: the monitor
@@ -143,7 +144,29 @@ def _session_in_use(platform_id: str, session_id: str) -> bool:
     used to reach into a job module that had been deleted, and every
     platform's session status came back as an error.) Guarded SEPARATELY so
     one broken import cannot silently answer "idle" on behalf of the other
-    runner, which is the failure this function exists to prevent."""
+    runner, which is the failure this function exists to prevent.
+
+    THE CLAIM IS ASKED FIRST, BECAUSE IT HAPPENS FIRST. `hold_session` is
+    recorded inside a worker, after that worker has waited out the
+    process-wide slot semaphore and its own start stagger; the CLAIM is
+    taken well before that, when `_claim_sessions` reserves the accounts
+    for the whole platform up front. Between the two this function used to
+    answer "idle" for an account a job had already reserved and was about
+    to open a browser on -- and that gap is not brief: a platform claims
+    every account it wants at once, then starts its workers one at a time
+    behind a global ceiling, so the last of them can sit claimed-but-not-
+    yet-held for minutes.
+
+    Which is exactly long enough for the 30-minute monitor to land in it.
+    The consequence is the one every comment in this module warns about: a
+    second Playwright context on one account from one IP, a challenge, and
+    a session marked checkpointed while the job that reserved it was still
+    waiting to start. Reading the claim closes the window at its real
+    start. Safe to trust now that a claim is a lease (see `_Claim`): a
+    stale one cannot pin a session out of the monitor's reach for ever,
+    because a lease whose holder is gone is not a lease."""
+    if _is_claimed(platform_id, session_id, _now()):
+        return True
     try:
         from backend.analysis.runner import analysis_runner
         if analysis_runner.holds_session(platform_id, session_id):
@@ -415,7 +438,7 @@ def _pick_least_recently_used(available: list[dict]) -> Optional[dict]:
 # session before either has written anything back. `_is_available()` reads
 # only `status`/`rate_limited_until` -- claiming a session doesn't change
 # either of those, so a lock around the read+pick alone wouldn't stop a
-# second caller from immediately re-picking the one just claimed; `_claimed`
+# second caller from immediately re-picking the one just claimed; `_claims`
 # is the actual exclusion signal, consulted (and updated) while still
 # holding the lock.
 #
@@ -430,7 +453,92 @@ def _pick_least_recently_used(available: list[dict]) -> Optional[dict]:
 # IP at once -- this codebase's own health-monitor comments call exactly
 # that scenario the single most reliable way to earn a checkpoint.
 _claim_lock = asyncio.Lock()
-_claimed: set[tuple[str, str]] = set()
+
+
+# A CLAIM IS A LEASE, NOT A FLAG -- because the release is not guaranteed.
+#
+# THE BUG THIS FIXES. The claim used to be a bare set, added to here and
+# removed from only by `release_claim` in a caller's `finally`. Every entry
+# therefore depended on its holder unwinding cleanly, and the thing that
+# most often stops a holder unwinding cleanly is the analyst pressing Stop:
+# `JobStore.cancel` hard-cancels the job's task once the five-second grace
+# period is up, and a task cancelled at an `await` that sits BEFORE its own
+# try/finally never runs that `finally` at all. Both runners have such an
+# await -- the process-wide worker-slot semaphore, discovery's per-worker
+# start stagger, and the up-to-five-minute busy wait inside
+# `_claim_sessions` itself.
+#
+# The leak was silent and permanent. The account stayed in the set for the
+# life of the PROCESS; `_is_available` still said it was fine, the Sessions
+# panel still showed it ready, and every later job was refused with "no
+# healthy sessions available". Stop a sweep and start it again and the
+# platform could no longer run, on cookies that were never the problem --
+# with a restart of the backend as the only way out.
+#
+# So a claim now records WHO holds it. The holder is the task that took it
+# -- in both runners the per-platform coroutine, which outlives every
+# worker it hands a session to -- and a claim whose holder is done
+# (finished, failed, or cancelled) is not a claim any more. Stopping a job
+# frees its accounts as a consequence of its task ending, with nothing left
+# for a `finally` to remember to do.
+#
+# `_CLAIM_MAX_S` is a second backstop, for a claim taken outside any task
+# or held by one that somehow never ends. It is deliberately far longer
+# than any real sweep or batch: expiring a claim that is still genuinely in
+# use would hand one account to two jobs at once and open two browser
+# contexts on one IP, which this module's own health notes call the single
+# most reliable way to earn a checkpoint. Reclaiming late is cheap;
+# reclaiming early is the failure being avoided.
+_CLAIM_MAX_S = 6 * 60 * 60
+
+
+class _Claim(NamedTuple):
+    owner: Optional["weakref.ReferenceType"]  # the task holding it, weakly
+    taken_at: float
+
+
+_claims: dict[tuple[str, str], _Claim] = {}
+
+
+def _owner_ref() -> Optional["weakref.ReferenceType"]:
+    """A weak handle on the task doing the claiming, or None if there isn't
+    one. Weak so a claim that outlives its holder can never be the reason
+    that holder's task object stays in memory."""
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:                     # no running loop
+        return None
+    return weakref.ref(task) if task is not None else None
+
+
+def _claim_live(claim: _Claim, now: float) -> bool:
+    """Is this lease still held by something that exists and is running?"""
+    if now - claim.taken_at > _CLAIM_MAX_S:
+        return False
+    if claim.owner is None:
+        # Taken outside a task, so there is no holder whose ending could
+        # free it; only an explicit release or the ceiling above ends it.
+        return True
+    task = claim.owner()
+    # A collected task is a finished task -- asyncio drops its own strong
+    # reference once a task completes.
+    return task is not None and not task.done()
+
+
+def _is_claimed(platform_id: str, session_id: str, now: float) -> bool:
+    """Claimed by a LIVE holder. Reaps the lease when it is not, so a
+    stopped job's accounts come back on the very next look rather than
+    needing the backend restarted."""
+    key = (platform_id, session_id)
+    claim = _claims.get(key)
+    if claim is None:
+        return False
+    if _claim_live(claim, now):
+        return True
+    del _claims[key]
+    log.info(f"{platform_id}/{session_id}: reclaimed -- the job holding this "
+             "session stopped without releasing it")
+    return False
 
 
 # How long a job will WAIT for a busy pool before giving up, and how often
@@ -468,7 +576,7 @@ async def _busy_only(platform_id: str) -> bool:
     items = await sessions_db.list_pool(platform_id)
     now = _now()
     return any(
-        _is_available(s, now) and (platform_id, s["id"]) in _claimed
+        _is_available(s, now) and _is_claimed(platform_id, s["id"], now)
         for s in items
     )
 
@@ -497,14 +605,16 @@ async def _claim_one(platform_id: str) -> Optional[dict]:
     """One attempt at the read-pick-claim-write above, with no waiting."""
     async with _claim_lock:
         items = await sessions_db.list_pool(platform_id)
+        claimed_at = _now()
         available = [
             s for s in items
-            if _is_available(s, _now()) and (platform_id, s["id"]) not in _claimed
+            if _is_available(s, claimed_at)
+            and not _is_claimed(platform_id, s["id"], claimed_at)
         ]
         chosen = _pick_least_recently_used(available)
         if chosen is None:
             return None
-        _claimed.add((platform_id, chosen["id"]))
+        _claims[(platform_id, chosen["id"])] = _Claim(_owner_ref(), claimed_at)
     now = _now()
     await sessions_db.update_item(platform_id, chosen["id"], status="ready", rate_limited_until=0.0, last_used=now)
     # a real, durable count of how many times this session has actually
@@ -551,7 +661,7 @@ async def unavailable_reason(platform_id: str) -> str:
             limited += 1
             if not soonest_free or s["rate_limited_until"] < soonest_free:
                 soonest_free = s["rate_limited_until"]
-        elif (platform_id, s["id"]) in _claimed:
+        elif _is_claimed(platform_id, s["id"], now):
             busy += 1
         else:
             # Free RIGHT NOW -- so the pick that just failed lost a race
@@ -608,15 +718,24 @@ def proven_fresh(session_item: dict) -> bool:
 
 
 def release_claim(platform_id: str, session_id: str) -> None:
-    """The other half of `get_healthy_session`'s claim -- callers MUST call
-    this once they're done with the session (in a `finally`, alongside
-    their own JobStore `release_session`), or it looks permanently in-use
-    to every other job. A no-op for a blank id (anonymous/no-session
-    platforms never claimed anything to begin with), matching JobStore's
-    own `hold_session`/`release_session` convention so callers don't need
-    an extra branch."""
+    """The other half of `get_healthy_session`'s claim -- callers call this
+    once they're done with the session (in a `finally`, alongside their own
+    JobStore `release_session`), which hands the account back at once rather
+    than on the next look.
+
+    NO LONGER THE ONLY WAY A CLAIM ENDS, and deliberately so: a lease whose
+    holding task has finished or been cancelled is reaped by `_is_claimed`
+    regardless (see `_Claim`), because the cases that leaked were exactly
+    the ones where no `finally` ever ran. Callers should still release --
+    prompt is better than eventual, and a long-lived task that reuses the
+    pool would otherwise hold accounts it has finished with -- but a missed
+    release is now a delay, not a broken pool.
+
+    A no-op for a blank id (anonymous/no-session platforms never claimed
+    anything to begin with), matching JobStore's own `hold_session`/
+    `release_session` convention so callers don't need an extra branch."""
     if session_id:
-        _claimed.discard((platform_id, session_id))
+        _claims.pop((platform_id, session_id), None)
 
 
 async def session_for_job(

@@ -45,7 +45,9 @@ from backend.api.analysis import StartAnalysisAccepted
 from backend.api.models import (CancelResult, JobAccepted, JobStatus, Platform,
                                  PlatformState, PlatformStateList, SkippedInput)
 from backend.database.repositories import profile_repository as profiles_db
+from backend.discovery.runner import _TERMINAL as _TERMINAL_STATUSES
 from backend.discovery.runner import discovery_runner
+from backend.shared import live_poll
 from backend.shared.errors import NotFoundError, ValidationError
 from backend.shared.pagination import DEFAULT_LIMIT, MAX_LIMIT
 
@@ -217,6 +219,9 @@ class DiscoveryJobState(BaseModel):
     estimated_remaining_seconds: Optional[float] = None
     platforms: list[PlatformSweepState]
     history: list[CompletedSweepTelemetry] = Field(default_factory=list)
+    rev: str = Field(
+        "", description="Opaque id for this state. Send it back as `rev` "
+                        "with `wait` to be answered the moment it changes.")
 
 
 class StartDiscoveryAccepted(JobAccepted):
@@ -486,22 +491,69 @@ async def start_discovery(body: StartDiscovery) -> StartDiscoveryAccepted:
     )
 
 
+def _sweep_fingerprint(job) -> tuple:
+    """The parts of a sweep whose changing is worth waking a client for.
+
+    Counts, per-platform progress and the live telemetry strings the
+    progress rail renders -- everything an analyst can actually see move.
+    Deliberately NOT the whole snapshot: `elapsed_seconds` is recomputed
+    from the clock on every read and would report "changed" ten times a
+    second for ever, and `history` is compared by length rather than
+    content because an entry is appended, never edited.
+
+    Cheap by construction (attribute reads, no serialisation) because it
+    runs at `live_poll._TICK_S` for as long as a request is held -- see
+    that module for why change detection and rendering are separated.
+    """
+    return (
+        job.status, job.message, job.total, job.completed, job.found, job.new,
+        len(job.history),
+        tuple(
+            (p.platform, p.status, p.keywords_total, p.keywords_done,
+             p.found, p.new, p.note, p.current_keyword, p.current_tab,
+             p.current_step, p.workers)
+            for p in job.platforms.values()
+        ),
+    )
+
+
 @router.get("/jobs/{job_id}", response_model=DiscoveryJobState,
             summary="Poll a sweep")
-async def get_job(job_id: str = Path(..., description="From POST /discovery/jobs")) -> DiscoveryJobState:
+async def get_job(
+    job_id: str = Path(..., description="From POST /discovery/jobs"),
+    rev: str = Query("", description="The `rev` from your previous response."),
+    wait: float = Query(
+        0.0, ge=0.0,
+        description="Seconds to hold this request open while `rev` is still "
+                    "current, so the answer arrives the moment the sweep "
+                    "moves instead of on your next tick. 0 (the default) "
+                    "answers immediately."),
+) -> DiscoveryJobState:
     """Stop polling once `status` is `done`, `cancelled` or `failed`.
 
     Job state is held in memory and ages out; the PROFILES it wrote are in
     storage and outlive it, so a 404 here does not mean the results are
-    gone -- read them from `GET /discovery/profiles`."""
+    gone -- read them from `GET /discovery/profiles`.
+
+    With `wait` and `rev` this is a long poll: results become visible about
+    a tenth of a second after they are saved rather than on the next
+    client tick, and an idle sweep costs one request per wait window. See
+    backend/shared/live_poll.py."""
     job = await discovery_runner.get(job_id)
     if job is None:
         raise NotFoundError(
             f"no discovery job {job_id!r} -- job state is in-memory and ages out; "
             "any profiles it found are still available from GET /discovery/profiles"
         )
+    current = await live_poll.wait_for_change(
+        lambda: _sweep_fingerprint(job), rev=rev, wait_s=wait,
+        is_final=lambda: job.status in _TERMINAL_STATUSES,
+    )
     d = job.to_dict()
-    return DiscoveryJobState(**{**d, "platforms": [PlatformSweepState(**p) for p in d["platforms"]]})
+    return DiscoveryJobState(**{
+        **d, "rev": current,
+        "platforms": [PlatformSweepState(**p) for p in d["platforms"]],
+    })
 
 
 @router.post("/jobs/{job_id}/cancel", response_model=CancelResult,

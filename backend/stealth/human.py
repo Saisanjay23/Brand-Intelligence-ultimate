@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
 from datetime import datetime
 
 # rough seconds per action, before jitter and the multipliers below
@@ -24,12 +25,80 @@ BASE = {
 }
 
 
-class Human:
-    """Per-session pacing. Fatigue and time-of-day shape the delays."""
+# A SLEEP NOBODY CAN INTERRUPT IS A STOP BUTTON THAT DOES NOT WORK.
+#
+# Every gap in this file was a flat `asyncio.sleep`, and `maybe_rest` sleeps
+# for TWENTY TO SIXTY SECONDS. That pacing is the point of the module and it
+# is not being removed -- but it also sits on the path of every sweep and
+# every analysis visit on every platform, which made it the longest stretch
+# of a run during which nothing could be told to stop.
+#
+# What that cost, concretely: a `cancel` signal is only useful where
+# something looks at it, and of the twelve platform engines exactly one
+# checks it. For the other eleven the cooperative path never landed at all,
+# so Stop always fell through to the runner's five-second hard-cancel
+# backstop -- which unwinds a task wherever it stands, mid-navigation, and
+# tears the browser down under an in-flight page. Slow, and messy in a way
+# that the rest of this system then had to defend against.
+#
+# Rather than teach eleven engines a checkpoint each, the wait itself
+# becomes interruptible: every engine's pacing funnels through
+# `StealthSession.pause`, which owns a `Human`, so one predicate here
+# reaches all of them. `stop` is injected rather than imported so this
+# module keeps knowing nothing about jobs, options or runners.
+#
+# Polled in short slices rather than awaiting an event, deliberately: the
+# signal is documented as an Event OR a bool OR a callable (see
+# scan_options.cancelled), and a module-level asyncio primitive binds to the
+# first loop that awaits it -- the trap discovery/runner.py's own
+# `_worker_semaphore` exists to document. A fifth of a second is invisible
+# against gaps measured in seconds and costs 300 no-op wakeups across the
+# longest nap this file can produce.
+_STOP_TICK_S = 0.2
 
-    def __init__(self, session_start: datetime | None = None):
+
+class Human:
+    """Per-session pacing. Fatigue and time-of-day shape the delays.
+
+    `stop` is an optional `() -> bool` the owning run supplies (see
+    `stealth/browser.py`), asked during every wait so a stopped job stops
+    waiting. Absent, every pause behaves exactly as it always did.
+    """
+
+    def __init__(self, session_start: datetime | None = None, stop=None):
         self.started = session_start or datetime.now()
         self.actions = 0
+        self.stop = stop
+
+    def stopping(self) -> bool:
+        """Has the owning run been asked to stop? Never raises: a pacing
+        layer must not be able to fail a sweep because the predicate it was
+        handed misbehaved, and "no" is the answer that preserves the
+        previous behaviour."""
+        if self.stop is None:
+            return False
+        try:
+            return bool(self.stop())
+        except Exception:                        # noqa: BLE001 - never fatal
+            return False
+
+    async def sleep(self, seconds: float) -> bool:
+        """Wait `seconds`, or until the run is stopped. -> True if it was
+        cut short, so a caller can report the rest it did NOT take.
+
+        Timed against a monotonic deadline rather than by counting slices,
+        so the gap is the gap asked for and does not drift with the tick.
+        """
+        if seconds <= 0 or self.stopping():
+            return self.stopping()
+        deadline = time.monotonic() + seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(_STOP_TICK_S, remaining))
+            if self.stopping():
+                return True
 
     def fatigue(self) -> float:
         """People slow down. After ~200 actions this is a 1.5x drag."""
@@ -52,21 +121,23 @@ class Human:
 
     async def pause(self, context: str = "default", scale: float = 1.0) -> None:
         self.actions += 1
-        await asyncio.sleep(self.delay_for(context, scale))
+        await self.sleep(self.delay_for(context, scale))
 
     def should_rest(self) -> bool:
         """Occasional longer gap, the way a person gets distracted."""
         return self.actions > 0 and self.actions % random.randint(25, 45) == 0
 
     async def maybe_rest(self) -> float:
+        """-> the rest actually taken. 0.0 when none was due, and 0.0 when
+        one was cut short by a stop -- the caller logs this, and reporting a
+        60s break that was abandoned after 200ms would be a lie in the log
+        an analyst reads to work out why a stop took as long as it did."""
         if not self.should_rest():
             return 0.0
         nap = random.uniform(20, 60)
-        await asyncio.sleep(nap)
-        return nap
+        return 0.0 if await self.sleep(nap) else nap
 
     async def warmup_delay(self, scale: float = 1.0) -> float:
         """Initial orientation delay after session launch before commencing sweeps."""
         nap = random.uniform(1.2, 3.5) * scale
-        await asyncio.sleep(nap)
-        return nap
+        return 0.0 if await self.sleep(nap) else nap

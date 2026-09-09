@@ -420,6 +420,13 @@ export function LiveResultsView({
     if (resumeAnalysisJobId) setPhase("analysis");
   }, [resumeAnalysisJobId]);
 
+  // KEYED ON `liveKey` TOO, NOT JUST `refreshKey`. `refreshKey` moves when
+  // a sweep FINISHES; `liveKey` moves every time its counts do. Without the
+  // second one these tiles were the one part of this page that did not
+  // update while a sweep ran -- the grid below filled in with new rows
+  // while the per-platform "N results" above it sat on the number it had
+  // when the sweep started, which reads as the count being broken rather
+  // than as it being refreshed on a different schedule.
   useEffect(() => {
     if (!clientId) return;
     let cancelled = false;
@@ -436,7 +443,7 @@ export function LiveResultsView({
     return () => {
       cancelled = true;
     };
-  }, [clientId, platforms, refreshKey]);
+  }, [clientId, platforms, refreshKey, liveKey]);
 
   if (!clientId) {
     return (

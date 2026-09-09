@@ -186,6 +186,46 @@ _MAX_ITEM_ATTEMPTS = 2
 # monitor revived one) while this batch was running.
 _MAX_CLAIM_ROUNDS = 2
 
+# HOW LONG A TEARDOWN GETS BEFORE IT IS LET GO.
+#
+# Every `finally` in a worker closes something that talks to a browser, and
+# a browser being closed is precisely when those calls stop answering: the
+# page is gone, the transport is half-shut, and the close can sit there.
+#
+# That is worst exactly where it is least affordable. A hard cancel unwinds
+# THROUGH these `finally` blocks, so the job cannot reach a terminal status
+# until the last of them returns -- an analyst who pressed Stop watches
+# "stopping" for however long the slowest close decides to take, with no
+# ceiling on it and nothing in the UI able to say why. The stop had already
+# happened; only the reporting of it was stuck.
+#
+# So a teardown gets a bounded slice of time and is then abandoned. Giving
+# up on a close does not leak the thing being closed: the browser process is
+# already on its way down (that is what the close was for) and the OS reaps
+# it either way, whereas holding the job open tells the analyst something is
+# still running when nothing is.
+_TEARDOWN_TIMEOUT_S = 10.0
+
+
+async def _close_quietly(what: str, close) -> None:
+    """Await a teardown, but never past `_TEARDOWN_TIMEOUT_S`, and never let
+    it raise. `close` is a zero-arg callable rather than an already-created
+    coroutine so that nothing is left un-awaited when the wait is abandoned.
+
+    CancelledError is deliberately NOT swallowed: this runs while a task is
+    already unwinding, and swallowing the cancellation there would leave the
+    runner unable to tell a stop from a clean finish.
+    """
+    try:
+        await asyncio.wait_for(close(), timeout=_TEARDOWN_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        log.warning(
+            f"{what} did not close within {_TEARDOWN_TIMEOUT_S:.0f}s -- "
+            "abandoned so the job can finish reporting")
+    except Exception:                            # noqa: BLE001 - never fatal
+        pass
+
+
 # Bound on browser workers open at once across the WHOLE process, which is the
 # number that actually decides whether the host copes. `_run` scrapes every
 # platform of a job CONCURRENTLY, so a per-platform cap cannot see the total:
@@ -781,41 +821,57 @@ class AnalysisRunner:
         """
         plat: Any = None
         claimed: list[dict] = []
-        while len(claimed) < want:
-            try:
-                # WAIT FOR THE FIRST ONE, NEVER FOR THE EXTRAS.
-                #
-                # The first account decides whether this platform runs at
-                # all, and the commonest reason it is unavailable is simply
-                # that the OTHER phase is holding it -- discovery keeps a
-                # session for its whole sweep, analysis for its whole batch.
-                # Refusing there meant an analyst could not run discovery
-                # and analysis at the same time on a single-account
-                # platform: whichever started second failed outright, on a
-                # pool that was healthy and about to be free. Waiting turns
-                # that into a queue.
-                #
-                # A shortfall AFTER the first is not a failure at all --
-                # two of three accounts busy elsewhere just means fewer
-                # workers -- so the extras never wait, and never make a job
-                # slower than the work it actually has.
-                wait = sessions_engine.SESSION_WAIT_S if not claimed else 0.0
-                plat, session_item = await sessions_engine.session_for_job(
-                    platform_id, wait_s=wait)
-            except Exception:
-                if not claimed:
-                    raise
-                break
-            session_id = str(session_item.get("id") or "")
-            if not session_id or session_item.get("anonymous"):
-                # NOT A POOL ENTRY. `session_for_job` fell back to a
-                # logged-out context (tiktok) or an env API key; there is no
-                # second identity behind that to claim and it would hand back
-                # this same dict forever, so it is this platform's one worker.
-                if not claimed:
-                    claimed.append(session_item)
-                break
-            claimed.append(session_item)
+        try:
+            while len(claimed) < want:
+                try:
+                    # WAIT FOR THE FIRST ONE, NEVER FOR THE EXTRAS.
+                    #
+                    # The first account decides whether this platform runs at
+                    # all, and the commonest reason it is unavailable is simply
+                    # that the OTHER phase is holding it -- discovery keeps a
+                    # session for its whole sweep, analysis for its whole batch.
+                    # Refusing there meant an analyst could not run discovery
+                    # and analysis at the same time on a single-account
+                    # platform: whichever started second failed outright, on a
+                    # pool that was healthy and about to be free. Waiting turns
+                    # that into a queue.
+                    #
+                    # A shortfall AFTER the first is not a failure at all --
+                    # two of three accounts busy elsewhere just means fewer
+                    # workers -- so the extras never wait, and never make a job
+                    # slower than the work it actually has.
+                    wait = sessions_engine.SESSION_WAIT_S if not claimed else 0.0
+                    plat, session_item = await sessions_engine.session_for_job(
+                        platform_id, wait_s=wait)
+                except Exception:
+                    if not claimed:
+                        raise
+                    break
+                session_id = str(session_item.get("id") or "")
+                if not session_id or session_item.get("anonymous"):
+                    # NOT A POOL ENTRY. `session_for_job` fell back to a
+                    # logged-out context (tiktok) or an env API key; there is no
+                    # second identity behind that to claim and it would hand back
+                    # this same dict forever, so it is this platform's one worker.
+                    if not claimed:
+                        claimed.append(session_item)
+                    break
+                claimed.append(session_item)
+        except BaseException:
+            # STOPPING MID-CLAIM MUST NOT STRAND WHAT IS ALREADY CLAIMED.
+            # The first `session_for_job` here waits up to
+            # SESSION_WAIT_S for a busy pool, so a hard cancel
+            # (JobStore.cancel, five seconds after Stop) lands on this
+            # await far more often than anywhere else -- and it arrives
+            # as CancelledError, which the `except Exception` above does
+            # not catch and which unwinds past every account already in
+            # `claimed`. Those never reached a worker, so no `finally`
+            # of theirs will ever run. Handing them back here is what
+            # lets the analyst press Stop and start again immediately.
+            for taken in claimed:
+                sessions_engine.release_claim(
+                    platform_id, str(taken.get("id") or ""))
+            raise
         return plat, claimed
 
     async def _platform_worker(
@@ -840,108 +896,120 @@ class AnalysisRunner:
         held: Optional[tuple[str, str]] = None
 
         # Ceilinged process-wide, not per-platform -- see `_worker_semaphore`.
-        async with _worker_semaphore():
-            if not run.queue or job.cancel.is_set():
-                # The other workers drained it while this one waited for a
-                # slot. Do not pay for a browser launch to discover that.
-                sessions_engine.release_claim(platform_id, session_id)
-                return False
-            try:
-                held = self._store.hold_session(platform_id, session_id)
-                if session_item.get("anonymous"):
-                    scraper = plat.scraper()(
-                        run.options, [], anonymous=True,
-                    )
-                else:
-                    scraper = plat.scraper()(
-                        run.options, session_item.get("cookies", []),
-                        session_id=session_id,
-                    )
-                inner = getattr(scraper, "session", None)
-                if inner is not None:
-                    inner.on_cookies = sessions_engine.cookie_saver(platform_id, session_id)
-                await scraper.start()
-
-                # SKIPPED WHEN THE ANSWER IS ALREADY KNOWN -- the same reasoning
-                # and the same PROVEN_FRESH_S window discovery/runner.py uses.
-                # `check_session()` is a real authenticated page load (measured at
-                # 12.65s on Facebook) and it ran before every analysis job, asking
-                # a question the session monitor and the last job had already
-                # answered. A session that has died since is caught by the first
-                # profile visit through the identical classify_failure ->
-                # mark_session_failed path, which is what already handles a
-                # session dying mid-job.
-                if sessions_engine.proven_fresh(session_item):
-                    log.info(
-                        f"[{platform_id}] login probe skipped -- proven healthy "
-                        f"{(time.time() - float(session_item.get('last_ok') or 0)) / 60:.0f}m ago"
-                    )
-                else:
-                    if not await scraper.check_session():
-                        await sessions_engine.mark_session_failed(
-                            platform_id, session_id, "expired")
-                        raise RuntimeError(
-                            f"{registry.display_name(platform_id)} session is not usable -- "
-                            "check credentials under Sessions")
-                    await sessions_engine.mark_session_ok(platform_id, session_id)
-                if inner is not None and hasattr(inner, "sync_cookies"):
-                    await inner.sync_cookies()
-
-                if platform_id == "youtube":
-                    # ONE channels.list call for the whole platform, so there
-                    # is no queue to work through: it takes the lot in one go.
-                    # Pinned to a single worker by `_sessions_wanted` for the
-                    # same reason.
-                    batch = list(run.queue)
-                    run.queue.clear()
-                    await self._scrape_youtube_batch(
-                        job, platform_id, batch, scraper, session_item, progress)
+        try:
+            async with _worker_semaphore():
+                if not run.queue or job.cancel.is_set():
+                    # The other workers drained it while this one waited for a
+                    # slot. Do not pay for a browser launch to discover that.
+                    sessions_engine.release_claim(platform_id, session_id)
                     return False
+                try:
+                    held = self._store.hold_session(platform_id, session_id)
+                    if session_item.get("anonymous"):
+                        scraper = plat.scraper()(
+                            run.options, [], anonymous=True,
+                        )
+                    else:
+                        scraper = plat.scraper()(
+                            run.options, session_item.get("cookies", []),
+                            session_id=session_id,
+                        )
+                    inner = getattr(scraper, "session", None)
+                    if inner is not None:
+                        inner.on_cookies = sessions_engine.cookie_saver(platform_id, session_id)
+                    await scraper.start()
 
-                while run.queue and not job.cancel.is_set():
-                    chunk = [run.queue.popleft()
-                             for _ in range(min(run.concurrency, len(run.queue)))]
-                    fatal = await asyncio.gather(
-                        *(self._scrape_one(job, it, scraper, platform_id, session_item,
-                                           stagger=idx)
-                          for idx, it in enumerate(chunk))
-                    )
+                    # SKIPPED WHEN THE ANSWER IS ALREADY KNOWN -- the same reasoning
+                    # and the same PROVEN_FRESH_S window discovery/runner.py uses.
+                    # `check_session()` is a real authenticated page load (measured at
+                    # 12.65s on Facebook) and it ran before every analysis job, asking
+                    # a question the session monitor and the last job had already
+                    # answered. A session that has died since is caught by the first
+                    # profile visit through the identical classify_failure ->
+                    # mark_session_failed path, which is what already handles a
+                    # session dying mid-job.
+                    if sessions_engine.proven_fresh(session_item):
+                        log.info(
+                            f"[{platform_id}] login probe skipped -- proven healthy "
+                            f"{(time.time() - float(session_item.get('last_ok') or 0)) / 60:.0f}m ago"
+                        )
+                    else:
+                        if not await scraper.check_session():
+                            await sessions_engine.mark_session_failed(
+                                platform_id, session_id, "expired")
+                            raise RuntimeError(
+                                f"{registry.display_name(platform_id)} session is not usable -- "
+                                "check credentials under Sessions")
+                        await sessions_engine.mark_session_ok(platform_id, session_id)
                     if inner is not None and hasattr(inner, "sync_cookies"):
                         await inner.sync_cookies()
-                    if any(fatal):
-                        # THIS SESSION IS DONE, THE BATCH IS NOT. The URLs it
-                        # died on go back on the queue for another session;
-                        # everything still queued was never touched and stays
-                        # there. Both are why this worker stopping is no longer
-                        # the same event as the platform stopping.
-                        for it, is_fatal in zip(chunk, fatal):
-                            if is_fatal:
-                                self._requeue(job, run, it, label)
-                        return True
-                    if run.queue and run.inter_batch_delay > 0:
-                        # `pause()` takes a MULTIPLIER on the configured median
-                        # gap (settings.analysis_delay_sec), not a duration, so
-                        # convert og's target seconds into one rather than
-                        # sleeping flat -- that keeps jitter, fatigue and the
-                        # occasional longer rest in play (stealth/browser.py).
-                        base = settings.analysis_delay_sec or 0
-                        mult = (run.inter_batch_delay / base) if base > 0 else 1.0
-                        try:
-                            await scraper.pause(mult)
-                        except Exception:
-                            pass
-                return False
-            finally:
-                progress["current_url"] = ""
-                progress["current_step"] = ""
-                progress["item_started_at_ts"] = None
-                self._store.release_session(held)
-                sessions_engine.release_claim(platform_id, session_id)
-                if scraper is not None:
-                    try:
-                        await scraper.stop()
-                    except Exception:
-                        pass
+
+                    if platform_id == "youtube":
+                        # ONE channels.list call for the whole platform, so there
+                        # is no queue to work through: it takes the lot in one go.
+                        # Pinned to a single worker by `_sessions_wanted` for the
+                        # same reason.
+                        batch = list(run.queue)
+                        run.queue.clear()
+                        await self._scrape_youtube_batch(
+                            job, platform_id, batch, scraper, session_item, progress)
+                        return False
+
+                    while run.queue and not job.cancel.is_set():
+                        chunk = [run.queue.popleft()
+                                 for _ in range(min(run.concurrency, len(run.queue)))]
+                        fatal = await asyncio.gather(
+                            *(self._scrape_one(job, it, scraper, platform_id, session_item,
+                                               stagger=idx)
+                              for idx, it in enumerate(chunk))
+                        )
+                        if inner is not None and hasattr(inner, "sync_cookies"):
+                            await inner.sync_cookies()
+                        if any(fatal):
+                            # THIS SESSION IS DONE, THE BATCH IS NOT. The URLs it
+                            # died on go back on the queue for another session;
+                            # everything still queued was never touched and stays
+                            # there. Both are why this worker stopping is no longer
+                            # the same event as the platform stopping.
+                            for it, is_fatal in zip(chunk, fatal):
+                                if is_fatal:
+                                    self._requeue(job, run, it, label)
+                            return True
+                        if run.queue and run.inter_batch_delay > 0:
+                            # `pause()` takes a MULTIPLIER on the configured median
+                            # gap (settings.analysis_delay_sec), not a duration, so
+                            # convert og's target seconds into one rather than
+                            # sleeping flat -- that keeps jitter, fatigue and the
+                            # occasional longer rest in play (stealth/browser.py).
+                            base = settings.analysis_delay_sec or 0
+                            mult = (run.inter_batch_delay / base) if base > 0 else 1.0
+                            try:
+                                await scraper.pause(mult)
+                            except Exception:
+                                pass
+                    return False
+                finally:
+                    progress["current_url"] = ""
+                    progress["current_step"] = ""
+                    progress["item_started_at_ts"] = None
+                    self._store.release_session(held)
+                    sessions_engine.release_claim(platform_id, session_id)
+                    if scraper is not None:
+                        await _close_quietly(
+                            f"[{platform_id}] {label} browser", scraper.stop)
+
+        except BaseException:
+            # RELEASED WHEN THE STOP LANDS BEFORE THE INNER `try`. The
+            # awaits this wraps -- the process-wide worker slot -- sit OUTSIDE the
+            # try/finally that normally hands this session back, so a task
+            # cancelled while parked on one of them ran no `finally` at all
+            # and left the account claimed for the life of the process.
+            # `_is_claimed` reaps such a lease on its own now, but releasing
+            # here means the next job finds the account free at once rather
+            # than on its next look. Double-releasing is a no-op, so the
+            # normal path unwinding through its own `finally` is unaffected.
+            sessions_engine.release_claim(platform_id, session_id)
+            raise
 
     def _requeue(
         self, job: AnalysisJob, run: _PlatformRun, it: AnalysisItem, label: str,
@@ -1062,7 +1130,18 @@ class AnalysisRunner:
         except Exception as e:
             it.duration_seconds = round(time.time() - t0, 2)
             await self._fail_item(job, it, f"{type(e).__name__}: {e}")
-            if reason := classify_failure(e):
+            # A STOP IS NOT A BAD ACCOUNT. Tearing a browser down under an
+            # in-flight page produces platform-shaped error text: a Playwright
+            # timeout still carries the URL it was navigating to, and on
+            # Facebook that is very often a `/login/...` redirect -- which
+            # `classify_failure` reads, correctly for a real failure, as
+            # "expired". Reading it during a cancel puts a perfectly good
+            # account into the graduated 15m/1h/6h/24h cooldown because the
+            # analyst pressed Stop, and the next run then reports the whole
+            # pool as expired on cookies that were never touched. A cancel
+            # says nothing about the session, so it is recorded against the
+            # item/keyword and nowhere else.
+            if (reason := classify_failure(e)) and not job.cancel.is_set():
                 await sessions_engine.mark_session_failed(
                     platform_id, session_item.get("id", ""), reason, detail=str(e))
                 fatal = True

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 from typing import Awaitable, Callable, Optional, TypeVar
 
 T = TypeVar("T")
@@ -56,6 +57,31 @@ _TRANSIENT_TOKENS = (
 )
 
 
+# A URL IS NOT EVIDENCE. Every token below is matched as a plain substring
+# against the whole error text, and a browser's error text routinely quotes
+# the URL it was working on: Playwright's timeouts read `Timeout 30000ms
+# exceeded. navigating to "https://www.facebook.com/login/?next=..."`. Left
+# in, that URL alone matched `login` and turned a NETWORK TIMEOUT into a
+# verdict of "expired" -- quarantining a perfectly good account into the
+# graduated 15m/1h/6h/24h cooldown, after which the pool reported itself
+# expired on credentials nothing was ever wrong with. Facebook redirecting
+# an unauthenticated request to `/login` is a real signal, but it reaches
+# us as the platform's own text ("not authenticated", "checkpoint"), never
+# as a bare URL -- and the same stripping incidentally protects the numeric
+# tokens, which used to be able to match an id inside a query string.
+#
+# Only the address is dropped, never the message around it, so an error
+# that says BOTH what went wrong and where still classifies on what went
+# wrong.
+_URL_RE = re.compile(r"https?://\S+")
+
+
+def _evidence(err: BaseException | str) -> str:
+    """The part of an error that is actually a claim about the session:
+    lowercased, with any URL it happens to quote removed."""
+    return _URL_RE.sub(" ", str(err)).lower()
+
+
 def classify_failure(err: BaseException | str) -> Optional[str]:
     """A caught exception (or a `Sweep.stopped` string) -> the reason string
     `sessions.manager.mark_session_failed` wants, or None when this isn't
@@ -67,7 +93,7 @@ def classify_failure(err: BaseException | str) -> Optional[str]:
     of view, but "checkpointed" is the more actionable signal (paste fresh
     cookies) versus the generic "expired" a bare 401 gets.
     """
-    text = str(err).lower()
+    text = _evidence(err)
     if any(tok in text for tok in _CHECKPOINT_TOKENS):
         return "checkpointed"
     if any(tok in text for tok in _AUTH_TOKENS):
