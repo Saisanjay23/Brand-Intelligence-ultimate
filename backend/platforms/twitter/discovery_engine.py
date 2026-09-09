@@ -264,7 +264,17 @@ JS_DOM_USERS = """
     }
     out.push({
       handle,
-      name: name || handle,
+      // BLANK, NOT THE HANDLE, when no display name is on the cell. The
+      // handle is already carried as `handle` and is already visible in
+      // the URL, so repeating it here adds nothing and costs something:
+      // this value is stored as the profile's `display_name`, and analysis
+      // later reads that back as the name it trusts when its own visit
+      // could not read one (see analysis/runner.py::_populate). Filling it
+      // with the handle therefore fed a user id into the Profile name
+      // column by a second route, one the analysis-side fix cannot see.
+      // A row with no name renders through the UI's own
+      // display_name -> username -> entity_id fallback.
+      name,
       avatar: img ? img.getAttribute('src') : '',
       verified: !!cell.querySelector('[data-testid="icon-verified"]'),
     });

@@ -235,7 +235,17 @@ def _wire(monkeypatch, sessions: list[dict], fail_keywords: dict[str, set[str]] 
 
 
 def _job(keywords: list[str], platform: str = PLATFORM) -> R.DiscoveryJob:
-    plan = [(kw, "individual") for kw in keywords]
+    # `keyword_plan` holds KeywordPlans, not (term, type) pairs: every entry
+    # is one SEARCH plus the parent its hits file under. These fixtures are
+    # childless -- a keyword that is its own parent -- which is the shape a
+    # client with no permutations saved still produces.
+    plan = [
+        R.kw_groups.KeywordPlan(
+            search=kw, kw_type="individual",
+            targets=(R.kw_groups.MatchTarget(parent=kw, terms=(kw,)),),
+        )
+        for kw in keywords
+    ]
     job = R.DiscoveryJob(id="job1", group_id="client1", keyword_plan=plan)
     job.platforms[platform] = R.PlatformSweep(
         platform=platform, display_name="X (Twitter)", keywords_total=len(plan),

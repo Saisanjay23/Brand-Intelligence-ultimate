@@ -40,6 +40,7 @@ from backend.platforms import registry
 from backend.services import avatar_cache
 from backend.platforms.scan_options import DiscoveryOptions
 from backend.sessions import manager as sessions_engine
+from backend.shared import keywords as kw_groups
 from backend.shared.job_store import JobStore
 from backend.shared.logging import get_logger
 from backend.shared.models.row import Row
@@ -194,13 +195,29 @@ def _sessions_wanted(platform_id: str, keyword_count: int) -> int:
 
 @dataclass
 class _KeywordItem:
-    """One (keyword, kw_type) pair from `job.keyword_plan`, tracked for
-    retry the way analysis/runner.py's AnalysisItem tracks `attempts` for a
-    URL -- see _MAX_KEYWORD_ATTEMPTS."""
+    """One search from `job.keyword_plan`, tracked for retry the way
+    analysis/runner.py's AnalysisItem tracks `attempts` for a URL -- see
+    _MAX_KEYWORD_ATTEMPTS.
+
+    `keyword` is what goes into the platform's search box; `parent` is what
+    its hits are FILED under. For a plain keyword the two are the same. For
+    one of an analyst's permutations they differ, and keeping both is the
+    whole point: "gautam.adani.hq" is a good thing to search for and a
+    useless thing to file under or to score a name against (see
+    shared/keywords.py).
+    """
 
     keyword: str
     kw_type: str
+    parent: str = ""
     attempts: int = 0
+
+    def __post_init__(self) -> None:
+        # A childless keyword is its own parent -- which is exactly the
+        # pre-groups behaviour, so a caller that knows nothing about
+        # permutations still gets correct filing.
+        if not self.parent:
+            self.parent = self.keyword
 
 
 @dataclass
@@ -400,7 +417,11 @@ class DiscoveryJob:
     # (keyword, kw_type) pairs, kw_type is "individual" | "domain" -- the
     # ORDER this sweeps in and the type each cap resolution needs (see
     # _resolve_cap). `keywords` below is derived from this for display.
-    keyword_plan: list[tuple[str, str]]
+    # Every SEARCH this job will run, in order, each carrying the parent
+    # its hits get filed under. Built by `_plans_for` from the client's
+    # keyword groups, so it holds the analyst's permutations and not only
+    # the parents they hang off.
+    keyword_plan: list[kw_groups.KeywordPlan]
     created_at: float = field(default_factory=time.time)
     status: str = QUEUED
     message: str = ""
@@ -422,7 +443,10 @@ class DiscoveryJob:
 
     @property
     def keywords(self) -> list[str]:
-        return [kw for kw, _ in self.keyword_plan]
+        # The SEARCHES, which is what the progress UI counts down and what
+        # an analyst watching a sweep is actually seeing run. Parents alone
+        # would under-report the work by the permutation multiple.
+        return [p.search for p in self.keyword_plan]
 
     @property
     def total(self) -> int:
@@ -505,6 +529,57 @@ class DiscoveryRunner:
                 skipped[p] = "unknown platform"
         return ready, skipped
 
+    async def _plans_for(
+        self, group_id: str, ind: list[str], dom: list[str],
+    ) -> list[kw_groups.KeywordPlan]:
+        """The searches this sweep should run: every requested parent AND
+        every permutation the analyst hung off it.
+
+        THE DEFECT THIS CLOSES. `POST /discovery` is handed the client's
+        `name_keywords`/`domain_keywords`, and those hold PARENTS ONLY --
+        the keyword-groups feature deliberately kept them that way for
+        back-compatibility (see shared/keywords.py). The plan was then
+        built straight from those two lists, so an analyst who generated a
+        dozen permutations per name had them saved, listed in the Keywords
+        tab, and never searched: `build_plans`, the function written to
+        expand `[parent, *children]`, had no caller at all. Measured on a
+        realistic client -- 3 parents, 7 permutations -- 7 of the 10 terms
+        were never run on any platform.
+
+        Degrades to exactly the old behaviour rather than failing: a client
+        that cannot be loaded, or one with no groups saved, yields one
+        childless plan per requested term, which searches itself. A sweep
+        must never be lost because the config read behind it hiccuped.
+        """
+        client: Optional[dict] = None
+        try:
+            from backend.database.repositories import client_repository as clients_db
+            client = await clients_db.get(group_id)
+        except Exception as e:                   # noqa: BLE001 - never fatal
+            log.warning(
+                f"discovery: could not read client {group_id!r} for keyword groups "
+                f"({type(e).__name__}: {e}) -- sweeping the requested terms as given")
+
+        # The caller already knows each term's type: `POST /discovery` takes
+        # two separate lists. Passed through so an ad-hoc term the client's
+        # config does not contain is not guessed at (and filed under the
+        # wrong per-type cap) by `classify_unknown`.
+        types = {t.lower(): kw_groups.INDIVIDUAL for t in ind}
+        types.update({t.lower(): kw_groups.DOMAIN for t in dom})
+
+        plans = kw_groups.build_plans(client, requested=ind + dom, requested_types=types)
+        if plans:
+            return plans
+        # No client, no groups, nothing matched -- the pre-groups plan.
+        return [
+            kw_groups.KeywordPlan(
+                search=term, kw_type=kw_type,
+                targets=(kw_groups.MatchTarget(parent=term, terms=(term,)),),
+            )
+            for kw_type, terms in ((kw_groups.INDIVIDUAL, ind), (kw_groups.DOMAIN, dom))
+            for term in terms
+        ]
+
     async def start(
         self, group_id: str,
         individual_keywords: list[str], domain_keywords: list[str],
@@ -522,7 +597,10 @@ class DiscoveryRunner:
         # caps (platform_limits_individual vs _domain).
         ind = list(dict.fromkeys(k.strip() for k in individual_keywords if k and k.strip()))
         dom = list(dict.fromkeys(k.strip() for k in domain_keywords if k and k.strip()))
-        plan = [(k, "individual") for k in ind] + [(k, "domain") for k in dom]
+        # EXPANDED, not taken as given: each requested parent brings its own
+        # permutations along -- see `_plans_for` for what used to happen
+        # instead.
+        plan = await self._plans_for(group_id, ind, dom)
         ready, skipped = await self.platform_readiness(platforms)
 
         job = DiscoveryJob(id=uuid.uuid4().hex[:12], group_id=group_id, keyword_plan=plan)
@@ -734,7 +812,8 @@ class DiscoveryRunner:
 
         run = _PlatformSweepRun(
             platform_id=platform_id,
-            queue=deque(_KeywordItem(kw, kt) for kw, kt in job.keyword_plan),
+            queue=deque(
+                _KeywordItem(p.search, p.kw_type, p.parent) for p in job.keyword_plan),
             tabs=tabs,
             max_results=max_results,
             max_seconds=max_seconds,
@@ -1022,7 +1101,8 @@ class DiscoveryRunner:
                 # be gained by a different session, so the whole platform
                 # stops instead -- see `run.hard_stop`).
                 async def _sweep_tab(
-                    keyword: str, kw_type: str, tab: str, stats: dict, fatal_kind: list,
+                    keyword: str, kw_type: str, parent: str, tab: str,
+                    stats: dict, fatal_kind: list,
                     stagger: float = 0.0, own_options: bool = False,
                 ) -> str:
                     if stagger:
@@ -1083,7 +1163,17 @@ class DiscoveryRunner:
                         # so a caller polling this job (or reading
                         # /profiles) sees results within seconds of them
                         # being found.
-                        rows = [row_to_fields(h, keyword) for h in hits]
+                        # FILED UNDER THE PARENT, SEARCHED AS THE PERMUTATION.
+                        # `keyword` is what went into the search box;
+                        # `parent` is the real name this investigation is
+                        # about. Storing the permutation instead would
+                        # scatter one investigation across a dozen filter
+                        # buckets in the grid and score every hit's name
+                        # against "gautam.adani.hq" -- which says nothing
+                        # about whether it impersonates Gautam Adani. See
+                        # shared/keywords.py's module docstring; this is the
+                        # PARENT/CHILDREN split it exists to express.
+                        rows = [row_to_fields(h, parent) for h in hits]
                         saved, new = await profiles_db.save_many(
                             job.group_id, platform_id, profiles_db.PHASE_DISCOVERY,
                             rows,
@@ -1186,7 +1276,8 @@ class DiscoveryRunner:
                         async def _slot(i: int, tab: str) -> str:
                             async with sem:
                                 return await _sweep_tab(
-                                    item.keyword, item.kw_type, tab, stats, fatal_kind,
+                                    item.keyword, item.kw_type, item.parent, tab,
+                                    stats, fatal_kind,
                                     stagger=i * TAB_STAGGER_SEC, own_options=True,
                                 )
 
@@ -1203,7 +1294,9 @@ class DiscoveryRunner:
                         for tab in run.tabs:
                             if job.cancel.is_set() or run.hard_stop:
                                 break
-                            reason = await _sweep_tab(item.keyword, item.kw_type, tab, stats, fatal_kind)
+                            reason = await _sweep_tab(
+                                item.keyword, item.kw_type, item.parent, tab,
+                                stats, fatal_kind)
                             if reason or fatal_kind[0]:
                                 break
 

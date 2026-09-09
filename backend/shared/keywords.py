@@ -18,13 +18,22 @@ THE PROBLEM THIS SOLVES
                  name_exact_run), the bucket every hit found by any of its
                  children is filed under, the only keyword the UI's filter
                  dropdown offers, and the name the analysis export reports
-                 in its AssetName column. It is ALSO searched, alongside
-                 its children -- see `build_plans`, which sweeps
-                 `[parent, *children]`.
+                 in its AssetName column.
 
-        CHILDREN the analyst's permutations. Searched on every platform.
-                 Never scored against, never stored as the hit's keyword,
-                 never shown as a filter option.
+                 It is searched ONLY when it has no children -- see
+                 `build_plans`, which sweeps `children or [parent]`. An
+                 analyst who has curated permutations has said what to
+                 search for, and the real name is rarely among the terms
+                 worth spending a sweep on; one who has curated none still
+                 gets their keyword searched, so nothing is ever configured
+                 and then silently not run. An analyst who DOES want the
+                 exact name queried alongside the permutations adds it as
+                 one of them.
+
+        CHILDREN the analyst's permutations. Searched on every platform,
+                 and when there is at least one they are the WHOLE search
+                 set for that parent. Never scored against, never stored as
+                 the hit's keyword, never shown as a filter option.
 
     One parent's children all roll up into that one parent, so an analyst
     filtering the results grid by "Gautam Adani" sees everything all twelve
@@ -46,7 +55,10 @@ BACK-COMPATIBILITY IS THE LOAD-BEARING PART
     NO children, and a childless parent searches ITSELF (see
     `build_plans`), which is precisely the old behaviour. Such a client
     sweeps identically before and after this feature, with nothing to
-    migrate and no backfill step.
+    migrate and no backfill step. That is also why the parent-as-fallback
+    rule has to be exactly "no children", not "no groups": a client may
+    have permutations for one keyword and none for the next, and the second
+    must still be swept.
 """
 
 from __future__ import annotations
@@ -274,8 +286,13 @@ def classify_unknown(client: Optional[dict], keyword: str) -> str:
 def build_plans(
     client: Optional[dict],
     requested: Optional[Iterable[str]] = None,
+    requested_types: Optional[dict[str, str]] = None,
 ) -> list[KeywordPlan]:
     """The searches one sweep should run, resolved from a client's groups.
+
+    Each requested parent contributes its CHILDREN, or -- when it has
+    none -- itself. See the module docstring for why permutations
+    replace the parent rather than joining it.
 
     `requested` scopes the sweep to a subset of the client's PARENTS -- the
     keyword list a caller passed to `POST /discovery`, which is always
@@ -295,6 +312,14 @@ def build_plans(
     same platform costs a real page load and risks the session for nothing.
     When that happens the single plan carries BOTH parents as targets, and
     `resolve_parent` picks per hit.
+
+    `requested_types` maps a lowered term to INDIVIDUAL/DOMAIN and is
+    consulted ONLY for a term the client's groups do not contain. Callers
+    that already know each term's type -- `POST /discovery` takes two
+    separate lists, so it always does -- pass it rather than letting
+    `classify_unknown` guess, which would file an ad-hoc individual name
+    under the domain caps. A term the client DOES know is never routed
+    here: its type comes from its own group.
     """
     groups = groups_for_client(client)
     wanted: Optional[set[str]] = None
@@ -315,7 +340,15 @@ def build_plans(
                 continue
             matched_parents.add(parent.lower())
             target = MatchTarget(parent=parent, terms=match_terms_for(client, parent, kw_type))
-            terms_to_search = _dedup([parent, *(group.get("children") or [])])
+            # PERMUTATIONS REPLACE THE PARENT; the parent is the fallback.
+            # A parent that has permutations is NOT searched under its own
+            # name -- the analyst's permutations are the search set, and the
+            # parent's job is to be what those hits are matched and filed
+            # against. A parent with none searches itself, which is what
+            # keeps a client who has curated nothing sweeping exactly as
+            # before. See this module's docstring.
+            children = _dedup(group.get("children") or [])
+            terms_to_search = children or [parent]
             for term in terms_to_search:
                 key = term.lower()
                 if key not in by_search:
@@ -330,7 +363,7 @@ def build_plans(
         for term in _dedup(requested or []):
             if term.lower() in matched_parents or term.lower() in by_search:
                 continue
-            kw_type = classify_unknown(client, term)
+            kw_type = (requested_types or {}).get(term.lower()) or classify_unknown(client, term)
             by_search[term.lower()] = {
                 "search": term, "kw_type": kw_type,
                 "targets": [MatchTarget(parent=term, terms=match_terms_for(client, term, kw_type))],
