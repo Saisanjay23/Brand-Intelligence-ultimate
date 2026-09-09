@@ -191,9 +191,16 @@ export interface Profile {
   // rows (the one platform whose discovery distinguishes people, pages,
   // and groups); blank everywhere else.
   entity_type?: string;
-  // every keyword sweep that has (re)found this profile, discovery cards
-  // only, see backend/services/profile_service.py::_to_card
+  // The PARENT keyword(s) whose investigation this profile belongs to --
+  // the bucket, the filter option, and the name its score was computed
+  // against. Never a permutation: those live in `matched_keywords`.
   keywords?: string[];
+  // The permutation(s) actually typed into the platform's search box to
+  // surface this profile, when they differ from the parent. EMPTY MEANS
+  // "found by its own keyword", not "unknown" -- a parent with no
+  // permutations configured searches itself, so there is nothing to
+  // distinguish. See backend/shared/keywords.py.
+  matched_keywords?: string[];
   // 0-100 name-vs-keyword closeness (discovery-seeded, analysis-refined) --
   // powers the card's High/Low match badge. The only automated match
   // signal in the system, confidence is scored off the client's own

@@ -26,6 +26,10 @@ export interface StartDiscoveryBody {
   // _resolve_cap. At least one of the two must be non-empty.
   individual_keywords: string[];
   domain_keywords: string[];
+  // Which of Facebook's three result tabs to sweep: any of "people",
+  // "pages", "groups". EMPTY MEANS ALL THREE, exactly as an omitted
+  // `platforms` means every platform. Inert for every other platform.
+  facebook_tabs?: string[];
   platforms?: string[];
   max_results?: number;
   max_seconds?: number;
@@ -139,7 +143,15 @@ export interface DiscoveredProfile {
   location: string;
   bio: string;
   created_at: string;
+  // The PARENT keyword(s) whose investigation this profile belongs to
+  // -- the bucket, the filter option, and the name its score was
+  // computed against. Never a permutation.
   keywords: string[];
+  // The permutation(s) actually typed into the platform's search box to
+  // surface it, when they differ from the parent. EMPTY MEANS "found by
+  // its own keyword", not "unknown": a parent with no permutations
+  // configured searches itself, so there is nothing to distinguish.
+  matched_keywords?: string[];
   name_score: number | null;
   // True High Match: the keyword's letters appear in this name as one
   // contiguous run (spacing/punctuation/case ignored). Word-order-sensitive

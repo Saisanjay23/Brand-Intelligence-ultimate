@@ -124,6 +124,19 @@ class StartDiscovery(BaseModel):
         default_factory=dict,
         description="Same as platform_limits_individual, for domain-type keywords.",
     )
+    facebook_tabs: list[str] = Field(
+        default_factory=list,
+        description="Which of Facebook's three result tabs to sweep: any of "
+                    "\"people\", \"pages\", \"groups\". EMPTY MEANS ALL THREE, "
+                    "matching how an omitted `platforms` means every platform. "
+                    "Inert for every other platform, which has only one tab. "
+                    "The three cost very different amounts -- People is "
+                    "effectively unbounded for a common name while Pages and "
+                    "Groups exhaust on their own in seconds -- so an analyst "
+                    "hunting impersonating Pages can skip the People sweep "
+                    "that would otherwise run for every keyword.",
+        examples=[["pages", "groups"]],
+    )
     platform_tab_limits: dict[str, dict[str, dict[str, int]]] = Field(
         default_factory=dict,
         description="platform id -> tab -> keyword type (\"individual\"/\"domain\") "
@@ -264,7 +277,18 @@ class DiscoveredProfile(BaseModel):
     location: str = ""
     bio: str = ""
     created_at: str = Field("", description="Account creation date (YYYY-MM-DD) where the platform publishes one.")
-    keywords: list[str] = Field(default_factory=list, description="Every keyword whose sweep has found this profile.")
+    keywords: list[str] = Field(
+        default_factory=list,
+        description="The PARENT keyword(s) whose investigation this profile belongs to. "
+                    "This is the bucket, the filter option, and the name its score was "
+                    "computed against -- never a permutation.")
+    matched_keywords: list[str] = Field(
+        default_factory=list,
+        description="The permutation(s) actually typed into the platform's search box to "
+                    "surface this profile, when they differ from the parent. Empty when "
+                    "the parent was itself the search term (a keyword with no permutations "
+                    "configured searches itself), so an empty list means \"found by its "
+                    "own keyword\", not \"unknown\".")
     name_score: Optional[int] = Field(None, description="0-100 similarity of the profile name to the keyword.")
     name_exact_run: Optional[bool] = Field(
         None,
@@ -350,6 +374,7 @@ def _to_profile(doc: dict) -> DiscoveredProfile:
         bio=doc.get("bio", "") or "",
         created_at=doc.get("created_at", "") or "",
         keywords=list(doc.get("keywords") or []),
+        matched_keywords=list(doc.get("matched_keywords") or []),
         name_score=doc.get("name_score"),
         name_exact_run=doc.get("name_exact_run"),
         source=doc.get("discovery_source", "") or "",
@@ -451,6 +476,7 @@ async def start_discovery(body: StartDiscovery) -> StartDiscoveryAccepted:
         platform_limits_individual=body.platform_limits_individual,
         platform_limits_domain=body.platform_limits_domain,
         platform_tab_limits=body.platform_tab_limits,
+        facebook_tabs=body.facebook_tabs,
     )
     return StartDiscoveryAccepted(
         job_id=job.id, status=JobStatus(job.status),

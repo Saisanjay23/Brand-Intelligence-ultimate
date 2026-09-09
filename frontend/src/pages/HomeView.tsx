@@ -49,6 +49,16 @@ type Mode = "select" | "create";
 type WorkspaceTab = "overview" | "keywords" | "limits" | "settings";
 
 type FacebookTab = "people" | "pages" | "groups";
+const ALL_FB_TABS: FacebookTab[] = ["people", "pages", "groups"];
+
+// The Run page's Facebook tab chips. Ordered as Facebook's own results are,
+// which -- with keywords sweeping one at a time -- is also the order results
+// come back in.
+const FB_TAB_CHIPS: { id: FacebookTab; label: string; icon: string }[] = [
+  { id: "people", label: "People", icon: "\u{1F464}" },
+  { id: "pages", label: "Pages", icon: "\u{1F4C4}" },
+  { id: "groups", label: "Groups", icon: "\u{1F465}" },
+];
 type FacebookTabLimits = Record<FacebookTab, { individual: string; domain: string }>;
 
 interface Props {
@@ -1783,6 +1793,18 @@ export function HomeView({
   // backend rebuild.
   const [sweepKeywordTypes, setSweepKeywordTypes] = useState<Set<KeywordScope>>(new Set());
 
+  // WHICH FACEBOOK TABS THIS RUN SWEEPS. Same convention as the two chip
+  // rows above it: an EMPTY selection means all of them, which is the
+  // default and what every sweep did before this control existed.
+  //
+  // Worth its own control because Facebook's three tabs cost very different
+  // amounts. People is effectively unbounded for a common name and runs to
+  // the sweep time budget; Pages and Groups are small finite sets that
+  // exhaust on their own in seconds. With keywords sweeping strictly one at
+  // a time, an analyst after impersonating PAGES was paying for a People
+  // sweep on every keyword to get them -- which is most of the run.
+  const [sweepFbTabs, setSweepFbTabs] = useState<Set<FacebookTab>>(new Set());
+
   // The scope persists across client switches (the platform chips do too),
   // which can strand it on a category the newly-selected client has none of
   // -- that chip is disabled, so the only way out would be noticing it and
@@ -1915,6 +1937,10 @@ export function HomeView({
         platform_limits_individual: activeClient.platform_limits_individual,
         platform_limits_domain: activeClient.platform_limits_domain,
         platform_tab_limits: activeClient.platform_tab_limits,
+        // Empty = all three, exactly as an omitted `platforms` means every
+        // platform. Sent unconditionally: the backend ignores it for every
+        // platform that has only one tab.
+        facebook_tabs: [...sweepFbTabs],
         max_seconds: sweepMaxMinutes.trim() ? Number(sweepMaxMinutes) * 60 : undefined,
       });
       if (res.skipped.length) {
@@ -2033,6 +2059,23 @@ export function HomeView({
     setSweepKeywordTypes(next.size === KEYWORD_SCOPES.length ? new Set() : next);
   };
   const selectAllKeywordTypes = () => setSweepKeywordTypes(new Set());
+
+  // Facebook tab chips, the same interaction again: toggle on, empty means
+  // all. Selecting all three collapses back to empty so the All chip lights
+  // up rather than three chips that together mean the same thing.
+  const toggleFbTab = (id: FacebookTab) => {
+    const next = new Set(sweepFbTabs);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    setSweepFbTabs(next.size === ALL_FB_TABS.length ? new Set() : next);
+  };
+  const selectAllFbTabs = () => setSweepFbTabs(new Set());
+
+  // Only shown when Facebook is actually in scope -- the row is inert for
+  // every other platform, and a control that cannot affect the run it sits
+  // above is a question the analyst has to answer for nothing.
+  const facebookInScope =
+    targetPlatforms.size === 0 || targetPlatforms.has("facebook");
 
   // The single category to send to the API, or "" for all. Only a
   // selection of exactly one narrows anything -- empty (and, by the
@@ -2444,6 +2487,40 @@ export function HomeView({
                       );
                     })}
                   </div>
+
+                  {/* WHICH FACEBOOK TABS -- People, Pages, Groups. Same
+                      interaction as the two rows above: toggle them on, and
+                      selecting NONE means all of them. Hidden when Facebook
+                      is not in scope, since it can change nothing there. */}
+                  {facebookInScope && (
+                    <div className="unified-platform-selector" style={{ marginTop: "8px" }}>
+                      <button
+                        type="button"
+                        className={`unified-platform-btn ${sweepFbTabs.size === 0 ? "active" : ""}`}
+                        onClick={selectAllFbTabs}
+                        title="Sweep all three Facebook result tabs"
+                      >
+                        <PlatformIcon platform="facebook" size={15} />
+                        <span>All FB Tabs</span>
+                      </button>
+                      {FB_TAB_CHIPS.map((opt) => {
+                        const on = sweepFbTabs.has(opt.id);
+                        return (
+                          <button
+                            key={opt.id}
+                            type="button"
+                            className={`unified-platform-btn ${on ? "active" : ""}`}
+                            onClick={() => toggleFbTab(opt.id)}
+                            title={`${on ? "Click to remove" : "Click to add"} the Facebook `
+                              + `${opt.label} tab -- selecting none sweeps all three`}
+                          >
+                            <span aria-hidden style={{ fontSize: "13px" }}>{opt.icon}</span>
+                            <span>{opt.label}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
 
                   {/* Per-sweep time safety net -- only bites a keyword that
                       is still finding new results when the clock runs out;

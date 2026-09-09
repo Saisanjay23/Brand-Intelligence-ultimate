@@ -462,8 +462,8 @@ def _is_identity_upgrade(current: str, incoming: str) -> bool:
 
 async def save(
     client_id: str, platform: str, phase: str, fields: dict,
-    *, url: str, entity_id: str = "", keyword: str = "", initial_status: str = "pending",
-    retry_pending: bool = False,
+    *, url: str, entity_id: str = "", keyword: str = "", matched_keyword: str = "",
+    initial_status: str = "pending", retry_pending: bool = False,
 ) -> bool:
     """Upsert one profile. Returns True when newly seen.
 
@@ -584,6 +584,24 @@ async def save(
                 update["$set"]["analysis_attempts"] = 0
     if keyword:
         update["$addToSet"]["keywords"] = keyword
+    # WHICH SEARCH ACTUALLY SURFACED THIS PROFILE, as opposed to which
+    # investigation it belongs to. `keyword` is the PARENT -- the real name,
+    # the bucket, the only thing the filter dropdown offers. When an analyst
+    # has curated permutations, that parent was never typed into any search
+    # box: "gautamadani" was. Recording only the parent left an analyst
+    # unable to tell which of a dozen permutations is earning its place, and
+    # unable to answer "why did this profile come up at all?" from the card.
+    #
+    # An ARRAY, accumulated like `keywords`, because one profile is
+    # routinely surfaced by several permutations of the same parent (and, on
+    # a repeat sweep, by the same one again -- $addToSet makes that a no-op
+    # rather than a growing pile of duplicates).
+    #
+    # Skipped when it would only repeat the parent: a childless keyword
+    # searches itself, and "found via Gautam Adani" under a Gautam Adani tag
+    # is noise on every card that has it.
+    if matched_keyword and matched_keyword.strip().lower() != (keyword or "").strip().lower():
+        update["$addToSet"]["matched_keywords"] = matched_keyword
 
     if existing:
         # Identity only ever sharpens: fill a blank, or upgrade a vanity
@@ -809,9 +827,9 @@ async def save_many(
     """Each item is `{**fields, "url":..., "entity_id":..., "keyword":...}`.
     -> (saved, newly seen). One bad row never sinks the batch.
 
-    `retry_pending` may ride along on an item like the other three control
-    keys: popped here so it reaches `save` as an argument and never lands
-    in the document itself.
+    `retry_pending` and `matched_keyword` may ride along on an item like the
+    other control keys: popped here so they reach `save` as arguments and
+    never land in the document itself.
     """
     saved = new = 0
     for item in items:
@@ -819,10 +837,12 @@ async def save_many(
         url = item.pop("url")
         entity_id = item.pop("entity_id", "")
         keyword = item.pop("keyword", "")
+        matched_keyword = item.pop("matched_keyword", "")
         retry_pending = bool(item.pop("retry_pending", False))
         try:
             if await save(client_id, platform, phase, item, url=url, entity_id=entity_id,
-                          keyword=keyword, retry_pending=retry_pending):
+                          keyword=keyword, matched_keyword=matched_keyword,
+                          retry_pending=retry_pending):
                 new += 1
             saved += 1
         except Exception as e:
@@ -1753,7 +1773,8 @@ async def cleanup_stale_pending(days: int = 60) -> int:
 # reads (display_name, has_logo) or anything the dedup match in save() needs
 # (client_id, platform, url, entity_id), an archived rejected profile
 # stays exactly as reconsider-able as an unarchived one.
-_ARCHIVE_STRIP_FIELDS = ("profile_image_url", "keywords", "comments", "sources", "urls")
+_ARCHIVE_STRIP_FIELDS = (
+    "profile_image_url", "keywords", "matched_keywords", "comments", "sources", "urls")
 
 
 async def archive_stale_rejected(days: int = 180) -> int:

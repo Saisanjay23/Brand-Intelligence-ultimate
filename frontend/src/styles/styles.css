@@ -2453,6 +2453,46 @@ a:hover {
   border-radius: 999px;
   padding: 2px 8px;
 }
+/* The permutation that surfaced the row, next to the parent it files under.
+   Deliberately quieter than the parent tag: the parent is what an analyst
+   groups and filters by, the search term is the supporting detail. Dashed
+   so the two read as different KINDS of tag at a glance, not just different
+   colours -- which is the distinction that survives a screenshot. */
+.card-keyword-tag-via {
+  border-style: dashed;
+  opacity: 0.85;
+}
+/* Small pill buttons for the per-client platform scope shortcuts
+   ("Select all" / "Only <first>") above the limits table. */
+.chip-toggle {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--cyan);
+  background: rgba(0, 229, 255, 0.12);
+  border: 1px solid rgba(0, 229, 255, 0.3);
+  border-radius: 999px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+.chip-toggle:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.chip-toggle:not(:disabled):hover {
+  background: rgba(0, 229, 255, 0.2);
+}
+
+/* People / Page / Group / Channel. Leads the tag row because it says what
+   the row IS, which is the first thing to know about it. */
+.card-entity-tag {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-muted);
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  padding: 2px 8px;
+  white-space: nowrap;
+}
 
 /* ---- published-incident preview/edit panel (analysis cards only) ---- */
 .incident-panel {

@@ -45,6 +45,80 @@ import { AvatarImg } from "./AvatarImg";
 import { PlatformIcon } from "./PlatformIcon";
 import { CloneIcon, GlobeIcon, LayersIcon, TargetIcon, TrashIcon, VerifiedBadgeIcon, ZapIcon } from "./AppIcons";
 
+// WHAT KIND OF THING THIS ROW IS -- a person, a Page, a Group, a channel.
+//
+// `entity_type` has always been stored and filterable, and was never shown,
+// so a Facebook result set read as one undifferentiated pile: a Page called
+// "Gautam Adani" and a person called "Gautam Adani" are very different
+// findings and the card gave an analyst no way to tell them apart without
+// opening the link.
+//
+// SHOWN ONLY WHERE IT SAYS SOMETHING. On a platform whose discovery can
+// only ever return one kind, the label is a constant -- "People" on every
+// single X card is furniture, not information. So it renders when the
+// platform genuinely distinguishes kinds, or when the value is not the
+// default "profile" (which covers a channel, and anything a new platform
+// starts returning before this list is updated).
+const MULTI_ENTITY_PLATFORMS = new Set(["facebook", "telegram"]);
+
+const ENTITY_LABELS: Record<string, { icon: string; label: string; tint: string }> = {
+  profile: { icon: "\u{1F464}", label: "People", tint: "rgba(102,112,133,0.16)" },
+  page: { icon: "\u{1F4C4}", label: "Page", tint: "rgba(0,122,255,0.16)" },
+  group: { icon: "\u{1F465}", label: "Group", tint: "rgba(154,80,233,0.16)" },
+  channel: { icon: "\u{1F4FA}", label: "Channel", tint: "rgba(255,171,0,0.18)" },
+};
+
+function EntityTypeTag({ p }: { p: DiscoveredProfile }) {
+  const kind = (p.entity_type || "").toLowerCase();
+  if (!kind) return null;
+  if (kind === "profile" && !MULTI_ENTITY_PLATFORMS.has((p.platform || "").toLowerCase())) {
+    return null;
+  }
+  const meta = ENTITY_LABELS[kind] ?? {
+    icon: "\u{1F4CC}", label: kind, tint: "rgba(102,112,133,0.16)",
+  };
+  return (
+    <span
+      className="card-entity-tag"
+      title={`Found on the ${meta.label} results`}
+      style={{ background: meta.tint }}
+    >
+      {meta.icon} {meta.label}
+    </span>
+  );
+}
+
+// WHICH SEARCH ACTUALLY TURNED THIS UP.
+//
+// The 🔑 tag is the PARENT -- the investigation this row belongs to, and the
+// only thing the filter dropdown offers. When an analyst has curated
+// permutations, that parent was never typed into a search box: one of its
+// permutations was, and which one is the thing that answers "why did this
+// come up at all?" and "is this permutation earning its place?".
+//
+// Rendered only when it differs from the parent. The backend already drops
+// a matched keyword equal to its parent, and this guards the same case
+// again for rows written before that rule existed -- "found via Gautam
+// Adani" under a Gautam Adani tag is noise on every card that carries it.
+function MatchedKeywordTags({ p }: { p: DiscoveredProfile }) {
+  const parents = new Set((p.keywords || []).map((k) => k.toLowerCase()));
+  const via = (p.matched_keywords || []).filter((k) => k && !parents.has(k.toLowerCase()));
+  if (!via.length) return null;
+  return (
+    <>
+      {via.map((kw) => (
+        <span
+          key={`via-${kw}`}
+          className="card-keyword-tag card-keyword-tag-via"
+          title={`Surfaced by the search term "${kw}"`}
+        >
+          🔎 {kw}
+        </span>
+      ))}
+    </>
+  );
+}
+
 interface Props {
   groupId: string;
   // Scope to one platform (set by the platform rail above this grid); ""
@@ -194,6 +268,11 @@ function exportRow(p: DiscoveredProfile): Record<string, unknown> {
     Followers: p.followers ?? "",
     "Match Score": p.name_score ?? "",
     Keywords: p.keywords.join("; "),
+    // The permutation that surfaced it, exported alongside the parent
+    // rather than instead of it -- an analyst reviewing a CSV needs the
+    // bucket to sort by AND the term to judge.
+    "Matched via": (p.matched_keywords || []).join("; "),
+    Type: p.entity_type || "",
     "First Seen": p.first_seen ?? "",
     "Avatar Changed": p.avatar_changed_at ?? "",
   };
@@ -377,11 +456,15 @@ function ProfileCard({
         {p.followers != null && (
           <div style={{ fontSize: "12px", color: "var(--text-dim)" }}>{p.followers.toLocaleString()} followers</div>
         )}
-        {!!p.keywords.length && (
+        {(!!p.keywords.length || !!p.matched_keywords?.length || !!p.entity_type) && (
           <div className="card-keyword-tags">
+            <EntityTypeTag p={p} />
             {p.keywords.map((kw) => (
-              <span key={kw} className="card-keyword-tag">🔑 {kw}</span>
+              <span key={kw} className="card-keyword-tag" title={`Filed under "${kw}"`}>
+                🔑 {kw}
+              </span>
             ))}
+            <MatchedKeywordTags p={p} />
           </div>
         )}
         {onValidate && (
@@ -469,7 +552,14 @@ function ProfileTable({
               <td>{statusLabel(p)}</td>
               <td>{p.name_score != null ? `${matchLevelOf(p)} (${p.name_score})` : "—"}</td>
               <td>{p.followers != null ? p.followers.toLocaleString() : "—"}</td>
-              <td>{p.keywords.join(", ")}</td>
+              <td>
+                {p.keywords.join(", ")}
+                {!!p.matched_keywords?.length && (
+                  <span style={{ color: "var(--text-dim)" }}>
+                    {" "}(via {p.matched_keywords.join(", ")})
+                  </span>
+                )}
+              </td>
               {(onValidate || onUnvalidate) && (
                 <td>
                   {onValidate && (

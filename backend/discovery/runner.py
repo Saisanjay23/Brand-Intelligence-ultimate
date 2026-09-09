@@ -93,6 +93,32 @@ _TERMINAL = frozenset({DONE, CANCELLED, FAILED})
 # platform sweeps exactly the tab(s) it supports regardless of what a caller
 # asked for -- a `tabs` list applied uniformly would sweep e.g. Twitter for
 # "pages", costing a whole extra pass per keyword for nothing.
+def tabs_for(platform_id: str, facebook_tabs: Optional[list[str]] = None) -> list[str]:
+    """Which result tabs to sweep for this platform, for this client.
+
+    Facebook is the only platform with more than one, and its three cost
+    very different amounts: People is effectively unbounded for a common
+    name (it rides the max_seconds ceiling), while Pages and Groups are
+    small finite sets that exhaust on their own in seconds. An analyst
+    hunting impersonating PAGES was paying for a People sweep on every
+    keyword to get them, which with sweeps running strictly one at a time is
+    most of the run.
+
+    EMPTY MEANS ALL, and so does a selection naming nothing this platform
+    has -- a scope that matches no tab would sweep the platform and find
+    nothing, which reads as a broken sweep rather than as a narrow one.
+    Order is the platform's own (people, pages, groups), not the order the
+    selection happened to arrive in, so results land in a predictable order
+    however the checkboxes were clicked.
+    """
+    available = PLATFORM_TABS.get(platform_id, ["people"])
+    if platform_id != "facebook" or not facebook_tabs:
+        return available
+    wanted = {t.strip().lower() for t in facebook_tabs if t}
+    chosen = [t for t in available if t in wanted]
+    return chosen or available
+
+
 PLATFORM_TABS: dict[str, list[str]] = {
     "facebook": ["people", "pages", "groups"],
     "twitter": ["people"],
@@ -284,7 +310,7 @@ def _resolve_cap(
     return _effective_cap(max_results, type_cap, tab_cap)
 
 
-def row_to_fields(row: Row, keyword: str) -> dict:
+def row_to_fields(row: Row, keyword: str, matched_keyword: str = "") -> dict:
     """A discovery `Row` -> the field dict `profile_repository.save_many`
     expects. `url`/`entity_id`/`keyword` are control keys it pops off
     itself; everything else must be a name in `DISCOVERY_FIELDS` or the
@@ -302,7 +328,13 @@ def row_to_fields(row: Row, keyword: str) -> dict:
     return {
         "url": row.url,
         "entity_id": row.profile_id,
+        # The PARENT: the bucket, the filter option, the name this hit is
+        # scored against.
         "keyword": keyword,
+        # The SEARCH that actually turned it up -- a permutation, when the
+        # analyst curated any. Dropped by `save` when it only repeats the
+        # parent. See that function for why both are worth keeping.
+        "matched_keyword": matched_keyword or "",
         # The handle, NOT `profile_id` -- see Row.username. Falls back to the
         # URL and then to the id, so a platform that publishes neither still
         # stores something rather than a blank.
@@ -422,6 +454,11 @@ class DiscoveryJob:
     # keyword groups, so it holds the analyst's permutations and not only
     # the parents they hang off.
     keyword_plan: list[kw_groups.KeywordPlan]
+    # The tabs each platform will actually sweep for THIS client, resolved
+    # once in `start` from its `facebook_tabs` setting. Held on the job
+    # rather than re-read per platform so the progress totals and the sweep
+    # itself can never disagree about how much work there is.
+    tabs: dict[str, list[str]] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     status: str = QUEUED
     message: str = ""
@@ -551,15 +588,28 @@ class DiscoveryRunner:
         childless plan per requested term, which searches itself. A sweep
         must never be lost because the config read behind it hiccuped.
         """
-        client: Optional[dict] = None
+        return self._plans_from(await self._client(group_id), ind, dom)
+
+    async def _client(self, group_id: str) -> Optional[dict]:
+        """This client's stored configuration, or None when it cannot be
+        read. Never raises: a config read that hiccuped must cost the
+        permutations and the saved scope, never the sweep itself."""
         try:
             from backend.database.repositories import client_repository as clients_db
-            client = await clients_db.get(group_id)
+            return await clients_db.get(group_id)
         except Exception as e:                   # noqa: BLE001 - never fatal
             log.warning(
-                f"discovery: could not read client {group_id!r} for keyword groups "
-                f"({type(e).__name__}: {e}) -- sweeping the requested terms as given")
+                f"discovery: could not read client {group_id!r} "
+                f"({type(e).__name__}: {e}) -- sweeping the requested terms as given, "
+                "on every ready platform")
+            return None
 
+    def _plans_from(
+        self, client: Optional[dict], ind: list[str], dom: list[str],
+    ) -> list[kw_groups.KeywordPlan]:
+        """The plan for an already-loaded client. Split from `_plans_for` so
+        `start` can read the document ONCE and use it for both the keyword
+        groups and the platform/tab scope."""
         # The caller already knows each term's type: `POST /discovery` takes
         # two separate lists. Passed through so an ad-hoc term the client's
         # config does not contain is not guessed at (and filed under the
@@ -588,6 +638,7 @@ class DiscoveryRunner:
         platform_limits_individual: Optional[dict[str, int]] = None,
         platform_limits_domain: Optional[dict[str, int]] = None,
         platform_tab_limits: Optional[dict[str, dict[str, dict[str, int]]]] = None,
+        facebook_tabs: Optional[list[str]] = None,
     ) -> tuple[DiscoveryJob, dict[str, str]]:
         # Deduped WITHIN each type, independently -- these are two
         # separately-curated lists (executive/person names vs brand/domain
@@ -600,12 +651,16 @@ class DiscoveryRunner:
         # EXPANDED, not taken as given: each requested parent brings its own
         # permutations along -- see `_plans_for` for what used to happen
         # instead.
-        plan = await self._plans_for(group_id, ind, dom)
+        client = await self._client(group_id)
+        plan = self._plans_from(client, ind, dom)
         ready, skipped = await self.platform_readiness(platforms)
 
-        job = DiscoveryJob(id=uuid.uuid4().hex[:12], group_id=group_id, keyword_plan=plan)
+        job = DiscoveryJob(
+            id=uuid.uuid4().hex[:12], group_id=group_id, keyword_plan=plan,
+            tabs={pid: tabs_for(pid, facebook_tabs) for pid in ready},
+        )
         for pid in ready:
-            tabs = PLATFORM_TABS.get(pid, ["people"])
+            tabs = job.tabs[pid]
             job.platforms[pid] = PlatformSweep(
                 platform=pid, display_name=registry.display_name(pid),
                 keywords_total=len(plan) * len(tabs),
@@ -807,7 +862,11 @@ class DiscoveryRunner:
         prog.status = "running"
         prog.started_at_ts = time.time()
         registry.get(platform_id)
-        tabs = PLATFORM_TABS.get(platform_id, ["people"])
+        # Resolved in `start` from this client's own tab selection -- see
+        # `tabs_for`. Falls back to the platform's full set for a job built
+        # by a caller that predates the setting (tests construct jobs
+        # directly), so this is never empty.
+        tabs = job.tabs.get(platform_id) or PLATFORM_TABS.get(platform_id, ["people"])
         platform_limits = {"individual": platform_limits_individual, "domain": platform_limits_domain}
 
         run = _PlatformSweepRun(
@@ -1173,7 +1232,7 @@ class DiscoveryRunner:
                         # about whether it impersonates Gautam Adani. See
                         # shared/keywords.py's module docstring; this is the
                         # PARENT/CHILDREN split it exists to express.
-                        rows = [row_to_fields(h, parent) for h in hits]
+                        rows = [row_to_fields(h, parent, keyword) for h in hits]
                         saved, new = await profiles_db.save_many(
                             job.group_id, platform_id, profiles_db.PHASE_DISCOVERY,
                             rows,
