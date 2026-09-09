@@ -57,6 +57,7 @@ IMPORT_NAMES = {
     "telethon": "telethon",
     "openpyxl": "openpyxl",
     "apscheduler": "apscheduler",
+    "pyotp": "pyotp",
 }
 
 OK, BAD, WARN = "ok ", "FAIL", "-- "

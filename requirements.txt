@@ -10,6 +10,8 @@ playwright>=1.40
 # back to playwright when absent, so this is a strong recommendation rather
 # than a hard requirement.
 patchright>=1.40
+# 2FA / OTP code generator for automated dummy account stealth login
+pyotp>=2.9.0
 
 # API + service
 fastapi>=0.110
@@ -18,6 +20,8 @@ pydantic>=2.5
 pydantic-settings>=2.2
 prometheus-client>=0.20
 aiohttp>=3.9
+python-multipart>=0.0.9
+httpx>=0.27.0
 
 # storage
 motor>=3.3
