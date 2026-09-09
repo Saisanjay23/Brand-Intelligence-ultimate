@@ -48,7 +48,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional
 from urllib.parse import parse_qs, quote, urlparse
 
 from backend.shared.extraction import ExtractionResult, run_strategies
@@ -524,12 +524,59 @@ TABS = {
 # three identically; see _tab_cap.
 
 
+def rank_hits(hits: Iterable[Hit]) -> list[Hit]:
+    """Search results in the order they should be KEPT, best first.
+
+    `by_id` is already in Facebook's own top-to-bottom order -- pagination
+    is sequential, edges are absorbed in render order, and a duplicate id on
+    a later page is dropped rather than overwriting its earlier position, so
+    dict insertion order preserves it. The ONLY thing reordered here is
+    graphql-confirmed results ahead of best-effort backfills, because
+    Facebook never said where a backfilled id would have ranked. `sorted` is
+    stable, so every other tie stays exactly where it landed.
+
+    Deliberately NOT sorted by `hit.rank`: rank restarts at 0 in every
+    pagination response, so sorting by it interleaves page 3 into page 1.
+    See docs/adr/0009-render-fidelity-in-discovery-results.md.
+    """
+    return sorted(hits, key=lambda h: h.source != "graphql")
+
+
+def capped_hits(hits: Iterable[Hit], cap: int) -> list[Hit]:
+    """Exactly `cap` results (or every one of them, when cap is 0/uncapped),
+    keeping the ones Facebook ranked highest.
+
+    THE THIRD OF THREE CAP CHECKS, and the reason a configured cap of N
+    yields N and never N+k:
+
+      absorb()        stops folding edges in at the limit. Needed because
+                      ONE response carries a whole page of edges, so a
+                      check only between scrolls let `by_id` overshoot by
+                      up to a page before the loop noticed.
+      the scroll loop stops FETCHING at the limit (`stopped=cap:results`),
+                      which is what makes a capped sweep fast rather than
+                      merely correct.
+      here            trims what reconciliation added AFTER both of those.
+                      The backfill pass adds a Hit for every id Facebook
+                      rendered but no edge was parsed for, and it runs once
+                      the loop has already stopped -- so it is the one path
+                      that can still push a capped sweep past its cap.
+
+    Backfills are what a cap sheds first (see `rank_hits`): a
+    graphql-confirmed result is something Facebook actually ranked and
+    showed, a backfill is an id we reconstructed a row for.
+    """
+    ranked = rank_hits(hits)
+    return ranked[:cap] if cap else ranked
+
+
 def _tab_cap(opts) -> int:
     """The result cap this sweep was configured with, resolved per
-    (keyword-type, tab) by discovery_service.py's cap grouping and baked
-    into `opts.max_results` before a discoverer is even constructed (see
-    _sweep_platform's `_options_for`). 0 means uncapped, scrape until one
-    of the three natural completeness signals fires (has_next_page=false,
+    (keyword-type, tab) by discovery/runner.py's `_resolve_cap` (most
+    restrictive of the blanket max_results, the per-type cap and the
+    per-(tab,type) cap) and written onto `opts.max_results` immediately
+    before each sweep -- see that module's `_sweep_tab`. 0 means uncapped:
+    scrape until one of the three natural completeness signals fires (has_next_page=false,
     end_of_serp, or no new ids after `--patience` scrolls), for every tab,
     not just Pages/Groups; People simply tends to hit that point far later
     for a common name."""
@@ -1815,25 +1862,17 @@ class Discovery:
             chain = await run_strategies(
                 f"facebook/search[{keyword!r}/{tab}]",
                 [
-                    ("network:graphql-search", lambda: sorted(
-                        by_id.values(), key=lambda h: h.source != "graphql",
-                    )),
+                    ("network:graphql-search", lambda: rank_hits(by_id.values())),
                     ("dom:results-page", lambda: dom_search_hits(page, keyword, tab)),
                 ],
             )
-            out.hits = [hit_to_row(h) for h in (chain.value or [])]
             out.extraction = chain
             if chain.degraded:
                 out.source = "dom"
-            if cap and len(out.hits) > cap:
-                # the loop's own cap check (above) stops fetching at the limit, but
-                # reconciliation can still add a page's worth of ids Facebook
-                # already told us about (rendered/processed) before the cap
-                # fired, trim back to the real limit here too, keeping the
-                # graphql-confirmed hits (sorted first) over backfilled ones.
-                # Applies to every tab, not just People, see absorb()'s
-                # comment for why Pages/Groups need this exact-N guarantee too.
-                out.hits = out.hits[:cap]
+            # THE LAST OF THE THREE CAP CHECKS, and the only one that can
+            # give an exact N. See `capped_hits` for what each of the three
+            # is for and why none of them is redundant.
+            out.hits = [hit_to_row(h) for h in capped_hits(chain.value or [], cap)]
             out.reported_total = state.total_results if state else None
         except Exception as e:
             out.stopped, out.error = "error", f"{type(e).__name__}: {e}"

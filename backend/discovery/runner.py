@@ -176,7 +176,14 @@ def _sessions_wanted(platform_id: str, keyword_count: int) -> int:
     API-key and MTProto platforms are pinned to one: `session_for_job` hands
     those credentials over by mutating os.environ or one local session file,
     so a second claim would overwrite the first rather than run beside it.
+
+    So is EVERY platform while `discovery_sequential_keywords` is on (the
+    default) -- one worker is what makes the keyword queue drain strictly in
+    order, one keyword at a time. See that setting for why that is a
+    correctness property and not just pacing, and why failover survives it.
     """
+    if settings.discovery_sequential_keywords:
+        return 1
     cap = _MAX_SESSIONS_PER_PLATFORM.get(
         platform_id, settings.discovery_max_parallel_sessions)
     plat = registry.PLATFORMS.get(platform_id)
@@ -1107,11 +1114,19 @@ class DiscoveryRunner:
 
                     # CONCURRENT ONLY WHEN IT IS SAFE AND WORTH IT: more than
                     # one tab, a factory to give each its own cap, and the
-                    # setting left above 1 -- identical gate to the original.
+                    # setting left above 1 -- identical gate to the original,
+                    # plus the sequential switch, which outranks
+                    # discovery_tab_concurrency so that ONE knob guarantees
+                    # the whole ordering property (keyword by keyword, and
+                    # within a keyword tab by tab in `run.tabs` order:
+                    # people, then pages, then groups). Without this, raising
+                    # tab concurrency for throughput would silently take the
+                    # per-keyword half of that guarantee back.
                     concurrent = (
                         len(run.tabs) > 1
                         and make_discoverer is not None
                         and settings.discovery_tab_concurrency > 1
+                        and not settings.discovery_sequential_keywords
                     )
                     if concurrent:
                         prog.current_tab = "+".join(run.tabs)

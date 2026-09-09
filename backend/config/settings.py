@@ -118,6 +118,37 @@ class Settings(BaseSettings):
     # different risk profiles (a sweep is many short requests, an analysis
     # visit is one long one) and different pools may be sized differently.
     discovery_max_parallel_sessions: int = 3
+    # ONE KEYWORD AT A TIME, IN THE ORDER THEY WERE CONFIGURED. Overrides
+    # both discovery_max_parallel_sessions and discovery_tab_concurrency:
+    # each platform claims exactly one session, and that session sweeps
+    # keyword 1 through every tab (facebook: people, then pages, then
+    # groups) before keyword 2 begins.
+    #
+    # DEFAULT ON, because "one by one" is a correctness property here, not a
+    # pacing preference. Three things depend on it:
+    #
+    #   readable progress   the progress chip names ONE keyword and ONE tab.
+    #                       With parallel workers it named whichever
+    #                       coroutine wrote to it last, so a sweep that was
+    #                       working perfectly read as if it were skipping
+    #                       keywords at random.
+    #   result ordering     the discovery grid sorts by ascending _id, i.e.
+    #                       insertion order, precisely so page 1 is what the
+    #                       platform's own search returned first (see
+    #                       profile_repository.list_profiles). Parallel
+    #                       workers interleave their writes, which destroys
+    #                       that ordering for every keyword involved.
+    #   footprint           N simultaneous searches under N pooled accounts
+    #                       is N times the concurrent load on one platform.
+    #
+    # FAILOVER IS NOT LOST. A single worker whose session dies mid-keyword
+    # still re-queues that keyword and _sweep_platform claims a replacement
+    # session for it on its next round (see _MAX_CLAIM_ROUNDS) -- recovery
+    # is the round loop's job, never the worker count's.
+    #
+    # Turn OFF only when total sweep throughput matters more than any of the
+    # above and the pool is genuinely healthy.
+    discovery_sequential_keywords: bool = True
     # THE MEDIAN GAP BETWEEN ONE KEYWORD SWEEP AND THE NEXT, in seconds, on
     # the same session. Discovery had no such gap at all: keywords ran
     # back-to-back, so a 15-keyword client hit Facebook with 45 searches

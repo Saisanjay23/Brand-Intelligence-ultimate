@@ -44,6 +44,19 @@ PLATFORM = "twitter"  # single tab, matches _MAX_SESSIONS_PER_PLATFORM's default
 FATAL = "checkpoint detected"  # what classify_failure() reads as a dead session
 
 
+# THIS WHOLE MODULE TESTS THE OPT-IN PATH. `discovery_sequential_keywords`
+# ships ON (see config/settings.py for why one-keyword-at-a-time is a
+# correctness property, not a pacing preference), and it pins every platform
+# to a single worker -- which is exactly what the multi-session behaviour
+# below cannot be observed through. Turned off here for every test in the
+# file so these keep testing the machinery they were written for; the
+# guarantee that the shipped default really is sequential is pinned
+# separately, in test_discovery_sequential_and_caps.py.
+@pytest.fixture(autouse=True)
+def _parallel_path(monkeypatch):
+    monkeypatch.setattr(R.settings, "discovery_sequential_keywords", False)
+
+
 # --------------------------------------------------------------------- fakes
 
 
