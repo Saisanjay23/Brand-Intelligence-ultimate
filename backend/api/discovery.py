@@ -730,7 +730,23 @@ async def delete_platform_data(
 class AnalyseValidated(BaseModel):
     group_id: str = Field(..., min_length=1)
     platform: Optional[Platform] = Field(
-        None, description="Scope to one platform's validated profiles. Omit for all.",
+        None, description="Scope to ONE platform's validated profiles. Omit for all. "
+                          "For a multi-platform selection use `platforms` instead; "
+                          "when both are sent, `platforms` wins.",
+    )
+    platforms: Optional[list[Platform]] = Field(
+        None,
+        description="Scope to SEVERAL platforms' validated profiles. Omit (or send "
+                    "an empty list) for every platform -- the same thing omitting "
+                    "`platform` means.\n\n"
+                    "Exists because the caller's platform picker is multi-select "
+                    "and this endpoint only spoke singular: a UI holding two "
+                    "platforms could not say so, and the one that tried it "
+                    "collapsed anything other than a single selection to \"no "
+                    "filter\" -- which analyses EVERY platform. Widening a scope "
+                    "silently is the wrong direction to fail in here: each extra "
+                    "platform is a live-session page visit per profile.",
+        examples=[["facebook", "twitter"]],
     )
     ids: Optional[list[str]] = Field(
         None,
@@ -764,14 +780,14 @@ class AnalyseValidated(BaseModel):
 _MAX_VALIDATED_PER_ANALYSE = 500
 
 
-async def _validated_docs(group_id: str, platform: Optional[str]) -> list[dict]:
-    """Every validated profile doc for a group (+ optional platform), paged
-    through in full rather than capped at one page -- a caller asking to
-    "analyse everything validated" must not silently get only the first
-    100."""
+async def _validated_docs_one(group_id: str, platform: Optional[str], budget: int) -> list[dict]:
+    """Every validated profile doc for a group on ONE platform (or all when
+    `platform` is None), paged through in full rather than capped at one
+    page -- a caller asking to "analyse everything validated" must not
+    silently get only the first 100."""
     docs_out: list[dict] = []
     offset = 0
-    while len(docs_out) < _MAX_VALIDATED_PER_ANALYSE:
+    while len(docs_out) < budget:
         docs, total, _ = await profiles_db.find(
             group_id, platform=platform, status="approved",
             phase=profiles_db.PHASE_DISCOVERY, limit=MAX_LIMIT, offset=offset,
@@ -781,7 +797,48 @@ async def _validated_docs(group_id: str, platform: Optional[str]) -> list[dict]:
         offset += len(docs)
         if offset >= total or not docs:
             break
-    return docs_out[:_MAX_VALIDATED_PER_ANALYSE]
+    return docs_out[:budget]
+
+
+async def _validated_docs(
+    group_id: str, platforms: Optional[list[str]] = None,
+) -> list[dict]:
+    """Every validated profile doc for a group across the SELECTED
+    platforms, or across all of them when nothing is selected.
+
+    EMPTY MEANS ALL, matching every other scope in this API -- and matching
+    what the analyst's picker means when they have ticked nothing.
+
+    Queried per platform and concatenated rather than with an `$in`, because
+    `profiles_db.find` takes one platform: keeping the loop here means the
+    ordering guarantee that query already provides (ascending `_id`, i.e.
+    the order each platform's own search returned them) survives within each
+    platform, and the platforms come out in the order the analyst picked
+    them. The shared `_MAX_VALIDATED_PER_ANALYSE` ceiling applies to the
+    WHOLE call, not per platform, so selecting three cannot triple the size
+    of a batch that is already bounded for a reason.
+    """
+    wanted = [p for p in (platforms or []) if p]
+    if not wanted:
+        return await _validated_docs_one(group_id, None, _MAX_VALIDATED_PER_ANALYSE)
+
+    docs_out: list[dict] = []
+    seen: set[str] = set()
+    for platform in wanted:
+        remaining = _MAX_VALIDATED_PER_ANALYSE - len(docs_out)
+        if remaining <= 0:
+            break
+        for d in await _validated_docs_one(group_id, platform, remaining):
+            # A duplicate platform in the selection must not analyse the
+            # same profile twice -- that is two live page visits for one
+            # answer.
+            key = str(d.get("id") or d.get("url") or "")
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            docs_out.append(d)
+    return docs_out
 
 
 # Discovery-doc fields worth carrying into analysis as a starting point --
@@ -820,8 +877,9 @@ def _seed_from_doc(doc: dict) -> dict:
              summary="Send validated profiles to analysis")
 async def analyse_validated(body: AnalyseValidated) -> StartAnalysisAccepted:
     """The "Analyse Validated Profiles" action: pulls every profile
-    currently `validated` for this group (optionally scoped to one
-    platform, or to a hand-picked `ids` list) and hands their URLs straight
+    currently `validated` for this group (optionally scoped to one platform
+    via `platform`, to several via `platforms`, or to a hand-picked `ids`
+    list) and hands their URLs straight
     to the analysis engine -- equivalent to reading the URLs off the
     Validated tab and pasting them into `POST /analysis/jobs` yourself,
     minus the copy-paste. The returned job is a completely ordinary
@@ -841,7 +899,13 @@ async def analyse_validated(body: AnalyseValidated) -> StartAnalysisAccepted:
             for d in ineligible
         ] + ([SkippedInput(value="(unresolved ids)", reason=f"{missing} id(s) not found for this group")] if missing else [])
     else:
-        eligible = await _validated_docs(body.group_id, body.platform.value if body.platform else None)
+        # `platforms` (plural) wins when sent; `platform` stays supported
+        # for the single-platform callers that already speak it.
+        selected = (
+            [p.value for p in body.platforms] if body.platforms
+            else ([body.platform.value] if body.platform else [])
+        )
+        eligible = await _validated_docs(body.group_id, selected)
         skipped = []
 
     urls = [d["url"] for d in eligible]

@@ -231,7 +231,13 @@ export interface SetProfileStatusResult {
 
 export interface AnalyseValidatedBody {
   group_id: string;
+  // ONE platform. The Discovery grid's rail is single-select, so it sends
+  // this.
   platform?: string;
+  // SEVERAL platforms, for the multi-select picker on Run & Overview.
+  // Empty/omitted means every platform -- the same thing omitting
+  // `platform` means. Wins over `platform` when both are sent.
+  platforms?: string[];
   ids?: string[];
   target_name?: string;
   official_feed?: string;

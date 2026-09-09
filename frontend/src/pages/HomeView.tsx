@@ -1976,10 +1976,22 @@ export function HomeView({
       return;
     }
     try {
-      const platformFilter = analysisPlatforms.size === 1 ? [...analysisPlatforms][0] : undefined;
       const res = await discoveryApi.analyseValidated({
         group_id: activeClient.client_id,
-        platform: platformFilter,
+        // THE WHOLE SELECTION, not just a selection of exactly one.
+        //
+        // This used to be
+        //   analysisPlatforms.size === 1 ? [...analysisPlatforms][0] : undefined
+        // against an endpoint that only spoke a single `platform`. So two or
+        // more platforms picked collapsed to "no filter", and "no filter"
+        // means EVERY platform -- an analyst who ticked Facebook and Twitter
+        // got all six scraped, each one a live-session page visit per
+        // validated profile. The confirmation dialog above even named the
+        // narrow scope ("on Twitter +1") while the request widened it.
+        //
+        // Empty stays empty: no chips ticked is the All Platforms state, and
+        // the API reads an empty list the same way it reads an omitted one.
+        platforms: [...analysisPlatforms],
         domain: activeClient.domain,
       });
       onAnalyseStarted(res.job_id);
