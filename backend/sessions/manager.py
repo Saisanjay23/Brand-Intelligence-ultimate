@@ -114,24 +114,49 @@ def _get_platform(platform_id: str):
 
 def _session_in_use(platform_id: str, session_id: str) -> bool:
     """Is something actually holding this exact session RIGHT NOW -- the
-    live answer, not "was picked at some point". Drives the "currently
-    running" marker in the Sessions panel.
+    live answer, not "was picked at some point".
 
-    Asks the analysis runner, which registers a session the moment
-    `session_for_job()` hands it one and releases it in a `finally` when
-    that platform's batch ends, so a crashed or cancelled run cannot leave
-    a session marked busy forever.
+    NOT cosmetic. Three callers act on it, and two of them open a browser:
 
-    Imported lazily and guarded: this is a cosmetic indicator, and a
-    missing/half-built runner must never be able to break the Sessions
-    panel itself. (It did exactly that once -- this used to reach into a
-    job module that had been deleted, and every platform's session status
-    came back as an error.)"""
+      _pick_batch   the background health monitor skips a session a job is
+                    driving. A probe is a second Playwright context on one
+                    account from one IP, which this module's own comments
+                    call the single most reliable way to earn a checkpoint.
+      check_item    the analyst's per-session "Check" button, refused for
+                    the same reason.
+      _public       the "currently running" marker in the Sessions panel.
+
+    ASKS BOTH RUNNERS. Discovery and analysis each own a SEPARATE JobStore
+    with its own `_sessions_in_use` set (see get_healthy_session's note on
+    why the cross-runner claim lives in `_claimed` instead), so asking only
+    analysis reported every session a DISCOVERY sweep was holding as idle.
+    A Facebook sweep holds its session for the whole run, and the monitor
+    wakes every 30 minutes, so the two overlapped routinely: the monitor
+    opened a second Chrome on an account mid-sweep, Facebook challenged it,
+    and the session was marked checkpointed -- after which analysis
+    correctly reported no healthy session for a pool the analyst had just
+    watched working. The visible symptom was always the LAST link in that
+    chain, which is why it read as an analysis bug.
+
+    Imported lazily and guarded per runner: a missing or half-built runner
+    must never break the Sessions panel. (It did exactly that once -- this
+    used to reach into a job module that had been deleted, and every
+    platform's session status came back as an error.) Guarded SEPARATELY so
+    one broken import cannot silently answer "idle" on behalf of the other
+    runner, which is the failure this function exists to prevent."""
     try:
         from backend.analysis.runner import analysis_runner
+        if analysis_runner.holds_session(platform_id, session_id):
+            return True
     except Exception:
-        return False
-    return analysis_runner.holds_session(platform_id, session_id)
+        pass
+    try:
+        from backend.discovery.runner import discovery_runner
+        if discovery_runner.holds_session(platform_id, session_id):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _required_cookie_expiry(s: dict, required: tuple[str, ...]) -> float:
@@ -408,7 +433,68 @@ _claim_lock = asyncio.Lock()
 _claimed: set[tuple[str, str]] = set()
 
 
-async def get_healthy_session(platform_id: str) -> Optional[dict]:
+# How long a job will WAIT for a busy pool before giving up, and how often
+# it re-checks while waiting.
+#
+# WHY WAITING AT ALL. Discovery holds a session for the whole of its sweep
+# and analysis for the whole of its batch, so on a platform with one healthy
+# account the second of the two used to fail instantly with "no healthy
+# sessions available" -- an error, for a pool that was working perfectly and
+# would have been free shortly. That made "run discovery and analysis at the
+# same time" something an analyst could not do rather than something the
+# system sequenced for them.
+#
+# Waiting is only ever right for a BUSY pool. A pool that is empty, dead or
+# rate-limited will not become available by being waited on, so those still
+# fail immediately with the reason that actually applies (see
+# `unavailable_reason`) -- a job that hangs for five minutes and then reports
+# "expired cookies" is worse than one that says so at once.
+#
+# Polled rather than signalled on purpose: an asyncio primitive binds to the
+# loop that first awaits it, and a module-level one outlives any single
+# loop -- the exact trap discovery/runner.py's `_worker_semaphore` documents.
+# A one-second granularity is invisible against a job measured in minutes.
+SESSION_WAIT_S = 300.0
+_SESSION_POLL_S = 1.0
+
+
+async def _busy_only(platform_id: str) -> bool:
+    """Is every otherwise-usable account merely CLAIMED right now?
+
+    True means waiting can succeed. False means the pool is blocked by
+    something waiting cannot fix (nothing saved, all dead, all
+    rate-limited), so the caller should fail now and say why.
+    """
+    items = await sessions_db.list_pool(platform_id)
+    now = _now()
+    return any(
+        _is_available(s, now) and (platform_id, s["id"]) in _claimed
+        for s in items
+    )
+
+
+async def get_healthy_session(
+    platform_id: str, *, wait_s: float = 0.0,
+) -> Optional[dict]:
+    """The least-recently-used available account, claimed for the caller.
+
+    With `wait_s`, a pool whose accounts are all BUSY is waited on for up to
+    that long rather than refused -- which is what lets a discovery sweep and
+    an analysis batch both run against a single-account platform, one after
+    the other, instead of whichever started second failing outright.
+    """
+    deadline = _now() + max(0.0, wait_s)
+    while True:
+        item = await _claim_one(platform_id)
+        if item is not None:
+            return item
+        if _now() >= deadline or not await _busy_only(platform_id):
+            return None
+        await asyncio.sleep(_SESSION_POLL_S)
+
+
+async def _claim_one(platform_id: str) -> Optional[dict]:
+    """One attempt at the read-pick-claim-write above, with no waiting."""
     async with _claim_lock:
         items = await sessions_db.list_pool(platform_id)
         available = [
@@ -430,6 +516,68 @@ async def get_healthy_session(platform_id: str) -> Optional[dict]:
         "ready", 0.0, now, use_count,
     )
     return chosen
+
+
+async def unavailable_reason(platform_id: str) -> str:
+    """Why `get_healthy_session` just returned None, in words an analyst can
+    act on. Appended to every "cannot run this platform" error.
+
+    THE MESSAGE WAS THE BUG. All three refusals said the same thing --
+    "please add more cookies" -- for four unrelated situations, and only one
+    of them is fixed by adding cookies. The one an analyst hits most is a
+    healthy session that is simply BUSY on another job, and being told to
+    add cookies for it means re-pasting credentials that were never the
+    problem, or concluding the pool is broken while looking at a session the
+    Sessions panel reports as ready. "unable to run even though healthy
+    sessions are present" is that message, not that state.
+
+    Each entry lands in exactly one bucket, in the order
+    `get_healthy_session` would have rejected it, so the counts add up to
+    the pool and cannot double-count one account.
+    """
+    items = await sessions_db.list_pool(platform_id)
+    if not items:
+        return "no accounts are saved for this platform yet"
+
+    now = _now()
+    dead = busy = limited = pending = free = 0
+    soonest_free = 0.0
+    for s in items:
+        if s["status"] in DEAD_STATES:
+            dead += 1
+        elif s["status"] in PENDING_STATES:
+            pending += 1
+        elif s["rate_limited_until"] > now:
+            limited += 1
+            if not soonest_free or s["rate_limited_until"] < soonest_free:
+                soonest_free = s["rate_limited_until"]
+        elif (platform_id, s["id"]) in _claimed:
+            busy += 1
+        else:
+            # Free RIGHT NOW -- so the pick that just failed lost a race
+            # with something releasing, rather than finding nothing.
+            free += 1
+
+    total = len(items)
+    if free:
+        return (f"{free} of {total} account(s) came free while this job was starting -- "
+                "run it again")
+    # BUSY FIRST. It is the only cause that resolves on its own, and the
+    # only one where touching the credentials would make things worse.
+    if busy:
+        why = (f"{busy} of {total} account(s) are already in use by another running job -- "
+               "wait for it to finish, or add another account under /sessions")
+        if dead:
+            why += f" (the other {dead} need re-authenticating)"
+        return why
+    if limited:
+        mins = max(1, int((soonest_free - now) // 60)) if soonest_free else 0
+        return (f"{limited} of {total} account(s) are rate-limited"
+                + (f" for another ~{mins}m" if mins else "") + " -- try again later")
+    if pending:
+        return f"{pending} of {total} account(s) are still finishing an interactive login"
+    return (f"all {total} account(s) are expired or checkpointed -- "
+            "re-authenticate them under /sessions")
 
 
 def proven_fresh(session_item: dict) -> bool:
@@ -471,12 +619,20 @@ def release_claim(platform_id: str, session_id: str) -> None:
         _claimed.discard((platform_id, session_id))
 
 
-async def session_for_job(platform_id: str) -> tuple[object, dict]:
+async def session_for_job(
+    platform_id: str, *, wait_s: float = 0.0,
+) -> tuple[object, dict]:
     """What a discovery/analysis job needs to actually run: the Platform
     metadata plus a healthy pooled session's credentials (cookies for
     cookie-authed platforms, api_key for key-authed ones, or just
     id/identifier for MTProto since its credentials go into os.environ +
-    a session file rather than being handed to the caller directly)."""
+    a session file rather than being handed to the caller directly).
+
+    `wait_s` is how long to wait for an account that is merely BUSY, and it
+    is what makes discovery and analysis usable at the same time on a
+    single-account platform -- see `get_healthy_session`. A pool blocked by
+    anything waiting cannot fix still raises immediately, carrying the
+    reason that applies."""
     plat = _get_platform(platform_id)
     if plat.env_keys:
         # Telegram: MTProto only ever has ONE local session file open at a
@@ -489,9 +645,10 @@ async def session_for_job(platform_id: str) -> tuple[object, dict]:
         # dead/rate-limited account is skipped and the real pooled id
         # flows into mark_session_failed/mark_session_ok downstream instead
         # of the no-op empty dict this used to return.
-        item = await get_healthy_session(platform_id)
+        item = await get_healthy_session(platform_id, wait_s=wait_s)
         if item is None:
-            raise ConflictError(f"{platform_id}: no healthy accounts available -- please add more accounts or check credentials")
+            raise ConflictError(
+                f"{platform_id}: {await unavailable_reason(platform_id)}")
         # RELEASE THE CLAIM IF SETUP FAILS. `get_healthy_session` has already
         # marked this session in-use; everything below can still raise (the
         # session-blob write touches the filesystem, so a full or read-only
@@ -513,14 +670,15 @@ async def session_for_job(platform_id: str) -> tuple[object, dict]:
             raise
         return plat, {"id": item["id"], "identifier": item["identifier"]}
     if plat.uses_api_key:
-        item = await get_healthy_session(platform_id)
+        item = await get_healthy_session(platform_id, wait_s=wait_s)
         if item is None:
             items = await sessions_db.list_pool(platform_id)
             if not items:
                 import os
                 if os.environ.get(plat.api_key_env):
                     return plat, {"id": "", "identifier": "env", "api_key": os.environ[plat.api_key_env]}
-            raise ConflictError(f"{platform_id}: no healthy API keys available -- please add more keys or check quotas")
+            raise ConflictError(
+                f"{platform_id}: {await unavailable_reason(platform_id)}")
         try:
             import os
             os.environ[plat.api_key_env] = str(item.get("api_key", ""))
@@ -528,14 +686,15 @@ async def session_for_job(platform_id: str) -> tuple[object, dict]:
             release_claim(platform_id, item["id"])
             raise
         return plat, {"id": item["id"], "identifier": item["identifier"], "api_key": item["api_key"]}
-    item = await get_healthy_session(platform_id)
+    item = await get_healthy_session(platform_id, wait_s=wait_s)
     if item is None:
         if plat.can_run_anonymously:
             # this platform's search/profile pages work logged-out (see
             # registry.Platform.anonymous_context_path) -- a dead/missing
             # session pool costs it one field, not the whole platform.
             return plat, {"id": "", "identifier": "anonymous", "anonymous": True}
-        raise ConflictError(f"{platform_id}: no healthy sessions available -- please add more cookies")
+        raise ConflictError(
+            f"{platform_id}: {await unavailable_reason(platform_id)}")
     return plat, {"id": item["id"], "identifier": item["identifier"],
                   "cookies": item["cookies"],
                   # When real work last proved this session healthy. Carried

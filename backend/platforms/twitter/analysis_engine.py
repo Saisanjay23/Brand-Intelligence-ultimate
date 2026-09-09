@@ -127,6 +127,82 @@ JS_TWEET_TIMES = """
 _DOM_TIMELINE_WAIT_MS = 3000
 
 
+# DOM display-name fallback
+# `_user_from_result` reads the display name out of the UserByScreenName
+# payload (`core.name`, `legacy.name`), which is the right source and the
+# one this engine is built around. It is also a single point of failure: X
+# rotates that query's id on its own schedule, and when it does the payload
+# is never recognised, `found` stays empty, and the row comes back with NO
+# name at all. What the analyst then saw in the Profile name column was the
+# HANDLE -- because the mapping layer substituted `entity_id` for a missing
+# name (see analysis/runner.py::_populate) -- so a scrape that had failed to
+# read the name was indistinguishable from one that had read a display name
+# which happens to equal the handle.
+#
+# The display name is rendered on the page regardless of which query served
+# it, so it is readable even when the payload is not. Two tiers, because
+# each fails differently:
+#
+#   [data-testid="UserName"]  X's own long-lived hook for the name block.
+#                             Survives class-name churn, which is constant;
+#                             would not survive the testid being renamed.
+#   document.title            "Display Name (@handle) / X". Not a DOM shape
+#                             at all, so it survives any amount of markup
+#                             change -- but it is localised and X has
+#                             changed the suffix before (" / Twitter").
+#
+# Both parse the SAME rendered value, so agreeing tiers are not extra
+# confidence -- the point is that a change breaking one rarely breaks both.
+JS_DISPLAY_NAME = r"""
+() => {
+  const clean = (t) => (t || '').replace(/\u00a0/g, ' ').trim();
+  const block = document.querySelector('[data-testid="UserName"]');
+  if (block) {
+    // The block renders the display name first and the @handle second.
+    // Taking the first span that is not the handle is what makes this
+    // independent of how many wrapper spans X nests them in this week.
+    for (const sp of block.querySelectorAll('span')) {
+      const t = clean(sp.textContent);
+      if (!t || t.startsWith('@')) continue;
+      // Verified badges and similar render as their own text nodes; a
+      // name is never a lone punctuation mark.
+      if (!/[\p{L}\p{N}]/u.test(t)) continue;
+      return t;
+    }
+  }
+  // "Display Name (@handle) / X" -- the parenthesised handle is the anchor,
+  // so this does not depend on the suffix X is using today.
+  const m = clean(document.title).match(/^(.*?)\s*\(@[^)]+\)/);
+  return m ? clean(m[1]) : '';
+}
+"""
+
+
+async def dom_display_name(page, handle: str = "") -> str:
+    """The account's DISPLAY NAME read off the rendered profile page, or ''.
+
+    Never a guess and never the handle: a value that is just the @handle
+    back again carries no more information than the URL already did, and
+    passing it off as a display name is precisely the confusion this
+    fallback exists to end. '' means "not read", which every caller
+    already distinguishes from "read as blank".
+
+    LINKED TO: called from Scraper.process() on both paths that would
+    otherwise produce a nameless row -- a profile payload that never
+    arrived, and one that arrived carrying no name.
+    """
+    try:
+        name = (await page.evaluate(JS_DISPLAY_NAME) or "").strip()
+    except Exception:
+        return ""
+    if not name:
+        return ""
+    bare = name.lstrip("@").strip()
+    if handle and bare.lower() == handle.strip().lstrip("@").lower():
+        return ""
+    return name
+
+
 async def dom_last_post(page) -> str:
     """Newest ORGANIC post date read off the already-rendered timeline.
     '' when nothing usable is on screen, never a guess. LINKED TO: called
@@ -348,6 +424,21 @@ class Scraper:
                 else:
                     row.status = "PARTIAL"
                     row.note("profile payload not seen")
+                # THE NAME IS STILL ON SCREEN. A payload this visit never
+                # recognised does not mean the page did not render the
+                # account -- X rotates that query's id, the response goes
+                # unparsed, and the profile loads normally anyway. Reading
+                # the display name off the rendered page is what stops such
+                # a row falling back to showing the handle as its "profile
+                # name". Only attempted on a page that actually rendered a
+                # profile: a checkpoint, a login wall or a suspended
+                # account has no name to read and `dom_display_name`
+                # returns "" for all three.
+                if not row.profile_name:
+                    if name := await dom_display_name(page, row.profile_id):
+                        row.profile_name = name
+                        row.name_score = name_score(name, row.target)
+                        row.mark("name", "dom")
                 # See instagram/analysis_engine.py: a row we could not
                 # read is the one most worth having a picture of, and
                 # returning before screenshot() threw that away.
@@ -373,6 +464,15 @@ class Scraper:
                     # posts_seen as it found it
                     pass
             self.fill(row, found[0])
+            # The payload arrived but carried no name -- a shape change that
+            # moved the field again, or a node that only had counts on it.
+            # Same reasoning as the no-payload path above: read it off the
+            # page rather than let the mapping layer show the handle.
+            if not row.profile_name:
+                if name := await dom_display_name(page, row.profile_id):
+                    row.profile_name = name
+                    row.name_score = name_score(name, row.target)
+                    row.mark("name", "dom")
             if posts:
                 row.last_post_iso = max(posts)
                 row.posts_seen = "yes"

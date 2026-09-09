@@ -293,6 +293,14 @@ class AnalysisItem:
     url: str
     platform: str
     entity_id: str
+    # WHICH CLIENT THIS READING BELONGS TO. Carried on the item, not looked
+    # up from the job, because `result_id` is computed in `to_dict()` and
+    # has to produce the SAME id the repository will store the row under --
+    # a live row and its saved counterpart are merged by that value, so if
+    # the two disagreed the workspace would show every profile twice.
+    # Blank for a pasted-URL run with no client selected, which is its own
+    # bucket rather than a wildcard (see results_db.result_id).
+    org_id: str = ""
     status: str = "pending"  # pending | running | done | error
     error: str = ""
     analysed_at: Optional[str] = None
@@ -340,7 +348,7 @@ class AnalysisItem:
             # uuid per job). It is what lets the UI lay a running job's rows
             # over the saved set without showing the same profile twice, and
             # what addresses a saved row's screenshot once its job is gone.
-            "result_id": results_db.result_id(self.platform, self.url),
+            "result_id": results_db.result_id(self.platform, self.url, self.org_id),
             "platform_name": registry.display_name(self.platform),
             "entity_id": self.entity_id, "status": self.status,
             "error": self.error, "analysed_at": self.analysed_at,
@@ -507,6 +515,7 @@ class AnalysisRunner:
             items.append(AnalysisItem(
                 id=uuid.uuid4().hex[:12], raw_url=raw, url=url,
                 platform=platform, entity_id=entity_id,
+                org_id=org_id.strip(),
             ))
 
         job = AnalysisJob(
@@ -596,6 +605,22 @@ class AnalysisRunner:
                 errored = sum(1 for i in job.items if i.status == "error")
                 job.message = f"{job.total - errored}/{job.total} scraped" + (
                     f", {errored} failed" if errored else "")
+        except asyncio.CancelledError:
+            # THE HARD-CANCEL BACKSTOP LANDING (see JobStore.cancel). The
+            # cooperative flag did not reach a checkpoint inside the grace
+            # period -- a profile page load is a single long await -- so
+            # this task was cancelled where it stood, running every
+            # worker's `finally` (session released, browser closed) on the
+            # way out.
+            #
+            # SWALLOWED, NOT RE-RAISED: this is the job's own top-level
+            # coroutine, the cancellation is exactly what was asked for,
+            # and re-raising would leave the job reported as RUNNING to
+            # every poller. Results already scraped are already saved --
+            # each item is written as it completes, not at the end.
+            job.status = CANCELLED
+            job.message = f"stopped after {job.completed}/{job.total}"
+            log.info(f"analysis job {job.id}: {job.message}")
         except Exception as e:
             job.status = FAILED
             job.message = f"{type(e).__name__}: {e}"
@@ -639,6 +664,11 @@ class AnalysisRunner:
                 delay=settings.analysis_delay_sec,
                 concurrency=concurrency,
                 headful=not settings.headless,
+                # Handed to the SCRAPER, so an adapter that visits several
+                # pages for one profile can put the work down mid-URL
+                # instead of the stop only being noticed between URLs --
+                # see scan_options.cancelled.
+                cancel=job.cancel,
             ),
             concurrency=concurrency,
             inter_batch_delay=_PLATFORM_INTER_BATCH_DELAY.get(
@@ -753,7 +783,25 @@ class AnalysisRunner:
         claimed: list[dict] = []
         while len(claimed) < want:
             try:
-                plat, session_item = await sessions_engine.session_for_job(platform_id)
+                # WAIT FOR THE FIRST ONE, NEVER FOR THE EXTRAS.
+                #
+                # The first account decides whether this platform runs at
+                # all, and the commonest reason it is unavailable is simply
+                # that the OTHER phase is holding it -- discovery keeps a
+                # session for its whole sweep, analysis for its whole batch.
+                # Refusing there meant an analyst could not run discovery
+                # and analysis at the same time on a single-account
+                # platform: whichever started second failed outright, on a
+                # pool that was healthy and about to be free. Waiting turns
+                # that into a queue.
+                #
+                # A shortfall AFTER the first is not a failure at all --
+                # two of three accounts busy elsewhere just means fewer
+                # workers -- so the extras never wait, and never make a job
+                # slower than the work it actually has.
+                wait = sessions_engine.SESSION_WAIT_S if not claimed else 0.0
+                plat, session_item = await sessions_engine.session_for_job(
+                    platform_id, wait_s=wait)
             except Exception:
                 if not claimed:
                     raise
@@ -1033,7 +1081,23 @@ class AnalysisRunner:
         if it.status == "error":
             it.error = row.status
         it.analysed_at = datetime.now(timezone.utc).isoformat()
-        it.profile_name = row.profile_name or it.entity_id
+        # THE SCRAPED DISPLAY NAME, AND NOTHING ELSE YET. This used to be
+        # `row.profile_name or it.entity_id`, and that one `or` caused the
+        # complaint that analysis "shows the user id instead of the profile
+        # name": for X, `entity_id` is the handle parsed out of the URL, so
+        # any visit that failed to read a display name silently presented
+        # the handle as one -- indistinguishable, in the column, from an
+        # account whose display name genuinely is its handle.
+        #
+        # It also made the `known` fallback below DEAD CODE. That branch
+        # fills a missing name from the display name discovery already
+        # stored, and it is guarded on `not it.profile_name` -- which was
+        # never true again once the handle had been substituted here. So
+        # the tool had the real name on file and showed the handle anyway.
+        #
+        # The handle is still a last resort, but it is applied AFTER
+        # everything that might know the actual name has had its turn.
+        it.profile_name = row.profile_name
         it.followers = row.followers
         it.followers_exact = row.followers_exact
         it.location = row.location
@@ -1072,6 +1136,7 @@ class AnalysisRunner:
                 it.avatar_sha = known["avatar_sha"]
             if it.verified is None and known.get("verified") is not None:
                 it.verified = known["verified"]
+
             # THE LOGO VERDICT IS DISCOVERY'S, NOT ANALYSIS'S -- the one
             # field here that does not follow the "only fill a gap" rule
             # above, and deliberately so.
@@ -1095,6 +1160,20 @@ class AnalysisRunner:
                 # needs no re-derivation here: `_populate` already set it
                 # True, unconditionally, before this merge ran.
                 it.name_score = row.name_score = known["name_score"]
+
+        # THE HANDLE, ONLY ONCE NOTHING ELSE CAN NAME THIS ACCOUNT. Placed
+        # here, after the `known` merge, so the display name discovery
+        # already stored gets its turn first -- doing this at the top is
+        # what made that merge unreachable and put user ids in the Profile
+        # name column.
+        #
+        # Still a fallback rather than a blank, because a row has to be
+        # identifiable in a list and an empty name is not: `entity_id` is
+        # the handle for X, the vanity path or numeric id for Facebook, and
+        # in every case it is what the URL already shows. It is a LABEL of
+        # last resort here, not a claim that the account is called this.
+        if not it.profile_name:
+            it.profile_name = it.entity_id
 
         if it.profile_image_url and not it.avatar_sha:
             try:

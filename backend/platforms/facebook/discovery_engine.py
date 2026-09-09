@@ -51,6 +51,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, Optional
 from urllib.parse import parse_qs, quote, urlparse
 
+from backend.platforms.scan_options import cancelled
 from backend.shared.extraction import ExtractionResult, run_strategies
 from backend.shared.avatars import looks_like_placeholder
 from backend.shared.models.hit import Hit, hit_to_row
@@ -1578,6 +1579,15 @@ class Discovery:
                 out.stopped, out.complete = "no-results", True
             stalls = 0
             while not (out.stopped == "no-results"):
+                # CHECKED FIRST, AND EVERY SCROLL. A sweep can legitimately
+                # hold this loop for the whole `max_seconds` ceiling, so a
+                # cancel noticed only between sweeps meant Stop did nothing
+                # observable for up to fifteen minutes. Here it lands within
+                # one scroll, and everything already parsed is still
+                # returned below -- stopping is not discarding.
+                if cancelled(self.a):
+                    out.stopped = "cancelled"
+                    break
                 if cap and len(by_id) >= cap:
                     out.stopped = "cap:results"
                     break
@@ -1755,6 +1765,17 @@ class Discovery:
                     f"{len(already_known)} from parsed edges, "
                     f"{len(missing) - len(already_known) - len(missing_worth_visiting)} skipped as cap-doomed)"
                 )
+            if to_resolve and cancelled(self.a):
+                # THE OTHER HALF OF THE 15-MINUTE WAIT. Reconciliation is a
+                # profile-page visit per candidate under a live session, up
+                # to RESOLVE_TIME_BUDGET_SEC of it, and it runs after the
+                # loop has already stopped. Starting it for a sweep the
+                # analyst has just cancelled spends the slowest and most
+                # detectable operation this engine has on a result nobody
+                # is waiting for. The candidates keep their already-known
+                # (possibly blank) data, exactly as they do when the time
+                # budget elapses.
+                to_resolve = []
             if to_resolve:
                 _resolve_started = time.time()
                 try:

@@ -83,7 +83,12 @@ class FakePool:
         self.marked_failed: list[tuple[str, str]] = []
         self.released: list[str] = []
 
-    async def session_for_job(self, platform_id: str):
+    async def session_for_job(self, platform_id: str, *, wait_s: float = 0.0):
+        # `wait_s` is accepted and ignored: a real pool waits out a BUSY
+        # account so discovery and analysis can share a one-account platform
+        # (see sessions/manager.py::get_healthy_session). Nothing here is
+        # ever transiently busy -- a session is claimed or it is not -- so
+        # waiting would only add real seconds to a scheduling test.
         for s in self.sessions:
             if s["id"] not in self.claimed and s["id"] not in self.dead:
                 self.claimed.add(s["id"])

@@ -481,8 +481,12 @@ async def get_job(job_id: str = Path(..., description="From POST /discovery/jobs
 @router.post("/jobs/{job_id}/cancel", response_model=CancelResult,
              summary="Cancel a running sweep")
 async def cancel_job(job_id: str) -> dict:
-    """Cancellation is checked between sweeps, so a job stops at the next
-    boundary rather than instantly. Profiles already written stay written."""
+    """Stops the sweep. The engine sees the cancel at its next checkpoint
+    -- every scroll, not every sweep -- and any step still parked on one
+    long await is cancelled outright once the grace period expires, so this
+    lands in seconds rather than whenever the current keyword happened to
+    finish. Profiles already written stay written: results are saved per
+    completed sweep, not at the end."""
     cancelled = await discovery_runner.cancel(job_id)
     return {"cancelled": cancelled}
 

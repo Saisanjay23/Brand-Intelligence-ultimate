@@ -31,6 +31,13 @@ class TrackedJob(Protocol):
     cancel: "asyncio.Event"
 
 
+# How long a cancelled job is given to stop cleanly on its own before its
+# task is cancelled outright. Short enough that "Stop" means what an analyst
+# reads it as, long enough that the cooperative path -- which saves what it
+# has read and releases its session on the way out -- wins in the ordinary
+# case. See `JobStore.cancel`.
+HARD_CANCEL_GRACE_S = 5.0
+
 J = TypeVar("J", bound=TrackedJob)
 
 
@@ -58,6 +65,9 @@ class JobStore(Generic[J]):
         # running" in an operational view; released in the runner's own
         # `finally` so a crash can never leave a session stuck "busy".
         self._sessions_in_use: set[tuple[str, str]] = set()
+        # Live cancel watchdogs (see `cancel`), held so the event loop's
+        # weak task references cannot collect one before its deadline.
+        self._watchdogs: set["asyncio.Task"] = set()
 
     def age_seconds(self, job: J) -> float:
         return time.time() - job.created_at
@@ -83,13 +93,68 @@ class JobStore(Generic[J]):
             return job
 
     async def cancel(self, job_id: str) -> bool:
-        """False means nothing to cancel -- unknown id, or already
-        terminal -- never an error; a caller can treat this as idempotent."""
+        """Stop this job now. False means nothing to cancel -- unknown id,
+        or already terminal -- never an error; a caller can treat this as
+        idempotent.
+
+        TWO MECHANISMS, BECAUSE THE COOPERATIVE ONE ALONE IS NOT "NOW".
+        Setting `job.cancel` asks the runner to put the work down at its
+        next checkpoint, which is the clean stop: whatever has been read is
+        saved, sessions are released, browsers are closed by their own
+        `finally`. Every checkpoint is inside a loop, though, so how fast
+        that lands depends entirely on how long the CURRENT step takes --
+        and a Facebook sweep can hold one step for its whole `max_seconds`
+        ceiling plus a reconciliation phase. Pressing Stop was therefore
+        accepted instantly, shown as "cancelling", and then did nothing
+        observable for up to a quarter of an hour.
+
+        So the flag is followed by a deadline. If the job has not reached a
+        terminal status within `HARD_CANCEL_GRACE_S`, its task is cancelled
+        outright, which unwinds it through whatever `await` it is parked on
+        -- a page load, a sleep, a gather -- and runs every `finally` on the
+        way out. The grace period is what lets the cooperative path win
+        whenever it can, so the hard cancel is the backstop and not the
+        normal route.
+        """
         job = await self.get(job_id)
         if job is None or job.status in self._terminal:
             return False
         job.cancel.set()
+        task = getattr(job, "task", None)
+        if task is not None and not task.done():
+            # HELD IN A SET, not fire-and-forget. asyncio keeps only a weak
+            # reference to a task, so a watchdog with no strong reference
+            # can be collected before its deadline -- which would silently
+            # remove the backstop under exactly the load that needs it.
+            watchdog = asyncio.create_task(self._enforce_cancel(job, task))
+            self._watchdogs.add(watchdog)
+            watchdog.add_done_callback(self._watchdogs.discard)
         return True
+
+    async def _enforce_cancel(self, job: J, task: "asyncio.Task") -> None:
+        """The deadline behind `cancel`. Waits out the grace period and,
+        only if the job is still going, cancels its task.
+
+        `asyncio.wait` is used rather than `wait_for` on purpose: it does
+        NOT cancel the thing it is waiting on when the timeout expires, so
+        the decision to cancel stays here and explicit rather than being a
+        side effect of the wait.
+        """
+        try:
+            done, _ = await asyncio.wait({task}, timeout=HARD_CANCEL_GRACE_S)
+            if done or job.status in self._terminal:
+                # The cooperative path got there first, which is the
+                # outcome this grace period exists to allow.
+                return
+            task.cancel()
+        except asyncio.CancelledError:
+            # The watchdog itself was cancelled (process shutting down).
+            # Nothing to enforce, and re-raising would be noise.
+            return
+        except Exception:                        # noqa: BLE001 - never fatal
+            # A stop that fails must never take the process with it; the
+            # cooperative flag is still set and still honoured.
+            return
 
     def _drop_locked(self, job_id: str) -> None:
         if self._jobs.pop(job_id, None) is not None and self._on_evict is not None:

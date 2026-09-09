@@ -104,11 +104,19 @@ export interface SavedResultPage {
 }
 
 export const analysisApi = {
-  start: async (urls: string[], targetName?: string, officialFeed?: string): Promise<AnalysisStartResponse> => {
+  // `orgId` is the client this batch belongs to, and it is what keeps one
+  // client's readings out of another's workspace: the backend stores every
+  // result under it, keys the result_id by it, and only ever lists results
+  // back to the same client. An empty id is a scratch run with no client
+  // selected -- its own bucket, not a wildcard.
+  start: async (
+    urls: string[], targetName?: string, officialFeed?: string, orgId?: string,
+  ): Promise<AnalysisStartResponse> => {
     const res = await post("/analysis/jobs", {
       urls,
       target_name: targetName || "",
       official_feed: officialFeed || "",
+      org_id: orgId || "",
     });
     return json<AnalysisStartResponse>(res);
   },
@@ -127,10 +135,17 @@ export const analysisApi = {
     return url(`/analysis/jobs/${jobId}/items/${itemId}/screenshot`);
   },
 
-  // Everything analysed inside the retention window, newest first. What the
+  // ONE CLIENT'S results inside the retention window, newest first. What the
   // workspace loads on mount, so a reload no longer costs the batch.
-  listResults: async (): Promise<SavedResultPage> => {
-    const res = await fetch(url("/analysis/results?limit=1000"));
+  //
+  // `orgId` IS NOT OPTIONAL IN EFFECT. This call used to send no org_id at
+  // all, and the backend read a missing one as "no filter", so the workspace
+  // listed every client's analysis results under whichever client was open.
+  // Passing "" now means the no-client bucket, which is the right answer for
+  // a scratch run and never another client's work.
+  listResults: async (orgId: string): Promise<SavedResultPage> => {
+    const res = await fetch(
+      url(`/analysis/results?limit=1000&org_id=${encodeURIComponent(orgId || "")}`));
     return json<SavedResultPage>(res);
   },
 
@@ -145,8 +160,10 @@ export const analysisApi = {
     return json<{ deleted: number }>(res);
   },
 
-  deleteAllResults: async (): Promise<{ deleted: number }> => {
-    const res = await post("/analysis/results/delete", { all: true });
+  // Clears THIS client's saved results only. Same reasoning as listResults:
+  // without the id this cleared every client's work from one button.
+  deleteAllResults: async (orgId: string): Promise<{ deleted: number }> => {
+    const res = await post("/analysis/results/delete", { all: true, org_id: orgId || "" });
     return json<{ deleted: number }>(res);
   },
 

@@ -72,6 +72,15 @@ class StartAnalysis(BaseModel):
         description="The genuine account, for comparison. Recorded in the export "
                     "as Original feed; not scraped.",
     )
+    org_id: str = Field(
+        "", max_length=128,
+        description="The client this batch belongs to. Every result it produces is "
+                    "stored under this id and is only ever listed back to the same "
+                    "client -- results are NOT shared between clients, and the same "
+                    "URL analysed by two clients is two independent readings. Omit "
+                    "it for a scratch run with no client selected; those rows form "
+                    "their own bucket and never surface under a client.",
+    )
 
 
 class ExportXlsx(BaseModel):
@@ -186,7 +195,8 @@ async def start_analysis(body: StartAnalysis) -> StartAnalysisAccepted:
     A request whose URLs are all unsupported is still accepted (202) and
     completes immediately with everything under `skipped`."""
     job, skipped = await analysis_runner.start(
-        body.urls, body.target_name.strip(), body.official_feed.strip())
+        body.urls, body.target_name.strip(), body.official_feed.strip(),
+        org_id=body.org_id.strip())
     return StartAnalysisAccepted(
         job_id=job.id, status=JobStatus(job.status),
         poll_url=f"/analysis/jobs/{job.id}",
@@ -232,8 +242,11 @@ async def get_job(job_id: str = Path(..., description="From POST /analysis/jobs"
 @router.post("/jobs/{job_id}/cancel", response_model=CancelResult,
              summary="Cancel a running scrape")
 async def cancel_job(job_id: str) -> dict:
-    """Checked between profiles, so the job stops at the next boundary.
-    Profiles already scraped stay readable on the job."""
+    """Stops the scrape. The signal reaches the scraper itself, and a step
+    still parked on one long await (a profile page load) is cancelled
+    outright once the grace period expires -- so this lands in seconds
+    rather than whenever the current profile happened to finish. Profiles
+    already scraped stay readable on the job and stay saved."""
     return {"cancelled": await analysis_runner.cancel(job_id)}
 
 
@@ -281,8 +294,10 @@ class DeleteResults(BaseModel):
                     "front of it.")
     org_id: str = Field(
         "", max_length=128,
-        description="With `all`, narrows the delete to one client's results. "
-                    "Omit to clear everything.")
+        description="With `all`, the client whose results are cleared. This is "
+                    "NOT optional in effect: an omitted id clears the no-client "
+                    "bucket (scratch runs), never every client's results. There "
+                    "is deliberately no way to wipe across clients from here.")
 
 
 class DeleteResultsOutcome(BaseModel):

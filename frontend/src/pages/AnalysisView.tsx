@@ -21,6 +21,7 @@ import {
   startAnalysis,
   useAnalysisField,
   loadSaved,
+  setOrg,
   mergedItems,
   getSnapshot,
   deleteSaved,
@@ -421,9 +422,14 @@ interface Props {
   // A bump (even to the same value re-sent) re-triggers the
   // watch effect below -- see its key.
   resumeJobId?: string | null;
+  // The client this workspace belongs to. Everything the table reads,
+  // writes or deletes is scoped to it, so one client's readings can never
+  // appear under another. Empty is a scratch run with no client selected --
+  // its own bucket, not "show me everything".
+  clientId?: string;
 }
 
-export function AnalysisView({ resumeJobId }: Props = {}) {
+export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
   // Every field below lives in services/analysisSession.ts, NOT in this
   // component. AnalysisView is unmounted whenever the analyst switches away
   // from Live Results (App.tsx swaps the whole page), and component state
@@ -473,11 +479,14 @@ export function AnalysisView({ resumeJobId }: Props = {}) {
     [saved, jobData],
   );
 
-  // Pull the saved set on mount. This is what makes a reload no longer cost
-  // the day's work -- the one thing the in-memory session could never do.
+  // Point the workspace at the selected client and pull ITS saved set --
+  // on mount, and again whenever the analyst switches client. This is what
+  // makes a reload no longer cost the day's work, and what keeps the table
+  // to one client: `setOrg` empties it before the new client's rows are
+  // requested, so another client's readings are never on screen.
   useEffect(() => {
-    void loadSaved();
-  }, []);
+    void setOrg(clientId);
+  }, [clientId]);
 
   // Only SETTLED rows can be ticked. A row still pending or running has a
   // result_id but nothing saved under it yet, so deleting it would report

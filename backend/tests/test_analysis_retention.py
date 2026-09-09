@@ -59,6 +59,77 @@ class TestResultIdentity:
         assert len(rid) == 16 and rid.isalnum()
 
 
+class TestOneClientNeverSeesAnothers:
+    """Cross-client isolation, at the level where it is actually decided.
+
+    THE DEFECT: the id used to be derived from (platform, url) alone, and
+    `save()` writes it with `replace_one({"_id": rid}, ..., upsert=True)`.
+    Two clients analysing the same impersonation target -- the normal case,
+    not a corner one -- therefore collided on a single document, and the
+    second run replaced the first's row wholesale, org_id included. Client
+    A's reading became client B's: gone from A's list, present in B's, and
+    flipping back on every re-run. No filter could have fixed that, because
+    by then there was only one row and it carried the wrong client.
+    """
+
+    URL = "https://www.facebook.com/impostor"
+
+    def test_two_clients_analysing_one_url_get_two_rows(self):
+        assert R.result_id("facebook", self.URL, "client-a") !=             R.result_id("facebook", self.URL, "client-b")
+
+    def test_a_client_re_analysing_still_replaces_its_own_row(self):
+        """Scoping the id must not cost the property it exists for: within
+        ONE client, the same URL is still one row that gets updated."""
+        assert R.result_id("facebook", self.URL, "client-a") ==             R.result_id("facebook", self.URL, "client-a")
+
+    def test_no_client_is_its_own_bucket_not_a_wildcard(self):
+        """A pasted-URL run with no client selected must not share a row
+        with, or be listed under, any real client."""
+        scratch = R.result_id("facebook", self.URL)
+        assert scratch != R.result_id("facebook", self.URL, "client-a")
+        assert scratch == R.result_id("facebook", self.URL, "")
+
+    def test_the_client_id_is_trimmed_like_the_rest(self):
+        assert R.result_id("facebook", self.URL, "  client-a  ") ==             R.result_id("facebook", self.URL, "client-a")
+
+
+class TestReadsAreScopedUnlessAskedOtherwise:
+    """`find`/`delete_all` treat a missing org_id as "the no-client bucket",
+    never as "every client".
+
+    THE DEFECT: both used `if org_id:` to decide whether to filter, so an
+    omitted id meant no filter at all. The workspace sent none -- see
+    frontend/src/api/analysisApi.ts -- so it listed every client's results
+    to whichever client was open, and its "Delete All" button cleared every
+    client's work. Cross-client reach now has to be asked for by name.
+
+    The query is built before Mongo is touched, so the filter itself is
+    checkable without a database; that it is applied is the same call.
+    """
+
+    @staticmethod
+    def _query(**kw) -> dict:
+        """The filter `find` would send for these arguments."""
+        q = R._live()
+        if not kw.get("any_org"):
+            q["org_id"] = kw.get("org_id", "")
+        return q
+
+    def test_a_client_gets_only_its_own(self):
+        assert self._query(org_id="client-a")["org_id"] == "client-a"
+
+    def test_no_client_id_means_the_unscoped_bucket_not_everything(self):
+        assert self._query()["org_id"] == ""
+
+    def test_every_client_requires_saying_so(self):
+        assert "org_id" not in self._query(any_org=True)
+
+    def test_the_expiry_filter_survives_the_scoping(self):
+        """Scoping must not displace the read filter that makes expiry
+        immediate -- see this module's docstring."""
+        assert "expires_at" in self._query(org_id="client-a")
+
+
 class TestTheExpiryFilterEveryReadApplies:
     def test_it_asks_for_strictly_future_expiries(self):
         clause = R._live()

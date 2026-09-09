@@ -10,8 +10,46 @@ and `backend/core/discovery_options.py`.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
+
+
+
+# STOPPING A RUN THAT IS ALREADY INSIDE A PAGE LOAD.
+#
+# Cancelling used to be checked only BETWEEN units of work -- between
+# keywords, between tabs, between URLs. That is the right place to decide
+# whether to start the next one, and completely useless for stopping the one
+# already running: a single Facebook sweep can hold the loop for its whole
+# `max_seconds` ceiling plus a resolve phase, so "Stop" was accepted
+# instantly by the API, reported as cancelling in the UI, and then did
+# nothing observable for up to a quarter of an hour. To the analyst that is
+# a broken button.
+#
+# `cancel` carries the SAME `asyncio.Event` the job owns down into the
+# adapter, so a long-running engine can check it at its own natural
+# checkpoints (every scroll, before each page visit) and put the work down
+# between them. Optional and defaulted to None: an adapter that never looks
+# at it behaves exactly as before, and the hard task-cancel backstop in each
+# runner covers whatever a cooperative check cannot reach.
+def cancelled(args) -> bool:
+    """Has the job that owns this run asked it to stop?
+
+    Reads via getattr because adapters are documented as taking a
+    "ScanOptions-shaped object", not necessarily a ScanOptions -- and
+    tolerates a plain bool or a callable in that slot as well as an Event,
+    so a caller (or a test) can signal a stop without building one.
+    """
+    flag = getattr(args, "cancel", None)
+    if flag is None:
+        return False
+    if isinstance(flag, bool):
+        return flag
+    is_set = getattr(flag, "is_set", None)
+    if callable(is_set):
+        return bool(is_set())
+    return bool(flag() if callable(flag) else flag)
 
 
 @dataclass
@@ -25,6 +63,8 @@ class ScanOptions:
     scrolls: int = 0  # newest post is in the first render
     concurrency: int = 1  # >1 is faster and more conspicuous
     keep_going: bool = False  # continue past a checkpoint
+    # The owning job's stop signal -- see `cancelled` above.
+    cancel: Optional[Any] = None
 
 
 def captures_screenshot(args) -> bool:
@@ -93,3 +133,8 @@ class DiscoveryOptions:
     # live path, discovery/runner.py, always sets one explicitly from
     # settings). See that setting's own comment for why 900, not 300.
     max_seconds: float = 900  # per sweep; 0 = no cap
+
+    # The owning job's stop signal -- see `cancelled` above. This is what
+    # lets Stop interrupt a sweep mid-pagination instead of only being
+    # noticed once the whole sweep has run its course.
+    cancel: Optional[Any] = None

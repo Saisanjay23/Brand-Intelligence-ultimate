@@ -525,7 +525,7 @@ export function LiveResultsView({
 
       {phase === "analysis" && (
         <div style={{ marginTop: "24px" }}>
-          <AnalysisView resumeJobId={resumeAnalysisJobId} />
+          <AnalysisView resumeJobId={resumeAnalysisJobId} clientId={clientId} />
         </div>
       )}
     </div>

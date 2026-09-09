@@ -61,6 +61,13 @@ export interface AnalysisSession {
   // thing that makes someone stop trusting the checkboxes.
   selected: string[];
   deleting: boolean;
+  // WHICH CLIENT THIS WORKSPACE IS SHOWING. Every server call that reads,
+  // writes or deletes a result carries it, so the table can only ever hold
+  // one client's readings. "" is a scratch run with no client selected --
+  // its own bucket, never a wildcard. Switching clients clears the table
+  // rather than filtering it, because rows for the previous client have no
+  // business being on screen for a moment longer than the request takes.
+  orgId: string;
 }
 
 function emptySession(): AnalysisSession {
@@ -81,6 +88,7 @@ function emptySession(): AnalysisSession {
     retentionHours: 24,
     selected: [],
     deleting: false,
+    orgId: "",
   };
 }
 
@@ -160,6 +168,13 @@ let pollTimer: number | null = null;
 // that had just been emptied.
 let generation = 0;
 
+// The same guard, for the saved-results load specifically. A client switch
+// fires its own request, and two switches in quick succession can return out
+// of order -- without this, client A's slower response would repopulate a
+// workspace already showing client B, which is precisely the cross-client
+// leak the scoping is here to close.
+let savedGeneration = 0;
+
 export function stopPolling(): void {
   if (pollTimer !== null) {
     clearInterval(pollTimer);
@@ -234,11 +249,35 @@ export function watchJob(id: string): void {
   })();
 }
 
-/** Repopulate `saved` from the server. Safe to call at any time. */
+/** Point the workspace at a client and repopulate `saved` for it.
+ *
+ *  Called on mount and whenever the selected client changes. The table is
+ *  emptied BEFORE the request goes out, not after it returns: leaving the
+ *  previous client's rows up while the new client's load is in flight is
+ *  showing one client another's work, briefly, which is the exact thing
+ *  this scoping exists to prevent.
+ *
+ *  `gen` guards against two client switches overlapping -- a slow response
+ *  for client A must never repopulate a workspace that has since moved to
+ *  client B.
+ */
+export async function setOrg(orgId: string): Promise<void> {
+  const next = orgId || "";
+  if (state.orgId === next && (state.saved.length > 0 || state.savedLoading)) return;
+  patch({ orgId: next, saved: [], selected: [] });
+  await loadSaved();
+}
+
+/** Repopulate `saved` for the current client. Safe to call at any time. */
 export async function loadSaved(): Promise<void> {
+  const org = state.orgId;
+  const gen = ++savedGeneration;
   patch({ savedLoading: true });
   try {
-    const res = await analysisApi.listResults();
+    const res = await analysisApi.listResults(org);
+    // The client changed (or another load started) while this was in
+    // flight -- these rows belong to a workspace that no longer exists.
+    if (gen !== savedGeneration || state.orgId !== org) return;
     patch({
       saved: res.items,
       retentionHours: res.retention_hours,
@@ -249,6 +288,7 @@ export async function loadSaved(): Promise<void> {
       selected: state.selected.filter((id) => res.items.some((i) => i.result_id === id)),
     });
   } catch (e) {
+    if (gen !== savedGeneration) return;
     patch({ savedLoading: false });
     toast.error((e as Error).message || "Could not load saved results");
   }
@@ -294,7 +334,7 @@ export async function deleteSaved(mode: "selected" | "all"): Promise<number> {
   patch({ deleting: true });
   try {
     const res = mode === "all"
-      ? await analysisApi.deleteAllResults()
+      ? await analysisApi.deleteAllResults(state.orgId)
       : await analysisApi.deleteResults(ids);
     const gone = new Set(mode === "all" ? [] : ids);
     const job = state.jobData;
@@ -324,7 +364,7 @@ export async function startAnalysis(urls: string[]): Promise<void> {
   stopPolling();
   patch({ loading: true, jobId: null, jobData: null, edits: {} });
   try {
-    const res = await analysisApi.start(urls, "", "");
+    const res = await analysisApi.start(urls, "", "", state.orgId);
     // Clear, or a newer start, landed while this request was in flight.
     // Installing this job now would attach it to a workspace the analyst
     // has already moved on from.

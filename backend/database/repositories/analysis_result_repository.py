@@ -82,10 +82,26 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def result_id(platform: str, url: str) -> str:
-    """One stable id per analysed profile.
+def result_id(platform: str, url: str, org_id: str = "") -> str:
+    """One stable id per analysed profile, PER CLIENT.
 
-    Derived from (platform, url) rather than being random, which is what
+    `org_id` IS PART OF THE IDENTITY, and leaving it out was a cross-client
+    data leak, not a filtering oversight. `save()` writes with
+    `replace_one({"_id": rid}, ..., upsert=True)`, so with an id of only
+    (platform, url) two clients analysing the SAME profile -- the normal
+    case for a shared impersonation target -- collided on one document. The
+    second client's run REPLACED the first's row wholesale, org_id
+    included: client A's reading silently became client B's, disappeared
+    from A's list and surfaced in B's, and every re-run flipped it back.
+    Scoping the id gives each client its own row for the same URL, which is
+    also the truthful shape -- the two readings were taken at different
+    times against different keywords and can legitimately disagree.
+
+    An empty `org_id` is its own bucket, not a wildcard: it is what a
+    pasted-URL run with no client selected writes, and those rows belong to
+    no client and must never surface under one.
+
+    Derived from (org_id, platform, url) rather than being random, which is
     makes re-analysing a profile REPLACE its previous reading instead of
     leaving two rows that disagree. It is also what lets a live job's item
     and its saved counterpart be recognised as the same row by the UI, so
@@ -95,7 +111,8 @@ def result_id(platform: str, url: str) -> str:
     Hashed rather than concatenated: URLs are long and unbounded, and this
     value is used as `_id`, which is indexed.
     """
-    raw = f"{(platform or '').strip()}\x00{(url or '').strip()}".encode("utf-8", "replace")
+    raw = (f"{(org_id or '').strip()}\x00{(platform or '').strip()}\x00"
+           f"{(url or '').strip()}").encode("utf-8", "replace")
     return hashlib.sha1(raw).hexdigest()[:16]
 
 
@@ -142,7 +159,7 @@ async def save(
     if not url:
         raise ValueError("analysis result has no url")
 
-    rid = result_id(platform, url)
+    rid = result_id(platform, url, org_id)
     now = _now()
     expires_at = now + timedelta(hours=RETENTION_HOURS)
 
@@ -188,16 +205,25 @@ async def save(
 
 async def find(
     *, org_id: str = "", platform: str = "", job_id: str = "",
-    limit: int = 500, offset: int = 0,
+    any_org: bool = False, limit: int = 500, offset: int = 0,
 ) -> tuple[list[dict], int]:
-    """Saved results, newest first, plus the total matching count.
+    """ONE CLIENT'S saved results, newest first, plus the total matching
+    count.
 
     Newest first because this list is a work queue read from the top: the
     batch an analyst just ran is the one they are looking at, and yesterday
     evening's is context underneath it.
+
+    SCOPED TO ONE CLIENT UNLESS `any_org` IS PASSED. `org_id=""` filters to
+    the unscoped bucket -- pasted-URL runs with no client selected -- rather
+    than meaning "no filter at all". It used to mean the latter, and the
+    workspace sent no org_id, so every client's results were listed to
+    whichever client happened to be open. Cross-client visibility has to be
+    something a caller asks for by name, never what it gets by omitting an
+    argument.
     """
     q: dict[str, Any] = _live()
-    if org_id:
+    if not any_org:
         q["org_id"] = org_id
     if platform:
         q["platform"] = platform
@@ -258,15 +284,17 @@ async def delete_many(ids: list[str]) -> int:
     return res.deleted_count
 
 
-async def delete_all(*, org_id: str = "", platform: str = "") -> int:
-    """Delete every saved result, or every one for a client/platform.
+async def delete_all(*, org_id: str = "", platform: str = "", any_org: bool = False) -> int:
+    """Delete every saved result FOR ONE CLIENT -- or, only when `any_org`
+    is passed, for every client.
 
-    Scoping is available but the UI's "Delete All" passes neither, on
-    purpose: it means what it says. The confirmation in front of it is what
-    stands between an analyst and that, not this function.
+    Same rule and same reason as `find`: an omitted org_id used to widen the
+    blast radius to the whole database, so the workspace's "Delete All",
+    which sent none, cleared other clients' work along with the analyst's
+    own. Deleting across clients is now stated outright or not done.
     """
     q: dict[str, Any] = {}
-    if org_id:
+    if not any_org:
         q["org_id"] = org_id
     if platform:
         q["platform"] = platform

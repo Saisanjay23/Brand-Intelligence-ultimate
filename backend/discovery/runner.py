@@ -614,6 +614,23 @@ class DiscoveryRunner:
                 notes = [f"{p.platform}: {p.note}" for p in job.platforms.values() if p.note]
                 job.message = f"{job.found} profile(s) found, {job.new} new" + (
                     f" -- {'; '.join(notes)}" if notes else "")
+        except asyncio.CancelledError:
+            # THE HARD-CANCEL BACKSTOP LANDING (see JobStore.cancel). The
+            # cooperative path did not reach a checkpoint inside the grace
+            # period, so this task was cancelled where it stood. Every
+            # worker's own `finally` has already released its session and
+            # closed its browser on the way here.
+            #
+            # SWALLOWED, NOT RE-RAISED, and that is deliberate: this is the
+            # job's own top-level coroutine and the cancellation is the
+            # outcome that was asked for, so there is nothing above to
+            # propagate it to and a re-raise would only leave the job
+            # reported as still RUNNING to every poller. Whatever each
+            # platform saved before the stop stands -- results are written
+            # per completed sweep, not at the end.
+            job.status = CANCELLED
+            job.message = f"stopped after {job.completed}/{job.total} sweeps"
+            log.info(f"discovery job {job.id}: {job.message}")
         except Exception as e:
             job.status = FAILED
             job.message = f"{type(e).__name__}: {e}"
@@ -626,8 +643,16 @@ class DiscoveryRunner:
             # downloads it deliberately kept off the critical path.
             job.finished_at = datetime.now(timezone.utc).isoformat()
             job.finished_at_ts = time.time()
+            # `_settle_avatars` CANCELS these rather than awaiting them when
+            # the job was stopped, so this stays fast on the cancel path.
             await self._settle_avatars(job)
-            await self._maybe_report(job)
+            if not job.cancel.is_set():
+                # NOT ON A CANCELLED JOB. The sweep report is a summary of a
+                # completed sweep; generating one for a run the analyst just
+                # stopped reports a partial as though it were the finding,
+                # and it is the slowest thing in this block -- which is the
+                # last place to spend time when the whole point was to stop.
+                await self._maybe_report(job)
 
     async def _maybe_report(self, job: DiscoveryJob) -> None:
         """Email this client's sweep report, if an operator asked for it.
@@ -838,7 +863,25 @@ class DiscoveryRunner:
         claimed: list[dict] = []
         while len(claimed) < want:
             try:
-                plat_obj, session_item = await sessions_engine.session_for_job(platform_id)
+                # WAIT FOR THE FIRST ONE, NEVER FOR THE EXTRAS.
+                #
+                # The first account decides whether this platform runs at
+                # all, and the commonest reason it is unavailable is simply
+                # that the OTHER phase is holding it -- discovery keeps a
+                # session for its whole sweep, analysis for its whole batch.
+                # Refusing there meant an analyst could not run discovery
+                # and analysis at the same time on a single-account
+                # platform: whichever started second failed outright, on a
+                # pool that was healthy and about to be free. Waiting turns
+                # that into a queue.
+                #
+                # A shortfall AFTER the first is not a failure at all --
+                # two of three accounts busy elsewhere just means fewer
+                # workers -- so the extras never wait, and never make a job
+                # slower than the work it actually has.
+                wait = sessions_engine.SESSION_WAIT_S if not claimed else 0.0
+                plat_obj, session_item = await sessions_engine.session_for_job(
+                    platform_id, wait_s=wait)
             except Exception:
                 if not claimed:
                     raise
@@ -924,6 +967,12 @@ class DiscoveryRunner:
                     settle=settings.discovery_settle_sec,
                     page_wait=settings.discovery_page_wait_sec,
                     patience=settings.discovery_patience,
+                    # Handed to the ENGINE, not just checked between
+                    # keywords here. One Facebook sweep can hold this
+                    # worker for its whole max_seconds ceiling, so a cancel
+                    # the engine cannot see is a Stop button that does
+                    # nothing for minutes -- see scan_options.cancelled.
+                    cancel=job.cancel,
                 )
                 make_discoverer = None
 
