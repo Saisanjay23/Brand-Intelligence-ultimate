@@ -8,35 +8,6 @@ and operating system identity, preventing OS-leak detection on Linux servers.
 from __future__ import annotations
 
 
-def build_user_agent_data(
-    major_version: str = "132",
-    full_version: str = "132.0.6834.83",
-    platform: str = "Windows",
-) -> dict:
-    """Builds Playwright context user_agent_data (Sec-CH-UA Client Hints).
-
-    Ensures HTTP headers and navigator.userAgentData match the exact browser
-    build and hide underlying hosting OS environments (e.g. Docker Linux).
-    """
-    return {
-        "brands": [
-            {"brand": "Not(A:Brand", "version": "24"},
-            {"brand": "Chromium", "version": str(major_version)},
-            {"brand": "Google Chrome", "version": str(major_version)},
-        ],
-        "full_version_list": [
-            {"brand": "Not(A:Brand", "version": "24.0.0.0"},
-            {"brand": "Chromium", "version": str(full_version)},
-            {"brand": "Google Chrome", "version": str(full_version)},
-        ],
-        "mobile": False,
-        "platform": platform,
-        "architecture": "x86",
-        "platform_version": "10.0.0",
-        "model": "",
-    }
-
-
 def build_extra_headers(locale: str = "en-US") -> dict[str, str]:
     """Ensures default navigation HTTP headers align with context locale.
 

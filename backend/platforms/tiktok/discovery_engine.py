@@ -65,7 +65,7 @@ from typing import Any, Iterator, Optional
 from urllib.parse import quote
 
 from backend.config.settings import settings
-from backend.shared.extraction import ExtractionResult, run_strategies
+from backend.shared.extraction import run_strategies
 from backend.shared.logging import get_logger
 from backend.shared.models.row import Row
 from backend.shared.text import iter_dicts
@@ -1005,7 +1005,7 @@ async def user_cards(page) -> list[TikTokUser]:
 
 
 async def search_users(
-    keywords: list[str], timeout_s: float = 45.0,
+    keywords: list[str], timeout_s: float = 45.0, max_results: int = 0,
 ) -> dict[str, list[TikTokUser]]:
     """{keyword: name-matched accounts} from TikTok's Users tab.
 
@@ -1018,14 +1018,15 @@ async def search_users(
     try:
         async with anonymous_context() as ctx:
             for kw in keywords:
-                out[kw] = await _users_for(ctx, kw, timeout_s)
+                out[kw] = await _users_for(ctx, kw, timeout_s, max_results)
                 log.info(f"tiktok/users {kw!r}: {len(out[kw])} account(s)")
     except Exception as e:
         log.warning(f"tiktok/users: account search unavailable -- {type(e).__name__}: {e}")
     return out
 
 
-async def search_users_in(ctx, keywords: list[str], timeout_s: float = 45.0
+async def search_users_in(ctx, keywords: list[str], timeout_s: float = 45.0,
+                           max_results: int = 0,
                           ) -> dict[str, list[TikTokUser]]:
     """`search_users` against a context the caller already owns -- used when
     a sweep is ALREADY running anonymously and must not try to take the
@@ -1033,7 +1034,7 @@ async def search_users_in(ctx, keywords: list[str], timeout_s: float = 45.0
     out: dict[str, list[TikTokUser]] = {}
     for kw in keywords:
         try:
-            out[kw] = await _users_for(ctx, kw, timeout_s)
+            out[kw] = await _users_for(ctx, kw, timeout_s, max_results)
         except Exception as e:
             log.warning(f"tiktok/users {kw!r}: {type(e).__name__}: {e}")
             out[kw] = []
@@ -1041,7 +1042,9 @@ async def search_users_in(ctx, keywords: list[str], timeout_s: float = 45.0
     return out
 
 
-async def _users_for(ctx, keyword: str, timeout_s: float) -> list[TikTokUser]:
+async def _users_for(
+    ctx, keyword: str, timeout_s: float, max_results: int = 0,
+) -> list[TikTokUser]:
     """One keyword's Users tab, read off `/api/search/user/full/`, scrolled
     to the end of the list the same way the Top tab is."""
     page = await ctx.new_page()
@@ -1096,6 +1099,12 @@ async def _users_for(ctx, keyword: str, timeout_s: float) -> list[TikTokUser]:
         await harvest()
         stalls = 0
         for _ in range(25):
+            if max_results and len(ordered) >= max_results:
+                # This loop used to have no idea a cap even existed, and
+                # would run all 25 scrolls (~55s) even when the Top tab
+                # sweep calling in here already had all the results it
+                # needed and was only topping up from the Users tab.
+                break
             before = len(ordered)
             await page.evaluate(JS_SCROLL_RESULTS)
             await page.wait_for_timeout(2200)
@@ -1155,7 +1164,6 @@ class Sweep:
     # "hydration+network" normally; "dom" when both came up empty and the
     # rendered results page had to stand in
     source: str = "hydration+network"
-    extraction: Optional[ExtractionResult] = None
 
     @property
     def account_hits(self) -> int:
@@ -1369,7 +1377,6 @@ class Discovery:
                 ],
             )
             users = chain.value or []
-            out.extraction = chain
             if chain.degraded:
                 out.source = "dom"
 
@@ -1401,7 +1408,14 @@ class Discovery:
             # than in run(): the discovery service drives sweep() directly
             # per (keyword, tab) and never calls run(), so anything hung
             # off run() is dead code in production.
-            await self._merge_user_accounts(out)
+            #
+            # Skipped outright once the Top tab alone already satisfied the
+            # cap: this used to run unconditionally, opening a SECOND page
+            # and scrolling it up to 25 times (~55s) even when nothing more
+            # was needed -- directly delaying every keyword behind it under
+            # the default discovery_sequential_keywords=True.
+            if out.stopped != "cap:results":
+                await self._merge_user_accounts(out)
 
             if self.a.max_results:
                 out.hits = out.hits[: self.a.max_results]
@@ -1424,11 +1438,13 @@ class Discovery:
                 # This task already owns the profile lock (the whole sweep
                 # is running inside anonymous_context), so reuse that
                 # context -- taking the lock again would deadlock.
-                found = (await search_users_in(self.ctx, [out.keyword])).get(out.keyword) or []
+                found = (await search_users_in(
+                    self.ctx, [out.keyword], max_results=self.a.max_results,
+                )).get(out.keyword) or []
             else:
                 # search_users takes the lock itself, via anonymous_context
                 found = (await search_users(
-                    [out.keyword],
+                    [out.keyword], max_results=self.a.max_results,
                 )).get(out.keyword) or []
         except Exception as e:
             log.warning(f"tiktok/users {out.keyword!r}: skipped -- {type(e).__name__}: {e}")
@@ -1446,29 +1462,3 @@ class Discovery:
             for u in out.users
             if u.url
         ]
-
-    async def run(self, keywords: list[str], tabs: Optional[list[str]] = None) -> list[Sweep]:
-        """WHAT: sweeps a whole list of keywords. HOW: concurrently up to
-        the configured limit, with a staggered start so several browser
-        tabs do not hit TikTok in the same instant, and results re-sorted
-        back into the caller's keyword order (which `gather` does not
-        guarantee). `tabs` is accepted and ignored: TikTok has one
-        people-search surface, and the parameter exists so every
-        platform's Discovery.run has the same signature. LINKED TO: the
-        standalone entry point; the API path drives sweep() per keyword
-        through services/discovery_service.py instead."""
-        sem = asyncio.Semaphore(max(1, self.a.concurrency))
-
-        async def one(i: int, keyword: str) -> tuple[int, Sweep]:
-            """One keyword, holding a concurrency slot for its duration."""
-            async with sem:
-                await asyncio.sleep(i % max(1, self.a.concurrency) * 1.0)
-                s = await self.sweep(keyword)
-                print(
-                    f"  [tiktok/people] {keyword!r}: {s.summary()} ({s.seconds:.1f}s)",
-                    file=sys.stderr,
-                )
-                return i, s
-
-        pairs = await asyncio.gather(*(one(i, k) for i, k in enumerate(keywords)))
-        return [s for _, s in sorted(pairs, key=lambda p: p[0])]

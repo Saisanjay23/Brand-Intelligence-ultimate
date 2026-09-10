@@ -224,10 +224,6 @@ def _detect_chrome_version(binary_path: str | None) -> tuple[str, str]:
 
 CHROME_MAJOR_VERSION, CHROME_FULL_VERSION = _detect_chrome_version(chrome_binary())
 
-# False means no real browser was found and the stale fallback above is
-# what every session is advertising. Read by services/preflight_service.py.
-CHROME_VERSION_DETECTED = CHROME_FULL_VERSION != FALLBACK_CHROME_FULL
-
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     f"(KHTML, like Gecko) Chrome/{CHROME_FULL_VERSION} Safari/537.36"

@@ -67,7 +67,7 @@ from backend.stealth.fingerprint import (
     get_identity,
 )
 from backend.stealth.headers import build_extra_headers
-from backend.stealth.mouse_movement import humanize_interaction, natural_scroll_down
+from backend.stealth.mouse_movement import humanize_interaction
 from backend.stealth.navigator_spoofing import build_init_js
 from backend.stealth.timezone import DEFAULT_TIMEZONE_ID
 
@@ -86,8 +86,6 @@ TRANSPARENT_GIF = (
     b"\x47\x49\x46\x38\x39\x61\x01\x00\x01\x00\x80\x00\x00\x05\x04\x04\x00\x00\x00"
     b"\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b"
 )
-# Empty binary payload for fonts to avoid triggering font load failure diagnostics
-EMPTY_FONT = b"\x00\x01\x00\x00" + b"\x00" * 32
 
 BLOCKED_TRACKERS = (
     "connect.facebook.net",
@@ -325,10 +323,6 @@ class Session:
     async def interact(self, page, scroll: bool = True, moves: int = 3) -> None:
         """Executes passive human pointer motion and micro-scrolling on a page."""
         await humanize_interaction(page, scroll=scroll, moves=moves)
-
-    async def natural_scroll(self, page, distance: int = 800, to_bottom: bool = False) -> None:
-        """Dispatches natural mouse wheel scrolling on the page."""
-        await natural_scroll_down(page, distance=distance, to_bottom=to_bottom)
 
     async def wait_for_visible_content(
         self, page, min_chars: int = 200, timeout_ms: int = 4000, poll_ms: int = 250,

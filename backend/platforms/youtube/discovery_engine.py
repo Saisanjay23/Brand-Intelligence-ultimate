@@ -28,7 +28,6 @@ import asyncio
 import json
 import os
 import re
-import sys
 import time
 import urllib.error
 import urllib.parse
@@ -438,29 +437,4 @@ class Discovery:
                 out.hits = out.hits[: self.a.max_results]
             out.seconds = time.time() - started
         return out
-
-    async def run(self, keywords: list[str], tabs=None) -> list[Sweep]:
-        """WHAT: sweeps a whole list of keywords. HOW: concurrently, but
-        capped at 4 -- API calls parallelise cheaply, yet the quota they
-        spend comes from a single shared daily pool, so more concurrency
-        only exhausts it faster and in a less predictable order. Results
-        are re-sorted back into the caller keyword order, which `gather`
-        does not guarantee. LINKED TO: the standalone entry point; the API
-        path drives sweep() per keyword through
-        services/discovery_service.py instead."""
-        sem = asyncio.Semaphore(max(1, min(self.a.concurrency, 4)))
-
-        async def one(i: int, keyword: str) -> tuple[int, Sweep]:
-            """One keyword, holding a quota/concurrency slot. Returns its
-            index alongside the Sweep so the caller can restore order."""
-            async with sem:
-                s = await self.sweep(keyword)
-                print(
-                    f"  [youtube] {keyword!r}: {s.summary()} ({s.seconds:.1f}s)",
-                    file=sys.stderr,
-                )
-                return i, s
-
-        pairs = await asyncio.gather(*(one(i, k) for i, k in enumerate(keywords)))
-        return [s for _, s in sorted(pairs, key=lambda p: p[0])]
 

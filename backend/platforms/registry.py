@@ -4,10 +4,11 @@ Static catalog plus lazy class loading only, no Mongo, no filesystem
 cookie access itself. Adding a platform is one entry here plus its adapter
 package under `platforms/<name>/`; nothing else changes.
 
-`session_state()` imports `engine.sessions` lazily (inside the function,
-not at module load) purely to dodge a real circular import: `engine.jobs`
-imports this registry to pick adapter classes, and `engine.sessions`
-(which this function needs) sits in that same import graph.
+`session_state()` imports `sessions/manager.py` lazily (inside the
+function, not at module load) purely to dodge a real circular import:
+`discovery/runner.py` and `analysis/runner.py` import this registry to
+pick adapter classes, and `sessions/manager.py` (which this function
+needs) sits in that same import graph.
 """
 
 from __future__ import annotations
@@ -53,12 +54,6 @@ class Platform:
     # letting the platform sit dark because a cookie expired trades the
     # whole platform for one field.
     anonymous_context_path: str = ""
-    # True when `analysis_path` exists but doesn't actually extract fields.
-    # Analysis_path itself is always set (every platform needs a Scraper class),
-    # so it can't be used as the "does analysis actually work" signal, this is
-    # the real one, surfaced to the frontend so an analyst sees the caveat
-    # before running analysis, not after it silently produces nothing.
-    analysis_stub: bool = False
 
     @property
     def can_discover(self) -> bool:
@@ -195,19 +190,3 @@ async def session_state(p: Platform) -> str:
     from backend.sessions import manager as sessions_engine
 
     return await sessions_engine.state_for(p.id)
-
-
-async def ready_platforms() -> tuple[list[str], dict[str, str]]:
-    """(ready platform ids, {unavailable id: state}) across every enabled
-    platform, shared by anything that needs to gate a sweep on "is at
-    least one platform usable" without silently dropping why the others
-    weren't (the analysis catch-up sweep and the round-robin engine both
-    need exactly this)."""
-    ready: list[str] = []
-    unavailable: dict[str, str] = {}
-    for platform_id, plat in PLATFORMS.items():
-        if not plat.enabled:
-            continue
-        state = await session_state(plat)
-        (ready.append(platform_id) if state == "ready" else unavailable.setdefault(platform_id, state))
-    return ready, unavailable

@@ -70,26 +70,20 @@ def _to_out(doc: dict) -> dict:
         "order": doc.get("order", 0),
         "cron": doc.get("cron"),
         "created_at": _utc(doc.get("created_at")),
-        # set by the round-robin engine after each of its turns for this
-        # client, see services/round_robin_service.py::_process_client.
-        # Absent entirely for a client the engine hasn't reached yet.
+        # last_run_at/status/note/duration_s/run_count were written by a
+        # server-side round-robin engine that no longer exists (client-side
+        # sequencing replaced it, see SchedulerPanel.tsx's module docstring)
+        # -- nothing writes them anymore, so they stay whatever they were
+        # on a client that predates the rewrite, and absent on any newer one.
         "last_run_at": _utc(doc.get("last_run_at")),
         "last_run_status": doc.get("last_run_status"),
         "last_run_note": doc.get("last_run_note", ""),
-        # wall-clock seconds the most recent completed turn took (discovery
-        # + any analysis catch-up combined). None for a client that
-        # hasn't completed a turn yet, or one saved before this field
-        # existed.
         "last_run_duration_s": doc.get("last_run_duration_s"),
-        # total completed turns since this client was created, success,
-        # failed, and skipped alike, since all three mean the round-robin
-        # engine actually reached this client's slot in the rotation.
         "run_count": doc.get("run_count", 0),
-        # False takes this client OUT of the round-robin rotation entirely:
-        # the engine stops picking it up until an admin re-enables it from
-        # the Scheduler tab. Manual Discover/Analyse runs are unaffected --
-        # this is about the automatic rotation only. Absent means enabled,
-        # so every client saved before this existed keeps running.
+        # Same story: `set_scheduler_enabled` below can still flip this, but
+        # nothing reads it back to decide whether to run a client -- the
+        # round-robin rotation it used to gate is gone, and the client-side
+        # scheduler doesn't check it either.
         "scheduler_enabled": doc.get("scheduler_enabled", True),
         # WHAT THE SCHEDULER SHOULD RUN FOR THIS CLIENT, remembered between
         # runs so an analyst sets it once rather than on every queueing.
@@ -102,6 +96,8 @@ def _to_out(doc: dict) -> dict:
         # "" (all) | "individual" | "domain". Same convention as the Clients
         # page's own keyword-scope chips.
         "scheduler_keyword_scope": doc.get("scheduler_keyword_scope") or "",
+        "scheduler_facebook_tabs": doc.get("scheduler_facebook_tabs") or [],
+        "scheduler_budget_minutes": doc.get("scheduler_budget_minutes") or 0,
     }
 
 
@@ -248,6 +244,8 @@ async def upsert(
 async def set_scheduler_prefs(
     client_id: str, *, platforms: Optional[list[str]] = None,
     keyword_scope: Optional[str] = None,
+    facebook_tabs: Optional[list[str]] = None,
+    budget_minutes: Optional[int] = None,
 ) -> dict:
     """What the Scheduler should sweep for this client, and with which
     keywords. Persisted so the choice survives the queue being cleared, the
@@ -259,11 +257,11 @@ async def set_scheduler_prefs(
     scheduler preferences and sends none -- silently reset them to empty.
     That is the same shape of bug as the client-overwrite this repository
     already had once, so this is a separate narrow `$set` that touches these
-    two fields and nothing else.
+    fields and nothing else.
 
     `platforms=[]` means every ready platform, which is exactly what
     omitting `platforms` means to the discovery API. `keyword_scope=""`
-    means both keyword types.
+    means both keyword types. `facebook_tabs=[]` means all FB tabs.
     """
     fields: dict[str, Any] = {}
     if platforms is not None:
@@ -276,6 +274,15 @@ async def set_scheduler_prefs(
             raise ValidationError(
                 f"keyword_scope must be 'individual', 'domain' or empty, not {scope!r}")
         fields["scheduler_keyword_scope"] = scope
+    if facebook_tabs is not None:
+        fields["scheduler_facebook_tabs"] = [
+            t.strip().lower() for t in facebook_tabs if str(t).strip()
+        ]
+    if budget_minutes is not None:
+        try:
+            fields["scheduler_budget_minutes"] = max(0, int(budget_minutes))
+        except (ValueError, TypeError):
+            fields["scheduler_budget_minutes"] = 0
     if not fields:
         return await get(client_id)
 
@@ -362,57 +369,6 @@ async def list_all() -> list[dict]:
     an analyst's Scheduler-tab reorder change the engine's actual rotation
     sequence, not just the tab's own display order."""
     return [_to_out(d) async for d in db()[CLIENTS].find({}).sort([("order", 1), ("_id", 1)])]
-
-
-async def record_run_result(
-    client_id: str, status: str, note: str = "", duration_s: Optional[float] = None,
-    platforms: Optional[dict] = None,
-) -> None:
-    """Called by the round-robin engine after every turn it takes on this
-    client, feeds the Scheduler admin tab's last-run/status/duration
-    columns and its running total. `status` is "success" | "failed" |
-    "skipped". A plain `update_one`, not an upsert: the round-robin engine
-    only ever processes clients that already exist.
-
-    `platforms` is the per-platform breakdown of that turn --
-    {platform_id: "done" | "partial" | "interrupted" | "failed" |
-    "skipped"} -- taken from the finished job's own `platform_progress`.
-
-    It is stored because the aggregate `status` cannot express the case
-    this exists for: a turn where Instagram and X finished cleanly and
-    Facebook died halfway through its session is neither a success nor a
-    failure, and calling it either one loses the only fact that matters --
-    WHICH platform still owes this client work. Persisting the breakdown is
-    what lets the engine come back and re-run just that platform (see
-    round_robin_service._unfinished_platforms) instead of re-sweeping
-    everything or, worse, quietly leaving the gap.
-    """
-    fields: dict = {
-        "last_run_at": datetime.now(timezone.utc),
-        "last_run_status": status,
-        "last_run_note": note,
-    }
-    if platforms is not None:
-        fields["last_run_platforms"] = platforms
-    if duration_s is not None:
-        fields["last_run_duration_s"] = round(duration_s, 1)
-    await db()[CLIENTS].update_one(
-        {"_id": client_id},
-        {"$set": fields, "$inc": {"run_count": 1}},
-    )
-
-
-async def set_scheduler_enabled(client_id: str, enabled: bool) -> bool:
-    """Take a client in or out of the round-robin rotation. Persisted (not
-    just held in the engine's memory) so an admin's decision to park a
-    client survives a restart -- the engine's own rotation is rebuilt from
-    Mongo once per lap, which is where this is read."""
-    res = await db()[CLIENTS].update_one(
-        {"_id": client_id}, {"$set": {"scheduler_enabled": enabled}},
-    )
-    if res.matched_count == 0:
-        raise NotFoundError(f"client {client_id!r} not found")
-    return enabled
 
 
 async def delete(client_id: str) -> dict:

@@ -469,6 +469,8 @@ async function runEntry(entry: ScheduleEntry): Promise<void> {
       // behave identically.
       const wanted = client?.scheduler_platforms || [];
       const scope = client?.scheduler_keyword_scope || "";
+      const fbTabs = client?.scheduler_facebook_tabs || [];
+      const budgetMinutes = client?.scheduler_budget_minutes || 0;
       // Narrowed by sending an EMPTY list for the excluded type rather than
       // filtering afterwards, so the per-type caps below only ever apply to
       // keywords genuinely part of this sweep -- the same thing the Clients
@@ -481,6 +483,8 @@ async function runEntry(entry: ScheduleEntry): Promise<void> {
         platform_limits_individual: client?.platform_limits_individual,
         platform_limits_domain: client?.platform_limits_domain,
         platform_tab_limits: client?.platform_tab_limits,
+        facebook_tabs: fbTabs.length ? fbTabs : undefined,
+        max_seconds: budgetMinutes > 0 ? budgetMinutes * 60 : undefined,
       });
       jobId = res.job_id;
       patchEntry(entry.client_id, { job_id: jobId, message: "sweeping…" });

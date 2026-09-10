@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterator, Optional
 from urllib.parse import quote
 
-from backend.shared.extraction import ExtractionResult, run_strategies
+from backend.shared.extraction import run_strategies
 from backend.shared.avatars import hd_picture_url, looks_like_placeholder
 from backend.shared.models.row import Row
 from backend.shared.text import iter_dicts
@@ -659,9 +659,6 @@ class Sweep:
     # had to stand in. Carried onto each Row so a card can say where it came
     # from rather than implying every field was equally well sourced.
     source: str = "graphql"
-    # the full blame trail (see shared/extraction.py) when any strategy
-    # failed, so discovery_service can put file+line into the incident/email
-    extraction: Optional["ExtractionResult"] = None
 
     def summary(self) -> str:
         """One-line log form. Names `source` whenever it is not the
@@ -903,7 +900,6 @@ class Discovery:
                 ],
             )
             out.users = chain.value or []
-            out.extraction = chain
             if chain.degraded:
                 out.source = "dom"
 
@@ -931,27 +927,5 @@ class Discovery:
                 pass
             out.seconds = time.time() - started
         return out
-
-    async def run(
-        self, keywords: list[str], tabs: Optional[list[str]] = None
-    ) -> list[Sweep]:
-        """X has one people-search surface, so `tabs` is accepted and ignored."""
-        sem = asyncio.Semaphore(max(1, self.a.concurrency))
-
-        async def one(i: int, keyword: str) -> tuple[int, Sweep]:
-            """One keyword sweep, holding a concurrency slot and starting
-            staggered. Returns its index so the caller can restore the
-            original keyword order."""
-            async with sem:
-                await asyncio.sleep(i % max(1, self.a.concurrency) * random.uniform(1.5, 3.0))
-                s = await self.sweep(keyword)
-                print(
-                    f"  [x/people] {keyword!r}: {s.summary()} ({s.seconds:.1f}s)",
-                    file=sys.stderr,
-                )
-                return i, s
-
-        pairs = await asyncio.gather(*(one(i, k) for i, k in enumerate(keywords)))
-        return [s for _, s in sorted(pairs, key=lambda p: p[0])]
 
 

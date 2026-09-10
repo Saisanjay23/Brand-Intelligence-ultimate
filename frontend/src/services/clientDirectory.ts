@@ -66,6 +66,13 @@ export function findClient(clientId: string): Client | undefined {
   return state.clients.find((c) => c.client_id === clientId);
 }
 
+// Synchronously patch one client in the local cache, immediately emitting
+// to all subscribers so the UI and runner reflect changes in real time.
+export function patchClientLocal(clientId: string, patch: Partial<Client>): void {
+  const next = state.clients.map((c) => (c.client_id === clientId ? { ...c, ...patch } : c));
+  setState({ clients: next });
+}
+
 // A client's two curated keyword lists. These come off the client's own
 // record now; they used to be mirrored into localStorage by whichever save
 // happened last, which meant a browser that had never saved a client had no

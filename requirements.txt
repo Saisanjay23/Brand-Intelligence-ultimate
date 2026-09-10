@@ -18,7 +18,6 @@ fastapi>=0.110
 uvicorn[standard]>=0.27
 pydantic>=2.5
 pydantic-settings>=2.2
-prometheus-client>=0.20
 aiohttp>=3.9
 python-multipart>=0.0.9
 httpx>=0.27.0
@@ -41,8 +40,6 @@ openpyxl>=3.1
 # better name matching; the tool falls back to difflib without it
 rapidfuzz>=3.6
 
-# scheduled per-client discovery/analysis cron
-apscheduler>=3.10
 
 # --- development only ---
 pytest>=8.0

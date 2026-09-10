@@ -32,7 +32,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
-import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -569,31 +568,4 @@ class Discovery:
         finally:
             out.seconds = time.time() - started
         return out
-
-    async def run(self, keywords: list[str], tabs=None) -> list[Sweep]:
-        """Sequential on purpose: one session, and search is what gets limited."""
-        self.tg = Telegram(self.a)
-        sweeps: list[Sweep] = []
-        try:
-            await self.tg.start()
-            if not await self.tg.check_session():
-                raise NotAuthorised("telegram session rejected -- not authenticated")
-            for i, keyword in enumerate(keywords):
-                s = await self.sweep(keyword)
-                sweeps.append(s)
-                print(
-                    f"  [telegram] {keyword!r}: {s.summary()} ({s.seconds:.1f}s)",
-                    file=sys.stderr,
-                )
-                if s.stopped == "flood-wait":
-                    print(
-                        "  telegram asked us to slow down -- stopping the sweep",
-                        file=sys.stderr,
-                    )
-                    break
-                if i < len(keywords) - 1:
-                    await asyncio.sleep(2.0)  # unhurried between searches
-        finally:
-            await self.tg.stop()
-        return sweeps
 

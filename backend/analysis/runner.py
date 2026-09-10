@@ -1356,8 +1356,13 @@ class AnalysisRunner:
         Score column carried no information and an analyst could not tell a
         real logo match from an assumed one. These come from the Row's own
         resolved values (see shared/models/row.py), which is the point of
-        scraping the profile at all. `Original Name`/`Original feed` are
-        likewise filled from what the analyst typed instead of left blank.
+        scraping the profile at all. `Original Name` (legacy) and
+        `AssetName` (incident) both prefer `main_keyword` -- the PARENT
+        keyword this profile was found/validated under -- over whatever the
+        caller typed as `target_name`, which no current UI flow actually
+        collects ("Analyse Validated Profiles" doesn't send it, and the
+        paste-URLs form always sends an empty string), so `target_name`
+        alone left both columns permanently blank in practice.
         """
         platform_name = registry.display_name(it.platform)
         def yes_no(v):
@@ -1402,7 +1407,13 @@ class AnalysisRunner:
         # names and order are a fixed contract with what consumes the sheet
         # downstream -- a value can be blank, a column cannot go missing.
         it.legacy_row = {
-            "Original Name": job.target_name,
+            # Same priority as AssetName below: the parent keyword this
+            # profile was found/validated under, before whatever the caller
+            # typed as target_name (see _build_rows' own docstring for why
+            # that alone was never enough). "Original feed" has no keyword
+            # equivalent -- a feed URL, not a name -- so it stays exactly
+            # what the caller typed, blank included.
+            "Original Name": it.main_keyword or job.target_name,
             "Original feed": job.official_feed,
             "IMPERSONATED": it.url,
             "Profile name": it.profile_name,

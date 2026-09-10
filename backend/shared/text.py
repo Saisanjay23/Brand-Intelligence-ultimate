@@ -110,37 +110,6 @@ def epoch_to_dt(ts: Any) -> Optional[datetime]:
     return datetime.fromtimestamp(ts, timezone.utc)
 
 
-def parse_joined(raw: str) -> str:
-    """'June 2025' | 'July 16, 2026' -> ISO 'YYYY-MM' or 'YYYY-MM-DD'."""
-    raw = raw.strip().rstrip(".")
-    for fmt, out in (
-        ("%B %d, %Y", "%Y-%m-%d"),
-        ("%B %d %Y", "%Y-%m-%d"),
-        ("%b %d, %Y", "%Y-%m-%d"),
-        ("%B %Y", "%Y-%m"),
-        ("%b %Y", "%Y-%m"),
-    ):
-        try:
-            return datetime.strptime(raw, fmt).strftime(out)
-        except ValueError:
-            continue
-    return ""
-
-
-def fmt_created(iso: str) -> str:
-    """ISO -> 'Jun-25' (month-year) or 'DD-MM-YYYY' when a day is known."""
-    if not iso:
-        return ""
-    try:
-        if len(iso) == 7:
-            dt = datetime.strptime(iso, "%Y-%m")
-            return f"{MONTHS[dt.month - 1][:3]}-{dt.strftime('%y')}"
-        dt = datetime.strptime(iso, "%Y-%m-%d")
-        return dt.strftime("%d-%m-%Y")
-    except ValueError:
-        return iso
-
-
 def parse_normalized_url(url: str, extra_schemes: tuple[str, ...] = ()) -> Optional[ParseResult]:
     """Strip whitespace/quotes and default to an https:// scheme; the
     common preamble every platform's own `normalize_url()` builds on before

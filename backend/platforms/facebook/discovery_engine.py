@@ -52,7 +52,7 @@ from typing import Any, Iterable, Iterator, Optional
 from urllib.parse import parse_qs, quote, urlparse
 
 from backend.platforms.scan_options import cancelled
-from backend.shared.extraction import ExtractionResult, run_strategies
+from backend.shared.extraction import run_strategies
 from backend.shared.avatars import looks_like_placeholder
 from backend.shared.models.hit import Hit, hit_to_row
 from backend.shared.models.row import Row
@@ -538,7 +538,6 @@ def rank_hits(hits: Iterable[Hit]) -> list[Hit]:
 
     Deliberately NOT sorted by `hit.rank`: rank restarts at 0 in every
     pagination response, so sorting by it interleaves page 3 into page 1.
-    See docs/adr/0009-render-fidelity-in-discovery-results.md.
     """
     return sorted(hits, key=lambda h: h.source != "graphql")
 
@@ -732,7 +731,6 @@ class Sweep:
     # "graphql" normally; "dom" when the search payload yielded nothing and
     # the rendered results page had to stand in
     source: str = "graphql"
-    extraction: Optional["ExtractionResult"] = None
     # What the resolve phase cost: how many candidates got a profile-page
     # visit, and how long that phase took. Recorded because resolve is both
     # the slowest part of a sweep and its biggest detection surface, so
@@ -1661,7 +1659,6 @@ class Discovery:
             # Facebook's own statement of that. Kept as a count
             # (out.unshown, in summary()) so the gap stays observable if
             # Facebook's filtering behaviour shifts.
-            # See docs/adr/0009-render-fidelity-in-discovery-results.md.
             unshown = processed_ids - by_id.keys()
 
             # one cheap profile-page visit per reconciled id to recover a
@@ -1855,7 +1852,6 @@ class Discovery:
             # would have ranked), and let the stable sort keep every other
             # tie where it landed. Deliberately NOT by `hit.rank`: rank
             # resets per response, so using it interleaves pages.
-            # See docs/adr/0009-render-fidelity-in-discovery-results.md.
             # GraphQL payload first, rendered page second. The DOM pass only
             # runs when the payload produced nothing at all, so a healthy
             # sweep never pays for it, and a doc-id rotation degrades to
@@ -1887,7 +1883,6 @@ class Discovery:
                     ("dom:results-page", lambda: dom_search_hits(page, keyword, tab)),
                 ],
             )
-            out.extraction = chain
             if chain.degraded:
                 out.source = "dom"
             # THE LAST OF THE THREE CAP CHECKS, and the only one that can
@@ -1904,25 +1899,4 @@ class Discovery:
                 pass
             out.seconds = time.time() - started
         return out
-
-    async def run(self, keywords: list[str], tabs: list[str]) -> list[Sweep]:
-        """Every keyword on every tab. Keywords are independent, so they overlap."""
-        jobs = [(k, t) for k in keywords for t in tabs]
-        sem = asyncio.Semaphore(max(1, self.a.concurrency))
-
-        async def one(i: int, keyword: str, tab: str):
-            """One (keyword, tab) sweep, holding a concurrency slot and
-            starting staggered so several tabs do not hit Facebook in the
-            same instant."""
-            async with sem:
-                await asyncio.sleep(i % max(1, self.a.concurrency) * 1.0)
-                s = await self.sweep(keyword, tab)
-                print(
-                    f"  [{tab:<6}] {keyword!r}: {s.summary()} ({s.seconds:.1f}s)",
-                    file=sys.stderr,
-                )
-                return i, s
-
-        pairs = await asyncio.gather(*(one(i, k, t) for i, (k, t) in enumerate(jobs)))
-        return [s for _, s in sorted(pairs, key=lambda p: p[0])]
 

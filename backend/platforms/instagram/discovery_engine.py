@@ -17,7 +17,6 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -25,7 +24,7 @@ from typing import Any, Iterator, Optional
 from urllib.parse import quote
 
 from backend.shared.avatars import extract_instagram_hd_avatar, looks_like_placeholder
-from backend.shared.extraction import ExtractionResult, run_strategies
+from backend.shared.extraction import run_strategies
 from backend.shared.models.row import Row
 from backend.shared.text import iter_dicts
 from backend.stealth.browser import Session
@@ -413,18 +412,6 @@ def about_country(body: str) -> str:
     return (m.group(1).strip() if m else "")
 
 
-def iter_search_users(blob: Any) -> Iterator[InstagramUser]:
-    """Users from a search payload, in result order."""
-    seen: set[str] = set()
-    for d in iter_dicts(blob):
-        node = d.get("user") if isinstance(d.get("user"), dict) else None
-        if node is None:
-            continue
-        user = user_from_node(node)
-        if user and user.username.lower() not in seen:
-            seen.add(user.username.lower())
-            yield user
-
 def iter_mobile_search_users(blob: Any) -> Iterator[InstagramUser]:
     """Users from a mobile search payload (`api/v1/users/search/`)."""
     seen: set[str] = set()
@@ -599,7 +586,6 @@ class Sweep:
     # "api" normally; "web-api" when the private mobile endpoint refused us
     # or stopped being parseable and the web client's endpoint stood in
     source: str = "api"
-    extraction: Optional["ExtractionResult"] = None
 
     def summary(self) -> str:
         """One-line log form. Names `source` whenever it is not the
@@ -694,6 +680,19 @@ class Discovery:
                 if new_users > 0:
                     out.pages += 1
 
+                if self.a.max_results and len(by_name) >= self.a.max_results:
+                    # Stop the instant the caller's own cap is satisfied --
+                    # same "cap:results" vocabulary the other platforms use
+                    # for this. Deliberately checked before computing the
+                    # next page_token/has_more and before the 2.5s pacing
+                    # sleep below: this used to be untested (max_pages alone
+                    # bounded the loop, defaulting to 10 full pages of up to
+                    # 100 users each regardless of any configured cap), so a
+                    # keyword capped at 5 results still ran up to 1,000
+                    # fetched users and ~22.5s of unconditional sleeps.
+                    out.stopped = "cap:results"
+                    break
+
                 # Check for pagination
                 has_more = data.get("has_more")
                 rank_token = data.get("rank_token")
@@ -750,7 +749,6 @@ class Discovery:
                     ],
                 )
                 out.users = chain.value or []
-                out.extraction = chain
                 if chain.degraded:
                     out.source = "web-api"
                     # the mobile leg failed, so whatever `stopped` recorded
@@ -771,29 +769,4 @@ class Discovery:
             out.seconds = time.time() - started
 
         return out
-
-    async def run(self, keywords: list[str], tabs=None) -> list[Sweep]:
-        """Every keyword, `self.a.concurrency` at a time, each staggered
-        by a couple seconds (see the sleep just below) to avoid firing a
-        burst of near-simultaneous search requests off one session --
-        `tabs` is accepted and ignored, Instagram search has no tab
-        concept the way Facebook's People/Pages/Groups does. LINKED TO:
-        called by discovery_service.py once per client's keyword batch."""
-        sem = asyncio.Semaphore(max(1, self.a.concurrency))
-
-        async def one(i: int, keyword: str) -> tuple[int, Sweep]:
-            """One keyword sweep, holding a concurrency slot. Returns its
-            index alongside the Sweep so the caller can restore order."""
-            async with sem:
-                # Initial delay to space out concurrent requests
-                await asyncio.sleep(i % max(1, self.a.concurrency) * 2.0)
-                s = await self.sweep(keyword)
-                print(
-                    f"  [instagram] {keyword!r}: {s.summary()} ({s.seconds:.1f}s)",
-                    file=sys.stderr,
-                )
-                return i, s
-
-        pairs = await asyncio.gather(*(one(i, k) for i, k in enumerate(keywords)))
-        return [s for _, s in sorted(pairs, key=lambda p: p[0])]
 

@@ -16,6 +16,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Iterator, Optional
 
+from backend.config.settings import settings
 from backend.shared.avatars import looks_like_placeholder
 from backend.shared.models.row import Row
 from backend.platforms.scan_options import captures_screenshot
@@ -865,6 +866,59 @@ def read_profile(row: Row, h: Harvest) -> None:
     read_verified(row, h)
 
 
+async def read_profile_adaptive(row: Row, h: Harvest) -> None:
+    """Last-resort adaptive schema healing for analysis fields.
+
+    Runs off the main asyncio thread via asyncio.to_thread with strict node and
+    time budgets. Only runs if standard multi-tier readers failed to extract
+    a field despite the entity payload being present.
+    """
+    if not settings.adaptive_healer_enabled or not h.ents:
+        return
+
+    from backend.adaptive import find_audience_count, find_display_name, staging_registry
+
+    # 1. Adaptive Audience / Followers recovery
+    if row.followers is None:
+        val, key, path = await asyncio.to_thread(find_audience_count, h.ents)
+        if val is not None and key and path:
+            row.followers = val
+            row.followers_exact = "yes"
+            row.mark("followers", f"adaptive-healed:{key}")
+            # read_counts() already concluded "not-published" (with its own
+            # NO_AUDIENCE_NOTE) whenever every standard tier missed -- correct
+            # given what it could see, but a healed value proves it wrong.
+            # Retract both, or the row ends up asserting "publishes no
+            # audience count" right next to a follower number.
+            if NO_AUDIENCE_NOTE in row.notes:
+                row.notes = "; ".join(
+                    n for n in row.notes.split("; ") if n and n != NO_AUDIENCE_NOTE
+                )
+            # Track candidate in staging registry (human-gated, no blind promotion)
+            staging_registry.record_match(
+                platform="facebook",
+                field_name="followers",
+                matched_key=key,
+                json_path=path,
+                sample_value=val,
+            )
+
+    # 2. Adaptive Display Name recovery
+    if not row.profile_name:
+        val_name, key_name, path_name = await asyncio.to_thread(find_display_name, h.ents)
+        if val_name and key_name and path_name:
+            row.profile_name = val_name
+            row.name_score = name_score(row.profile_name, row.target)
+            row.mark("name", f"adaptive-healed:{key_name}")
+            staging_registry.record_match(
+                platform="facebook",
+                field_name="name",
+                matched_key=key_name,
+                json_path=path_name,
+                sample_value=val_name,
+            )
+
+
 # Scraper
 # Drives a logged-in browser over Facebook profiles and reads their fields.
 #
@@ -1376,6 +1430,7 @@ class Scraper:
                 row.entity_type = "page"
 
             read_profile(row, hs)
+            await read_profile_adaptive(row, hs)
             await self.screenshot(page, row)
 
             # Payload timestamps first (read_profile -> read_last_post,

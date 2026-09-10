@@ -239,21 +239,6 @@ def flat_keywords(groups: dict[str, list[dict]]) -> dict[str, list[str]]:
     return {FLAT_FIELD[t]: parents_of(groups, t) for t in KEYWORD_TYPES}
 
 
-def search_terms(groups: dict[str, list[dict]], kw_type: str) -> list[str]:
-    """Every string that will actually be typed into a platform's search
-    box for one keyword type: the parent itself plus all of its child
-    permutations. Used for previews/counts; the sweep itself wants
-    `build_plans`, which also carries the match targets."""
-    out: list[str] = []
-    for group in groups.get(kw_type, []):
-        parent = group.get("parent")
-        children = group.get("children") or []
-        if parent:
-            out.append(parent)
-        out.extend(children)
-    return _dedup(out)
-
-
 def match_terms_for(parent: str, children: Optional[Iterable[str]] = None) -> tuple[str, ...]:
     """Every string a hit found under `parent` is scored against: the parent
     and its children.
@@ -496,51 +481,3 @@ def best_match(
     )
 
 
-def resolve_parent(plan: KeywordPlan, name: str, scorer) -> tuple[str, int]:
-    """`(parent to file this hit under, its name score)`.
-
-    Ordinarily a plan has exactly one target and this just scores the name
-    against that target's terms. The interesting case is a permutation an
-    analyst listed under two different parents (see `build_plans`): the hit
-    is filed under whichever parent's own terms it actually resembles,
-    rather than arbitrarily under whichever group happened to be saved
-    first.
-
-    Within one target the BEST-scoring term wins but the PARENT is still
-    what is returned. With asset names removed each target now has exactly
-    one term (its own parent), so that inner loop is a formality today --
-    kept because the outer loop over multiple TARGETS, which is the case
-    that actually matters, shares it.
-
-    `scorer` is injected (rather than importing `shared.text.name_score`
-    here) purely so this stays a pure function testable without pulling in
-    the text-matching stack.
-    """
-    best_parent, best_score = plan.parent, -1
-    for target in plan.targets or (MatchTarget(plan.search, (plan.search,)),):
-        for term in target.terms or (target.parent,):
-            try:
-                score = int(scorer(name or "", term))
-            except Exception:
-                score = 0
-            if score > best_score:
-                best_parent, best_score = target.parent, score
-    return best_parent, max(best_score, 0)
-
-
-def match_any(plan: KeywordPlan, name: str, predicate) -> bool:
-    """True when `name` satisfies `predicate` against ANY match term of any
-    of this plan's targets -- the boolean counterpart to `resolve_parent`,
-    used for `name_exact_run` (shared/text.py::contiguous_letters_match).
-
-    Same reason for injecting `predicate` as `resolve_parent` injects
-    `scorer`: keeps this module free of the text-matching stack.
-    """
-    for target in plan.targets or (MatchTarget(plan.search, (plan.search,)),):
-        for term in target.terms or (target.parent,):
-            try:
-                if predicate(name or "", term):
-                    return True
-            except Exception:
-                continue
-    return False

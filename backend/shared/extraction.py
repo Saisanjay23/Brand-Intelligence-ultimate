@@ -35,7 +35,6 @@ import inspect
 import linecache
 import traceback
 from dataclasses import dataclass, field
-from importlib import import_module
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional, Sequence, Union
 
@@ -182,39 +181,6 @@ def _definition_site(fn: Callable) -> tuple[str, int, str, str]:
         return (_repo_relative(file) if file else ""), lineno, name, src
     except (OSError, TypeError):
         return "", 0, getattr(fn, "__name__", ""), ""
-
-
-def locate(target: str) -> str:
-    """"backend.platforms.twitter.analysis_engine:Scraper.fill" ->
-    "backend/platforms/twitter/analysis_engine.py:271 in Scraper.fill()".
-
-    Resolved live, by import, every time an alert is built. The obvious
-    alternative -- writing the line number into the alert text by hand --
-    is wrong within a week: any edit above that function shifts it, and an
-    alert that points at the wrong line is worse than one that points at
-    no line, because it costs the reader the time to discover it lied.
-    Falls back to the plain module path if the symbol has been renamed or
-    moved, so a stale entry degrades to "less precise" instead of raising
-    inside the alerting path.
-    """
-    module_path, _, qualname = target.partition(":")
-    file_hint = module_path.replace(".", "/") + ".py"
-    if not qualname:
-        return file_hint
-    try:
-        obj: Any = import_module(module_path)
-        for part in qualname.split("."):
-            obj = getattr(obj, part)
-        # staticmethod/classmethod objects only expose the function via
-        # __func__ when reached through the class dict; getattr already
-        # unwraps those, but a decorated method still needs it.
-        obj = getattr(obj, "__func__", obj)
-        file, line, name, _src = _definition_site(obj)
-        if not file:
-            return f"{file_hint} in {qualname}()"
-        return f"{file}:{line} in {name or qualname}()"
-    except (ImportError, AttributeError, TypeError):
-        return f"{file_hint} in {qualname}() (symbol not found -- it may have been renamed)"
 
 
 async def run_strategies(

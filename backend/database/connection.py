@@ -1,8 +1,11 @@
 """Mongo connection lifecycle, the one place a Motor client is created.
 
 One database (`settings.mongo_db_name`), collections `clients`, `profiles`,
-`sessions`, `session_health`, `session_item_health`, `incidents`, see
-docs/adr/0004 for why this isn't split one-database-per-platform.
+`sessions`, `session_health`, `session_item_health`, `incidents`. Not split
+one-database-per-platform: a profile's platform is just a field on one
+document (see `database/repositories/profile_repository.py`), so "every
+profile for this client" is one query against one collection instead of a
+fan-out across N per-platform databases.
 
 Naive (non-tz-aware) datetimes are used deliberately: PyMongo without
 tz_aware hands back naive-but-UTC-VALUED datetimes, and `database/repositories/profile_repository.py`

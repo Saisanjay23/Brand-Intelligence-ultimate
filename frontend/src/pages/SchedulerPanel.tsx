@@ -79,10 +79,10 @@ const PANE: React.CSSProperties = {
   background: "var(--bg-surface)",
   border: "1px solid var(--border-subtle)",
   borderRadius: "12px",
-  padding: "14px 16px",
+  padding: "16px 18px",
   display: "flex",
   flexDirection: "column",
-  minHeight: "420px",
+  minHeight: "calc(100vh - 270px)",
 };
 
 const PANE_TITLE: React.CSSProperties = {
@@ -218,13 +218,13 @@ export function SchedulerPanel({ platforms }: { platforms: PlatformState[] }) {
     : `Run queue (${counts.pending})`;
 
   return (
-    <div style={{ padding: "24px", color: "var(--text-main, #f2f4f7)", maxWidth: "1200px", margin: "0 auto" }}>
+    <div style={{ color: "var(--text-main, #f2f4f7)", width: "100%", margin: 0, padding: 0 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "18px", flexWrap: "wrap", gap: "12px" }}>
         <div>
           <h1 style={{ fontSize: "22px", fontWeight: 700, color: "var(--text-primary, #fff)", margin: 0, letterSpacing: "-0.3px" }}>
             🔁 Scheduler
           </h1>
-          <p style={{ fontSize: "13px", color: "var(--text-muted, #98a2b3)", margin: "4px 0 0 0", maxWidth: "720px" }}>
+          <p style={{ fontSize: "13px", color: "var(--text-muted, #98a2b3)", margin: "4px 0 0 0", maxWidth: "960px" }}>
             Drag clients from the left into the run queue, then press Run. Discovery sweeps them one
             at a time, top to bottom — never two at once, so no two clients compete for the same
             platform session. You can keep working elsewhere while it runs; leaving this tab does not
@@ -286,7 +286,7 @@ export function SchedulerPanel({ platforms }: { platforms: PlatformState[] }) {
         </div>
       )}
 
-      <div style={{ display: "grid", gridTemplateColumns: "minmax(240px, 1fr) minmax(320px, 1.4fr)", gap: "16px", alignItems: "start" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "320px 1fr", gap: "18px", alignItems: "start", width: "100%" }}>
         {/* ─────────────────────────── saved clients ─────────────────────── */}
         <div style={PANE}>
           <div style={PANE_TITLE}>Saved clients ({available.length})</div>
@@ -305,7 +305,7 @@ export function SchedulerPanel({ platforms }: { platforms: PlatformState[] }) {
             />
           </div>
 
-          <div style={{ display: "flex", flexDirection: "column", gap: "6px", overflowY: "auto", maxHeight: "460px" }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: "6px", overflowY: "auto", maxHeight: "calc(100vh - 350px)", minHeight: "350px" }}>
             {available.length === 0 && (
               <div style={{ fontSize: "12px", color: "var(--text-dim)", padding: "16px 4px", textAlign: "center", lineHeight: 1.6 }}>
                 {clients.length === 0
@@ -406,7 +406,7 @@ export function SchedulerPanel({ platforms }: { platforms: PlatformState[] }) {
               <span style={{ fontSize: "12px" }}>They will be swept in the order you drop them.</span>
             </div>
           ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: "6px", overflowY: "auto", maxHeight: "460px" }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: "8px", overflowY: "auto", maxHeight: "calc(100vh - 350px)", minHeight: "350px" }}>
               {state.entries.map((entry, i) => (
                 <QueueRow
                   key={entry.client_id}

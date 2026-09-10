@@ -1,12 +1,13 @@
 """The risk rubric. One definition, two entry points.
 
 `compute_score` drives the tool's internal `risk_score`/`priority`;
-`compute_incident_risk_score` drives the `riskRating` on a client-facing
-published incident. They differ only in how each learns whether the
+`compute_incident_risk_score` drives the `RiskScore` on an exported
+incident/takedown-report row (built in `analysis/runner.py`, see
+`it.incident_row`). They differ only in how each learns whether the
 account is active -- one from a last-post date, one from a flag its caller
 already resolved -- and both then run the SAME cascade below. They were
-once two implementations of one spec and drifted; see
-docs/adr/0008-one-risk-rubric.md.
+once two implementations of one spec and drifted, so this file is
+deliberately the one place that cascade is written down.
 
     logo match + name match:
         + location + active (posted within ACTIVE_WINDOW_DAYS)  -> 9
@@ -161,12 +162,12 @@ def compute_incident_risk_score(
     last_post_iso: Optional[str],
     is_active: bool,
 ) -> int:
-    """The `riskRating` written onto a published incident.
+    """The `RiskScore` written onto an exported incident/takedown-report row.
 
-    Both booleans arrive ALREADY RESOLVED -- `incident_publisher` runs the
-    analyst's call, the validated-profile default and the scraper's signal
-    through `resolve_match` before calling this -- so undoing a match moves
-    the published rating down the same cascade.
+    `has_logo`/`has_name_match` are expected ALREADY RESOLVED -- see
+    `resolve_match` above, which folds an analyst's explicit call and the
+    validated-profile default together with the scraper's own signal -- so
+    undoing a match moves the exported rating down the same cascade.
 
     `is_active` is likewise resolved by the caller (it reads the same
     ACTIVE_WINDOW_DAYS defined above), so dormancy here means "a post date

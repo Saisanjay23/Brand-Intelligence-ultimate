@@ -17,7 +17,6 @@ import random
 import weakref
 from datetime import datetime, timezone
 from typing import NamedTuple, Optional
-from urllib.parse import urlparse
 
 from backend.config.settings import settings
 from backend.database.repositories import session_repository as sessions_db

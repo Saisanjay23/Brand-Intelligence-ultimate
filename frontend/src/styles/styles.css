@@ -2444,6 +2444,54 @@ a:hover {
   gap: 5px;
   margin: 2px 0 8px;
 }
+
+.card-keywords-container {
+  position: relative;
+  display: inline-block;
+  margin: 2px 0 8px;
+}
+
+.card-keywords-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+}
+
+.card-keyword-more {
+  cursor: pointer;
+  background: rgba(136, 56, 221, 0.12) !important;
+  border-color: rgba(136, 56, 221, 0.3) !important;
+  color: var(--cyan) !important;
+}
+
+.card-keywords-popover {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  margin-bottom: 6px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  padding: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 220px;
+  max-width: 260px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  z-index: 10;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.2s, visibility 0.2s;
+  pointer-events: none;
+}
+
+.card-keywords-container:hover .card-keywords-popover {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
 .card-keyword-tag {
   font-size: 10px;
   font-weight: 600;

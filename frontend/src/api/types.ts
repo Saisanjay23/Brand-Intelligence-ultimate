@@ -75,6 +75,8 @@ export interface Client {
   // PUT /clients/{id}/scheduler-prefs, never by the Clients form.
   scheduler_platforms?: string[];
   scheduler_keyword_scope?: string;
+  scheduler_facebook_tabs?: string[];
+  scheduler_budget_minutes?: number;
 }
 
 // What the Clients form produces for one client. Formerly the request body

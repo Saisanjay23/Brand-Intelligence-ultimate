@@ -2,9 +2,7 @@
 `(client_id, platform, url)`. Every platform's discovery/analysis results
 land in the same collection, distinguished by a `platform` field, so
 "every profile for this client" is one query, not a fan-out across
-per-platform databases (see docs/adr/0004, the reasoning for a single
-shared document per profile is unchanged from the original design, just
-the physical storage got simpler).
+per-platform databases.
 
 Writes are field-scoped on purpose: discovery must never blank the analysis
 fields of a profile it rediscovers, and an analyst's approve/reject must
@@ -262,11 +260,14 @@ EDITABLE = {
     # Reject, and validating means both matches hold by default, so these
     # stay unset until an analyst actually corrects one.
     "logo_match", "username_match",
-    # an analyst's hand-edits to the computed published-incident preview
-    # (see services/incident_publisher.py), flat dotted-path keys, merged
-    # into whatever's already stored rather than replacing it wholesale
-    # (see the special-casing in patch() below), so editing one field never
-    # clobbers another already-saved override.
+    # an analyst's hand-edits to the computed published-incident preview.
+    # The builder that used to read this (an incident-publishing service)
+    # was deleted with the old backend, along with `published_incident_
+    # repository.py`'s only caller -- this field is still written (flat
+    # dotted-path keys, merged into whatever's already stored rather than
+    # replacing it wholesale, see the special-casing in patch() below, so
+    # editing one field never clobbers another already-saved override) but
+    # nothing currently reads it back into a published incident.
     "incident_overrides",
     # THE GENUINE ACCOUNT, marked by an analyst -- the real brand or person,
     # not an impersonation of them. A sweep for "Gautam Adani" finds the real
@@ -821,13 +822,6 @@ async def existing_avatar_urls(client_id: str, platform: str, urls: list[str]) -
     return {doc["url"]: (doc.get("profile_image_url") or "") async for doc in cur if doc.get("url")}
 
 
-async def existing_avatar_shas(client_id: str, platform: str, urls: list[str]) -> set[str]:
-    """Returns the subset of URLs from `urls` that already have a non-empty
-    `avatar_sha` stored in this client's profile records."""
-    res = await existing_avatar_urls(client_id, platform, urls)
-    return set(res.keys())
-
-
 async def save_many(
     client_id: str, platform: str, phase: str, items: list[dict],
 ) -> tuple[int, int]:
@@ -872,18 +866,6 @@ async def get_by_ids(client_id: str, ids: list[str]) -> list[dict]:
         return []
     coll = db()[PROFILES]
     return [_stamp_utc_for_api(d) async for d in coll.find({"client_id": client_id, "_id": {"$in": oids}})]
-
-
-async def get_by_urls(client_id: str, platform: str, urls: list[str]) -> list[dict]:
-    """Raw profile docs matching a list of URLs for a specific client and platform."""
-    if not urls:
-        return []
-    coll = db()[PROFILES]
-    return [_stamp_utc_for_api(d) async for d in coll.find({
-        "client_id": client_id,
-        "platform": platform,
-        "$or": [{"url": {"$in": urls}}, {"urls": {"$in": urls}}],
-    })]
 
 
 def _build_query(
@@ -977,9 +959,10 @@ def _build_query(
             ]})
     if keyword_match_type and client_keywords is not None:
         # "was this found under one of the client's INDIVIDUAL-name keywords
-        # or one of its DOMAIN/brand keywords", the same classification
-        # services/incident_publisher.py uses to pick a category, done as a
-        # set-membership query rather than a stored per-profile field.
+        # or one of its DOMAIN/brand keywords" -- a set-membership query
+        # against the client's own saved keyword lists rather than a stored
+        # per-profile field, so a keyword moved between lists after the fact
+        # is reflected immediately instead of needing every profile rewritten.
         bucket = ("name_keywords" if keyword_match_type == "individual" else "domain_keywords")
         wanted = list(client_keywords.get(bucket) or [])
         # an empty configured list can never match anything, express that
@@ -1244,109 +1227,6 @@ async def find(
               "keywords": keyword_counts, "ages": age_counts,
               "validated_ages": validated_age_counts}
     return rows, total, counts
-
-
-async def urls_for(
-    client_id: str, platform: str, status: Optional[str] = None,
-    *, exclude_analysed: bool = False, with_keywords: bool = False,
-) -> "list[str] | list[tuple[str, list[str]]]":
-    """URLs an analysis run should visit.
-
-    `with_keywords=True` returns `(url, keywords)` pairs instead of bare
-    URLs -- `keywords` is the client keyword(s) this profile was actually
-    discovered under (see `save()`'s own `keyword` param, `$addToSet`'d
-    into this same field). analysis_service.py needs this to score each
-    profile against ITS OWN matched keyword; every caller used to pass an
-    empty target into every scrape instead (see that module's own comment
-    on the bug this exists to fix).
-
-    `exclude_analysed` means "skip what we have already READ", not "skip what
-    we have already attempted". A profile whose last attempt ended in
-    ERROR/CHECKPOINT/LOGIN_REQUIRED was never actually looked at, the
-    session was challenged, the proxy died, the page timed out, so it
-    stays in the queue.
-
-    Before this distinction existed, any transient failure wrote
-    `phase=analysis` and the profile was excluded from every future run:
-    an approved impersonation candidate could silently drop out of the
-    pipeline for good on one network blip, with nothing anywhere reporting
-    that it had. `analysis_attempts` bounds the retry so a genuinely dead
-    URL still stops eventually (MAX_ANALYSIS_ATTEMPTS) rather than
-    consuming real page loads on every catch-up sweep forever.
-    """
-    q: dict[str, Any] = {"client_id": client_id, "platform": platform}
-    if status:
-        q["status"] = status
-    if exclude_analysed:
-        q["$or"] = [
-            {"phase": {"$ne": PHASE_ANALYSIS}},
-            {
-                "analysis_status": {"$in": list(RETRYABLE_ANALYSIS_STATUSES)},
-                "analysis_attempts": {"$lt": MAX_ANALYSIS_ATTEMPTS},
-            },
-            # NOTE: the old clause that re-queued profiles with
-            # analysis_complete=False was removed by design. Profiles with
-            # missing fields are now only re-analysed when an analyst
-            # manually triggers a re-run, not automatically on every
-            # catch-up sweep.
-        ]
-        # An analyst's manual "stop retrying" (see set_retry_state below)
-        # overrides every clause above, including the un-throttled first
-        # one. Without this AND, a profile an analyst had deliberately
-        # given up on (a dead account, a confirmed false positive still
-        # sitting at phase=discovery) would be swept right back in on the
-        # very next catch-up tick -- the retry queue UI's Stop button would
-        # have looked like it worked and done nothing.
-        q["retry_disabled"] = {"$ne": True}
-    if not with_keywords:
-        return [d["url"] async for d in db()[PROFILES].find(q, {"url": 1, "_id": 0}) if d.get("url")]
-    return [
-        (d["url"], [str(k) for k in (d.get("keywords") or [])])
-        async for d in db()[PROFILES].find(q, {"url": 1, "keywords": 1, "_id": 0})
-        if d.get("url")
-    ]
-
-
-async def stuck_analysis(client_id: str, platform: Optional[str] = None) -> list[dict]:
-    """Profiles that will NEVER be retried automatically -- either they
-    exhausted MAX_ANALYSIS_ATTEMPTS, or an analyst manually stopped them
-    (see set_retry_state). These are exactly the ones an analyst must be
-    told about, "approved but we could never read it" is a coverage gap,
-    not a result, and it is invisible unless something surfaces it."""
-    q: dict[str, Any] = {
-        "client_id": client_id, "status": "approved",
-        "$or": [
-            {
-                "analysis_attempts": {"$gte": MAX_ANALYSIS_ATTEMPTS},
-                # Either kind of exhaustion is a coverage gap worth an
-                # analyst's attention: never read at all (a retryable
-                # status), or read but permanently missing a field the
-                # platform publishes. Nested inside this $or element (not a
-                # second top-level "$or" key, which Python/Mongo would just
-                # overwrite) so it stays scoped to "AND attempts >= max".
-                "$or": [
-                    {"analysis_status": {"$in": list(RETRYABLE_ANALYSIS_STATUSES)}},
-                    {"analysis_complete": False},
-                ],
-            },
-            {"retry_disabled": True},
-        ],
-    }
-    if platform:
-        q["platform"] = platform
-    out = []
-    async for d in db()[PROFILES].find(q, {"url": 1, "platform": 1, "display_name": 1,
-                                            "analysis_status": 1, "analysis_attempts": 1,
-                                            "comments": 1, "retry_disabled": 1}):
-        d["id"] = str(d.pop("_id"))
-        # "manually stopped" is the more honest reason when that's why this
-        # row is here, an analyst reading "PARTIAL" or "" as the reason for
-        # a row THEY stopped would reasonably think the scraper is still
-        # the problem.
-        if d.pop("retry_disabled", False):
-            d["reason"] = "manually stopped"
-        out.append(d)
-    return out
 
 
 # Every state `field_report()` (shared/completeness.py) can hand back for
@@ -1734,111 +1614,6 @@ async def delete_matching(
     return {"deleted": res.deleted_count, "urls": urls, "screenshot_keys": screenshot_keys}
 
 
-async def delete_by_ids(ids: list[str]) -> int:
-    """An analyst's explicit, individually-chosen hard delete, the Live
-    Activity tab's DB browser. Unlike `cleanup_stale_pending`'s age/status
-    gate, this trusts the caller's own selection completely: a malformed id
-    is simply skipped (never a 404 for the whole batch) rather than failing
-    an otherwise-valid bulk delete over one bad entry."""
-    oids = []
-    for doc_id in ids:
-        try:
-            oids.append(ObjectId(doc_id))
-        except (InvalidId, TypeError):
-            continue
-    if not oids:
-        return 0
-    res = await db()[PROFILES].delete_many({"_id": {"$in": oids}})
-    return res.deleted_count
-
-
-async def cleanup_stale_pending(days: int = 60) -> int:
-    """Deletes discovery-phase profiles that have sat in `pending`, never
-    approved, never rejected, for `days` without a rediscovery bumping
-    `last_seen`. Safe to hard-delete: a pending profile has no analyst
-    decision recorded, so there is nothing for a future rediscovery to lose
-    by starting over. Scoped to `phase=discovery` on purpose, a
-    pending ANALYSIS-phase profile is either a fresh unpublished finding
-    (still actively in the publish-hold review window) or one that just
-    bounced back from `rejected` via the reconsideration path (see
-    `save()`'s RECONSIDER_FIELDS) and carries a `changes` diff the analyst
-    hasn't seen yet; neither should ever be silently deleted.
-
-    Deliberately NOT wired into an automatic cron, call this from an
-    operator-triggered endpoint or your own external scheduler so a
-    misconfigured `days` value can't silently run unattended.
-    """
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    res = await db()[PROFILES].delete_many({
-        "status": "pending", "phase": PHASE_DISCOVERY, "last_seen": {"$lt": cutoff},
-    })
-    return res.deleted_count
-
-
-# fields stripped by archive_stale_rejected(), the heavy, purely-cosmetic
-# or search-convenience ones. Never includes anything RECONSIDER_FIELDS
-# reads (display_name, has_logo) or anything the dedup match in save() needs
-# (client_id, platform, url, entity_id), an archived rejected profile
-# stays exactly as reconsider-able as an unarchived one.
-_ARCHIVE_STRIP_FIELDS = (
-    "profile_image_url", "keywords", "matched_keywords", "comments", "sources", "urls")
-
-
-async def archive_stale_rejected(days: int = 180) -> int:
-    """Shrinks (does NOT delete) rejected profiles untouched for `days`,
-    strips the signed CDN avatar URL (500-800 chars, and expired within
-    hours of being scraped anyway), the keywords array, free-text comments,
-    and provenance metadata, while keeping status/display_name/has_logo/url/
-    entity_id fully intact. A rediscovery of an archived profile still goes
-    through the exact same reconsideration check in save() as an
-    unarchived one, this only reduces document size, it never changes
-    triage behavior.
-
-    Trade-off, by design: an archived rejected profile's avatar renders as
-    a fallback initial-circle instead of its real photo if an analyst ever
-    filters back to it (ProfileAvatar already handles a missing image
-    gracefully, no error, no broken UI), and it drops out of the
-    discovery keyword-filter dropdown for keywords that were only ever
-    tracked in the now-stripped `keywords` array. Both are judged
-    acceptable specifically because this only ever touches profiles a
-    human already rejected AND then didn't revisit for `days`, opt-in,
-    not run automatically, so you're accepting this trade-off deliberately
-    each time you call it, not by default.
-    """
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    res = await db()[PROFILES].update_many(
-        {
-            "status": "rejected", "last_seen": {"$lt": cutoff},
-            # only bother touching a document that still has something to strip
-            "$or": [{f: {"$exists": True, "$ne": None}} for f in _ARCHIVE_STRIP_FIELDS],
-        },
-        {"$unset": {f: "" for f in _ARCHIVE_STRIP_FIELDS}},
-    )
-    return res.modified_count
-
-
-async def find_duplicate_identities(limit: int = 50) -> list[dict]:
-    """Groups of documents that violate what the unique indexes are meant to
-    guarantee. Reported by `GET /health/data-integrity` so a build-index
-    failure has an answer attached to it instead of just a stack trace."""
-    coll = db()[PROFILES]
-    out: list[dict] = []
-    for field, prefilter in (("url", {}), ("entity_id", {"entity_id": {"$nin": [None, ""]}})):
-        pipeline: list[dict] = [
-            {"$match": prefilter},
-            {"$group": {
-                "_id": {"client_id": "$client_id", "platform": "$platform", "value": f"${field}"},
-                "n": {"$sum": 1}, "ids": {"$push": "$_id"},
-            }},
-            {"$match": {"n": {"$gt": 1}}},
-            {"$limit": limit},
-        ]
-        async for d in coll.aggregate(pipeline):
-            out.append({
-                "on": field, **d["_id"],
-                "count": d["n"], "ids": [str(i) for i in d["ids"]],
-            })
-    return out
 
 
 async def ensure_indexes() -> None:

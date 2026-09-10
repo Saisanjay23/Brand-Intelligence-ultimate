@@ -44,6 +44,7 @@ from backend.analysis.runner import analysis_runner
 from backend.api.analysis import StartAnalysisAccepted
 from backend.api.models import (CancelResult, JobAccepted, JobStatus, Platform,
                                  PlatformState, PlatformStateList, SkippedInput)
+from backend.database.repositories import client_repository as clients_db
 from backend.database.repositories import profile_repository as profiles_db
 from backend.discovery.runner import _TERMINAL as _TERMINAL_STATUSES
 from backend.discovery.runner import discovery_runner
@@ -604,6 +605,15 @@ async def list_profiles(
         None, max_length=40,
         description="profile | page | group | channel.",
     ),
+    keyword_match_type: Optional[Literal["individual", "domain"]] = Query(
+        None,
+        description="Only profiles found under one of this client's "
+                    "individual-name keywords, or one of its domain/brand "
+                    "keywords. Resolved server-side against the client's own "
+                    "saved keyword lists, so it survives pagination. A "
+                    "group_id with no saved client record matches nothing "
+                    "under this filter rather than silently matching every row.",
+    ),
     age: Optional[Literal["new", "old"]] = Query(
         None,
         description="Split by how recently the profile was first discovered: "
@@ -664,6 +674,20 @@ async def list_profiles(
             f"first_seen_from ({first_seen_from}) is not before first_seen_to "
             f"({first_seen_to}) -- that range cannot contain anything"
         )
+    # Resolved once per request, not per row: `keyword_match_type` asks
+    # "which of THIS CLIENT's two keyword buckets was this found under",
+    # which needs the client's own saved lists, not anything on the profile
+    # itself. A group_id with no saved client record (an ad-hoc sweep) gets
+    # empty buckets, which _build_query treats as an impossible clause --
+    # matching nothing is correct here, since there is no bucket to check
+    # against, and quietly falling back to "all" would make the filter lie.
+    client_keywords = None
+    if keyword_match_type:
+        client = await clients_db.try_get(group_id)
+        client_keywords = {
+            "name_keywords": (client or {}).get("name_keywords") or [],
+            "domain_keywords": (client or {}).get("domain_keywords") or [],
+        }
     docs, total, counts = await profiles_db.find(
         group_id, platform=platform.value if platform else None,
         status=_TO_DB_STATUS[status_.value] if status_ else None,
@@ -673,6 +697,7 @@ async def list_profiles(
         logo_matched=logo_matched, is_original=is_original,
         first_seen_from=seen_from, first_seen_to=seen_to,
         match_level=match_level, entity_type=entity_type,
+        keyword_match_type=keyword_match_type, client_keywords=client_keywords,
     )
     return DiscoveredProfilePage(
         items=[_to_profile(d) for d in docs], total=total, limit=limit, offset=offset,

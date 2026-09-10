@@ -107,3 +107,29 @@ def test_absent_optional_config_becomes_empty_not_none():
     assert out["platform_tab_limits"] == {}
     assert out["name_keywords"] == []
     assert out["domain_keywords"] == []
+
+
+def test_scheduler_fields_defaults():
+    from backend.database.repositories.client_repository import _to_out
+    doc = {"_id": "test-org", "name": "Test Org"}
+    client = _to_out(doc)
+    assert client["scheduler_platforms"] == []
+    assert client["scheduler_keyword_scope"] == ""
+    assert client["scheduler_facebook_tabs"] == []
+    assert client["scheduler_budget_minutes"] == 0
+
+    # Non-empty values
+    doc_configured = {
+        "_id": "test-org",
+        "name": "Test Org",
+        "scheduler_platforms": ["facebook"],
+        "scheduler_keyword_scope": "domain",
+        "scheduler_facebook_tabs": ["pages", "groups"],
+        "scheduler_budget_minutes": 25,
+    }
+    client_conf = _to_out(doc_configured)
+    assert client_conf["scheduler_platforms"] == ["facebook"]
+    assert client_conf["scheduler_keyword_scope"] == "domain"
+    assert client_conf["scheduler_facebook_tabs"] == ["pages", "groups"]
+    assert client_conf["scheduler_budget_minutes"] == 25
+

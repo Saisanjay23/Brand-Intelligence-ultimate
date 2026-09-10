@@ -21,9 +21,9 @@
 // hard cap on how many pending rows this can meaningfully page through.
 // Validated keeps true server-side pagination (no age split needed there).
 //
-// Filters -- keyword+search are server params; match level, entity type,
-// and Individual+Domain are applied client-side on whatever's loaded (see
-// each one's own comment below for why the backend can't do them).
+// Filters -- keyword, search, match level, entity type and Individual/Domain
+// are all server params now, on both the pending and validated loads, so
+// every filter this grid offers survives pagination.
 //
 // Export reuses POST /analysis/export/xlsx (backend/api/analysis.py) --
 // a generic "rows -> .xlsx" endpoint with no analysis-specific logic in
@@ -37,7 +37,7 @@ import { analysisApi } from "../api/analysisApi";
 import { discoveryApi } from "../api/discoveryApi";
 import type { DiscoveredProfile } from "../api/discoveryApi";
 import { useRefreshOnFocus } from "../hooks/useRefreshOnFocus";
-import { findClient, keywordCategories } from "../services/clientDirectory";
+import { findClient } from "../services/clientDirectory";
 
 import { confirmAction } from "../utils/confirmAction";
 import { download, rowsToCsv } from "../utils/download";
@@ -142,6 +142,63 @@ function MatchTermTag({ p }: { p: DiscoveredProfile }) {
     >
       🎯 {term}
     </span>
+  );
+}
+
+// CONDENSED KEYWORDS POPOVER.
+//
+// Shows the primary entity tag, the first keyword tag, and a "+N more" badge
+// if there are additional keywords. Hovering the container reveals a popover
+// with the complete list of tags. This prevents cards with dozens of keywords
+// from stretching and breaking the grid layout.
+function CardKeywordsPopover({ p }: { p: DiscoveredProfile }) {
+  const parents = new Set((p.keywords || []).map((k) => k.toLowerCase()));
+  const via = (p.matched_keywords || []).filter((k) => k && !parents.has(k.toLowerCase()));
+  const matchTerm = (p.match_term || "").trim();
+  const hasMatchTerm = matchTerm && !parents.has(matchTerm.toLowerCase());
+
+  const allStringTags = [
+    ...p.keywords.map(kw => ({ type: "keyword", text: kw })),
+    ...(hasMatchTerm ? [{ type: "match", text: matchTerm }] : []),
+    ...via.map(kw => ({ type: "via", text: kw }))
+  ];
+
+  if (allStringTags.length === 0 && !p.entity_type) return null;
+
+  const firstTag = allStringTags[0];
+  const remainingCount = Math.max(0, allStringTags.length - 1);
+
+  return (
+    <div className="card-keywords-container">
+      <div className="card-keywords-summary">
+        <EntityTypeTag p={p} />
+        {firstTag && (
+          <span 
+            className={`card-keyword-tag ${firstTag.type === 'match' ? 'card-keyword-tag-match' : firstTag.type === 'via' ? 'card-keyword-tag-via' : ''}`}
+            title={firstTag.type === 'keyword' ? `Filed under "${firstTag.text}"` : firstTag.type === 'match' ? `Graded against "${firstTag.text}"` : `Surfaced by the search term "${firstTag.text}"`}
+          >
+            {firstTag.type === 'keyword' ? `🔑 ${firstTag.text}` : firstTag.type === 'match' ? `🎯 ${firstTag.text}` : `🔎 ${firstTag.text}`}
+          </span>
+        )}
+        {remainingCount > 0 && (
+          <span className="card-keyword-tag card-keyword-more">
+            +{remainingCount} more
+          </span>
+        )}
+      </div>
+      {remainingCount > 0 && (
+        <div className="card-keywords-popover">
+          <EntityTypeTag p={p} />
+          {p.keywords.map((kw) => (
+            <span key={`pop-${kw}`} className="card-keyword-tag" title={`Filed under "${kw}"`}>
+              🔑 {kw}
+            </span>
+          ))}
+          <MatchTermTag p={p} />
+          <MatchedKeywordTags p={p} />
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -503,27 +560,16 @@ function ProfileCard({
         {p.followers != null && (
           <div style={{ fontSize: "12px", color: "var(--text-dim)" }}>{p.followers.toLocaleString()} followers</div>
         )}
-        {(!!p.keywords.length || !!p.matched_keywords?.length || !!p.match_term || !!p.entity_type) && (
-          <div className="card-keyword-tags">
-            <EntityTypeTag p={p} />
-            {p.keywords.map((kw) => (
-              <span key={kw} className="card-keyword-tag" title={`Filed under "${kw}"`}>
-                🔑 {kw}
-              </span>
-            ))}
-            <MatchTermTag p={p} />
-            <MatchedKeywordTags p={p} />
-          </div>
-        )}
+        <CardKeywordsPopover p={p} />
         {onValidate && (
-          <div className="card-actions-row" style={{ display: "flex", gap: "8px", marginTop: "8px" }}>
+          <div className="card-actions-row" style={{ display: "flex", gap: "8px", marginTop: "auto" }}>
             <button className="btn-accept" disabled={busy} onClick={(e) => { stop(e); onValidate(p.id); }}>
               ✅ Validate
             </button>
           </div>
         )}
         {onUnvalidate && (
-          <div className="card-actions-row" style={{ display: "flex", gap: "8px", marginTop: "8px" }}>
+          <div className="card-actions-row" style={{ display: "flex", gap: "8px", marginTop: "auto" }}>
             <button
               className="btn-reject"
               disabled={busy}
@@ -795,18 +841,18 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
 
   // Any filter (or tab) changing resets to page 1.
   //
-  // `matchLevel` and `entityType` were missing from this list, and they are
-  // SERVER-side params (`match_level`/`entity_type`), so changing one changed
-  // the result set while the offset stayed put: picking "High Match" from
-  // page 7 of the unfiltered list asked the server for rows 168-195 of a set
-  // that no longer had that many, and the grid came back empty. To the
-  // analyst that reads as "the filter did nothing" -- the reported symptom.
-  // `groupId` belongs here for the same reason: a different client is an
-  // entirely different dataset.
+  // `matchLevel`, `entityType` and `keywordMatchType` were missing from this
+  // list, and they are SERVER-side params (`match_level`/`entity_type`/
+  // `keyword_match_type`), so changing one changed the result set while the
+  // offset stayed put: picking "High Match" from page 7 of the unfiltered
+  // list asked the server for rows 168-195 of a set that no longer had that
+  // many, and the grid came back empty. To the analyst that reads as "the
+  // filter did nothing" -- the reported symptom. `groupId` belongs here for
+  // the same reason: a different client is an entirely different dataset.
   useEffect(() => {
     setOffset(0);
   }, [tab, validatedAge, logoOnly, originalFilter, seenFrom, keywordFilter,
-      search, pageSize, platform, matchLevel, entityType, groupId]);
+      search, pageSize, platform, matchLevel, entityType, keywordMatchType, groupId]);
 
   // REQUEST SEQUENCING. Both lists are fetched by an effect keyed on the
   // filter state, and a single analyst action can legitimately fire two
@@ -834,6 +880,7 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
         group_id: groupId, platform: platform || undefined, status: "pending",
         keyword: keywordFilter || undefined, search: search || undefined,
         match_level: matchLevel || undefined, entity_type: entityType || undefined,
+        keyword_match_type: keywordMatchType || undefined,
         // On the Validated tab this call exists only to keep the New/Old
         // badges truthful, so it asks for one row and reads `counts`.
         age: tab === "validated" ? undefined : tab,
@@ -853,7 +900,7 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
     } finally {
       if (ticket === pendingSeq.current) setLoadingPending(false);
     }
-  }, [groupId, platform, keywordFilter, search, matchLevel, entityType, tab, effectivePageSize, offset, logoOnly, originalFilter, seenFrom]);
+  }, [groupId, platform, keywordFilter, search, matchLevel, entityType, keywordMatchType, tab, effectivePageSize, offset, logoOnly, originalFilter, seenFrom]);
 
   const loadValidated = useCallback(async () => {
     const ticket = ++validatedSeq.current;
@@ -862,6 +909,13 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
       const res = await discoveryApi.listProfiles({
         group_id: groupId, platform: platform || undefined, status: "validated",
         keyword: keywordFilter || undefined, search: search || undefined,
+        // Server-side, same as the pending tabs. This used to be missing on
+        // this tab specifically: match_level/entity_type were sent on
+        // loadPending but not here, so "High Match Only" on the Validated
+        // tab silently filtered only the current page while the displayed
+        // total still reflected every validated row.
+        match_level: matchLevel || undefined, entity_type: entityType || undefined,
+        keyword_match_type: keywordMatchType || undefined,
         // Server-side, so the split holds across pages. `counts.validated_ages`
         // comes back with THIS filter dropped, so the badge for the tab the
         // analyst is not looking at is still the true total.
@@ -888,7 +942,7 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
     } finally {
       if (ticket === validatedSeq.current) setLoadingValidated(false);
     }
-  }, [groupId, platform, keywordFilter, search, effectivePageSize, offset, validatedAge, logoOnly, originalFilter, seenFrom]);
+  }, [groupId, platform, keywordFilter, search, matchLevel, entityType, keywordMatchType, effectivePageSize, offset, validatedAge, logoOnly, originalFilter, seenFrom]);
 
   // Imperative use only (e.g. after a bulk delete) -- NOT an effect
   // dependency anywhere, see the two load effects below for why: bundling
@@ -940,33 +994,19 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [groupId, platform, keywordFilter, search, tab, refreshKey, seenFrom]);
 
-  // Individual/Domain classification, from this client's OWN record in
-  // the database -- its two curated keyword lists, matched against each
-  // profile's keywords[] case-insensitively. This used to read a
-  // localStorage mirror written by whichever browser last saved the
-  // client, so a machine that had never saved it could not classify
-  // anything.
-  const { individual: individualKw, domain: domainKw } = keywordCategories(groupId);
-  const individualSet = new Set(individualKw.map((k) => k.toLowerCase()));
-  const domainSet = new Set(domainKw.map((k) => k.toLowerCase()));
-  const matchesCategory = (p: DiscoveredProfile, cat: "individual" | "domain"): boolean => {
-    const set = cat === "individual" ? individualSet : domainSet;
-    return p.keywords.some((kw) => set.has(kw.toLowerCase()));
-  };
+  // match_level/entity_type/keyword_match_type (Individual/Domain) are all
+  // sent as server params on both loads above (see loadPending/
+  // loadValidated) -- every filter this grid offers is resolved server-side,
+  // before limit/offset, so it survives pagination instead of only ever
+  // being applied to whatever page happened to be loaded while the
+  // server-reported `total` stayed unfiltered. That mismatch is what used to
+  // make "High Match Only" look like it silently dropped rows past page 1.
 
-  // Client-side only -- the backend has no match-level/entity-type/
-  // keyword-category filter param.
-  const clientFilter = (p: DiscoveredProfile): boolean => {
-    if (matchLevel && matchLevelOf(p) !== matchLevel) return false;
-    if (entityType && p.entity_type !== entityType) return false;
-    if (keywordMatchType && !matchesCategory(p, keywordMatchType)) return false;
-    return true;
-  };
-
-  // All three tabs are now server-paged: `pendingItems` IS the current page
-  // of the active age tab, not a capped fetch to be split and sliced here.
-  const validatedItemsAll = (validatedPage?.items || []).filter(clientFilter);
-  const displayed = tab === "validated" ? validatedItemsAll : (pendingItems || []).filter(clientFilter);
+  // All three tabs are now server-paged: `pendingItems`/`validatedPage.items`
+  // ARE the current page of the active tab, not a capped fetch to be split
+  // and filtered here.
+  const validatedItemsAll = validatedPage?.items || [];
+  const displayed = tab === "validated" ? validatedItemsAll : (pendingItems || []);
 
   const total =
     tab === "new" ? ageCounts.new

@@ -33,7 +33,8 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8000
 
-    # storage, one database, not one-per-platform (see docs/adr/0004)
+    # storage, one database, not one-per-platform -- see
+    # database/connection.py's module docstring for why
     mongo_uri: str = "mongodb://localhost:27017"
     mongo_db_name: str = "brand_intelligence"
 
@@ -55,11 +56,13 @@ class Settings(BaseSettings):
     # at once should expect Telegram specifically to fight over this file.
     # Every other platform is unaffected (Mongo-backed, not file-backed).
     session_blob_path: Path = ROOT / "session"
-    # Fallback evidence directory for the STANDALONE engine only
-    # (`backend/engine/`, which deliberately runs with no MongoDB, see its
-    # own README) when a caller doesn't pass `--evidence-dir`. The normal API
-    # path (this process, `backend/main.py`) stores evidence screenshots in
-    # Mongo GridFS instead, see database/repositories/evidence_repository.py
+    # The legacy pre-GridFS evidence directory: where evidence screenshots
+    # lived on disk before they moved into Mongo. Not written to anymore --
+    # read only by the one-off migration script
+    # (database/migrations/migrate_evidence_to_gridfs.py) that moves
+    # whatever is still here into GridFS. The normal API path (this process,
+    # `backend/main.py`) stores evidence screenshots in Mongo GridFS
+    # directly, see database/repositories/evidence_repository.py
     #, specifically so captures live alongside the rest of this engine's
     # data rather than as files on one server's disk.
     evidence_path: Path = ROOT / "evidence"
@@ -83,21 +86,13 @@ class Settings(BaseSettings):
     # json.loads() the raw env value for any list-typed field BEFORE
     # _split_csv below ever runs, and crashes the whole process on startup
     # the moment .env has a plain non-JSON value here (exactly what
-    # write_env() writes, see services/settings_service.py).
+    # write_env(), below in this file, writes).
     alert_emails: Annotated[list[str], NoDecode] = Field(default_factory=list)
     alert_from: str = "alerts@brand-intelligence.local"
 
     # pacing, the single most important knob for staying unremarkable
     request_timeout_sec: int = 45
     analysis_delay_sec: float = 2.5
-    # Declared but NOT read anywhere, and the file it used to name
-    # (analysis_service.py) no longer exists. Analysis concurrency is
-    # per-platform rather than one global number -- see
-    # _PLATFORM_CONCURRENCY and _PLATFORM_INTER_BATCH_DELAY in
-    # analysis/runner.py, which are what actually decide how many of a
-    # platform's URLs run at once and how long it waits between chunks.
-    # Left declared so a .env that already carries it still loads.
-    analysis_concurrency: int = 2
     # HOW MANY BROWSER WORKERS ANALYSIS MAY HOLD OPEN AT ONCE, PROCESS-WIDE.
     # A job scrapes every platform concurrently and each platform now works
     # its URLs through as many pooled sessions as it can safely claim (see
@@ -226,20 +221,11 @@ class Settings(BaseSettings):
     discovery_max_seconds: float = 900
     headless: bool = True
 
-    # webhook callbacks (job completion push-back to the caller)
-    webhook_timeout_sec: float = 10.0
-    webhook_max_retries: int = 3
-    # A `callback_url` is caller-supplied, and this process will POST a job
-    # payload to it with retries, that is a server-side request forgery
-    # primitive unless it is constrained. Empty means "any public host is
-    # allowed" (still never a private/loopback/link-local address, see
-    # services/webhook_service.py); set a comma-separated host list to
-    # narrow it to exactly the callers you expect.
-    webhook_allowed_hosts: Annotated[list[str], NoDecode] = Field(default_factory=list)
-    # HMAC-SHA256 over the exact JSON body, sent as `X-BI-Signature`, so a
-    # receiver can prove a callback really came from this engine and wasn't
-    # forged by anything else that learned the URL. Empty disables signing.
-    webhook_secret: str = ""
+    # Kill switch for backend/adaptive/'s last-resort schema healer. Off
+    # returns analysis to exactly its pre-healer behaviour (standard tiers
+    # only) with no code change or restart-time flag needed -- flip this the
+    # moment the healer is suspected of costing more than it recovers.
+    adaptive_healer_enabled: bool = True
 
     # Browser-facing CORS. "*" is the historical default (this engine was
     # designed to sit behind a trusted internal path), but it is also what
@@ -265,17 +251,10 @@ class Settings(BaseSettings):
     # a freshly analysed profile is held back from the default (client-
     # facing) view for this long, so an analyst who approved a false
     # positive has a window to revert it before anyone downstream sees the
-    # scored result, see docs/adr/0007-publish-hold.md
+    # scored result
     publish_hold_minutes: float = 10.0
 
-    # how many clients the always-on round-robin engine processes
-    # concurrently, see services/round_robin_service.py. Too high and 400
-    # clients' discovery jobs pile up behind the same handful of per-platform
-    # session locks for no benefit; too low and a full lap over 400 clients
-    # takes unnecessarily long.
-    round_robin_slots: int = 4
-
-    @field_validator("alert_emails", "webhook_allowed_hosts", "cors_allow_origins", mode="before")
+    @field_validator("alert_emails", "cors_allow_origins", mode="before")
     @classmethod
     def _split_csv(cls, v):
         if isinstance(v, str):

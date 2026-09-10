@@ -136,8 +136,3 @@ class Human:
             return 0.0
         nap = random.uniform(20, 60)
         return 0.0 if await self.sleep(nap) else nap
-
-    async def warmup_delay(self, scale: float = 1.0) -> float:
-        """Initial orientation delay after session launch before commencing sweeps."""
-        nap = random.uniform(1.2, 3.5) * scale
-        return 0.0 if await self.sleep(nap) else nap

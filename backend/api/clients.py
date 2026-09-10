@@ -83,8 +83,8 @@ class NewClientBody(ClientBody):
 
 
 class SchedulerPrefsBody(BaseModel):
-    """What the Scheduler should run for this client. Both optional: send
-    only the half you are changing."""
+    """What the Scheduler should run for this client. All optional: send
+    only the fields you are changing."""
 
     platforms: Optional[list[str]] = Field(
         None,
@@ -94,6 +94,12 @@ class SchedulerPrefsBody(BaseModel):
     keyword_scope: Optional[str] = Field(
         None,
         description="'individual' | 'domain' | '' for both.")
+    facebook_tabs: Optional[list[str]] = Field(
+        None,
+        description="Facebook tabs to sweep: 'people', 'pages', 'groups'. Empty list means all.")
+    budget_minutes: Optional[int] = Field(
+        None,
+        description="Per-sweep time budget in minutes. 0 or None = default (15m).")
 
 
 class ClientOut(BaseModel):
@@ -118,6 +124,11 @@ class ClientOut(BaseModel):
         description="Scheduler-only: which platforms to sweep. Empty = all.")
     scheduler_keyword_scope: str = Field(
         "", description="Scheduler-only: 'individual' | 'domain' | '' for both.")
+    scheduler_facebook_tabs: list[str] = Field(
+        default_factory=list,
+        description="Scheduler-only: which FB tabs to sweep. Empty = all.")
+    scheduler_budget_minutes: int = Field(
+        0, description="Scheduler-only: sweep time budget in minutes. 0 = default.")
 
 
 class ClientList(BaseModel):
@@ -194,7 +205,11 @@ async def set_scheduler_prefs(
     or caps. See `client_repository.set_scheduler_prefs`.
     """
     return await clients_db.set_scheduler_prefs(
-        client_id, platforms=body.platforms, keyword_scope=body.keyword_scope,
+        client_id,
+        platforms=body.platforms,
+        keyword_scope=body.keyword_scope,
+        facebook_tabs=body.facebook_tabs,
+        budget_minutes=body.budget_minutes,
     )
 
 

@@ -106,21 +106,6 @@ async def delete_for_client(client_id: str) -> int:
     return n
 
 
-async def delete_for_client_platform(client_id: str, platform: str) -> int:
-    """Same as `delete_for_client`, scoped to one platform, the
-    unscoped (phase/status = None) "Delete Platform Data" cascade (see
-    profile_service.delete_for_client_platform)."""
-    if not client_id or not platform:
-        return 0
-    bucket = _bucket_for()
-    n = 0
-    prefix = f"{re.escape(client_id)}/{re.escape(platform)}/"
-    async for f in bucket.find({"filename": {"$regex": f"^{prefix}"}}):
-        await bucket.delete(f._id)
-        n += 1
-    return n
-
-
 async def delete_many(keys: list[str]) -> int:
     """Delete exactly these screenshots, the scoped "Delete Platform Data"
     cascade (see profile_service.delete_for_client_platform): when the
@@ -159,31 +144,4 @@ async def delete_older_than(days: int = 7) -> int:
     if n > 0:
         log.info(f"retention: pruned {n} evidence screenshot(s) older than {days} days")
     return n
-
-
-async def cleanup_orphaned_chunks() -> int:
-    """Find and delete any binary chunks in `evidence.chunks` that have no
-    parent metadata record in `evidence.files`.
-
-    This purges dangling chunks left behind by interrupted or legacy deletions.
-    """
-    database = db()
-    files_coll = database["evidence.files"]
-    chunks_coll = database["evidence.chunks"]
-
-    try:
-        file_count = await files_coll.count_documents({})
-        if file_count == 0:
-            res = await chunks_coll.delete_many({})
-            deleted = res.deleted_count
-        else:
-            file_ids = await files_coll.distinct("_id")
-            res = await chunks_coll.delete_many({"files_id": {"$nin": file_ids}})
-            deleted = res.deleted_count
-        if deleted > 0:
-            log.info(f"cleanup: purged {deleted} orphaned evidence chunk(s)")
-        return deleted
-    except Exception as e:
-        log.error(f"error cleaning up orphaned chunks: {e}")
-        return 0
 

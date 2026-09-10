@@ -42,7 +42,12 @@ export const clientsApi = {
   // cannot reset it.
   setSchedulerPrefs: (
     clientId: string,
-    prefs: { platforms?: string[]; keyword_scope?: string },
+    prefs: {
+      platforms?: string[];
+      keyword_scope?: string;
+      facebook_tabs?: string[];
+      budget_minutes?: number;
+    },
   ) =>
     fetch(url(`/clients/${encodeURIComponent(clientId)}/scheduler-prefs`),
           jsonInit("PUT", prefs)).then(json<Client>),

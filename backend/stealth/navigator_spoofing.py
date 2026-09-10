@@ -337,9 +337,3 @@ def build_init_js() -> str:
 
 }})();
 """  # noqa: F541
-
-
-# Module-level convenience build. Nothing imports it today (browser.py calls
-# build_init_js() directly), but it is cheap and keeps the module importable
-# as a script for eyeballing the generated JS.
-INIT_JS = build_init_js()

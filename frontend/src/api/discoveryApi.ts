@@ -229,6 +229,10 @@ export interface ListProfilesQuery {
   is_original?: boolean;
   match_level?: "high" | "medium" | "low";
   entity_type?: string;
+  // Which of THIS CLIENT's two keyword buckets a profile was found under.
+  // Resolved server-side against group_id's own saved keyword lists, so
+  // (like match_level/entity_type) it survives pagination.
+  keyword_match_type?: "individual" | "domain";
   limit?: number;
   offset?: number;
 }
@@ -306,6 +310,7 @@ export const discoveryApi = {
     if (q.is_original !== undefined) p.set("is_original", String(q.is_original));
     if (q.match_level) p.set("match_level", q.match_level);
     if (q.entity_type) p.set("entity_type", q.entity_type);
+    if (q.keyword_match_type) p.set("keyword_match_type", q.keyword_match_type);
     if (q.limit) p.set("limit", String(q.limit));
     if (q.offset) p.set("offset", String(q.offset));
     return fetch(url(`/discovery/profiles?${p}`)).then(json<DiscoveredProfilePage>);
