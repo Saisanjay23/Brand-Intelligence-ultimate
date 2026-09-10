@@ -2462,6 +2462,14 @@ a:hover {
   border-style: dashed;
   opacity: 0.85;
 }
+/* The keyword the High/Medium/Low badge was actually decided against (see
+   DiscoveryProfileGrid.tsx::MatchTermTag). Tinted rather than outlined, so
+   it reads as a verdict at a glance and is not mistaken for the dashed
+   "surfaced by this search term" provenance chip sitting next to it. */
+.card-keyword-tag-match {
+  border-color: rgba(0, 193, 77, 0.55);
+  background: rgba(0, 193, 77, 0.12);
+}
 /* Small pill buttons for the per-client platform scope shortcuts
    ("Select all" / "Only <first>") above the limits table. */
 .chip-toggle {

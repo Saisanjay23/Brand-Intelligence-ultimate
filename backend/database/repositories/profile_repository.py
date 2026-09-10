@@ -65,6 +65,13 @@ DISCOVERY_FIELDS = (
     "avatar_phash", "avatar_dhash", "avatar_embedding",
     "logo_similarity", "logo_ref_id", "logo_match_tier",
     "name_score",
+    # WHICH keyword the grade above was computed against -- the parent, or
+    # whichever of its children the name actually resembled (see
+    # discovery/runner.py::row_to_fields). A single string, not a set: it
+    # answers "why is this card graded like that", and only one term can be
+    # the reason. Distinct from `matched_keywords`, which accumulates every
+    # search term that has ever SURFACED this profile.
+    "match_term",
     "name_exact_run", "followers", "friends", "location", "bio", "created_at",
     # Set when a repeat sweep detects a genuinely different profile picture
     # (asset path changed, not just expired CDN signatures). Surfaces the

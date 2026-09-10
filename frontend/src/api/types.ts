@@ -192,8 +192,9 @@ export interface Profile {
   // and groups); blank everywhere else.
   entity_type?: string;
   // The PARENT keyword(s) whose investigation this profile belongs to --
-  // the bucket, the filter option, and the name its score was computed
-  // against. Never a permutation: those live in `matched_keywords`.
+  // the bucket and the filter option. NOT necessarily what the name was
+  // scored against: that is `match_term`, which may be one of the parent's
+  // children. Never a permutation itself: those live in `matched_keywords`.
   keywords?: string[];
   // The permutation(s) actually typed into the platform's search box to
   // surface this profile, when they differ from the parent. EMPTY MEANS
@@ -201,6 +202,12 @@ export interface Profile {
   // permutations configured searches itself, so there is nothing to
   // distinguish. See backend/shared/keywords.py.
   matched_keywords?: string[];
+  // WHICH keyword the High/Medium/Low badge is about: the parent, or
+  // whichever of its configured children this name actually resembled.
+  // name_score and name_exact_run are both computed against this one term,
+  // so it is the reason for the grade. Distinct from `matched_keywords`,
+  // which is provenance (what was searched) rather than the verdict.
+  match_term?: string;
   // 0-100 name-vs-keyword closeness (discovery-seeded, analysis-refined) --
   // powers the card's High/Low match badge. The only automated match
   // signal in the system, confidence is scored off the client's own

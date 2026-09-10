@@ -119,6 +119,32 @@ function MatchedKeywordTags({ p }: { p: DiscoveredProfile }) {
   );
 }
 
+// WHY THIS CARD IS GRADED THE WAY IT IS.
+//
+// The High/Medium/Low badge is decided against ONE keyword, and until now
+// there was no way to tell which. That was tolerable while every hit was
+// scored against its parent, and stopped being tolerable once the analyst's
+// own child permutations joined the comparison: a client with a dozen terms
+// under one parent gets a badge that could be about any of them.
+//
+// Suppressed when it merely repeats a parent chip already on the card --
+// the same rule MatchedKeywordTags applies, for the same reason. Nothing is
+// lost when it does: the badge's own tooltip always names the term.
+function MatchTermTag({ p }: { p: DiscoveredProfile }) {
+  const term = (p.match_term || "").trim();
+  if (!term) return null;
+  const parents = new Set((p.keywords || []).map((k) => k.toLowerCase()));
+  if (parents.has(term.toLowerCase())) return null;
+  return (
+    <span
+      className="card-keyword-tag card-keyword-tag-match"
+      title={`Graded against "${term}" -- the closest-matching of this keyword's configured terms`}
+    >
+      🎯 {term}
+    </span>
+  );
+}
+
 interface Props {
   groupId: string;
   // Scope to one platform (set by the platform rail above this grid); ""
@@ -169,6 +195,22 @@ function matchLevelOf(p: { name_score: number | null; name_exact_run: boolean | 
   const score = p.name_score;
   if (score !== null && score >= MATCH_MEDIUM_THRESHOLD) return "medium";
   return "low";
+}
+
+// The badge in words, naming the keyword it was decided against. A grade
+// with no stated reason is the thing an analyst has to take on trust, and
+// this is the one place the reason is actually known.
+function matchReason(p: DiscoveredProfile): string {
+  const term = (p.match_term || "").trim();
+  const against = term ? `"${term}"` : "this profile's keyword";
+  const score = p.name_score != null ? ` (name score ${p.name_score}/100)` : "";
+  if (p.name_exact_run) {
+    return `High match: the name contains ${against} as one contiguous run${score}.`;
+  }
+  if (p.name_score != null && p.name_score >= MATCH_MEDIUM_THRESHOLD) {
+    return `Medium match: the name resembles ${against} but does not contain it as a contiguous run${score}.`;
+  }
+  return `Low match: the name barely resembles ${against}${score}.`;
 }
 
 // ---- First-seen window -----------------------------------------------
@@ -271,6 +313,7 @@ function exportRow(p: DiscoveredProfile): Record<string, unknown> {
     // The permutation that surfaced it, exported alongside the parent
     // rather than instead of it -- an analyst reviewing a CSV needs the
     // bucket to sort by AND the term to judge.
+    "Matched keyword": p.match_term || "",
     "Matched via": (p.matched_keywords || []).join("; "),
     Type: p.entity_type || "",
     "First Seen": p.first_seen ?? "",
@@ -435,7 +478,11 @@ function ProfileCard({
           const level = matchLevelOf(p);
           const color = level === "high" ? "rgba(0,193,77,0.85)" : level === "medium" ? "rgba(255,171,0,0.85)" : "rgba(102,112,133,0.85)";
           return (
-            <span className="card-badge-top-right" style={{ background: color, color: "#fff" }}>
+            <span
+              className="card-badge-top-right"
+              style={{ background: color, color: "#fff" }}
+              title={matchReason(p)}
+            >
               {level} match
             </span>
           );
@@ -456,7 +503,7 @@ function ProfileCard({
         {p.followers != null && (
           <div style={{ fontSize: "12px", color: "var(--text-dim)" }}>{p.followers.toLocaleString()} followers</div>
         )}
-        {(!!p.keywords.length || !!p.matched_keywords?.length || !!p.entity_type) && (
+        {(!!p.keywords.length || !!p.matched_keywords?.length || !!p.match_term || !!p.entity_type) && (
           <div className="card-keyword-tags">
             <EntityTypeTag p={p} />
             {p.keywords.map((kw) => (
@@ -464,6 +511,7 @@ function ProfileCard({
                 🔑 {kw}
               </span>
             ))}
+            <MatchTermTag p={p} />
             <MatchedKeywordTags p={p} />
           </div>
         )}
@@ -550,7 +598,12 @@ function ProfileTable({
                 </a>
               </td>
               <td>{statusLabel(p)}</td>
-              <td>{p.name_score != null ? `${matchLevelOf(p)} (${p.name_score})` : "—"}</td>
+              <td title={p.name_score != null ? matchReason(p) : undefined}>
+                {p.name_score != null ? `${matchLevelOf(p)} (${p.name_score})` : "—"}
+                {!!p.match_term && (
+                  <span style={{ color: "var(--text-dim)" }}> · {p.match_term}</span>
+                )}
+              </td>
               <td>{p.followers != null ? p.followers.toLocaleString() : "—"}</td>
               <td>
                 {p.keywords.join(", ")}

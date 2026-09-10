@@ -92,13 +92,10 @@ class MatchTarget:
     """One parent a hit could be filed under, and every string a hit's name
     is scored against for it.
 
-    `terms` is currently always just `(parent,)` -- it used to also carry
-    that type's configured asset names, an alternate public name the same
-    entity was known by, but that feature was removed (see the note by
-    FLAT_FIELD). The tuple shape is kept because `resolve_parent` still
-    needs to pick a parent per hit when one permutation is listed under
-    two different parents, which is a separate concern from how many names
-    each parent is scored under.
+    `terms` is the parent AND its children -- see `match_terms_for` for why
+    the permutations belong in the match set and not only in the search
+    set. The parent stays first because it is the canonical name and wins
+    ties, but any child may out-rank it on a given hit.
     """
 
     parent: str
@@ -257,17 +254,43 @@ def search_terms(groups: dict[str, list[dict]], kw_type: str) -> list[str]:
     return _dedup(out)
 
 
-def match_terms_for(client: Optional[dict], parent: str, kw_type: str) -> tuple[str, ...]:
-    """Every string a hit found under `parent` is scored against.
+def match_terms_for(parent: str, children: Optional[Iterable[str]] = None) -> tuple[str, ...]:
+    """Every string a hit found under `parent` is scored against: the parent
+    and its children.
 
-    That is now the parent, and only the parent. This used to also return
-    the type's configured asset names; that feature was removed (see the
-    note by FLAT_FIELD). Kept as a function rather than inlined so
-    `MatchTarget` keeps one obvious place to change if a second match name
-    is ever reintroduced. `client`/`kw_type` are unused for the same
-    reason -- the call sites stay stable.
+    THE CHILDREN USED TO BE SEARCH-ONLY, AND THAT WAS THE BUG. A hit was
+    scored purely against the parent, which meant the High/Medium/Low badge
+    an analyst reads answered a question nobody asked. Take parent "Gautam
+    Adani" with the permutation "adani gautam": a profile actually named
+    "Adani Gautam" reads as a dead-on match for the term the analyst
+    curated, yet against the PARENT it is word-order-reversed -- so
+    `contiguous_letters_match` says no, it misses High, and it lands in
+    Medium next to profiles that merely share a token.
+
+    Worse, the two halves of the badge disagreed about what they were
+    measuring. `name_exact_run` compares the name against `Row.target`, the
+    permutation actually typed into the search box, while `name_score`
+    compared it against the parent. High was judged on the child and
+    Medium/Low on the parent, so a hit could be graded against two
+    different strings depending on which band it fell into.
+
+    Scoring against the whole set fixes both: the analyst's own
+    permutations are the terms they decided were worth looking for, so they
+    are the terms a match should be judged on, and one comparison set means
+    every band is judged the same way.
+
+    THE PARENT STAYS IN THE SET. It is the real name and therefore the
+    strongest possible match; dropping it would demote a profile that is
+    literally called "Gautam Adani" on a client whose permutations all
+    happen to be handles. Because `best_match` takes the BEST term, adding
+    the children can only ever raise a hit's grade, never lower it -- which
+    is what makes this safe to apply to a pipeline already in use.
+
+    Deduped case-insensitively: `normalize_groups` already drops a child
+    equal to its own parent, and this guards the same case for a group
+    built by any other route.
     """
-    return (parent,)
+    return tuple(_dedup([parent, *(children or [])]))
 
 
 def classify_unknown(client: Optional[dict], keyword: str) -> str:
@@ -339,7 +362,10 @@ def build_plans(
             if wanted is not None and parent.lower() not in wanted:
                 continue
             matched_parents.add(parent.lower())
-            target = MatchTarget(parent=parent, terms=match_terms_for(client, parent, kw_type))
+            target = MatchTarget(
+                parent=parent,
+                terms=match_terms_for(parent, group.get("children") or []),
+            )
             # PERMUTATIONS REPLACE THE PARENT; the parent is the fallback.
             # A parent that has permutations is NOT searched under its own
             # name -- the analyst's permutations are the search set, and the
@@ -366,7 +392,7 @@ def build_plans(
             kw_type = (requested_types or {}).get(term.lower()) or classify_unknown(client, term)
             by_search[term.lower()] = {
                 "search": term, "kw_type": kw_type,
-                "targets": [MatchTarget(parent=term, terms=match_terms_for(client, term, kw_type))],
+                "targets": [MatchTarget(parent=term, terms=match_terms_for(term))],
             }
             order.append(term.lower())
 
@@ -378,6 +404,96 @@ def build_plans(
         )
         for k in order
     ]
+
+
+def _specificity(term: str) -> int:
+    """How much a match term actually pins down: its letters and digits,
+    ignoring case, spacing and punctuation -- the same characters
+    `contiguous_letters_match` compares. "Jeet Adani" is 9, "adani" is 5.
+    Used only to break ties between terms that matched equally well; see
+    `best_match`."""
+    return sum(1 for ch in (term or "") if ch.isalnum())
+
+
+@dataclass(frozen=True)
+class NameMatch:
+    """Everything a discovered hit's name comparison produced, in one pass.
+
+    Separate fields rather than a bare score because the UI's badge is not
+    a threshold: High is `exact_run` (a real contiguous letter-run of the
+    term inside the name), Medium/Low band on `score` below it. Both come
+    from the SAME winning term, which is what makes `term` a truthful
+    answer to "why is this card graded like that" -- and what lets the card
+    show it.
+    """
+
+    parent: str      # which bucket this hit is filed under
+    term: str        # the keyword that produced the verdict
+    score: int       # 0-100, word-order-insensitive similarity
+    exact_run: bool  # the High Match criterion
+
+
+def best_match(
+    plan_or_targets, name: str, scorer, exact_predicate,
+) -> NameMatch:
+    """The strongest match between `name` and any term of any target.
+
+    RANKED ON (exact_run, score, specificity), IN THAT ORDER.
+
+    `exact_run` leads because that is the order the badge itself is decided
+    in: an exact run is High regardless of how the fuzzy score lands, so a
+    term that achieves one must out-rank a term that merely scores well, or
+    `term` would name a keyword that does not explain the badge sitting
+    next to it. `score` breaks ties among equally exact terms.
+
+    `specificity` -- how many letters the matched term actually pins down --
+    breaks the ties those two leave, and it is not cosmetic. A permutation
+    listed under TWO parents produces one search with both as candidates
+    (see `build_plans`), and that shared child matches both of them
+    identically by construction. Without a third key the hit files under
+    whichever group was saved first: "adani" is a child of both "Gautam
+    Adani" and "Jeet Adani", so a profile called "Jeet Adani Official"
+    matched "adani" under Gautam's target first and landed in the wrong
+    investigation. Comparing on length puts the hit where the most evidence
+    points -- "Jeet Adani" is nine letters of agreement, "adani" is five.
+
+    On a genuine tie the earlier term still wins, which puts the parent
+    first: the canonical name is the better label when nothing separates
+    them.
+
+    Taking the BEST across the set is what makes this safe to switch on
+    over existing data: adding the children to the comparison can only
+    raise a hit's grade, never lower it.
+
+    Accepts a `KeywordPlan` or a bare tuple of targets so callers that hold
+    only the targets (discovery's queue items) need not rebuild a plan.
+    `scorer`/`exact_predicate` are injected for the same reason
+    `resolve_parent` injects its scorer: this module stays free of the
+    text-matching stack and stays testable without it.
+    """
+    targets = getattr(plan_or_targets, "targets", plan_or_targets) or ()
+    if not targets:
+        return NameMatch(parent="", term="", score=0, exact_run=False)
+
+    best = NameMatch(parent=targets[0].parent, term="", score=-1, exact_run=False)
+    for target in targets:
+        for term in target.terms or (target.parent,):
+            try:
+                score = int(scorer(name or "", term))
+            except Exception:                    # noqa: BLE001 - never fatal
+                score = 0
+            try:
+                run = bool(exact_predicate(name or "", term))
+            except Exception:                    # noqa: BLE001 - never fatal
+                run = False
+            rank = (run, score, _specificity(term))
+            if rank > (best.exact_run, best.score, _specificity(best.term)):
+                best = NameMatch(
+                    parent=target.parent, term=term, score=score, exact_run=run)
+    return NameMatch(
+        parent=best.parent, term=best.term,
+        score=max(best.score, 0), exact_run=best.exact_run,
+    )
 
 
 def resolve_parent(plan: KeywordPlan, name: str, scorer) -> tuple[str, int]:

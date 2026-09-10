@@ -45,7 +45,8 @@ from backend.shared.job_store import JobStore
 from backend.shared.logging import get_logger
 from backend.shared.models.row import Row
 from backend.shared.resilience import classify_failure
-from backend.shared.text import handle_from_url, name_score
+from backend.shared.text import (contiguous_letters_match, handle_from_url,
+                                 name_score)
 
 log = get_logger("discovery.runner")
 
@@ -276,6 +277,15 @@ class _KeywordItem:
     keyword: str
     kw_type: str
     parent: str = ""
+    # WHAT THIS HIT'S NAME IS SCORED AGAINST -- the parent plus every one of
+    # its children (shared/keywords.py::match_terms_for). Carried on the
+    # item because the queue is all a worker sees: the plan's targets used
+    # to be dropped here, which left `resolve_parent` with no caller and
+    # scoring with nothing but the parent to compare against. Defaulted
+    # empty so a caller that builds items by hand (tests, an ad-hoc sweep)
+    # still works -- `row_to_fields` falls back to the parent alone, which
+    # is exactly the old behaviour.
+    targets: tuple[kw_groups.MatchTarget, ...] = ()
     attempts: int = 0
 
     def __post_init__(self) -> None:
@@ -350,27 +360,57 @@ def _resolve_cap(
     return _effective_cap(max_results, type_cap, tab_cap)
 
 
-def row_to_fields(row: Row, keyword: str, matched_keyword: str = "") -> dict:
+def row_to_fields(
+    row: Row, keyword: str, matched_keyword: str = "",
+    targets: tuple = (),
+) -> dict:
     """A discovery `Row` -> the field dict `profile_repository.save_many`
     expects. `url`/`entity_id`/`keyword` are control keys it pops off
     itself; everything else must be a name in `DISCOVERY_FIELDS` or the
-    field-scoped write drops it silently."""
+    field-scoped write drops it silently.
+
+    `targets` is what the name is graded against: the parent AND every
+    child the analyst curated for it (shared/keywords.py::match_terms_for).
+    Empty means "just the parent", which is what a childless keyword
+    produces anyway and what every caller that predates permutations gets.
+    """
     src = ",".join(sorted({v.split(":", 1)[-1] for v in row.src.values()})) or "search"
-    # Scored HERE rather than in each platform's converter: `Row.name_score`
-    # is a plain field (only analysis's fill() ever set it), so a discovered
-    # profile would otherwise be stored with a score of 0 no matter how
-    # exactly its name matched -- which is what the name-match filters and
-    # the risk rubric both read. `row.target` is the keyword this sweep
-    # searched, set by every platform's *_to_row, so `name_exact_run`
-    # (a property over profile_name vs target) already resolves correctly.
-    if not row.name_score and row.profile_name:
-        row.name_score = name_score(row.profile_name, keyword)
+
+    # GRADED HERE, AGAINST THE WHOLE KEYWORD SET, IN ONE PASS.
+    #
+    # Scoring lives here rather than in each platform's converter because
+    # `Row.name_score` is a plain field that only analysis's fill() ever
+    # set -- a discovered profile would otherwise be stored with a score of
+    # 0 no matter how exactly its name matched, and the name-match filters
+    # and the risk rubric both read it.
+    #
+    # It used to score against `keyword` (the PARENT) alone while
+    # `row.name_exact_run` compared against `row.target` (the permutation
+    # actually searched). Two different strings, so High was decided on one
+    # and Medium/Low on the other, and a profile matching a curated
+    # permutation dead-on could still be graded against the real name it
+    # deliberately does not spell the same way. `best_match` compares the
+    # name against the parent and every child, ranks by the badge's own
+    # cascade, and reports the single term that won -- so the score, the
+    # exact-run flag and the keyword shown on the card all describe the
+    # same comparison.
+    fallback = (kw_groups.MatchTarget(parent=keyword, terms=(keyword,)),)
+    match = kw_groups.best_match(
+        targets or fallback, row.profile_name, name_score, contiguous_letters_match)
+    # An analysis-seeded row arrives with its own score already set (see
+    # each analysis_engine's fill); discovery's own hits never do, and
+    # overwriting a real reading with a search-time one would be a
+    # downgrade.
+    score = row.name_score or match.score
     return {
         "url": row.url,
         "entity_id": row.profile_id,
-        # The PARENT: the bucket, the filter option, the name this hit is
-        # scored against.
-        "keyword": keyword,
+        # The PARENT: the bucket, and the only keyword the filter dropdown
+        # offers. `best_match` chooses it when one permutation is listed
+        # under two different parents, so the hit lands under whichever
+        # name it actually resembles rather than whichever group was saved
+        # first.
+        "keyword": match.parent or keyword,
         # The SEARCH that actually turned it up -- a permutation, when the
         # analyst curated any. Dropped by `save` when it only repeats the
         # parent. See that function for why both are worth keeping.
@@ -385,8 +425,16 @@ def row_to_fields(row: Row, keyword: str, matched_keyword: str = "") -> dict:
         "profile_image_url": row.profile_pic_url,
         "has_logo": row.has_custom_pic,
         "verified": row.verified,
-        "name_score": row.name_score,
-        "name_exact_run": row.name_exact_run,
+        "name_score": score,
+        # Both from the SAME winning term -- see the note above. Taken from
+        # `match` rather than `Row.name_exact_run`, which is a property over
+        # `row.target` and therefore only ever sees the one permutation this
+        # sweep happened to search.
+        "name_exact_run": match.exact_run,
+        # WHICH keyword produced that grade, so the card can say why it is
+        # graded the way it is instead of leaving an analyst to guess which
+        # of a dozen permutations the badge is about.
+        "match_term": match.term,
         # Carried straight from the search payload where the platform put
         # one there (Twitter and Telegram do; see each discovery_engine's
         # *_to_row). Blank/None values are dropped by save() itself, so a
@@ -912,7 +960,8 @@ class DiscoveryRunner:
         run = _PlatformSweepRun(
             platform_id=platform_id,
             queue=deque(
-                _KeywordItem(p.search, p.kw_type, p.parent) for p in job.keyword_plan),
+                _KeywordItem(p.search, p.kw_type, p.parent, targets=p.targets)
+                for p in job.keyword_plan),
             tabs=tabs,
             max_results=max_results,
             max_seconds=max_seconds,
@@ -1217,7 +1266,8 @@ class DiscoveryRunner:
                     # be gained by a different session, so the whole platform
                     # stops instead -- see `run.hard_stop`).
                     async def _sweep_tab(
-                        keyword: str, kw_type: str, parent: str, tab: str,
+                        keyword: str, kw_type: str, parent: str,
+                        targets: tuple, tab: str,
                         stats: dict, fatal_kind: list,
                         stagger: float = 0.0, own_options: bool = False,
                     ) -> str:
@@ -1301,7 +1351,10 @@ class DiscoveryRunner:
                             # about whether it impersonates Gautam Adani. See
                             # shared/keywords.py's module docstring; this is the
                             # PARENT/CHILDREN split it exists to express.
-                            rows = [row_to_fields(h, parent, keyword) for h in hits]
+                            rows = [
+                                row_to_fields(h, parent, keyword, targets=targets)
+                                for h in hits
+                            ]
                             saved, new = await profiles_db.save_many(
                                 job.group_id, platform_id, profiles_db.PHASE_DISCOVERY,
                                 rows,
@@ -1408,7 +1461,8 @@ class DiscoveryRunner:
                             async def _slot(i: int, tab: str) -> str:
                                 async with sem:
                                     return await _sweep_tab(
-                                        item.keyword, item.kw_type, item.parent, tab,
+                                        item.keyword, item.kw_type, item.parent,
+                                        item.targets, tab,
                                         stats, fatal_kind,
                                         stagger=i * TAB_STAGGER_SEC, own_options=True,
                                     )
@@ -1427,7 +1481,8 @@ class DiscoveryRunner:
                                 if job.cancel.is_set() or run.hard_stop:
                                     break
                                 reason = await _sweep_tab(
-                                    item.keyword, item.kw_type, item.parent, tab,
+                                    item.keyword, item.kw_type, item.parent,
+                                    item.targets, tab,
                                     stats, fatal_kind)
                                 if reason or fatal_kind[0]:
                                     break

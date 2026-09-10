@@ -294,7 +294,18 @@ class DiscoveredProfile(BaseModel):
                     "the parent was itself the search term (a keyword with no permutations "
                     "configured searches itself), so an empty list means \"found by its "
                     "own keyword\", not \"unknown\".")
-    name_score: Optional[int] = Field(None, description="0-100 similarity of the profile name to the keyword.")
+    name_score: Optional[int] = Field(
+        None,
+        description="0-100 similarity of the profile name to whichever keyword matched it "
+                    "best -- see match_term for which one that was.")
+    match_term: Optional[str] = Field(
+        None,
+        description="The keyword name_score and name_exact_run were both computed against: "
+                    "the parent, or whichever of its configured children the profile name "
+                    "actually resembled. This is what the High/Medium/Low badge is ABOUT, "
+                    "so a card can show the reason for its own grade. Distinct from "
+                    "matched_keywords, which lists every search term that has surfaced this "
+                    "profile whether or not its name resembles them.")
     name_exact_run: Optional[bool] = Field(
         None,
         description="True High Match: the keyword's letters appear in the profile name as one "
@@ -381,6 +392,7 @@ def _to_profile(doc: dict) -> DiscoveredProfile:
         keywords=list(doc.get("keywords") or []),
         matched_keywords=list(doc.get("matched_keywords") or []),
         name_score=doc.get("name_score"),
+        match_term=doc.get("match_term") or "",
         name_exact_run=doc.get("name_exact_run"),
         source=doc.get("discovery_source", "") or "",
         first_seen=iso(doc.get("first_seen")),

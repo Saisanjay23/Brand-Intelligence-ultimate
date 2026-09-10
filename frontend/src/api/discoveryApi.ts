@@ -145,15 +145,22 @@ export interface DiscoveredProfile {
   location: string;
   bio: string;
   created_at: string;
-  // The PARENT keyword(s) whose investigation this profile belongs to
-  // -- the bucket, the filter option, and the name its score was
-  // computed against. Never a permutation.
+  // The PARENT keyword(s) whose investigation this profile belongs to --
+  // the bucket and the filter option. NOT necessarily what the name was
+  // scored against: that is `match_term`, which may be one of the parent's
+  // children. Never a permutation itself.
   keywords: string[];
   // The permutation(s) actually typed into the platform's search box to
   // surface it, when they differ from the parent. EMPTY MEANS "found by
   // its own keyword", not "unknown": a parent with no permutations
   // configured searches itself, so there is nothing to distinguish.
   matched_keywords?: string[];
+  // WHICH keyword the High/Medium/Low badge is about: the parent, or
+  // whichever of its configured children this name actually resembled.
+  // name_score and name_exact_run are both computed against this one term,
+  // so it is the reason for the grade. Distinct from `matched_keywords`,
+  // which is provenance (what was searched) rather than the verdict.
+  match_term?: string;
   name_score: number | null;
   // True High Match: the keyword's letters appear in this name as one
   // contiguous run (spacing/punctuation/case ignored). Word-order-sensitive
