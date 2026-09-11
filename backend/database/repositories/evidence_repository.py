@@ -25,12 +25,15 @@ only to where the bytes physically live.
 
 from __future__ import annotations
 
+import asyncio
+import random
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from motor.motor_asyncio import AsyncIOMotorGridFSBucket
 
+from backend.config.settings import settings
 from backend.database.connection import db
 from backend.shared.logging import get_logger
 
@@ -144,4 +147,40 @@ async def delete_older_than(days: int = 7) -> int:
     if n > 0:
         log.info(f"retention: pruned {n} evidence screenshot(s) older than {days} days")
     return n
+
+
+# --- background retention sweep -----------------------------------------
+# `settings.evidence_retention_days` promised auto-deletion "to prevent
+# unlimited storage growth", but nothing ever called delete_older_than() on
+# a schedule -- the setting existed, the function existed, and the two were
+# never connected. Mirrors sessions/manager.py's own start_monitor() shape
+# (a single jittered asyncio task started/stopped from main.py's lifespan)
+# rather than reintroducing apscheduler for one daily sweep.
+_retention_task: Optional[asyncio.Task] = None
+_RETENTION_INTERVAL_S = 24 * 3600
+_RETENTION_JITTER = 0.1  # +/-10%, so a fleet of instances doesn't all sweep GridFS at once
+
+
+async def _retention_loop() -> None:
+    while True:
+        try:
+            await delete_older_than(settings.evidence_retention_days)
+        except Exception as e:
+            log.error(f"evidence retention sweep failed: {type(e).__name__}: {e}")
+        await asyncio.sleep(_RETENTION_INTERVAL_S * (1.0 + random.uniform(-_RETENTION_JITTER, _RETENTION_JITTER)))
+
+
+def start_retention_monitor() -> None:
+    global _retention_task
+    if _retention_task is None or _retention_task.done():
+        _retention_task = asyncio.create_task(_retention_loop())
+        log.info(f"evidence retention monitor started -- purging screenshots older than "
+                 f"{settings.evidence_retention_days}d, checked daily")
+
+
+def stop_retention_monitor() -> None:
+    global _retention_task
+    if _retention_task is not None:
+        _retention_task.cancel()
+        _retention_task = None
 

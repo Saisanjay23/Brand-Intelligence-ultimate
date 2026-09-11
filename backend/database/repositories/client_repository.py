@@ -310,42 +310,6 @@ async def reorder(client_ids: list[str]) -> None:
         await db()[CLIENTS].bulk_write(ops, ordered=False)
 
 
-async def add_keyword(client_id: str, keyword: str, kind: str) -> None:
-    """Appends `keyword` as a new PARENT to a client's name_keywords
-    (kind="name") or domain_keywords (kind="domain") without touching the
-    rest of the document. Unlike `upsert` this never replaces the array
-    wholesale, so it's safe to call from a flow (e.g. add_manual_urls) that
-    only knows about the one new keyword, not the client's full configured
-    set. `$addToSet` makes it idempotent: adding the same keyword twice is
-    a no-op, not a duplicate entry.
-
-    The new parent is added to `keyword_groups` too, with NO children --
-    it searches itself, which is exactly right for a keyword an analyst
-    just introduced by pasting a URL rather than by curating permutations
-    for it. Skipping this would leave the flat list and the groups
-    disagreeing, and `groups_for_client` treats non-empty groups as
-    authoritative, so the new keyword would be stored but never actually
-    swept. Read-modify-write rather than a `$addToSet` on a nested array
-    because groups are objects keyed by `parent`, which `$addToSet` cannot
-    dedupe on.
-    """
-    field = "name_keywords" if kind == "name" else "domain_keywords"
-    kw_type = _keywords.INDIVIDUAL if kind == "name" else _keywords.DOMAIN
-
-    doc = await db()[CLIENTS].find_one({"_id": client_id})
-    if doc is None:
-        return
-    groups = _keywords.groups_for_client(doc)
-    if not any(g["parent"].strip().lower() == keyword.strip().lower()
-               for g in groups.get(kw_type, [])):
-        groups.setdefault(kw_type, []).append({"parent": keyword, "children": []})
-
-    await db()[CLIENTS].update_one(
-        {"_id": client_id},
-        {"$addToSet": {field: keyword}, "$set": {"keyword_groups": groups}},
-    )
-
-
 async def get(client_id: str) -> dict:
     doc = await db()[CLIENTS].find_one({"_id": client_id})
     if doc is None:

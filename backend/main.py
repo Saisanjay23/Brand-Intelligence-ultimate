@@ -88,6 +88,7 @@ from backend.database.connection import ping as mongo_ping
 from backend.database.repositories import analysis_result_repository as analysis_results_db
 from backend.database.repositories import avatar_repository as avatars_db
 from backend.database.repositories import logo_repository as logos_db
+from backend.database.repositories import evidence_repository as evidence_db
 from backend.database.repositories import profile_repository as profiles_db
 from backend.database.repositories import session_repository as sessions_db
 from backend.sessions import manager as sessions_engine
@@ -146,7 +147,8 @@ async def lifespan(app: FastAPI):
         for p in registry.PLATFORMS.values():
             await registry.session_state(p)
         sessions_engine.start_monitor()
-        log.info("startup: mongo reachable, indexes ensured, session monitor running")
+        evidence_db.start_retention_monitor()
+        log.info("startup: mongo reachable, indexes ensured, session + evidence-retention monitors running")
     else:
         log.warning(
             "startup: mongo unreachable -- /health/ready will report unavailable, "
@@ -154,6 +156,7 @@ async def lifespan(app: FastAPI):
         )
     yield
     sessions_engine.stop_monitor()
+    evidence_db.stop_retention_monitor()
     await media_close()
     await mongo_close()
 

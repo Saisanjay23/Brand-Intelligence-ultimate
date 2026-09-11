@@ -19,11 +19,10 @@ from typing import Any, Optional
 
 from bson import ObjectId
 from bson.errors import InvalidId
-from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 from backend.config.settings import settings
-from backend.shared.errors import ConflictError, NotFoundError, ValidationError
+from backend.shared.errors import NotFoundError, ValidationError
 from backend.shared.logging import get_logger
 from backend.shared.models.scoring import MEDIUM_MATCH_THRESHOLD
 from backend.database.connection import db
@@ -1237,76 +1236,6 @@ async def find(
 _ACTIONABLE_FIELD_VERDICT = "MISSED"
 
 
-async def retry_queue_profiles(
-    client_id: str, platform: Optional[str] = None, *, limit: int = 500,
-) -> list[dict]:
-    """Every approved profile analysis has not FINISHED with, whether or not
-    it will still be retried automatically -- the full picture behind
-    `urls_for`'s exclude_analysed union and `stuck_analysis`'s "gave up"
-    subset, combined into one list a monitoring UI can render as a single
-    queue instead of an analyst having to reconcile two different partial
-    views by hand.
-
-    Every returned document carries enough of its own state (analysis_
-    attempts, analysis_status, analysis_complete, retry_disabled,
-    field_status) for the caller to classify it as "eligible" (will be
-    retried automatically), "exhausted" (hit MAX_ANALYSIS_ATTEMPTS), or
-    "stopped" (an analyst turned it off) without a second query --
-    services/profile_service.py::retry_queue does exactly that
-    classification, kept there rather than here because "what a row's
-    state MEANS" is a presentation decision, not a storage one.
-
-    `limit` bounds an unbounded query on a large client: this is a live
-    monitoring view meant to be read by a person, not an export, and a
-    person does not review 5,000 rows in one screen either way.
-    """
-    q: dict[str, Any] = {
-        "client_id": client_id, "status": "approved", "phase": PHASE_ANALYSIS,
-        "$or": [
-            {
-                "analysis_status": {"$in": list(RETRYABLE_ANALYSIS_STATUSES)},
-            },
-            {"analysis_complete": False},
-            {"retry_disabled": True},
-        ],
-    }
-    if platform:
-        q["platform"] = platform
-    out = []
-    async for d in (
-        db()[PROFILES]
-        .find(q)
-        .sort("analysed_at", -1)
-        .limit(max(1, limit))
-    ):
-        d["id"] = str(d.pop("_id"))
-        out.append(d)
-    return out
-
-
-async def set_retry_state(profile_id: str, *, disabled: bool, reset_attempts: bool = False) -> Optional[dict]:
-    """The retry queue UI's Stop / Resume action. A profile's own analysis
-    fields (ANALYSIS_FIELDS) are untouched -- this only ever writes
-    `retry_disabled` (+ optionally `analysis_attempts` for Resume), so
-    stopping or resuming a profile can never be mistaken for, or interfere
-    with, an actual re-read of it.
-
-    `reset_attempts=True` is what makes Resume actually resume something
-    that had already hit MAX_ANALYSIS_ATTEMPTS -- clearing `retry_disabled`
-    alone would leave `urls_for`'s attempts<MAX condition still failing, so
-    the profile would silently stay excluded and Resume would look like it
-    did nothing.
-    """
-    fields: dict[str, Any] = {"retry_disabled": disabled}
-    if reset_attempts:
-        fields["analysis_attempts"] = 0
-    res = await db()[PROFILES].find_one_and_update(
-        {"_id": _oid(profile_id)}, {"$set": fields}, return_document=ReturnDocument.AFTER,
-    )
-    if res is None:
-        return None
-    res["id"] = str(res.pop("_id"))
-    return res
 
 
 async def get_by_id(doc_id: str) -> Optional[dict]:
@@ -1447,84 +1376,6 @@ async def patch(doc_id: str, fields: dict) -> dict:
         raise NotFoundError(f"profile {doc_id!r} not found")
     updated = await get_by_id(doc_id)
     return updated or {}
-
-
-async def publish(doc_id: str) -> dict:
-    """An analyst confirming a held analysis result early, before its hold
-    naturally clears, see ADR 0007. A no-op find()-visibility-wise for a
-    row that was never held (already published, or not yet analysed).
-
-    Guarded against publishing anything that isn't an approved, analysed
-    finding: a profile still in `discovery` phase has no scored analysis to
-    publish, and a `rejected` profile is an analyst's explicit call that this
-    isn't a genuine impersonation, an incident must never be raised for it,
-    even if it was rejected after already clearing analysis. Both are 409s,
-    not silent no-ops, so a stale "Publish" click surfaces instead of quietly
-    doing nothing (or, before this guard, publishing anyway).
-    """
-    oid = _oid(doc_id)
-    doc = await db()[PROFILES].find_one({"_id": oid}, {"phase": 1, "status": 1, "analysis_status": 1})
-    if doc is None:
-        raise NotFoundError(f"profile {doc_id!r} not found")
-    if doc.get("phase") != PHASE_ANALYSIS:
-        raise ConflictError(f"profile {doc_id!r} has not been analysed yet")
-    if doc.get("status") == "rejected":
-        raise ConflictError(f"profile {doc_id!r} was rejected and cannot be published")
-    if doc.get("analysis_status") in RETRYABLE_ANALYSIS_STATUSES:
-        # ERROR/CHECKPOINT/LOGIN_REQUIRED: the analysis run never actually
-        # read this profile. PARTIAL: it read SOME of the profile but not
-        # enough to trust, either way this is queued for another attempt,
-        # not a finding to publish yet.
-        raise ConflictError(
-            f"profile {doc_id!r} last analysis ended in {doc['analysis_status']} -- "
-            "not a complete result yet, so there is nothing to publish "
-            "(it will be retried automatically)"
-        )
-    res = await db()[PROFILES].update_one(
-        {"_id": oid},
-        # clearing the hold alongside `published` keeps the two consistent:
-        # a row can otherwise read as published AND still-holding, which the
-        # UI renders as a countdown on something already sent downstream
-        {"$set": {"published": True}, "$unset": {"publish_hold_until": ""}},
-    )
-    if res.matched_count == 0:
-        raise NotFoundError(f"profile {doc_id!r} not found")
-    updated = await get_by_id(doc_id)
-    return updated or {}
-
-
-async def list_unpublished_ids(
-    client_id: str, platform: Optional[str] = None, since: Optional[datetime] = None,
-) -> list[str]:
-    """Every analysis-phase profile for this client not yet flagged
-    `published`, what a "Publish All" action iterates over, regardless
-    of whether each row's own publish hold has already cleared. Excludes
-    rejected profiles, see publish()'s guard for why those must never
-    be published. `since`, when set, additionally restricts to profiles
-    analysed on/after that time (the Publish filter's Recent/2-Days/Week
-    scopes, see services/profile_service.py::publish_all_profiles)."""
-    q: dict[str, Any] = {
-        "client_id": client_id, "phase": PHASE_ANALYSIS,
-        "published": {"$ne": True}, "status": {"$ne": "rejected"},
-        # a failed attempt carries no reading, see publish()'s guard
-        "analysis_status": {"$nin": list(RETRYABLE_ANALYSIS_STATUSES)},
-    }
-    if platform:
-        q["platform"] = platform
-    if since:
-        # `analysed_at` only started being written at a certain point (see
-        # save()'s PHASE_ANALYSIS branch); rows analysed before that have no
-        # such field. Matching on it alone would silently drop every one of
-        # those from a date-scoped publish, the analyst asks for "last
-        # week" and quietly gets less than they asked for, with no error.
-        # `last_seen` is written on every save (a $currentDate, so it is
-        # present on 100% of rows) and is never later than the analysis that
-        # produced the row, so it is the correct fallback.
-        q["$or"] = [
-            {"analysed_at": {"$gte": since}},
-            {"analysed_at": {"$exists": False}, "last_seen": {"$gte": since}},
-        ]
-    return [str(d["_id"]) async for d in db()[PROFILES].find(q, {"_id": 1})]
 
 
 async def stats(client_id: str, platform: Optional[str] = None) -> dict:
