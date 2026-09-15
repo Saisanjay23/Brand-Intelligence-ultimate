@@ -5,7 +5,7 @@ extraction-fallback-chain / parser-drift-canary machinery in
 `shared/extraction.py`, which already correctly answers "did this sweep's
 PARSER break". This module answers a different question: "was this failure
 worth burning the session over, and should the next attempt wait before
-trying again". Two things live here:
+trying again". Three things live here:
 
 1. `classify_failure`, one place that turns a raised exception (or a
    `Sweep.stopped` code) into the SAME vocabulary `sessions/manager.py`'s
@@ -29,6 +29,12 @@ policy; this module only ever retries one operation a bounded number of
 times. What actually breaks "runs forever" in practice is a session going
 bad and nothing ever noticing, so the same broken account gets handed out
 again next cycle, that's what `classify_failure` closes off.
+
+3. `sweep_outcome` / `describe_stop` / `summarise_stops`, which turn a
+`Sweep`'s `(stopped, complete)` pair into what an analyst is actually owed:
+whether the sweep got what was asked of it, merely ran out of budget, or
+broke -- and, for the last two, WHICH of those in words. See the block
+above `sweep_outcome` for why one boolean was not enough.
 """
 
 from __future__ import annotations
@@ -106,3 +112,135 @@ def is_transient(err: BaseException | str) -> bool:
     retrying would just hit again identically)."""
     text = str(err).lower()
     return any(tok in text for tok in _TRANSIENT_TOKENS)
+
+
+# ------------------------------------------------------- sweep outcomes
+
+# WHAT A SWEEP'S ENDING MEANS, AS OPPOSED TO WHERE IT ENDED.
+#
+# Every discovery engine sets `Sweep.complete = True` on exactly one thing:
+# it paged or scrolled until the platform ran out of results. That is a
+# true and useful engine-level fact and it is left exactly as it is. What
+# it is NOT is an answer to "should the analyst act on this" -- and it was
+# being read as one. `discovery/runner.py` counted every `complete is
+# False` sweep into a single `incomplete` tally and reported the lot as
+# "N sweep(s) did not run to completion", with no reason attached.
+#
+# Most of those were `cap:results`: a sweep that stopped because it had
+# collected exactly the number of profiles the analyst configured. A cap
+# doing its job is not an incomplete sweep, and reporting it as one had
+# two costs -- it trained analysts to scroll past the one warning that
+# also carries real breakage (a stall, a geoblock, a dead parser), and it
+# left every capped platform permanently `partial`, which the scheduler
+# reads as "still owing" forever.
+#
+# So a stop code resolves to one of three outcomes instead:
+#
+#   satisfied -- we have what was asked for. Either the platform ran out
+#                of results, or our own result cap was met. Nothing to say.
+#   truncated -- a budget that is not about results ended it early. More
+#                results exist; we chose not to spend the time on them.
+#                Worth stating, not worth alarm.
+#   broken    -- something went wrong that a human should look at.
+#
+# Anything unrecognised is BROKEN on purpose: a stop code this module has
+# never been taught is either a new failure mode or a new engine, and both
+# are better surfaced loudly once than swallowed silently forever.
+
+SATISFIED = "satisfied"
+TRUNCATED = "truncated"
+BROKEN = "broken"
+
+# `no-results` is here rather than in broken because a keyword nobody on
+# the platform matches is a real, common, correct answer -- see
+# instagram/discovery_engine.py's own note on not routing it through the
+# extraction-fallback chain.
+_SATISFIED_STOPS = frozenset({
+    "exhausted", "end-of-serp", "no-results", "cap:results",
+})
+
+# `cancelled` sits here, not in broken: the analyst pressing Stop is a
+# budget decision like any other, and the platform-level cancel branch in
+# discovery/runner.py reports the cancel itself separately anyway.
+_TRUNCATED_STOPS = frozenset({
+    "cap:seconds", "cap:pages", "cancelled",
+})
+
+
+def sweep_outcome(stopped: str, complete: bool = False) -> str:
+    """A `Sweep`'s (stopped, complete) pair -> SATISFIED | TRUNCATED |
+    BROKEN.
+
+    `complete` wins when it is set, because only the engine can know it
+    reached the true end of a result set; the stop code decides everything
+    else. Both are read rather than just the code so that an engine which
+    sets `complete` without a code (or with one this module has not been
+    taught) still reports cleanly.
+    """
+    if complete:
+        return SATISFIED
+    code = (stopped or "").strip().lower()
+    if code in _SATISFIED_STOPS:
+        return SATISFIED
+    if code in _TRUNCATED_STOPS:
+        return TRUNCATED
+    return BROKEN
+
+
+# Plain English for each stop code, written to read as the predicate of
+# "N sweep(s) ___". Anything missing falls back to the raw code, which is
+# still infinitely more use than the bare count this replaces.
+_STOP_PHRASES = {
+    "cap:seconds": "ran out of time budget",
+    "cap:pages": "hit the page limit",
+    "cancelled": "were cancelled",
+    "stalled": "stalled with no new results",
+    "error": "errored",
+    "quota": "exhausted the platform's API quota",
+    "checkpoint": "hit a login checkpoint",
+    "checkpointed": "hit a login checkpoint",
+    "geoblocked": "were geoblocked for this IP",
+    "rate_limited": "were rate limited",
+    "flood-wait": "were put on a flood wait",
+    "session-failed": "lost every session that attempted them",
+    # Instagram's private mobile API failed and the web endpoint stood in.
+    # Results were still recovered, so this is not a total loss -- but a
+    # fallback that fires on every sweep means the primary path is dead,
+    # which is exactly the thing worth telling somebody about.
+    "mobile-api-failed-web-recovered": "fell back to the web API",
+}
+
+_HTTP_RE = re.compile(r"^http-(\d{3})$")
+
+
+def describe_stop(stopped: str) -> str:
+    """One stop code -> the phrase an analyst reads."""
+    code = (stopped or "").strip().lower()
+    if not code:
+        return "stopped for an unrecorded reason"
+    if phrase := _STOP_PHRASES.get(code):
+        return phrase
+    if m := _HTTP_RE.match(code):
+        return f"got HTTP {m.group(1)}"
+    return f"stopped on {code!r}"
+
+
+def summarise_stops(counts: dict[str, int]) -> str:
+    """Stop code -> count, as the one sentence a platform's note carries.
+
+    One reason reads as a plain statement ("3 sweep(s) ran out of time
+    budget"); several are listed after a total, commonest first, so the
+    dominant cause is the first thing read. Deterministic on ties (by
+    code) because this string is asserted on in tests and diffed by eye
+    across runs.
+    """
+    live = {code: n for code, n in counts.items() if n > 0}
+    if not live:
+        return ""
+    total = sum(live.values())
+    ranked = sorted(live.items(), key=lambda kv: (-kv[1], kv[0]))
+    if len(ranked) == 1:
+        code, n = ranked[0]
+        return f"{n} sweep(s) {describe_stop(code)}"
+    detail = ", ".join(f"{n} {describe_stop(code)}" for code, n in ranked)
+    return f"{total} sweep(s) stopped early -- {detail}"
