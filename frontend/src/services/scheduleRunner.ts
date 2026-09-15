@@ -108,6 +108,25 @@ export interface ScheduleEntry {
   // so `job_id` points at a job that is very probably STILL RUNNING on the
   // server. Cleared as soon as the next run has decided what to do with it.
   resume: boolean;
+  // HOW MANY (platform, tab, keyword) SEARCHES THIS CLIENT STILL OWES,
+  // read from the backend's durable coverage ledger after the sweep
+  // settles -- NOT derived from the job, which reports aggregates and is
+  // evicted from memory within the hour.
+  //
+  // This is the number the whole guarantee comes down to: every keyword an
+  // analyst saved has to be searched on every platform in scope, and a
+  // keyword that was never searched must never be indistinguishable from
+  // one that was searched and found nothing. `status: "done"` cannot say
+  // that on its own -- a sweep whose Facebook pool died halfway finishes
+  // perfectly happily.
+  //
+  // -1 means "not known": the coverage read failed, or this entry has not
+  // run yet. Deliberately not 0, because 0 is the clean bill of health and
+  // a failed read must never be able to impersonate one.
+  owed: number;
+  // Set while the gap-closing lap is sweeping this entry, so the UI can
+  // say why a client it already reported `done` is running again.
+  closingGaps?: boolean;
 }
 
 export interface ScheduleState {
@@ -242,6 +261,8 @@ export function enqueue(client: Client): void {
       new_profiles: 0,
       platforms: {},
       platform_details: {},
+      owed: -1,
+      closingGaps: false,
       resume: false,
       started_at: null,
       finished_at: null,
@@ -294,6 +315,8 @@ export function resetStatuses(): void {
       new_profiles: 0,
       platforms: {},
       platform_details: {},
+      owed: -1,
+      closingGaps: false,
       started_at: null,
       finished_at: null,
     })),
@@ -397,7 +420,21 @@ function liveScopeFor(entry: ScheduleEntry): string {
   return findClient(entry.client_id)?.scheduler_keyword_scope || "";
 }
 
-async function runEntry(entry: ScheduleEntry): Promise<void> {
+// What this client still owes, straight from the durable ledger.
+//
+// ANY FAILURE ANSWERS "UNKNOWN", NEVER "NOTHING". Reporting a client as
+// fully covered because a GET timed out is the exact false clean bill of
+// health the ledger exists to prevent -- and the one that would be hardest
+// to ever notice, since it looks identical to success.
+async function owedFor(groupId: string): Promise<number> {
+  try {
+    return (await discoveryApi.coverage(groupId)).owed;
+  } catch {
+    return -1;
+  }
+}
+
+async function runEntry(entry: ScheduleEntry, opts?: { onlyOwed?: boolean }): Promise<void> {
   const client = await liveClientFor(entry);
   const individual = client ? dedupe(client.name_keywords || []) : entry.individual_keywords;
   const domain = client ? dedupe(client.domain_keywords || []) : entry.domain_keywords;
@@ -485,6 +522,11 @@ async function runEntry(entry: ScheduleEntry): Promise<void> {
         platform_tab_limits: client?.platform_tab_limits,
         facebook_tabs: fbTabs.length ? fbTabs : undefined,
         max_seconds: budgetMinutes > 0 ? budgetMinutes * 60 : undefined,
+        // The gap-closing lap sends the same request in every respect but
+        // this: the backend narrows each platform's queue to the cells its
+        // ledger still lists as owed. Same keywords, same caps, same scope
+        // -- just not the work already done.
+        only_owed: opts?.onlyOwed || undefined,
       });
       jobId = res.job_id;
       patchEntry(entry.client_id, { job_id: jobId, message: "sweeping…" });
@@ -544,6 +586,11 @@ async function runEntry(entry: ScheduleEntry): Promise<void> {
         // platform session on every lap. It gets its own terminal status
         // instead, which the loop skips and Reset can clear.
         const cancelStatus: EntryStatus = state.stopping ? "pending" : "cancelled";
+        // ASKED AFTER THE JOB SETTLES, ALWAYS -- including after a
+        // failure, which is precisely when the answer matters most. The
+        // job's own report cannot say which keywords went unsearched; the
+        // ledger can, and it outlives the job.
+        const owed = await owedFor(entry.client_id);
         patchEntry(entry.client_id, {
           status: job.status === "done" ? "done" : job.status === "cancelled" ? cancelStatus : "failed",
           message: job.message || job.status,
@@ -551,6 +598,8 @@ async function runEntry(entry: ScheduleEntry): Promise<void> {
           new_profiles: job.new,
           platforms: platformOutcomes(job),
           platform_details: platformDetails(job),
+          owed,
+          closingGaps: false,
           finished_at: Date.now(),
         });
         return;
@@ -603,6 +652,8 @@ export async function start(): Promise<void> {
       new_profiles: 0,
       platforms: {},
       platform_details: {},
+      owed: -1,
+      closingGaps: false,
       started_at: null,
       finished_at: null,
     })),
@@ -625,8 +676,54 @@ export async function start(): Promise<void> {
       if (state.stopping) break;
       if (state.entries.some((e) => e.status === "pending")) await sleep(GAP_MS);
     }
+    if (!state.stopping) await closeGaps();
   } finally {
     setState({ running: false, currentId: "", stopping: false });
+  }
+}
+
+// ONE EXTRA LAP, OVER THE GAPS ONLY.
+//
+// The requirement the Scheduler exists to meet is that every keyword saved
+// under every queued client actually gets searched on every platform in
+// scope. A single pass cannot guarantee that and never could: a pool can
+// run dry halfway down a ten-client queue, a platform can checkpoint, an
+// account can be cooling off when a client's turn comes and be free again
+// twenty minutes later. Those are ordinary operating conditions, not bugs
+// to be eliminated -- so the answer is to come back for what was missed
+// rather than to pretend it did not happen.
+//
+// It is cheap because it is scoped: `only_owed` narrows each platform to
+// the exact (tab, keyword) cells its ledger still lists as owed, so a
+// client that missed two keywords costs two searches, not a re-sweep. A
+// client that owes nothing is skipped entirely and never claims a session.
+//
+// EXACTLY ONE LAP, NOT A LOOP. A keyword failing for a structural reason
+// (the account is genuinely dead, the platform is geoblocked for this IP)
+// would otherwise be retried for ever, burning the same session on the
+// same doomed search -- which is both the worst thing to do to an account
+// pool and the surest way to turn a small problem into a ban. One lap
+// closes the transient gaps; whatever still owes after it is a real
+// problem, and stays visible as owed work for a human to look at.
+async function closeGaps(): Promise<void> {
+  const owing = state.entries.filter((e) => e.owed > 0);
+  if (!owing.length) return;
+
+  for (const entry of owing) {
+    if (state.stopping) break;
+    patchEntry(entry.client_id, {
+      status: "pending",
+      closingGaps: true,
+      message: `closing ${entry.owed} missed search(es)…`,
+      resume: false,
+      job_id: "",
+    });
+    const fresh = state.entries.find((e) => e.client_id === entry.client_id);
+    if (!fresh) continue;
+    await runEntry(fresh, { onlyOwed: true });
+    setState({ currentId: "" });
+    if (state.stopping) break;
+    if (owing.indexOf(entry) < owing.length - 1) await sleep(GAP_MS);
   }
 }
 

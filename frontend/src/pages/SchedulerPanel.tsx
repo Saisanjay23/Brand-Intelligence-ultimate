@@ -488,11 +488,31 @@ function PlatformChips({ entry }: { entry: ScheduleEntry }) {
             </span>
           );
         })}
-        {owing > 0 && (
-          <span style={{ fontSize: "10.5px", color: "var(--warn-yellow, #fdb71b)", fontWeight: 700 }}>
-            {owing} still owing
+        {/* THE NUMBER THAT ACTUALLY ANSWERS THE QUESTION. "2 platforms
+            still owing" says a platform did not finish cleanly; it cannot
+            say whether a keyword went unsearched, which is the only thing
+            that matters in impersonation monitoring -- an unsearched
+            permutation is an impersonator nobody looked for. `entry.owed`
+            is read from the backend's durable per-cell ledger after the
+            sweep settles, so it counts real (platform, tab, keyword)
+            searches still outstanding. -1 means the coverage read failed
+            and is shown as unknown rather than as zero: a failed read must
+            never be able to impersonate a clean bill of health. */}
+        {entry.owed > 0 ? (
+          <span
+            title="Keyword searches this client still owes. The Scheduler runs one gap-closing pass over these automatically after the queue finishes."
+            style={{ fontSize: "10.5px", color: "var(--warn-yellow, #fdb71b)", fontWeight: 700 }}
+          >
+            {entry.owed} search{entry.owed === 1 ? "" : "es"} still owing
           </span>
-        )}
+        ) : entry.owed < 0 && owing > 0 ? (
+          <span
+            title="Coverage could not be read, so what this client still owes is unknown."
+            style={{ fontSize: "10.5px", color: "var(--warn-yellow, #fdb71b)", fontWeight: 700 }}
+          >
+            {owing} platform{owing === 1 ? "" : "s"} unfinished
+          </span>
+        ) : null}
       </div>
 
       {/* Failure / partial notes: show why each non-done platform had issues */}

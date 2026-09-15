@@ -72,6 +72,9 @@ const BASE: ScheduleEntry = {
   new_profiles: 0,
   platforms: {},
   platform_details: {},
+  // -1 is "not known", never 0: 0 is the clean bill of health and a
+  // coverage read that never happened must not be able to impersonate one.
+  owed: -1,
   resume: false,
   started_at: null,
   finished_at: null,

@@ -502,6 +502,18 @@ class TestWhenNothingCanBeClaimed:
 class TestCancellation:
     @pytest.mark.asyncio
     async def test_a_cancelled_platform_keeps_what_it_read_and_fails_nothing(self, monkeypatch):
+        """A cancel must not turn the analyst's own Stop into a screenful
+        of errors -- that is what this has always pinned, and `failed` is
+        still the wrong answer.
+
+        IT USED TO PIN `done`, AND THAT WAS TOO KIND. Nothing here broke,
+        so the incomplete count is zero, and reporting on that alone said
+        a platform whose four keywords nobody searched had finished
+        cleanly. "Done" about unsearched keywords is exactly the silence
+        the coverage ledger exists to end (see test_keyword_coverage.py),
+        and the status has to agree with it: `partial`, with the four
+        recorded as owed so resuming picks them up.
+        """
         _wire(monkeypatch, [_session("a")])
         job = _job([f"kw{n}" for n in range(4)])
         job.cancel.set()
@@ -510,7 +522,8 @@ class TestCancellation:
 
         prog = job.platforms[PLATFORM]
         assert prog.keywords_done == 0
-        assert prog.status == "done"
+        assert prog.status == "partial"
+        assert "4 keyword(s) unsearched" in prog.note
 
 
 # --------------------------------------------------- the process-wide ceiling
