@@ -93,6 +93,7 @@ from backend.database.repositories import coverage_repository as coverage_db
 from backend.database.repositories import profile_repository as profiles_db
 from backend.database.repositories import session_repository as sessions_db
 from backend.database.repositories import telemetry_repository as telemetry_db
+from backend.services import avatar_backfill
 from backend.sessions import manager as sessions_engine
 from backend.shared.errors import DomainError
 from backend.shared.logging import configure_logging, get_logger
@@ -156,6 +157,7 @@ async def lifespan(app: FastAPI):
     storage_task.cancel()
     sessions_engine.stop_monitor()
     evidence_db.stop_retention_monitor()
+    avatar_backfill.stop_retry_monitor()
     await media_close()
     await mongo_close()
 
@@ -203,6 +205,15 @@ async def _bring_up_storage() -> None:
                     await registry.session_state(plat)
                 sessions_engine.start_monitor()
                 evidence_db.start_retention_monitor()
+                # KEEPS PROFILE PICTURES, rather than hoping the sweep
+                # caught them. A card showing a letter circle for a profile
+                # that visibly has a photo is the single most common "this
+                # tool is broken" report, and the cause is always the same:
+                # one fetch, at sweep time, best-effort, never retried. Meta
+                # signs its picture URLs for 110-307 hours, so retrying
+                # hourly gets hundreds of attempts inside the window -- no
+                # realistic outage survives that.
+                avatar_backfill.start_retry_monitor()
             except Exception as e:
                 # Reachable but not usable (auth, a replica-set election
                 # mid-flight). Same treatment as unreachable: say so, and

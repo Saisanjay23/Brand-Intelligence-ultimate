@@ -16,7 +16,10 @@ drifts is the one that becomes an SSRF relay. There is one copy.
 from __future__ import annotations
 
 import asyncio
+import re
+import time
 from dataclasses import dataclass
+from typing import Optional
 from urllib.parse import urlparse
 
 import aiohttp
@@ -104,6 +107,49 @@ async def close() -> None:
     if _session is not None and not _session.closed:
         await _session.close()
     _session = None
+
+
+# HOW LONG A SIGNED CDN URL HAS LEFT.
+#
+# Meta signs every picture URL and stamps the expiry into `oe=`, as a hex
+# unix timestamp. Knowing it turns "this fetch failed" into two very
+# different facts: a URL that is still valid and failed is a transient
+# problem worth retrying, and one that has expired can never be fetched
+# again from that URL by anybody, so retrying is pure waste and the picture
+# has to be re-discovered instead.
+#
+# MEASURED, NOT ASSUMED. The comment this replaces said fbcdn signs "hours
+# not days". Against the stored data the real window is 110-307 hours --
+# four and a half to nearly thirteen days. That difference is the whole
+# reason a background retry is a complete fix rather than a race: there is
+# no realistic outage that outlasts a week of hourly retries.
+_OE_RE = re.compile(r"[?&]oe=([0-9A-Fa-f]{1,16})")
+
+
+def signed_expiry(raw: str) -> Optional[float]:
+    """Unix seconds when this URL stops working, or None when it carries no
+    expiry stamp (YouTube, Twitter and Telegram URLs do not sign, and a
+    data: URI has no lifetime at all)."""
+    m = _OE_RE.search(raw or "")
+    if not m:
+        return None
+    try:
+        return float(int(m.group(1), 16))
+    except ValueError:
+        return None
+
+
+def url_is_live(raw: str, now: Optional[float] = None) -> bool:
+    """Is this URL still fetchable, as far as its own signature says?
+
+    Unsigned URLs answer True: they have no stated lifetime, so the only
+    way to know is to try, and trying is what the caller wants. Only a
+    signature that has demonstrably passed answers False.
+    """
+    exp = signed_expiry(raw)
+    if exp is None:
+        return True
+    return exp > (now if now is not None else time.time())
 
 
 def allowed(raw: str) -> bool:

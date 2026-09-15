@@ -47,11 +47,42 @@ log = get_logger("services.avatar_cache")
 # problem worth solving.
 CONCURRENCY = 4
 
-# One fetch that hangs must not hold a job's completion. Every avatar is
-# best-effort: the card falls back to the live CDN URL and then to its
-# initial-letter circle, both of which already work.
+# One fetch that hangs must not hold a job's completion.
 PER_IMAGE_TIMEOUT_SEC = 20.0
-BATCH_TIMEOUT_SEC = 180.0
+
+# THE FLAT 180s BATCH CAP WAS WRONG, AND THE COMMENT EXPLAINING IT WAS THE
+# REASON. It said an avatar is best-effort because "the card falls back to
+# the live CDN URL". That fallback is not durable: Facebook and Instagram
+# sign their picture URLs and they expire within hours (a stored Instagram
+# URL fetched twelve days later answers `403 URL signature expired`). So a
+# batch cut short does not cost a card its picture until the next sweep --
+# it costs that picture permanently, and the card shows an initial-letter
+# circle for a profile that visibly has a photo.
+#
+# Measured, not theorised: a Facebook sweep on 2026-09-08 found 3,301
+# profiles and cached 1,514 of them. Every other run that week cached
+# 99-100%. The difference is batch size against a fixed clock.
+#
+# A per-batch budget still exists -- something has to stop a pathological
+# hang -- but it scales with the work, so a big batch gets proportionally
+# longer rather than being truncated for being big. The floor covers small
+# batches; the ceiling stops any single batch holding a job indefinitely.
+_BATCH_SECONDS_PER_IMAGE = 2.0
+_BATCH_TIMEOUT_FLOOR_SEC = 180.0
+_BATCH_TIMEOUT_CEILING_SEC = 3600.0
+
+
+def batch_timeout_for(count: int) -> float:
+    """How long a batch of `count` avatars is allowed to take.
+
+    At CONCURRENCY=4 and a 20s per-image ceiling, the worst realistic case
+    is 5s of wall clock per image; 2s each is a generous budget for the
+    few-KB thumbnails these actually are, and still finite.
+    """
+    return max(
+        _BATCH_TIMEOUT_FLOOR_SEC,
+        min(_BATCH_TIMEOUT_CEILING_SEC, count * _BATCH_SECONDS_PER_IMAGE),
+    )
 MAX_BYTES = 8 * 1024 * 1024  # Size cap matching imagefetch.MAX_BYTES
 
 
@@ -208,6 +239,16 @@ async def cache_one(
     return None, None, None, None
 
 
+def _host_of(url: str) -> str:
+    """The CDN a failure came from, for the log line. Never raises and never
+    echoes the signed URL itself -- the host is the actionable part."""
+    try:
+        from urllib.parse import urlparse
+        return urlparse(url).hostname or "unknown"
+    except Exception:
+        return "unknown"
+
+
 async def cache_for_profiles(
     client_id: str, platform: str, items: Iterable[dict],
 ) -> int:
@@ -282,6 +323,12 @@ async def cache_for_profiles(
 
     sem = asyncio.Semaphore(CONCURRENCY)
     stored = 0
+    # WHY EACH ONE THAT DID NOT LAND, DID NOT LAND. `one()` used to return
+    # silently when `cache_one` produced no digest, so an entire batch could
+    # fail to cache and the job reported nothing at all -- which is how 284
+    # Instagram profiles ended up with a stored URL, no stored bytes, and no
+    # record anywhere that a fetch had ever been attempted.
+    failed: dict[str, int] = {}
     # What landed, keyed by profile URL, so the logo pass below runs over
     # this batch without re-reading anything from Mongo.
     landed: dict[str, tuple[str, Optional[dict], Optional[list]]] = {}
@@ -293,6 +340,17 @@ async def cache_for_profiles(
                 image_url, want_embedding=want_embedding, platform=platform,
             )
         if not sha:
+            # RETRIED ONCE, because the commonest failure here is transient
+            # (a CDN hiccup, a connection reset under four-way concurrency)
+            # and the URL that would let us try again later expires within
+            # hours. One retry is the difference between recovering now and
+            # losing the picture for good.
+            async with sem:
+                sha, fp, vec, generated = await cache_one(
+                    image_url, want_embedding=want_embedding, platform=platform,
+                )
+        if not sha:
+            failed[_host_of(image_url)] = failed.get(_host_of(image_url), 0) + 1
             return
         try:
             ok = await profiles_db.set_avatar_sha(
@@ -331,16 +389,31 @@ async def cache_for_profiles(
         if ok:
             stored += 1
 
+    budget = batch_timeout_for(len(targets))
     try:
         await asyncio.wait_for(
             asyncio.gather(*(one(u, e, i) for u, e, i in targets), return_exceptions=True),
-            timeout=BATCH_TIMEOUT_SEC,
+            timeout=budget,
         )
     except asyncio.TimeoutError:
         # Whatever finished has already been written -- each task persists
         # its own result as it lands rather than at the end of the batch --
-        # so a timeout costs the stragglers, not the batch.
-        log.warning(f"avatar cache batch timed out after {BATCH_TIMEOUT_SEC}s")
+        # so a timeout costs the stragglers, not the batch. It DOES cost
+        # them permanently, though (the URL they would be re-fetched from
+        # expires), so this is an error rather than a note.
+        missed = len(targets) - stored
+        log.error(
+            f"avatar cache batch timed out after {budget:.0f}s with {missed} of "
+            f"{len(targets)} picture(s) unfetched -- their CDN URLs expire within "
+            f"hours, so those cards will fall back to a letter circle permanently. "
+            f"Run the avatar backfill for this client to recover them.")
+
+    if failed:
+        detail = ", ".join(f"{n} from {host}" for host, n in sorted(failed.items()))
+        log.error(
+            f"avatar cache: {sum(failed.values())} picture(s) could not be fetched "
+            f"({detail}) -- stored URL kept, but it expires, so these need the "
+            f"backfill rather than another sweep")
 
     # Compare what just landed against the client's reference logos. Pure
     # arithmetic over stored hashes (~4us a comparison), and a no-op for a

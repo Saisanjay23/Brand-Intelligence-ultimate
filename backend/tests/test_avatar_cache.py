@@ -142,7 +142,28 @@ class TestPacing:
     def test_every_wait_is_bounded(self):
         """No avatar fetch may hold a finished job open indefinitely."""
         assert cache.PER_IMAGE_TIMEOUT_SEC > 0
-        assert cache.BATCH_TIMEOUT_SEC > cache.PER_IMAGE_TIMEOUT_SEC
+        for count in (1, 100, 3301, 100_000):
+            assert cache.batch_timeout_for(count) > cache.PER_IMAGE_TIMEOUT_SEC
+            assert cache.batch_timeout_for(count) <= cache._BATCH_TIMEOUT_CEILING_SEC
+
+    def test_a_big_batch_gets_proportionally_longer(self):
+        """THE BUG THIS REPLACED A FLAT CAP FOR. 180 seconds was enough for
+        a small sweep and nowhere near enough for a large one: a Facebook
+        sweep that found 3,301 profiles cached 1,514 of them and the rest
+        were cut off mid-batch.
+
+        That is not a delay, it is permanent loss -- the fallback the old
+        comment relied on ("the card falls back to the live CDN URL") is a
+        signed URL that expires within hours, so a picture not fetched
+        during the sweep cannot be fetched from that URL later at all.
+        """
+        assert cache.batch_timeout_for(3301) > cache.batch_timeout_for(100)
+        assert cache.batch_timeout_for(3301) >= 3301 * 1.0
+
+    def test_the_budget_never_grows_without_limit(self):
+        """Scaling with the work must not mean one pathological batch can
+        hold a job open for a day."""
+        assert cache.batch_timeout_for(10_000_000) == cache._BATCH_TIMEOUT_CEILING_SEC
 
 
 class TestNewAllowlistEntries:
