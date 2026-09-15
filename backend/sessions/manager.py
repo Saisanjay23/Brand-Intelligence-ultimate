@@ -1575,6 +1575,15 @@ async def _monitor_loop() -> None:
             await check_all_once()
             from backend.services.session_canary_service import check_token_expiries
             await check_token_expiries()
+            # CAN WE STILL LOG IN is only half the question; the other half
+            # is whether scraping still works once we have. A dead parser is
+            # silent where a dead session is loud, so it gets checked on the
+            # same cadence rather than waiting for somebody to notice a
+            # month of clean, empty sweeps. It has its own try/except and
+            # returns a report rather than raising, so it cannot cost the
+            # session sweep above it.
+            from backend.services import engine_health_service
+            await engine_health_service.check_once()
             if purged := await purge_stale_dead_sessions():
                 log.info(f"session cleanup: purged {purged} stale dead session(s)")
         except Exception as e:

@@ -53,6 +53,7 @@ from urllib.parse import parse_qs, quote, urlparse
 
 from backend.platforms.scan_options import cancelled
 from backend.shared.extraction import run_strategies
+from backend.shared.schema_probe import SchemaProbe, probe_or_null
 from backend.shared.avatars import looks_like_placeholder
 from backend.shared.models.hit import Hit, hit_to_row
 from backend.shared.models.row import Row
@@ -327,27 +328,69 @@ def profile_url_for(entity_id: str, kind: str = "profile") -> str:
     return f"https://www.facebook.com/profile.php?id={entity_id}"
 
 
-def iter_results(blob: Any) -> Iterator[Hit]:
+# EVERY ATTRIBUTE THIS ENGINE TARGETS IN FACEBOOK'S SEARCH PAYLOAD, named.
+#
+# These are the exact keys a Facebook change breaks. Naming them here and
+# probing each one at the point it is read is what turns "the GraphQL parse
+# stopped working" into "`edge.rendering_strategy.view_model` matched 0 of
+# 240 edges, and matched 240 of 240 last week" -- which is the difference
+# between an afternoon diffing a live capture and a one-line fix. See
+# shared/schema_probe.py.
+K_EDGES = "search.edges"
+K_VIEW_MODEL = "edge.rendering_strategy.view_model"
+K_VM_TYPENAME = "view_model.__typename"
+K_PROFILE = "view_model.profile"
+K_PROFILE_ID = "profile.id"
+K_PROFILE_NAME = "profile.name"
+K_PROFILE_URL = "profile.profile_url"
+K_PROFILE_PIC = "profile.profile_picture.uri"
+K_PAGE_INFO = "page_info.has_next_page"
+K_IDS_SHOWN = "end_cursor.result_ids_shown"
+K_EMBEDDED = "embedded.SearchProfileViewModel"
+
+
+def iter_results(blob: Any, probe: Any = None) -> Iterator[Hit]:
     """Every profile/page result in one pagination payload, in page order."""
+    probe = probe_or_null(probe)
     for edge_holder in iter_dicts(blob):
         edges = edge_holder.get("edges")
         if not isinstance(edges, list):
             continue
+        probe.hit(K_EDGES)
         for i, edge in enumerate(edges):
             if not isinstance(edge, dict):
                 continue
+            # PROBED PER EDGE, AND ONLY INSIDE AN EDGE. The parent is known
+            # to exist here, so a miss means Facebook rendered a result and
+            # we could not read it -- never that the search was empty. That
+            # is the entire distinction this instrumentation is for.
             vm = (edge.get("rendering_strategy") or {}).get("view_model")
-            if not isinstance(vm, dict) or vm.get("__typename") not in VIEW_MODELS:
+            if not isinstance(vm, dict):
+                probe.miss(K_VIEW_MODEL)
                 continue
+            probe.hit(K_VIEW_MODEL)
+            if vm.get("__typename") not in VIEW_MODELS:
+                # A shape we know but a type we do not: either Facebook
+                # added a result kind, or it renamed the ones we match.
+                probe.miss(K_VM_TYPENAME)
+                continue
+            probe.hit(K_VM_TYPENAME)
             prof = vm.get("profile")
             if not isinstance(prof, dict):
+                probe.miss(K_PROFILE)
                 continue
+            probe.hit(K_PROFILE)
             eid = prof.get("id")
             if not (isinstance(eid, str) and eid.isdigit()):
+                probe.miss(K_PROFILE_ID)
                 continue
+            probe.hit(K_PROFILE_ID)
+            probe.check(prof, "name", K_PROFILE_NAME)
+            probe.first_of(prof, ("profile_url", "url"), K_PROFILE_URL)
             url = prof.get("profile_url") or prof.get("url") or profile_url_for(eid, ENTITY_TYPES.get(prof.get("__typename"), "profile"))
             pic = prof.get("profile_picture")
             raw_uri = pic.get("uri", "") if isinstance(pic, dict) else ""
+            (probe.hit if raw_uri else probe.miss)(K_PROFILE_PIC)
             # THE PICTURE IS ALWAYS KEPT; whether it is a REAL one is a
             # separate question answered by `has_custom_pic`.
             #
@@ -418,17 +461,20 @@ async def _shows_no_results(page) -> bool:
         return False
 
 
-def page_state(blob: Any) -> Optional[PageState]:
+def page_state(blob: Any, probe: Any = None) -> Optional[PageState]:
     """The pagination cursor for the search connection, if this payload has one.
 
     Facebook puts a page_info on several connections per response (the
     notification dropdown has one too), so this only accepts a cursor that
     decodes to a search cursor, one carrying result_ids_shown.
     """
+    probe = probe_or_null(probe)
+    saw_page_info = False
     for d in iter_dicts(blob):
         pi = d.get("page_info")
         if not isinstance(pi, dict) or "has_next_page" not in pi:
             continue
+        saw_page_info = True
         cursor = pi.get("end_cursor")
         if not isinstance(cursor, str):
             continue
@@ -438,6 +484,13 @@ def page_state(blob: Any) -> Optional[PageState]:
             continue
         if "result_ids_shown" not in c:
             continue
+        # THE CURSOR IS THE COMPLETENESS SIGNAL. Losing it does not stop the
+        # sweep -- the scroll loop falls back to giving up after `patience`
+        # idle scrolls -- but it does silently cost every "we reached the
+        # real end of the results" verdict, which is what tells a capped
+        # sweep apart from an exhausted one.
+        probe.hit(K_IDS_SHOWN)
+        probe.hit(K_PAGE_INFO)
         totals = c.get("unit_id_logging_fields") or {}
         return PageState(
             has_next=bool(pi["has_next_page"]),
@@ -446,6 +499,10 @@ def page_state(blob: Any) -> Optional[PageState]:
             total_results=totals.get("num_total_results"),
             end_of_serp=bool(c.get("is_end_of_serp")),
         )
+    if saw_page_info:
+        # Facebook sent pagination cursors, and none of them was the search
+        # one we know how to read. That is a rename, not an empty page.
+        probe.miss(K_IDS_SHOWN)
     return None
 
 
@@ -492,17 +549,24 @@ def parse_lines(text: str) -> Iterator[Any]:
 RE_EMBEDDED = re.compile(r"^\s*\{")
 
 
-def parse_embedded(texts) -> Iterator[Any]:
+def parse_embedded(texts, probe: Any = None) -> Iterator[Any]:
     """The first page of results is server-rendered, not fetched over XHR."""
+    probe = probe_or_null(probe)
+    saw_any = False
     for t in texts or []:
         if not t or "SearchProfileViewModel" not in t:
             continue
+        saw_any = True
         if not RE_EMBEDDED.match(t):
             continue
         try:
             yield json.loads(t)
         except (json.JSONDecodeError, ValueError):
             continue
+    # Tallied once per call, not per script tag: this is a marker string in
+    # the server-rendered page, and Facebook renaming the view model is one
+    # event however many `<script type="application/json">` blocks carry it.
+    (probe.hit if saw_any else probe.miss)(K_EMBEDDED)
 
 
 # Crawling / pagination
@@ -592,7 +656,13 @@ JS_EMBEDDED = (
 
 async def _notify(on_progress, found_count: int, page_num: int, new_hits: list) -> None:
     """Best-effort progress callback, a broken callback must never abort
-    the scrape itself, so any exception here is swallowed by the caller."""
+    the scrape itself, so any exception here is swallowed by the caller.
+
+    `new_hits` are ROWS, not Hits. Every engine that streams hands the
+    caller the same shape the finished sweep returns, so the runner has one
+    contract to code against rather than one per platform -- see
+    twitter/discovery_engine.py::_emit, which does the same conversion.
+    """
     if asyncio.iscoroutinefunction(on_progress):
         await on_progress(found_count, page_num, new_hits)
     else:
@@ -738,6 +808,12 @@ class Sweep:
     # the answer was previously invisible from outside the engine.
     resolved_visits: int = 0
     resolve_seconds: float = 0.0
+    # WHICH TARGETED ATTRIBUTES FACEBOOK STILL SERVES: {key: [hits, misses]},
+    # from shared/schema_probe.py. Carried on the Sweep so the runner can
+    # fold it into the rolling telemetry without the engine needing to know
+    # anything about storage -- and so a rename is reported as the key that
+    # changed rather than as a mysterious drop in results.
+    schema: dict = field(default_factory=dict)
 
     def summary(self) -> str:
         """One-line log form. Reports `backfilled` and `unshown` counts
@@ -1459,6 +1535,11 @@ class Discovery:
         state: Optional[PageState] = None
         arrived = asyncio.Event()
         kind = kind_for_tab(tab)
+        # One tally per sweep of which targeted attributes Facebook still
+        # serves -- see shared/schema_probe.py. Rides out on the Sweep, into
+        # the rolling telemetry, and is what lets an alert name the exact
+        # renamed key instead of just saying the parse broke.
+        probe = SchemaProbe()
 
         cap = _tab_cap(self.a)
 
@@ -1467,7 +1548,7 @@ class Discovery:
             enforcing the cap as it goes. See the note below for why the
             cap is applied HERE and not only between scrolls."""
             nonlocal state
-            for hit in iter_results(blob):
+            for hit in iter_results(blob, probe):
                 # capped here, not only in the while-loop's own check below:
                 # one response can carry a whole page's worth of edges at
                 # once, so checking only between scrolls let by_id overshoot
@@ -1491,7 +1572,7 @@ class Discovery:
                     break
                 if hit.entity_id not in by_id:
                     by_id[hit.entity_id] = hit
-            if st := page_state(blob):
+            if st := page_state(blob, probe):
                 state = st
                 rendered_ids.update(st.ids_shown)
                 processed_ids.update(st.ids_processed)
@@ -1555,7 +1636,7 @@ class Discovery:
                     except asyncio.TimeoutError:
                         pass
 
-            for blob in parse_embedded(await page.evaluate(JS_EMBEDDED)):
+            for blob in parse_embedded(await page.evaluate(JS_EMBEDDED), probe):
                 absorb(blob)
 
             # Insertion order in by_id is discovery order, so slicing from
@@ -1567,7 +1648,8 @@ class Discovery:
             if on_progress and by_id:
                 notified = len(by_id)
                 try:
-                    await _notify(on_progress, len(by_id), 0, list(by_id.values()))
+                    await _notify(on_progress, len(by_id), 0,
+                                  [hit_to_row(h) for h in by_id.values()])
                 except Exception:
                     pass
 
@@ -1620,7 +1702,8 @@ class Discovery:
                         new_hits = list(by_id.values())[notified:]
                         notified = len(by_id)
                         try:
-                            await _notify(on_progress, len(by_id), out.pages, new_hits)
+                            await _notify(on_progress, len(by_id), out.pages,
+                                          [hit_to_row(h) for h in new_hits])
                         except Exception:
                             pass
                     # people search runs for a long time; show it is progressing
@@ -1898,5 +1981,20 @@ class Discovery:
             except Exception:
                 pass
             out.seconds = time.time() - started
+            # IN `finally`, so a sweep that raised still reports which keys
+            # it managed to match before it did -- an exception mid-parse is
+            # one of the shapes a rename actually takes, and dropping the
+            # tally on that path would blind the detector exactly when it
+            # has the most to say.
+            out.schema = probe.report()
+            if broken := probe.broken_keys():
+                # Local import, matching every other log call in this file:
+                # a module-level logger here has cost this file a NameError
+                # raised inside an except block before.
+                from backend.shared.logging import get_logger as _gl
+                _gl("facebook").warning(
+                    f"facebook: {keyword!r}/{tab} -- attribute(s) no longer served "
+                    f"where we look for them: {', '.join(broken)}. The search payload "
+                    f"shape has changed; see iter_results/page_state")
         return out
 

@@ -40,6 +40,7 @@ from typing import Any, Optional
 from backend.shared.avatars import hd_picture_url
 from backend.shared.logging import get_logger
 from backend.shared.models.row import Row
+from backend.shared.schema_probe import SchemaProbe, probe_or_null
 
 log = get_logger("telegram")
 
@@ -188,7 +189,20 @@ def _iso(value: Any) -> str:
     return ""
 
 
-def entity_from(obj: Any) -> Optional[TelegramEntity]:
+# EVERY ATTRIBUTE THIS ENGINE TARGETS ON A TELETHON RESULT OBJECT.
+#
+# Telegram is the odd one out: these are attributes on typed objects from a
+# maintained client library, not keys in a scraped JSON payload, so they
+# move on Telethon's release schedule rather than on Telegram's whim. That
+# makes drift rarer here -- it does not make it impossible, and a platform
+# with no probe is one whose rename arrives as a silent zero like any
+# other. See shared/schema_probe.py.
+K_TG_ID = "entity.id"
+K_TG_IDENTITY = "entity.{username|title|first_name}"
+K_TG_KIND = "entity.{title|broadcast}"
+
+
+def entity_from(obj: Any, probe: Any = None) -> Optional[TelegramEntity]:
     """WHAT: one `TelegramEntity` out of a raw Telethon User/Channel/Chat
     object. HOW: distinguishes profile/channel/group by whether the
     object has a `title` (channels/groups) and its `broadcast` flag
@@ -196,6 +210,7 @@ def entity_from(obj: Any) -> Optional[TelegramEntity]:
     accounts read this too -- see the note on `is_bot` having been removed
     as dead code, 2026-08-22). LINKED TO: called by `Telegram.search()`/
     `resolve()` below, the shared builder both use."""
+    probe = probe_or_null(probe)
     if obj is None:
         return None
     username = getattr(obj, "username", "") or ""
@@ -208,8 +223,14 @@ def entity_from(obj: Any) -> Optional[TelegramEntity]:
         last = getattr(obj, "last_name", "") or ""
         name = f"{first} {last}".strip()
         kind = "profile"
+    # Probed HERE, where the object is known to be a real search result:
+    # an entity with neither a handle nor a name is one whose identity
+    # attributes have moved, not an empty search.
+    (probe.hit if (username or name) else probe.miss)(K_TG_IDENTITY)
     if not username and not name:
         return None
+    (probe.hit if getattr(obj, "id", "") else probe.miss)(K_TG_ID)
+    (probe.hit if kind else probe.miss)(K_TG_KIND)
     photo = getattr(obj, "photo", None)
     has_photo = photo is not None and "Empty" not in type(photo).__name__
     return TelegramEntity(
@@ -331,12 +352,17 @@ class Telegram:
         except FloodWaitError as e:
             raise FloodWait(int(getattr(e, "seconds", 0))) from e
 
-    async def search(self, keyword: str, limit: int = 50) -> list[TelegramEntity]:
-        """Global search. Telegram returns one capped page, there is no cursor."""
+    async def search(self, keyword: str, limit: int = 50,
+                     probe: Any = None) -> list[TelegramEntity]:
+        """Global search. Telegram returns one capped page, there is no cursor.
+
+        `probe` tallies which identity attributes Telethon's result objects
+        still carry -- owned by the sweep above, so one sweep is one tally.
+        """
         res = await self._call(SearchRequest(q=keyword, limit=limit))
         out: list[TelegramEntity] = []
         for obj in list(getattr(res, "users", [])) + list(getattr(res, "chats", [])):
-            if ent := entity_from(obj):
+            if ent := entity_from(obj, probe):
                 if ent.has_photo:
                     try:
                         photo_bytes = await self.client.download_profile_photo(obj, file=bytes)
@@ -453,6 +479,10 @@ class Sweep:
     complete: bool = False
     seconds: float = 0.0
     error: str = ""
+    # WHICH TARGETED ATTRIBUTES ARE STILL PRESENT: {key: [hits, misses]},
+    # from shared/schema_probe.py -- folded into the rolling telemetry by
+    # the runner so an alert can name the exact attribute that moved.
+    schema: dict = field(default_factory=dict)
 
     def summary(self) -> str:
         """One-line log form: how many, and why the sweep stopped. No page
@@ -552,9 +582,12 @@ class Discovery:
         predates that harness -- see this class's own docstring)."""
         out = Sweep(keyword=keyword, tab=tab)
         started = time.time()
+        # One tally per sweep of which attributes Telethon's result objects
+        # still carry -- see shared/schema_probe.py.
+        probe = SchemaProbe()
         try:
             await self._ensure_connected()
-            found = await self.tg.search(keyword, SEARCH_LIMIT)
+            found = await self.tg.search(keyword, SEARCH_LIMIT, probe=probe)
             out.pages = 1
             out.hits = [entity_to_row(e, keyword) for e in found if e.url]
             if self.a.max_results:
@@ -567,5 +600,13 @@ class Discovery:
             log.error(f"[telegram] {keyword!r} sweep failed: {out.error}")
         finally:
             out.seconds = time.time() - started
+            # In `finally` so a sweep that raised mid-parse still reports
+            # which attributes it matched before it did.
+            out.schema = probe.report()
+            if broken := probe.broken_keys():
+                log.warning(
+                    f"telegram: {keyword!r} -- attribute(s) no longer present on "
+                    f"Telethon result objects: {', '.join(broken)}. Usually a client "
+                    f"library change rather than Telegram's; see entity_from()")
         return out
 

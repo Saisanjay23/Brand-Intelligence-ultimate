@@ -147,3 +147,34 @@ async def get_canary_status() -> dict[str, Any]:
     `last_run` is when the underlying checks actually happened, not when this
     was called."""
     return await session_canary_service.build_canary_report()
+
+
+@router.get("/engine/status", summary="Is discovery still actually working, per platform")
+async def get_engine_status(
+    hours: int = Query(24, ge=1, le=168,
+                       description="The recent window to judge."),
+    baseline_days: int = Query(7, ge=1, le=14,
+                               description="How much history to judge it against. "
+                                           "Excludes the recent window."),
+) -> dict[str, Any]:
+    """The parser-drift canary, read on demand.
+
+    `/canary/status` answers "can we still log in". This answers the other
+    half: when we do, does the scraping still work. They fail differently --
+    a dead session is rejected loudly by the platform, while a dead parser
+    keeps completing sweeps and reporting clean, empty results that are
+    indistinguishable from a client nobody is impersonating.
+
+    Per platform: `healthy`, `degraded` (still returning results, but from
+    the fallback extraction path -- fix the primary before the fallback goes
+    too), `broken` (yield collapsed or went to zero across many clients), or
+    `unknown`. `unknown` is never a pass: it means there is not enough
+    evidence to vouch for the platform, and a detector that has never seen a
+    platform work must not claim it does.
+
+    Built from the rolling sweep telemetry -- a few aggregations, no logins,
+    free to poll. The same check runs automatically on the session monitor's
+    cadence and raises an incident for anything not healthy.
+    """
+    from backend.services import engine_health_service
+    return await engine_health_service.check_once(hours=hours, baseline_days=baseline_days)

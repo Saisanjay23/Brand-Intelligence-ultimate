@@ -25,6 +25,7 @@ from urllib.parse import quote
 
 from backend.shared.avatars import extract_instagram_hd_avatar, looks_like_placeholder
 from backend.shared.extraction import run_strategies
+from backend.shared.schema_probe import SchemaProbe, probe_or_null
 from backend.shared.models.row import Row
 from backend.shared.text import iter_dicts
 from backend.stealth.browser import Session
@@ -221,6 +222,13 @@ def user_to_row(u: "InstagramUser", keyword: str, *, source: str = "api") -> Row
     return row
 
 
+def probe_avatar(probe: Any, url: str) -> str:
+    """Tally the avatar read and pass it straight through, so the call site
+    stays a single expression inside the constructor."""
+    (probe.hit if url else probe.miss)(K_AVATAR)
+    return url
+
+
 def _count(node: Any, *keys: str) -> Optional[int]:
     """WHAT: an integer count field, checked under each of `keys` in
     order. HOW: counts appear either as {"count": N} or as a bare integer,
@@ -247,7 +255,19 @@ def _latest_post(node: dict) -> str:
     return datetime.fromtimestamp(best, timezone.utc).date().isoformat()
 
 
-def user_from_node(node: dict) -> Optional[InstagramUser]:
+# EVERY ATTRIBUTE THIS ENGINE TARGETS IN INSTAGRAM'S SEARCH PAYLOAD.
+# Instagram has shipped more than one shape for the count and bio-link
+# fields already (see user_from_node's own docstring), so these are probed
+# for the same reason X's are: so the next rename is reported as the key
+# that moved rather than as a drop in results. See shared/schema_probe.py.
+K_USERS = "search.users[]"
+K_USERNAME = "user.username"
+K_USER_ID = "user.{id|pk|pk_id}"
+K_FULL_NAME = "user.full_name"
+K_AVATAR = "user.profile_pic_url"
+
+
+def user_from_node(node: dict, probe: Any = None) -> Optional[InstagramUser]:
     """WHAT: one `InstagramUser` out of a raw payload node (a search
     result, a profile object, or similar), or None if `node` doesn't even
     have a username. HOW: reads every field this project cares about off
@@ -256,12 +276,19 @@ def user_from_node(node: dict) -> Optional[InstagramUser]:
     bio links over time). LINKED TO: the shared builder every parser below
     (iter_search_users, iter_mobile_search_users, profile_from) calls once
     it has located the right node in its own payload shape."""
+    probe = probe_or_null(probe)
     if not isinstance(node, dict):
         return None
     username = node.get("username")
     if not isinstance(username, str) or not username:
+        # The node exists but carries no handle: Instagram renamed the one
+        # field a profile cannot be used without.
+        probe.miss(K_USERNAME)
         return None
+    probe.hit(K_USERNAME)
     pk = node.get("id") or node.get("pk") or node.get("pk_id") or ""
+    (probe.hit if pk else probe.miss)(K_USER_ID)
+    probe.check(node, "full_name", K_FULL_NAME)
     category = str(node.get("category_name") or node.get("category") or "").strip()
     external_url = str(node.get("external_url") or "").strip()
     if not external_url and isinstance(node.get("bio_links"), list) and node["bio_links"]:
@@ -277,7 +304,7 @@ def user_from_node(node: dict) -> Optional[InstagramUser]:
         followers=_count(node, "edge_followed_by", "follower_count"),
         following=_count(node, "edge_follow", "following_count"),
         posts=_count(node, "edge_owner_to_timeline_media", "media_count"),
-        avatar=extract_instagram_hd_avatar(node),
+        avatar=probe_avatar(probe, extract_instagram_hd_avatar(node)),
         biography=(node.get("biography") or "").strip(),
         verified=bool(node.get("is_verified")),
         private=bool(node.get("is_private")),
@@ -412,14 +439,20 @@ def about_country(body: str) -> str:
     return (m.group(1).strip() if m else "")
 
 
-def iter_mobile_search_users(blob: Any) -> Iterator[InstagramUser]:
+def iter_mobile_search_users(blob: Any, probe: Any = None) -> Iterator[InstagramUser]:
     """Users from a mobile search payload (`api/v1/users/search/`)."""
+    probe = probe_or_null(probe)
     seen: set[str] = set()
     users = blob.get("users", []) if isinstance(blob, dict) else []
+    if isinstance(blob, dict):
+        # A 200 that parsed but carries no `users` key at all is the
+        # container being renamed, not an empty search -- an empty search
+        # still sends `users: []`.
+        (probe.hit if "users" in blob else probe.miss)(K_USERS)
     for node in users:
         if not isinstance(node, dict):
             continue
-        user = user_from_node(node)
+        user = user_from_node(node, probe)
         if user and user.username.lower() not in seen:
             seen.add(user.username.lower())
             yield user
@@ -586,6 +619,11 @@ class Sweep:
     # "api" normally; "web-api" when the private mobile endpoint refused us
     # or stopped being parseable and the web client's endpoint stood in
     source: str = "api"
+    # WHICH TARGETED ATTRIBUTES THE PLATFORM STILL SERVES: {key: [hits,
+    # misses]}, from shared/schema_probe.py. Carried on the Sweep so the
+    # runner can fold it into the rolling telemetry, which is what lets an
+    # alert name the exact renamed key instead of reporting a mystery drop.
+    schema: dict = field(default_factory=dict)
 
     def summary(self) -> str:
         """One-line log form. Names `source` whenever it is not the
@@ -639,6 +677,9 @@ class Discovery:
         LINKED TO: called by `run()` below (one call per keyword).
         """
         out = Sweep(keyword=keyword, tab=tab)
+        # One tally per sweep of which targeted attributes Instagram still
+        # serves -- see shared/schema_probe.py.
+        probe = SchemaProbe()
         started = time.time()
         by_name: dict[str, InstagramUser] = {}
 
@@ -672,7 +713,7 @@ class Discovery:
                 data = json.loads(text)
 
                 new_users = 0
-                for user in iter_mobile_search_users(data):
+                for user in iter_mobile_search_users(data, probe):
                     if user.username.lower() not in by_name:
                         by_name[user.username.lower()] = user
                         new_users += 1
@@ -767,6 +808,16 @@ class Discovery:
             out.stopped, out.error = "error", f"{type(e).__name__}: {e}"
         finally:
             out.seconds = time.time() - started
+            # In `finally` so a sweep that raised mid-parse still reports
+            # which keys it matched before it did -- an exception during
+            # extraction is one of the shapes a rename actually takes.
+            out.schema = probe.report()
+            if broken := probe.broken_keys():
+                from backend.shared.logging import get_logger as _gl
+                _gl("instagram").warning(
+                    f"instagram: {keyword!r} -- attribute(s) no longer served where "
+                    f"we look for them: {', '.join(broken)}. The search payload shape "
+                    f"has changed; see user_from_node/iter_mobile_search_users")
 
         return out
 

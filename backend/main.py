@@ -89,8 +89,10 @@ from backend.database.repositories import analysis_result_repository as analysis
 from backend.database.repositories import avatar_repository as avatars_db
 from backend.database.repositories import logo_repository as logos_db
 from backend.database.repositories import evidence_repository as evidence_db
+from backend.database.repositories import coverage_repository as coverage_db
 from backend.database.repositories import profile_repository as profiles_db
 from backend.database.repositories import session_repository as sessions_db
+from backend.database.repositories import telemetry_repository as telemetry_db
 from backend.sessions import manager as sessions_engine
 from backend.shared.errors import DomainError
 from backend.shared.logging import configure_logging, get_logger
@@ -133,32 +135,104 @@ async def lifespan(app: FastAPI):
     # discovery's results, and now analysis's own 24-hour result store. A
     # Mongo-less process can still scrape -- a live job runs from memory --
     # but nothing it reads will survive the tab being reloaded.
-    if await mongo_ping():
-        await sessions_db.ensure_indexes()
-        await profiles_db.ensure_indexes()
-        await avatars_db.ensure_indexes()
-        await logos_db.ensure_indexes()
-        # The TTL indexes that delete analysis results after 24h. Without
-        # this call nothing ever expires and the collection grows forever,
-        # so it belongs with the other index guarantees rather than in a
-        # code path an operator has to remember to run.
-        await analysis_results_db.ensure_indexes()
-        from backend.platforms import registry
-        for p in registry.PLATFORMS.values():
-            await registry.session_state(p)
-        sessions_engine.start_monitor()
-        evidence_db.start_retention_monitor()
-        log.info("startup: mongo reachable, indexes ensured, session + evidence-retention monitors running")
-    else:
-        log.warning(
-            "startup: mongo unreachable -- /health/ready will report unavailable, "
-            "sessions cannot be read and discovery cannot persist"
-        )
+    # KEEPS TRYING, RATHER THAN DECIDING ONCE.
+    #
+    # This used to be a single `if await mongo_ping():`. A process that
+    # started while Mongo was a few seconds from ready -- a compose stack
+    # coming up, a database restarted during a deploy, a laptop waking --
+    # took the else branch, logged a warning, and then ran for days with no
+    # session monitor, no evidence retention, no drift canary and no
+    # indexes. Nothing retried, because nothing was watching: the one check
+    # had already happened. A transient dependency outage at the wrong
+    # second bought a permanently half-working process, and the only
+    # symptom was things quietly not happening.
+    #
+    # `_bring_up_storage` is idempotent (every ensure_indexes is
+    # create-if-absent, every start_monitor is a no-op when its task is
+    # already running), so retrying costs nothing and the success path is
+    # unchanged for a process that starts with Mongo already up.
+    storage_task = asyncio.create_task(_bring_up_storage())
     yield
+    storage_task.cancel()
     sessions_engine.stop_monitor()
     evidence_db.stop_retention_monitor()
     await media_close()
     await mongo_close()
+
+
+# How long to wait between attempts to bring storage up, and how long to
+# keep trying. Backed off gently: the common case resolves on the first or
+# second attempt, and a database that is still absent after an hour is an
+# operator problem that log-spamming will not fix.
+_STORAGE_RETRY_S = 15
+_STORAGE_RETRY_CEILING_S = 300
+_STORAGE_GIVE_UP_S = 3600
+
+
+async def _bring_up_storage() -> None:
+    """Ensure indexes and start the background monitors, retrying until
+    Mongo is actually reachable.
+
+    Every step here is idempotent, so this is safe to run repeatedly and
+    safe to run late. It is deliberately NOT awaited by the lifespan: the
+    API must come up and serve `/health/ready` (which reports the truth
+    about storage) whether or not the database is there yet -- blocking
+    startup on a dependency turns a degraded service into a dead one.
+    """
+    waited = 0.0
+    delay = float(_STORAGE_RETRY_S)
+    attempt = 0
+    while True:
+        attempt += 1
+        if await mongo_ping():
+            try:
+                await sessions_db.ensure_indexes()
+                await profiles_db.ensure_indexes()
+                await coverage_db.ensure_indexes()
+                await telemetry_db.ensure_indexes()
+                await avatars_db.ensure_indexes()
+                await logos_db.ensure_indexes()
+                # The TTL indexes that delete analysis results after 24h.
+                # Without this call nothing ever expires and the collection
+                # grows forever, so it belongs with the other index
+                # guarantees rather than in a code path an operator has to
+                # remember to run.
+                await analysis_results_db.ensure_indexes()
+                from backend.platforms import registry
+                for plat in registry.PLATFORMS.values():
+                    await registry.session_state(plat)
+                sessions_engine.start_monitor()
+                evidence_db.start_retention_monitor()
+            except Exception as e:
+                # Reachable but not usable (auth, a replica-set election
+                # mid-flight). Same treatment as unreachable: say so, and
+                # come back rather than concluding anything permanent.
+                log.error(
+                    f"startup: mongo reachable but could not be prepared "
+                    f"({type(e).__name__}: {e}) -- retrying in {delay:.0f}s")
+            else:
+                log.info(
+                    "startup: mongo reachable, indexes ensured, session + "
+                    "evidence-retention monitors running"
+                    + (f" (after {attempt} attempts, {waited:.0f}s)" if attempt > 1 else ""))
+                return
+        elif attempt == 1:
+            log.warning(
+                "startup: mongo unreachable -- /health/ready will report unavailable, "
+                "sessions cannot be read and discovery cannot persist. Retrying in "
+                f"{delay:.0f}s; the engine will start its monitors as soon as it connects")
+
+        if waited >= _STORAGE_GIVE_UP_S:
+            log.error(
+                f"startup: mongo still unreachable after {waited / 60:.0f} minutes -- "
+                "giving up on automatic recovery. The API stays up and /health/ready "
+                "keeps reporting the truth, but the session monitor, evidence "
+                "retention and the parser-drift canary are NOT running. Restart the "
+                "process once the database is back.")
+            return
+        await asyncio.sleep(delay)
+        waited += delay
+        delay = min(delay * 1.5, _STORAGE_RETRY_CEILING_S)
 
 
 app = FastAPI(

@@ -66,6 +66,7 @@ from urllib.parse import quote
 
 from backend.config.settings import settings
 from backend.shared.extraction import run_strategies
+from backend.shared.schema_probe import SchemaProbe, probe_or_null
 from backend.shared.logging import get_logger
 from backend.shared.models.row import Row
 from backend.shared.text import iter_dicts
@@ -254,13 +255,36 @@ def _avatar_url(*candidates: Any) -> str:
     return ""
 
 
-def user_from_node(user: dict, stats: Optional[dict] = None) -> Optional[TikTokUser]:
+# EVERY ATTRIBUTE THIS ENGINE TARGETS IN TIKTOK'S SEARCH PAYLOAD.
+# This module's own docstring already flags these as NEEDING LIVE
+# VERIFICATION -- TikTok ships both camelCase and snake_case spellings of
+# the same field depending on the endpoint. Probing them means the next
+# change is reported by name instead of being discovered by someone
+# noticing the results went thin. See shared/schema_probe.py.
+K_TT_USERNAME = "user.{uniqueId|unique_id}"
+K_TT_NICKNAME = "user.nickname"
+K_TT_AVATAR = "user.{avatarLarger|avatar_larger}"
+
+
+def probe_field(probe: Any, value: str, key: str) -> str:
+    """Tally one field read and pass the value straight through, so the
+    call site stays a single expression inside the constructor."""
+    (probe.hit if value else probe.miss)(key)
+    return value
+
+
+
+def user_from_node(user: dict, stats: Optional[dict] = None, probe: Any = None) -> Optional[TikTokUser]:
     """One `user`-shaped dict (+ its sibling `stats`/`statsV2` dict, if
     counts live separately rather than merged into `user` itself) ->
     TikTokUser."""
     if not isinstance(user, dict):
         return None
+    probe = probe_or_null(probe)
     username = user.get("uniqueId") or user.get("unique_id") or ""
+    # Tallied after both spellings, so TikTok serving whichever one it
+    # feels like today is a hit -- only a node with neither is a rename.
+    (probe.hit if username else probe.miss)(K_TT_USERNAME)
     if not username:
         return None
     stats = stats if isinstance(stats, dict) else {}
@@ -301,7 +325,7 @@ def user_from_node(user: dict, stats: Optional[dict] = None) -> Optional[TikTokU
     return TikTokUser(
         entity_id=str(user.get("id") or user.get("uid") or user.get("secUid") or user.get("sec_uid") or ""),
         username=username,
-        nickname=(user.get("nickname") or "").strip(),
+        nickname=probe_field(probe, (user.get("nickname") or "").strip(), K_TT_NICKNAME),
         avatar=_avatar_url(
             user.get("avatarLarger"), user.get("avatarMedium"), user.get("avatarThumb"),
             user.get("avatar_larger"), user.get("avatar_medium"), user.get("avatar_thumb"),
@@ -317,7 +341,7 @@ def user_from_node(user: dict, stats: Optional[dict] = None) -> Optional[TikTokU
     )
 
 
-def iter_users(blob: Any) -> Iterator[TikTokUser]:
+def iter_users(blob: Any, probe: Any = None) -> Iterator[TikTokUser]:
     """Every user-shaped node in a hydration/search payload, deduped by
     username. Walks the whole tree rather than trusting one fixed path,
     see this module's docstring on the key layout already having moved
@@ -340,6 +364,7 @@ def iter_users(blob: Any) -> Iterator[TikTokUser]:
     analyst reviews cards in) puts genuine name matches at the top instead
     of burying one behind twelve creators.
     """
+    probe = probe_or_null(probe)
     accounts: list[TikTokUser] = []
     authors: list[TikTokUser] = []
     seen: set[str] = set()
@@ -369,7 +394,7 @@ def iter_users(blob: Any) -> Iterator[TikTokUser]:
     for d in iter_dicts(blob):
         info = d.get("user_info")
         if isinstance(info, dict) and (info.get("unique_id") or info.get("uniqueId")):
-            u = user_from_node(info)
+            u = user_from_node(info, probe=probe)
             if u:
                 u.match_kind = "account"
             take(u, accounts)
@@ -380,9 +405,10 @@ def iter_users(blob: Any) -> Iterator[TikTokUser]:
         nested = d.get("user")
         if isinstance(nested, dict) and (nested.get("uniqueId") or nested.get("unique_id")):
             stats = d.get("stats") if isinstance(d.get("stats"), dict) else d.get("statsV2")
-            take(user_from_node(nested, stats if isinstance(stats, dict) else None), authors)
+            take(user_from_node(nested, stats if isinstance(stats, dict) else None,
+                                probe=probe), authors)
         elif d.get("uniqueId") or d.get("unique_id"):
-            take(user_from_node(d), authors)
+            take(user_from_node(d, probe=probe), authors)
 
     yield from accounts
     yield from authors
@@ -1116,7 +1142,7 @@ async def _users_for(
         # flag, exact counts, entity id) -- without disturbing DOM order.
         for text in bodies:
             for blob in parse_lines(text):
-                for u in iter_users(blob):
+                for u in iter_users(blob, probe):
                     key = u.username.lower()
                     u.match_kind = "account"
                     if key in ordered:
@@ -1164,6 +1190,11 @@ class Sweep:
     # "hydration+network" normally; "dom" when both came up empty and the
     # rendered results page had to stand in
     source: str = "hydration+network"
+    # WHICH TARGETED ATTRIBUTES THE PLATFORM STILL SERVES: {key: [hits,
+    # misses]}, from shared/schema_probe.py. Carried on the Sweep so the
+    # runner can fold it into the rolling telemetry, which is what lets an
+    # alert name the exact renamed key instead of reporting a mystery drop.
+    schema: dict = field(default_factory=dict)
 
     @property
     def account_hits(self) -> int:
@@ -1226,6 +1257,11 @@ class Discovery:
 
         by_username: dict[str, TikTokUser] = {}
         arrived = asyncio.Event()
+        # One tally per sweep of which targeted attributes this platform
+        # still serves -- see shared/schema_probe.py. Rides out on the
+        # Sweep, into the rolling telemetry, and is what lets an alert name
+        # the exact renamed key instead of reporting a mystery drop.
+        probe = SchemaProbe()
 
         async def on_response(resp):
             """Absorbs every search payload the page fires, keeping FIRST
@@ -1240,7 +1276,7 @@ class Discovery:
             except Exception:
                 return
             for blob in parse_lines(text):
-                for u in iter_users(blob):
+                for u in iter_users(blob, probe):
                     by_username.setdefault(u.username.lower(), u)
             out.pages += 1
             arrived.set()
@@ -1427,6 +1463,15 @@ class Discovery:
             except Exception:
                 pass
             out.seconds = time.time() - started
+            # In `finally` so a sweep that raised mid-parse still reports
+            # which keys it matched before it did -- an exception during
+            # extraction is one of the shapes a rename actually takes.
+            out.schema = probe.report()
+            if broken := probe.broken_keys():
+                log.warning(
+                    f"tiktok: {keyword!r} -- attribute(s) no longer served where "
+                    f"we look for them: {', '.join(broken)}. The search payload shape "
+                    f"has changed; see iter_users/user_from_node")
         return out
 
     async def _merge_user_accounts(self, out: "Sweep") -> None:

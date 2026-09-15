@@ -8,6 +8,7 @@
     POST   /discovery/profiles/delete     permanently delete cards (platform/status scoped)
     POST   /discovery/profiles/analyse    send validated cards to analysis
     GET    /discovery/platforms           which platforms can be swept now
+    GET    /discovery/coverage/{group_id} which keywords are still owed
 
 THE WORKFLOW THIS IS BUILT AROUND: keywords go in, candidate profiles come
 back as cards (`GET /discovery/profiles`, `status=pending` by default). An
@@ -45,6 +46,7 @@ from backend.api.analysis import StartAnalysisAccepted
 from backend.api.models import (CancelResult, JobAccepted, JobStatus, Platform,
                                  PlatformState, PlatformStateList, SkippedInput)
 from backend.database.repositories import client_repository as clients_db
+from backend.database.repositories import coverage_repository as coverage_db
 from backend.database.repositories import profile_repository as profiles_db
 from backend.discovery.runner import _TERMINAL as _TERMINAL_STATUSES
 from backend.discovery.runner import discovery_runner
@@ -140,6 +142,18 @@ class StartDiscovery(BaseModel):
                     "that would otherwise run for every keyword.",
         examples=[["pages", "groups"]],
     )
+    only_owed: bool = Field(
+        False,
+        description="Sweep ONLY the (platform, tab, keyword) cells this client's "
+                    "coverage ledger still lists as owed -- never searched, "
+                    "missed by an earlier run, or broken. A gap-closing pass: "
+                    "it costs what the gaps cost rather than what the client "
+                    "costs, so it is the cheap way to make good on a sweep that "
+                    "ran out of sessions. Everything already covered is left "
+                    "alone, and a platform with nothing owed is reported `done` "
+                    "without spending a session on it. See "
+                    "GET /discovery/coverage/{group_id} for what is owed.",
+    )
     platform_tab_limits: dict[str, dict[str, dict[str, int]]] = Field(
         default_factory=dict,
         description="platform id -> tab -> keyword type (\"individual\"/\"domain\") "
@@ -162,9 +176,13 @@ class PlatformSweepState(BaseModel):
     status: str = Field(
         ...,
         description="pending | running | done | partial | failed | skipped. "
-                    "`partial` means the platform was swept but not "
-                    "exhaustively (a cap fired, or a sweep stopped early); "
-                    "`skipped` means it was never attempted -- see `note`.",
+                    "`partial` means at least one sweep ended without "
+                    "getting everything asked of it -- it ran out of time "
+                    "or page budget, or it broke; `note` always names "
+                    "which. A sweep that stopped because it had collected "
+                    "the configured `max_results` is NOT partial: meeting "
+                    "the caller's own cap is a complete answer. `skipped` "
+                    "means the platform was never attempted -- see `note`.",
     )
     keywords_total: int
     keywords_done: int
@@ -189,12 +207,24 @@ class CompletedSweepTelemetry(BaseModel):
     hits_new: int
     timestamp: str
     complete: bool = Field(
-        True, description="Did this sweep reach one of its real stopping signals "
-                          "(exhausted / end-of-serp), rather than stopping on a cap, "
-                          "a stall or an error?")
+        True, description="Did this sweep page or scroll until the platform ran out "
+                          "of results? Raw engine telemetry -- a False here is NOT by "
+                          "itself a problem (a result cap being met reads as False). "
+                          "Use `outcome` to decide whether anything is wrong.")
     stopped: str = Field(
-        "", description="Which signal ended it: exhausted | end-of-serp | stalled | "
-                        "cap:results | cap:pages | cap:seconds | error.")
+        "", description="Which signal ended it: exhausted | end-of-serp | no-results | "
+                        "stalled | cap:results | cap:pages | cap:seconds | cancelled | "
+                        "quota | checkpoint | geoblocked | rate_limited | http-<code> | "
+                        "error.")
+    outcome: str = Field(
+        "satisfied",
+        description="What that ending MEANS. `satisfied`: we have what was asked for "
+                    "(the results ran out, or our own result cap was met). "
+                    "`truncated`: a time or page budget ended it early, so more "
+                    "results exist that we chose not to spend time on. `broken`: "
+                    "something went wrong that a human should look at (a stall, an "
+                    "error, a checkpoint, a geoblock). Only `broken` and `truncated` "
+                    "make a platform `partial`.")
     resolved_visits: int = Field(
         0, description="Candidates given a profile-page visit to recover a missing "
                        "name. The slowest and most detectable part of a sweep.")
@@ -230,6 +260,57 @@ class StartDiscoveryAccepted(JobAccepted):
     skipped: list[SkippedInput] = Field(
         ..., description="Platforms that will NOT be swept, each with the reason.",
     )
+
+
+class OwedCell(BaseModel):
+    """One (platform, tab, keyword) this client still owes a search on."""
+
+    platform: str
+    tab: str = Field(..., description="Facebook's people/pages/groups; every "
+                                      "other platform has one tab.")
+    kw_type: str = Field(..., description="individual | domain")
+    search: str = Field(..., description="The term that goes in the search box "
+                                         "-- a permutation, when the analyst "
+                                         "curated any.")
+    parent: str = Field(..., description="The keyword it files under, which is "
+                                         "the name an analyst recognises.")
+    outcome: str = Field(
+        ..., description="Why it is owed. \"\" = planned but never attempted; "
+                         "\"missed\" = a sweep gave up before reaching it; "
+                         "\"broken\" = it was reached and could not complete.")
+    reason: str = Field("", description="The stop code or message recorded "
+                                        "against the last attempt.")
+    attempts: int = 0
+    attempted_at: Optional[str] = None
+    covered_at: Optional[str] = Field(
+        None, description="When this cell was last genuinely searched. Null "
+                          "with a non-null `attempted_at` is a keyword that "
+                          "has been tried and never once actually searched.")
+
+
+class CoverageReport(BaseModel):
+    """What a client has and has not been searched for.
+
+    THE QUESTION THIS ANSWERS: every keyword saved under a client is
+    supposed to be searched on every platform in scope. A job's own
+    progress cannot answer whether that happened -- it reports counts, it
+    lives in memory, and it is gone by morning. This reads the durable
+    per-cell ledger instead, so "did anything get missed, and what" has an
+    answer for a sweep that finished last week.
+
+    An empty `owed` with a non-zero `cells` is the clean bill of health.
+    `cells` of 0 means this client has never been swept at all, which is
+    NOT the same thing and reads differently on purpose.
+    """
+
+    group_id: str
+    cells: int = Field(..., description="Every (platform, tab, keyword) cell "
+                                        "ever planned for this client.")
+    owed: int = Field(..., description="Of those, how many still need searching.")
+    by_outcome: dict[str, int] = Field(default_factory=dict)
+    by_platform: dict[str, dict[str, int]] = Field(default_factory=dict)
+    items: list[OwedCell] = Field(
+        default_factory=list, description="The owed cells themselves.")
 
 
 class DiscoveredProfile(BaseModel):
@@ -495,12 +576,48 @@ async def start_discovery(body: StartDiscovery) -> StartDiscoveryAccepted:
         platform_limits_domain=body.platform_limits_domain,
         platform_tab_limits=body.platform_tab_limits,
         facebook_tabs=body.facebook_tabs,
+        only_owed=body.only_owed,
     )
     return StartDiscoveryAccepted(
         job_id=job.id, status=JobStatus(job.status),
         poll_url=f"/discovery/jobs/{job.id}",
         platforms_queued=[p for p, s in job.platforms.items() if s.status != "skipped"],
         skipped=[SkippedInput(value=k, reason=v) for k, v in skipped.items()],
+    )
+
+
+@router.get("/coverage/{group_id}", response_model=CoverageReport,
+            summary="Which keywords this client still owes a search on")
+async def coverage(
+    group_id: str = Path(..., min_length=1, max_length=128),
+    platform: Optional[Platform] = Query(
+        None, description="Narrow the owed list to one platform."),
+) -> CoverageReport:
+    """The durable answer to "was every keyword actually searched".
+
+    A job's own progress cannot answer it: it reports counts, it lives in
+    memory, and it is gone by morning. This reads the per-cell ledger
+    every sweep writes as it goes, so a gap left by a platform that ran
+    out of sessions last Tuesday is still nameable today -- and can be
+    closed with `POST /discovery/jobs` carrying `only_owed: true`, which
+    sweeps just these cells.
+
+    `owed: 0` with a non-zero `cells` is the clean bill of health. `cells:
+    0` means this client has never been swept at all, which is a
+    different statement and deliberately does not read as "all clear".
+    """
+    gid = group_id.strip()
+    report = await coverage_db.summary(gid)
+    items = await coverage_db.owed(gid, [platform.value] if platform else None)
+    return CoverageReport(
+        group_id=gid,
+        cells=report["cells"],
+        # Recounted from the filtered list when a platform was named, so
+        # the number and the list below it can never disagree.
+        owed=len(items) if platform else report["owed"],
+        by_outcome=report["by_outcome"],
+        by_platform=report["by_platform"],
+        items=[OwedCell(**c) for c in items],
     )
 
 

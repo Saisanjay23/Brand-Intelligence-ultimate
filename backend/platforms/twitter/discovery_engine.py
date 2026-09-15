@@ -30,6 +30,7 @@ from typing import Any, Iterator, Optional
 from urllib.parse import quote
 
 from backend.shared.extraction import run_strategies
+from backend.shared.schema_probe import SchemaProbe, probe_or_null
 from backend.shared.avatars import hd_picture_url, looks_like_placeholder
 from backend.shared.models.row import Row
 from backend.shared.text import iter_dicts
@@ -317,7 +318,29 @@ def parse_created(raw: str) -> str:
         return ""
 
 
-def _user_from_result(res: dict) -> Optional[TwitterUser]:
+# EVERY ATTRIBUTE THIS ENGINE TARGETS IN X'S SEARCH PAYLOAD, named.
+#
+# X is the platform most actively moving fields around -- this module's own
+# docstring records `screen_name`, `name`, `created_at`, `location`,
+# `followers_count` and `protected` all migrating out of `legacy` into
+# sibling objects, one at a time, with `legacy` eventually disappearing
+# entirely from some responses. Every read below already tries both
+# spellings; what was missing was any record of WHICH one is answering, so
+# the next migration looked like a yield drop rather than a rename.
+#
+# A miss here means every known spelling failed on an object that was
+# otherwise a valid user result. See shared/schema_probe.py.
+K_RESULT = "user_results.result"
+K_HANDLE = "result.{legacy|core}.screen_name"
+K_NAME = "result.{legacy|core}.name"
+K_AVATAR = "result.{legacy.profile_image_url_https|avatar.image_url}"
+K_CREATED = "result.{legacy|core}.created_at"
+K_FOLLOWERS = "result.{legacy|relationship_counts}.followers_count"
+K_CURSOR = "TimelineTimelineCursor.Bottom"
+K_ENTRIES = "instructions[].entries"
+
+
+def _user_from_result(res: dict, probe: Any = None) -> Optional[TwitterUser]:
     """WHAT: one `TwitterUser` out of a raw `user_results.result`-shaped
     payload node, or None if it carries neither a handle nor an id. HOW:
     checks the LEGACY location for every field first, falls back to the
@@ -327,6 +350,7 @@ def _user_from_result(res: dict) -> Optional[TwitterUser]:
     every parser in this file uses once it has located a user node."""
     if not isinstance(res, dict):
         return None
+    probe = probe_or_null(probe)
     legacy = res.get("legacy")
     core = res.get("core") or {}
     if not isinstance(legacy, dict) and not core:
@@ -338,6 +362,14 @@ def _user_from_result(res: dict) -> Optional[TwitterUser]:
     handle = legacy.get("screen_name") or core.get("screen_name") or ""
     name = legacy.get("name") or core.get("name") or ""
     created = legacy.get("created_at") or core.get("created_at") or ""
+    # Tallied AFTER the fallbacks, so a field that has merely moved from
+    # `legacy` to `core` reads as a hit -- the engine handled it, nothing is
+    # broken, and waking somebody for a migration already absorbed would be
+    # the noise that gets this alert filtered. Only a field no spelling
+    # finds is a miss.
+    (probe.hit if handle else probe.miss)(K_HANDLE)
+    (probe.hit if name else probe.miss)(K_NAME)
+    (probe.hit if created else probe.miss)(K_CREATED)
     avatar = legacy.get("profile_image_url_https") or (res.get("avatar") or {}).get(
         "image_url", ""
     )
@@ -360,6 +392,8 @@ def _user_from_result(res: dict) -> Optional[TwitterUser]:
     privacy = res.get("privacy") or {}
     verification = res.get("verification") or {}
 
+    probe_avatar_ok = bool(avatar)
+    (probe.hit if probe_avatar_ok else probe.miss)(K_AVATAR)
     followers = legacy.get("followers_count")
     if followers is None:
         followers = relationship_counts.get("followers")
@@ -481,7 +515,7 @@ def about_account_from(blob: Any) -> Optional[AboutAccount]:
     return None
 
 
-def iter_users(blob: Any) -> Iterator[TwitterUser]:
+def iter_users(blob: Any, probe: Any = None) -> Iterator[TwitterUser]:
     """Every user object in a payload, deduped by id, in document order.
     LINKED TO: `search_state()` below (a search-results sweep) and
     analysis_engine.py's `process()` (the profile-visit UserByScreenName/
@@ -494,7 +528,11 @@ def iter_users(blob: Any) -> Iterator[TwitterUser]:
             res = d
         if res is None or res.get("__typename") not in (None, "User"):
             continue
-        user = _user_from_result(res)
+        # The parent exists and is a user result, so anything that fails
+        # below is a rename rather than an absent search result -- which is
+        # the distinction the whole probe rests on.
+        probe_or_null(probe).hit(K_RESULT)
+        user = _user_from_result(res, probe)
         if user and user.handle and user.handle.lower() not in seen:
             seen.add(user.handle.lower())
             yield user
@@ -590,13 +628,14 @@ class SearchState:
     users: list[TwitterUser] = field(default_factory=list)
 
 
-def search_state(blob: Any) -> SearchState:
+def search_state(blob: Any, probe: Any = None) -> SearchState:
     """WHAT: one SearchTimeline response's cursor + user list, combined.
     HOW: scans for the bottom pagination cursor (both the legacy
     entryType and the current __typename spelling, since this too has
     migrated) and the users via `iter_users()`. LINKED TO: called from
     Discovery.sweep()'s on_response handler, once per response."""
     st = SearchState()
+    probe = probe_or_null(probe)
     for d in iter_dicts(blob):
         if (
             d.get("entryType") == "TimelineTimelineCursor"
@@ -606,7 +645,13 @@ def search_state(blob: Any) -> SearchState:
                 st.bottom_cursor = d["value"]
         if isinstance(d.get("entries"), list):
             st.entries = max(st.entries, len(d["entries"]))
-    st.users = list(iter_users(blob))
+    st.users = list(iter_users(blob, probe))
+    if st.entries:
+        # X sent a timeline. Whether we could read a bottom cursor out of it
+        # decides whether this sweep can page at all, so its absence from a
+        # non-empty timeline is a rename worth naming -- not an empty search.
+        probe.hit(K_ENTRIES)
+        (probe.hit if st.bottom_cursor else probe.miss)(K_CURSOR)
     return st
 
 
@@ -659,6 +704,11 @@ class Sweep:
     # had to stand in. Carried onto each Row so a card can say where it came
     # from rather than implying every field was equally well sourced.
     source: str = "graphql"
+    # WHICH TARGETED ATTRIBUTES X STILL SERVES: {key: [hits, misses]}, from
+    # shared/schema_probe.py. X moves fields out of `legacy` one at a time,
+    # so this is the platform where a rename is likeliest and where naming
+    # the exact key saves the most time.
+    schema: dict = field(default_factory=dict)
 
     def summary(self) -> str:
         """One-line log form. Names `source` whenever it is not the
@@ -683,7 +733,7 @@ class Discovery:
         self.a = args
         self.ctx = ctx
 
-    async def sweep(self, keyword: str, tab: str = "people") -> Sweep:
+    async def sweep(self, keyword: str, tab: str = "people", on_progress=None) -> Sweep:
         """One keyword's People-search sweep, start to finish -- the
         counterpart to facebook/discovery_engine.py's Discovery.sweep(),
         but X only has one search surface (`tab` is accepted for
@@ -733,6 +783,52 @@ class Discovery:
         arrived = asyncio.Event()
         rate_limited = False
 
+        probe = SchemaProbe()
+        # How many users have already been handed to `on_progress`. X's
+        # `by_id` is insertion-ordered and never overwritten (setdefault
+        # below), so slicing from this index yields exactly the users found
+        # since the last notification, in X's own top-to-bottom order.
+        notified = 0
+
+        async def _emit() -> None:
+            """Hand everything found since the last call to the caller.
+
+            REALTIME, IN ORDER, AND NEVER PAST THE CAP. X returns ~20 users
+            per response, so a sweep of a common name spends minutes
+            scrolling before it returns -- and until this existed, nothing
+            reached the analyst's screen for the whole of it. Facebook's
+            engine has had this since it was written; X simply never grew
+            one, so its results all landed at the end.
+
+            Capped here as well as at the end: `out.hits` is trimmed to
+            `max_results` when the sweep finishes, and streaming past that
+            point would save rows the finished sweep then disowns. Because
+            `by_id` is insertion-ordered and the final trim is a prefix of
+            the same order, what gets streamed is always a prefix of what
+            gets returned -- never a row the cap would have dropped.
+            """
+            nonlocal notified
+            if on_progress is None:
+                return
+            users = list(by_id.values())
+            if self.a.max_results:
+                users = users[: self.a.max_results]
+            fresh = users[notified:]
+            if not fresh:
+                return
+            notified = len(users)
+            rows = [user_to_row(u, keyword, source=out.source) for u in fresh if u.url]
+            if not rows:
+                return
+            try:
+                res = on_progress(len(users), out.pages, rows)
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception:
+                # A broken callback must never abort the scrape -- same
+                # contract as facebook/discovery_engine.py::_notify.
+                pass
+
         async def on_response(resp):
             """Absorbs the search payloads and tracks the pagination
             cursor, which X carries in the response BODY rather than a
@@ -758,8 +854,12 @@ class Discovery:
                 return
 
             for blob in parse_lines(text):
-                st = search_state(blob)
+                st = search_state(blob, probe)
                 for u in st.users:
+                    # setdefault, never assignment: the first sighting of a
+                    # user is the one X ranked, and overwriting it on a
+                    # later page would move it in the insertion order that
+                    # IS the top-to-bottom ordering.
                     by_id.setdefault(u.entity_id or u.handle, u)
                 if st.bottom_cursor:
                     cursor = st.bottom_cursor
@@ -799,6 +899,12 @@ class Discovery:
                 except asyncio.TimeoutError:
                     pass
 
+            # The first page lands from the initial navigation, before the
+            # loop scrolls at all -- without this it would sit unreported
+            # until the second page arrived, which on a short sweep is the
+            # whole sweep.
+            await _emit()
+
             stalls, last_cursor = 0, ""
             while True:
                 if rate_limited:
@@ -833,6 +939,10 @@ class Discovery:
 
                 if len(by_id) > before:
                     stalls = 0
+                    # Straight after the scroll that found them, so results
+                    # reach the screen while the sweep is still running
+                    # rather than all at once when it ends.
+                    await _emit()
                     if out.pages % self.a.progress_every == 0:
                         print(
                             f"    [x/{tab}] {keyword!r}: {len(by_id)} so far, "
@@ -926,6 +1036,20 @@ class Discovery:
             except Exception:
                 pass
             out.seconds = time.time() - started
+            # In `finally` so a sweep that raised mid-parse still reports
+            # which keys it matched before it did -- an exception during
+            # extraction is one of the shapes a rename actually takes.
+            out.schema = probe.report()
+            if broken := probe.broken_keys():
+                # Imported here, not at module scope: this file has no
+                # module-level logger, and adding one for a single warning
+                # inside a `finally` is how a NameError gets raised on the
+                # error path it exists to describe.
+                from backend.shared.logging import get_logger as _gl
+                _gl("twitter").warning(
+                    f"twitter: {keyword!r} -- attribute(s) no longer served where we "
+                    f"look for them: {', '.join(broken)}. X has moved or renamed them; "
+                    f"see _user_from_result/search_state")
         return out
 
 

@@ -29,6 +29,7 @@ import json
 import os
 import re
 import time
+from backend.shared.schema_probe import SchemaProbe, probe_or_null
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -279,6 +280,15 @@ class YouTubeAPI:
 # Crawling / pagination
 
 
+# EVERY ATTRIBUTE THIS ENGINE TARGETS IN YOUTUBE'S SEARCH RESPONSE.
+# A documented public API drifts far less than a scraped payload -- but
+# "less" is not "never", and a platform with no probe is one whose rename
+# arrives as a silent zero. See shared/schema_probe.py.
+K_YT_CHANNEL_ID = "item.id.channelId"
+K_YT_SNIPPET = "item.snippet"
+K_YT_TITLE = "snippet.{channelTitle|title}"
+
+
 @dataclass
 class Sweep:
     """WHAT: the result of sweeping one keyword -- the hits, plus WHY the
@@ -298,6 +308,11 @@ class Sweep:
     complete: bool = False
     seconds: float = 0.0
     error: str = ""
+    # WHICH TARGETED ATTRIBUTES THE PLATFORM STILL SERVES: {key: [hits,
+    # misses]}, from shared/schema_probe.py. Carried on the Sweep so the
+    # runner can fold it into the rolling telemetry, which is what lets an
+    # alert name the exact renamed key instead of reporting a mystery drop.
+    schema: dict = field(default_factory=dict)
 
     def summary(self) -> str:
         """One-line log form: how many, over how many pages, and why it
@@ -347,6 +362,11 @@ class Discovery:
         discovery_service.py has one shape to handle; on_progress is that
         service page callback."""
         out = Sweep(keyword=keyword, tab=tab)
+        # YouTube is a documented public API rather than a scraped payload,
+        # so it drifts far less than the others -- but "less" is not "never"
+        # (the v3 search response has changed shape before), and a platform
+        # with no probe is a platform whose rename arrives as a silent zero.
+        probe = SchemaProbe()
         started = time.time()
         by_id: dict[str, Hit] = {}
         token = ""
@@ -373,8 +393,13 @@ class Discovery:
                     
                     cid = (it.get("id") or {}).get("channelId", "")
                     snip = it.get("snippet") or {}
+                    # Probed inside a result the API did return, so a search
+                    # that genuinely matched no channels records nothing.
+                    (probe.hit if cid else probe.miss)(K_YT_CHANNEL_ID)
+                    (probe.hit if snip else probe.miss)(K_YT_SNIPPET)
                     if not cid or cid in by_id:
                         continue
+                    probe.first_of(snip, ("channelTitle", "title"), K_YT_TITLE)
                     
                     thumbs = snip.get("thumbnails") or {}
                     avatar = hd_picture_url(
@@ -400,7 +425,17 @@ class Discovery:
 
                 if page_hits and on_progress and callable(on_progress):
                     try:
-                        res = on_progress(len(by_id), out.pages, page_hits)
+                        # ROWS, not Hits -- the same shape the finished
+                        # Sweep returns, which is the contract every
+                        # streaming engine here shares (see
+                        # facebook/discovery_engine.py::_notify). Handing
+                        # back raw Hits made the runner's save raise, and
+                        # because this callback swallows exceptions by
+                        # design, the whole sweep's results vanished
+                        # silently on the first live run.
+                        res = on_progress(
+                            len(by_id), out.pages,
+                            [hit_to_row(h) for h in page_hits])
                         if asyncio.iscoroutine(res):
                             await res
                     except Exception:
@@ -436,5 +471,12 @@ class Discovery:
                 # nothing here to trim it back down.
                 out.hits = out.hits[: self.a.max_results]
             out.seconds = time.time() - started
+            out.schema = probe.report()
+            if broken := probe.broken_keys():
+                from backend.shared.logging import get_logger as _gl
+                _gl("youtube").warning(
+                    f"youtube: {keyword!r} -- attribute(s) no longer served where we "
+                    f"look for them: {', '.join(broken)}. The search API response "
+                    f"shape has changed; see sweep()")
         return out
 

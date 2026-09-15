@@ -26,21 +26,25 @@ external client has one integration pattern to implement, not two.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 import uuid
 import weakref
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from backend.config.settings import settings
+from backend.database.repositories import coverage_repository as coverage_db
 from backend.database.repositories import profile_repository as profiles_db
+from backend.database.repositories import telemetry_repository as telemetry_db
 from backend.platforms import registry
 from backend.services import avatar_cache
 from backend.platforms.scan_options import DiscoveryOptions
 from backend.sessions import manager as sessions_engine
 from backend.shared import keywords as kw_groups
+from backend.shared import resilience
 from backend.shared.job_store import JobStore
 from backend.shared.logging import get_logger
 from backend.shared.models.row import Row
@@ -287,6 +291,17 @@ class _KeywordItem:
     # is exactly the old behaviour.
     targets: tuple[kw_groups.MatchTarget, ...] = ()
     attempts: int = 0
+    # WHICH TABS THIS ITEM STILL OWES, empty meaning "all of this
+    # platform's tabs" -- the ordinary case, and what every caller that
+    # predates gap-closing produces.
+    #
+    # Non-empty only on a gap-closing sweep (`only_owed`), where the
+    # coverage ledger may say that "gautam adani" is covered on Facebook's
+    # people and pages tabs but was never reached on groups. Re-sweeping
+    # all three to recover the one is three page loads and three searches
+    # on a live account to do work already done, which on a fifteen-keyword
+    # client is the difference between a short pass and a full re-run.
+    tabs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         # A childless keyword is its own parent -- which is exactly the
@@ -294,6 +309,14 @@ class _KeywordItem:
         # permutations still gets correct filing.
         if not self.parent:
             self.parent = self.keyword
+
+    @property
+    def search(self) -> str:
+        """`KeywordPlan`'s name for the same string, so the coverage ledger
+        takes a plan and a queue item interchangeably -- an abandoned item
+        and a planned one describe the same cell and must key to it
+        identically."""
+        return self.keyword
 
 
 @dataclass
@@ -321,10 +344,83 @@ class _PlatformSweepRun:
     # _requeue_keyword), which only removes that one session and lets the
     # others carry on.
     hard_stop: bool = False
-    incomplete: int = 0
+    # HOW THE SWEEPS THAT DID NOT EXHAUST THEIR RESULTS ENDED, split by
+    # outcome rather than pooled into one `incomplete` tally -- see
+    # shared/resilience.py::sweep_outcome for why the old single counter
+    # was wrong. `truncated` is a budget we chose to stop at; `broken` is
+    # something a human should look at. A sweep that merely met the
+    # analyst's own result cap is SATISFIED and lands in neither.
+    truncated: int = 0
+    broken: int = 0
+    # Stop code -> how many sweeps ended on it, for the note. Only
+    # non-satisfied sweeps are counted, so this is exactly the set of
+    # endings worth a word to the analyst.
+    stop_counts: "Counter[str]" = field(default_factory=Counter)
     sweep_errors: list[str] = field(default_factory=list)
 
+    @property
+    def incomplete(self) -> int:
+        """Sweeps that did not get everything asked of them, either way.
+        Kept as the one number that decides `partial` vs `done`, so that
+        splitting the counters above changed what is REPORTED without
+        changing which platforms are reported on."""
+        return self.truncated + self.broken
 
+    def record_stop(self, stopped: str, complete: bool, error: str = "") -> str:
+        """File one finished sweep under its outcome and return it.
+
+        The single place `truncated`/`broken`/`stop_counts` move, so the
+        note can never disagree with the status that introduces it. Errors
+        are truncated because this text is joined into a one-line chip: a
+        Playwright timeout's full message is several hundred characters of
+        selector and would push the actual diagnosis off the end of it.
+        """
+        outcome = resilience.sweep_outcome(stopped, complete)
+        if outcome == resilience.SATISFIED:
+            return outcome
+        if outcome == resilience.TRUNCATED:
+            self.truncated += 1
+        else:
+            self.broken += 1
+        self.stop_counts[(stopped or "").strip().lower()] += 1
+        if detail := " ".join(str(error or "").split())[:160]:
+            if detail not in self.sweep_errors:
+                self.sweep_errors.append(detail)
+        return outcome
+
+    def note(self) -> str:
+        """The line an analyst reads under a `partial` platform.
+
+        Always names a reason. It used to be the bare count "N sweep(s)
+        did not run to completion", which said nothing an analyst could
+        act on and read identically whether a cap had fired or the parser
+        had died. A real error message still leads, because it is more
+        specific than any category; the breakdown follows it in brackets.
+        """
+        reasons = resilience.summarise_stops(self.stop_counts)
+        if self.broken and self.sweep_errors:
+            # The diagnosis first, the count second -- the count is the
+            # part an analyst can do nothing with.
+            detail = " | ".join(self.sweep_errors[:2])
+            return f"{detail} ({reasons})" if reasons else detail
+        return reasons
+
+
+
+
+def _accepts_progress(sweep_fn: Any) -> bool:
+    """Can this engine hand results back DURING a sweep?
+
+    Facebook and X both can; Instagram, Telegram, TikTok and YouTube's
+    sweeps are short enough or API-paged enough that they return before it
+    would matter. Asked of the signature rather than kept as a list of
+    platform names, because a list is one more thing to forget to update
+    when an engine grows the capability.
+    """
+    try:
+        return "on_progress" in inspect.signature(sweep_fn).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 def _effective_cap(*caps: int) -> int:
@@ -467,6 +563,29 @@ class CompletedSweep:
     # names which one.
     complete: bool = True
     stopped: str = ""
+    # WHAT THAT ENDING MEANS: satisfied | truncated | broken, per
+    # shared/resilience.py::sweep_outcome. `complete` and `stopped` are the
+    # engine's raw facts; this is the judgement the platform's status and
+    # note are actually built from, recorded per sweep so that "which four
+    # sweeps, and why" is answerable from the job's own history rather than
+    # only from the aggregate. Defaulted satisfied so the many test fakes
+    # and hand-built records that predate it read as clean, exactly as
+    # `complete=True` already made them.
+    outcome: str = resilience.SATISFIED
+    # WHICH EXTRACTION PATH PRODUCED THIS. The engines read every field more
+    # than one way -- the platform's own payload first, the rendered DOM
+    # second -- and flip this when the first stops matching (see
+    # shared/extraction.py::run_strategies). Carried out of the engine and
+    # into the rolling telemetry because a platform that has quietly moved
+    # onto its backup parser is the earliest warning of drift there is, and
+    # it was previously visible only inside the sweep that noticed it.
+    source: str = ""
+    # WHICH TARGETED ATTRIBUTES THE PLATFORM STILL SERVES: {key: [hits,
+    # misses]}, straight off the engine's own schema probe. Carried here so
+    # the rolling telemetry can compare each key against its own history --
+    # which is what lets an alert say "profile.profile_picture.uri stopped
+    # matching" instead of "Facebook results dropped".
+    schema: dict = field(default_factory=dict)
     # What the profile-visit reconciliation phase cost. It is the slowest
     # part of a sweep and the most detectable, so it is the number to watch.
     resolved_visits: int = 0
@@ -484,6 +603,9 @@ class CompletedSweep:
             "timestamp": self.timestamp,
             "complete": self.complete,
             "stopped": self.stopped,
+            "outcome": self.outcome,
+            "source": self.source,
+            "schema": self.schema,
             "resolved_visits": self.resolved_visits,
             "resolve_seconds": self.resolve_seconds,
         }
@@ -547,6 +669,14 @@ class DiscoveryJob:
     # rather than re-read per platform so the progress totals and the sweep
     # itself can never disagree about how much work there is.
     tabs: dict[str, list[str]] = field(default_factory=dict)
+    # GAP-CLOSING MODE. When set, each platform sweeps only the cells its
+    # coverage ledger still lists as owed (never attempted, missed, or
+    # broken) instead of the whole plan -- see
+    # database/repositories/coverage_repository.py. A second lap over a
+    # queue of clients then costs what the gaps cost, not what the clients
+    # cost, which is the difference between gap-closing being something an
+    # analyst does and something they mean to do.
+    only_owed: bool = False
     created_at: float = field(default_factory=time.time)
     status: str = QUEUED
     message: str = ""
@@ -727,6 +857,7 @@ class DiscoveryRunner:
         platform_limits_domain: Optional[dict[str, int]] = None,
         platform_tab_limits: Optional[dict[str, dict[str, dict[str, int]]]] = None,
         facebook_tabs: Optional[list[str]] = None,
+        only_owed: bool = False,
     ) -> tuple[DiscoveryJob, dict[str, str]]:
         # Deduped WITHIN each type, independently -- these are two
         # separately-curated lists (executive/person names vs brand/domain
@@ -746,6 +877,7 @@ class DiscoveryRunner:
         job = DiscoveryJob(
             id=uuid.uuid4().hex[:12], group_id=group_id, keyword_plan=plan,
             tabs={pid: tabs_for(pid, facebook_tabs) for pid in ready},
+            only_owed=only_owed,
         )
         for pid in ready:
             tabs = job.tabs[pid]
@@ -758,6 +890,14 @@ class DiscoveryRunner:
                 platform=pid, display_name=registry.display_name(pid),
                 status="skipped", note=why,
             )
+            # A SKIPPED PLATFORM IS EVERY KEYWORD MISSED ON IT. The
+            # loudest version of the silence this ledger exists to end:
+            # one platform with no usable session took the client's whole
+            # keyword list with it, and left a single chip saying
+            # "skipped" as the only evidence. Recorded per cell so the
+            # next run knows exactly what that cost.
+            await coverage_db.miss(
+                group_id, job.id, pid, tabs_for(pid, facebook_tabs), plan, why)
 
         await self._store.put(job)
 
@@ -867,6 +1007,15 @@ class DiscoveryRunner:
             # `_settle_avatars` CANCELS these rather than awaiting them when
             # the job was stopped, so this stays fast on the cancel path.
             await self._settle_avatars(job)
+            # HOW THIS RUN WENT, INTO THE ROLLING RECORD. Written in one
+            # batch here rather than per sweep: it is bookkeeping, a sweep
+            # takes seconds to minutes, and nothing reading it cares about
+            # sub-job freshness. In `finally` so a job that failed or was
+            # cancelled still contributes -- a platform that starts failing
+            # is exactly the evidence the drift canary needs, and dropping
+            # it on the error path would blind the detector precisely when
+            # something is going wrong.
+            await telemetry_db.record_sweeps(job.group_id, job.id, job.history)
             if not job.cancel.is_set():
                 # NOT ON A CANCELLED JOB. The sweep report is a summary of a
                 # completed sweep; generating one for a run the analyst just
@@ -957,11 +1106,23 @@ class DiscoveryRunner:
         tabs = job.tabs.get(platform_id) or PLATFORM_TABS.get(platform_id, ["people"])
         platform_limits = {"individual": platform_limits_individual, "domain": platform_limits_domain}
 
+        # WHAT THIS PLATFORM OWES, AND THE DURABLE RECORD THAT IT OWES IT.
+        #
+        # `plan` is written BEFORE a single search runs, so a job that dies
+        # in its first second still leaves a complete statement of what it
+        # was supposed to do. Every early exit below then marks the exact
+        # cells it abandoned, which is what makes "was every keyword
+        # searched" a question with an answer after the job is gone. A
+        # ledger write failing is logged and swallowed inside the
+        # repository: bookkeeping must never cost the sweep itself.
+        items = await self._queue_for(job, platform_id, tabs)
+        prog.keywords_total = sum(len(it.tabs or tabs) for it in items)
+        await coverage_db.plan(
+            job.group_id, job.id, platform_id, tabs, job.keyword_plan)
+
         run = _PlatformSweepRun(
             platform_id=platform_id,
-            queue=deque(
-                _KeywordItem(p.search, p.kw_type, p.parent, targets=p.targets)
-                for p in job.keyword_plan),
+            queue=deque(items),
             tabs=tabs,
             max_results=max_results,
             max_seconds=max_seconds,
@@ -969,8 +1130,16 @@ class DiscoveryRunner:
             platform_tab_limits=platform_tab_limits,
             prog=prog,
         )
+        if not items:
+            # Nothing owed. Only reachable in gap-closing mode, and the one
+            # honest thing to report: this platform is fully covered, so
+            # spending a session on it would be pure cost.
+            prog.status = "done"
+            prog.note = "already fully covered -- nothing owed"
+            prog.finished_at_ts = time.time()
+            return
 
-        want = _sessions_wanted(platform_id, len(job.keyword_plan))
+        want = _sessions_wanted(platform_id, len(items))
         prog.workers = 0
         setup_error = ""
         worker_error = ""
@@ -1026,6 +1195,9 @@ class DiscoveryRunner:
             prog.status = "failed"
             prog.note = f"{type(e).__name__}: {e}"
             log.error(f"discovery job {job.id}: {platform_id} failed -- {prog.note}")
+            # The platform fell over with work still queued. Whatever it
+            # never reached is owed, by name.
+            await self._abandon(job, run, prog.note)
             prog.current_keyword = ""
             prog.current_tab = ""
             prog.current_step = ""
@@ -1043,10 +1215,25 @@ class DiscoveryRunner:
             # A cancelled platform keeps what it read; failing the rest
             # would turn the analyst's own cancel into a screenful of
             # errors.
-            if run.incomplete:
+            #
+            # It does NOT get to keep the pretence that the rest was
+            # swept. Stop is a legitimate instruction and its cost is
+            # legitimate too -- the keywords nobody reached are recorded
+            # as owed, so resuming this client picks up where the analyst
+            # interrupted it instead of starting the whole sweep again.
+            unreached = len(run.queue)
+            await self._abandon(job, run, "cancelled before this keyword was reached")
+            if run.incomplete or unreached:
+                # `unreached` is why the queue length is read BEFORE
+                # abandoning it. A Stop pressed with keywords still queued
+                # breaks nothing -- `run.incomplete` stays 0, because no
+                # sweep failed -- and this used to report `done` on the
+                # strength of that. "Done" about keywords nobody searched
+                # is the one thing this whole path must not say.
                 prog.status = "partial"
                 if not prog.note:
-                    prog.note = f"{run.incomplete} sweep(s) did not run to completion"
+                    prog.note = run.note() or (
+                        f"stopped with {unreached} keyword(s) unsearched")
             else:
                 prog.status = "done"
             return
@@ -1061,23 +1248,110 @@ class DiscoveryRunner:
                 prog.note = setup_error or worker_error or (
                     "every available session for this platform failed or checkpointed -- "
                     "see the earlier failed sweep(s) for why")
+            # THE CASE THIS LEDGER WAS BUILT FOR. `_MAX_CLAIM_ROUNDS` is
+            # spent, or the pool has nothing left to lend, and these
+            # keywords were never put into a search box on this platform
+            # by anyone. The note says how many; the ledger says which,
+            # after this job is gone.
+            await self._abandon(job, run, prog.note)
             prog.status = "failed" if prog.keywords_done == 0 else "partial"
             return
 
         if run.incomplete:
+            # PARTIAL EITHER WAY, BUT NO LONGER WORDED EITHER WAY. A
+            # platform that only ran out of budget now says so plainly
+            # ("3 sweep(s) ran out of time budget") instead of borrowing
+            # the same alarming sentence a dead parser gets, and a
+            # platform that merely met the analyst's own result cap is not
+            # here at all -- `cap:results` is SATISFIED, so it reaches the
+            # `done` branch below. That last case was the bulk of what
+            # this warning used to fire on.
             prog.status = "partial"
-            if run.sweep_errors:
-                # The diagnosis first, the count second -- the count is the
-                # part an analyst can do nothing with.
-                detail = " | ".join(run.sweep_errors[:2])
-                prog.note = f"{detail} ({run.incomplete} sweep(s) incomplete)"
-            else:
-                prog.note = f"{run.incomplete} sweep(s) did not run to completion"
+            prog.note = run.note()
         else:
             # Includes the case this was built for: a session died
             # mid-sweep, another one finished its keywords, and the
             # analyst gets a complete platform anyway.
             prog.status = "done"
+
+    async def _queue_for(
+        self, job: DiscoveryJob, platform_id: str, tabs: list[str],
+    ) -> list["_KeywordItem"]:
+        """The keyword items this platform should actually sweep.
+
+        The whole plan, normally. In gap-closing mode (`job.only_owed`) the
+        coverage ledger narrows it to the cells still owed, per TAB -- a
+        keyword covered on Facebook's people and pages tabs but never
+        reached on groups comes back owing groups alone.
+
+        A LEDGER THAT CANNOT BE READ FALLS BACK TO THE WHOLE PLAN, never to
+        an empty one. Sweeping work that was already done is wasteful;
+        concluding "nothing is owed" from a failed read would be the exact
+        false clean bill of health this ledger exists to prevent.
+        """
+        full = [
+            _KeywordItem(p.search, p.kw_type, p.parent, targets=p.targets)
+            for p in job.keyword_plan
+        ]
+        if not job.only_owed:
+            return full
+        try:
+            cells = await coverage_db.owed(job.group_id, [platform_id])
+        except Exception as e:
+            log.error(
+                f"[{platform_id}] coverage ledger unreadable ({type(e).__name__}: {e}) "
+                f"-- sweeping the full plan rather than risk reporting owed work as done")
+            return full
+
+        # Keyed the way `cell_id` keys it, so a casing change in the
+        # client's saved keywords cannot make a covered cell look owed.
+        owed_tabs: dict[tuple[str, str], set[str]] = {}
+        for cell in cells:
+            key = (cell["kw_type"], (cell["search"] or "").strip().lower())
+            owed_tabs.setdefault(key, set()).add(cell["tab"])
+
+        out: list["_KeywordItem"] = []
+        for item in full:
+            wanted = owed_tabs.get((item.kw_type, item.keyword.strip().lower()))
+            if wanted is None:
+                continue
+            # Intersected with the tabs THIS job is configured for, in the
+            # platform's own order: a cell owed on a tab the analyst has
+            # since switched off is not work this job can do.
+            item.tabs = tuple(t for t in tabs if t in wanted)
+            if item.tabs:
+                out.append(item)
+        log.info(
+            f"[{platform_id}] gap-closing: {len(out)} of {len(full)} keyword(s) still owed")
+        return out
+
+    async def _abandon(
+        self, job: DiscoveryJob, run: "_PlatformSweepRun", reason: str,
+    ) -> None:
+        """Record every cell still queued on this platform as missed, and
+        say why.
+
+        Called on EVERY path that ends a platform with work still in the
+        queue -- a spent session pool, a hard stop, a cancel. The queue is
+        about to be discarded either way; this is the difference between
+        discarding it and losing it. What lands in the ledger is the exact
+        (keyword, tab) list nobody reached, which is what the next run
+        picks up and what an analyst can be shown by name.
+        """
+        if not run.queue:
+            return
+        # Snapshot first: the queue is a live deque that workers may still
+        # be draining, and `plans` below is iterated twice by `miss`.
+        pending = list(run.queue)
+        by_tabs: dict[tuple[str, ...], list[_KeywordItem]] = {}
+        for item in pending:
+            by_tabs.setdefault(tuple(item.tabs or run.tabs), []).append(item)
+        for item_tabs, items in by_tabs.items():
+            await coverage_db.miss(
+                job.group_id, job.id, run.platform_id, item_tabs, items, reason)
+        log.warning(
+            f"[{run.platform_id}] {len(pending)} keyword(s) never attempted -- "
+            f"recorded as owed: {reason}")
 
     async def _claim_sessions(
         self, platform_id: str, want: int,
@@ -1268,12 +1542,34 @@ class DiscoveryRunner:
                     async def _sweep_tab(
                         keyword: str, kw_type: str, parent: str,
                         targets: tuple, tab: str,
-                        stats: dict, fatal_kind: list,
+                        stats: dict, fatal_kind: list, resolved: set,
                         stagger: float = 0.0, own_options: bool = False,
                     ) -> str:
+                        """`resolved` is every tab this call has accounted
+                        for in the coverage ledger, however it ended. The
+                        caller subtracts it from the tabs the item owed and
+                        records the remainder as missed -- which is what
+                        makes a tab that never ran AT ALL (a crash inside
+                        the concurrent gather, a stop between tabs)
+                        impossible to lose. A cell must leave this function
+                        either recorded or resolvable, never neither."""
                         if stagger:
                             await asyncio.sleep(stagger)
                         if job.cancel.is_set() or run.hard_stop:
+                            # NEVER SEARCHED, AND ALREADY OFF THE QUEUE.
+                            # Its item was popped before its tabs started,
+                            # so `_abandon`'s sweep of the remaining queue
+                            # cannot see this cell -- it has to record
+                            # itself or it is the one gap the ledger
+                            # misses. Both reasons are legitimate stops
+                            # and neither makes the keyword searched.
+                            await coverage_db.miss(
+                                job.group_id, job.id, platform_id, [tab],
+                                [_KeywordItem(keyword, kw_type, parent)],
+                                "platform stopped before this tab was reached"
+                                if run.hard_stop else
+                                "cancelled before this tab was reached")
+                            resolved.add(tab)
                             return ""
                         prog.current_keyword = keyword
                         prog.current_tab = tab
@@ -1289,8 +1585,99 @@ class DiscoveryRunner:
                         else:
                             options.max_results = cap
                             disc = discoverer
+                        # RESULTS AS THEY ARE FOUND, NOT WHEN THE SWEEP ENDS.
+                        #
+                        # Rows were only ever saved after a whole (keyword,
+                        # tab) sweep returned. A Facebook People sweep for a
+                        # common name runs to its fifteen-minute budget, so
+                        # an analyst watching the grid saw nothing at all for
+                        # fifteen minutes and then everything at once. Both
+                        # engines could already stream -- Facebook has had
+                        # the callback since it was written -- but nothing
+                        # ever passed one in, so the code was dead.
+                        #
+                        # `delivered` is what keeps the counters honest:
+                        # every row saved here is remembered by URL and
+                        # excluded from the final save below, so `found`
+                        # counts each profile exactly once however many
+                        # times it is seen.
+                        delivered: set[str] = set()
+
+                        async def _stream(found_count: int, page_num: int, rows: list) -> None:
+                            """NEVER RAISES, whatever the engine hands it.
+
+                            The engines all swallow exceptions from this
+                            callback by contract, so in principle it cannot
+                            abort a sweep. That is six separate places each
+                            remembering to do the right thing, and the
+                            guarantee here -- streaming costs freshness at
+                            worst, never a row -- must not rest on that.
+                            Anything that fails is logged and left
+                            undelivered, so the post-sweep save writes it
+                            exactly as it would for an engine that never
+                            streamed.
+                            """
+                            try:
+                                await _stream_inner(found_count, page_num, rows)
+                            except Exception as e:                     # noqa: BLE001
+                                log.error(
+                                    f"[{platform_id}] {keyword!r}/{tab}: live result "
+                                    f"delivery failed ({type(e).__name__}: {e}) -- "
+                                    f"these rows will be saved when the sweep ends")
+
+                        async def _stream_inner(found_count: int, page_num: int, rows: list) -> None:
+                            fresh = [
+                                r for r in rows
+                                if getattr(r, "url", "") and r.url not in delivered
+                            ]
+                            if not fresh:
+                                return
+                            # BUILT AND SAVED BEFORE ANYTHING IS MARKED
+                            # DELIVERED. Marking first cost every YouTube
+                            # result on the first live run: the engine hands
+                            # back its own Hit objects rather than Rows,
+                            # `row_to_fields` raised on the first one, and
+                            # the engine's progress callback swallows
+                            # exceptions by contract -- so five channels
+                            # were recorded as already-delivered, the final
+                            # save skipped them as duplicates, and the sweep
+                            # reported five found and saved none.
+                            #
+                            # Ordering it this way makes that impossible:
+                            # anything that fails here is simply not
+                            # delivered, and the post-sweep save picks it up
+                            # exactly as it would for an engine that never
+                            # streamed at all.
+                            field_rows = [
+                                row_to_fields(r, parent, keyword, targets=targets)
+                                for r in fresh
+                            ]
+                            saved, new = await profiles_db.save_many(
+                                job.group_id, platform_id, profiles_db.PHASE_DISCOVERY,
+                                field_rows,
+                            )
+                            delivered.update(r.url for r in fresh)
+                            # The same counters the post-sweep path bumps,
+                            # so the progress rail climbs while the sweep is
+                            # still running instead of jumping at the end --
+                            # and so `_requeue_keyword` can still roll this
+                            # attempt back exactly if the session dies.
+                            prog.found += saved
+                            prog.new += new
+                            job.found += saved
+                            job.new += new
+                            stats["found"] += saved
+                            stats["new"] += new
+                            task = avatar_cache.spawn(
+                                job.group_id, platform_id, field_rows)
+                            if task is not None:
+                                job.avatar_tasks.append(task)
+
                         try:
-                            sweep = await disc.sweep(keyword, tab)
+                            if _accepts_progress(disc.sweep):
+                                sweep = await disc.sweep(keyword, tab, on_progress=_stream)
+                            else:
+                                sweep = await disc.sweep(keyword, tab)
                         except Exception as e:
                             dur = time.time() - t0
                             log.error(f"[{platform_id}] {keyword!r}/{tab}: {type(e).__name__}: {e}")
@@ -1307,6 +1694,7 @@ class DiscoveryRunner:
                                 timestamp=datetime.now(timezone.utc).strftime("%H:%M:%S"),
                                 complete=False,
                                 stopped="error",
+                                outcome=resilience.BROKEN,
                             ))
                             if session is not None and hasattr(session, "sync_cookies"):
                                 await session.sync_cookies()
@@ -1328,13 +1716,44 @@ class DiscoveryRunner:
                                 prog.note = f"session {reason} mid-sweep"
                                 if fatal_kind[0] != "session":
                                     fatal_kind[0] = "session"
+                                # Deliberately NOT added to `resolved`: the
+                                # whole keyword is going back on the queue
+                                # for another session, so this cell is
+                                # owned by the item from here, not by this
+                                # attempt. Recording it missed now would
+                                # be overwritten seconds later by the
+                                # retry that succeeds.
                                 return reason
-                            run.incomplete += 1
+                            # NOT session-shaped, so nobody is going to
+                            # retry this keyword and the exception is the
+                            # last word on it. Recorded WITH its text: a
+                            # raised exception used to increment the
+                            # counter and go nowhere near `sweep_errors`,
+                            # so the one sweep failure that always had a
+                            # real message attached was the one the note
+                            # never quoted.
+                            run.record_stop(
+                                "error", False, f"{type(e).__name__}: {e}")
+                            await coverage_db.record(
+                                job.group_id, job.id, platform_id, tab,
+                                kw_type, keyword, resilience.BROKEN,
+                                stop=f"{type(e).__name__}: {e}")
+                            resolved.add(tab)
                             return ""
 
                         dur = time.time() - t0
-                        hits = [h for h in (sweep.hits or []) if h.url]
-                        saved_count = 0
+                        # WHATEVER STREAMING DID NOT ALREADY SAVE. On an
+                        # engine that streams this is usually empty, and on
+                        # one that does not it is the whole sweep -- which
+                        # is exactly the pre-existing behaviour, unchanged.
+                        hits = [
+                            h for h in (sweep.hits or [])
+                            if h.url and h.url not in delivered
+                        ]
+                        # Seeded with what streaming already banked, so the
+                        # telemetry row for this sweep reports the profiles
+                        # it actually found rather than only the remainder.
+                        saved_count = len(delivered)
                         new_count = 0
                         if hits:
                             # Saved per completed sweep, not batched at the end,
@@ -1359,8 +1778,14 @@ class DiscoveryRunner:
                                 job.group_id, platform_id, profiles_db.PHASE_DISCOVERY,
                                 rows,
                             )
-                            saved_count = saved
-                            new_count = new
+                            # `+=`, not `=`: `saved_count` is seeded with
+                            # what streaming already banked, and assigning
+                            # here threw that away -- then the line further
+                            # down added it back, so a non-streaming sweep
+                            # reported double. Instagram's first live sweep
+                            # said 10 hits for 5 profiles because of it.
+                            saved_count += saved
+                            new_count += new
                             # Pull each picture into our own store, BEHIND this
                             # sweep rather than inside it -- see the original
                             # method's own reasoning for why this is a spawned
@@ -1375,11 +1800,16 @@ class DiscoveryRunner:
                             stats["found"] += saved
                             stats["new"] += new
                         sweep_complete = bool(getattr(sweep, "complete", True))
-                        if not sweep_complete:
-                            run.incomplete += 1
-                            if reason := str(getattr(sweep, "error", "") or "").strip():
-                                if reason not in run.sweep_errors:
-                                    run.sweep_errors.append(reason)
+                        sweep_stopped = str(getattr(sweep, "stopped", "") or "")
+                        # CLASSIFIED, NOT JUST COUNTED. `record_stop`
+                        # decides whether this ending is worth telling the
+                        # analyst about at all -- a sweep that stopped
+                        # because it collected exactly the number of
+                        # profiles they configured (`cap:results`) is
+                        # satisfied and files under nothing.
+                        outcome = run.record_stop(
+                            sweep_stopped, sweep_complete,
+                            str(getattr(sweep, "error", "") or ""))
                         prog.keywords_done += 1
                         stats["units"] += 1
                         job.history.append(CompletedSweep(
@@ -1392,12 +1822,25 @@ class DiscoveryRunner:
                             hits_new=new_count,
                             timestamp=datetime.now(timezone.utc).strftime("%H:%M:%S"),
                             complete=sweep_complete,
-                            stopped=str(getattr(sweep, "stopped", "") or ""),
+                            stopped=sweep_stopped,
+                            outcome=outcome,
+                            source=str(getattr(sweep, "source", "") or ""),
+                            schema=dict(getattr(sweep, "schema", None) or {}),
                             resolved_visits=int(getattr(sweep, "resolved_visits", 0) or 0),
                             resolve_seconds=float(getattr(sweep, "resolve_seconds", 0.0) or 0.0),
                         ))
                         if session is not None and hasattr(session, "sync_cookies"):
                             await session.sync_cookies()
+                        # THE CELL'S OWN VERDICT, WRITTEN WHERE IT IS
+                        # KNOWN. `satisfied`/`truncated` both mean the term
+                        # genuinely reached this platform's search box, so
+                        # both close the coverage question; `broken` leaves
+                        # it owed for the next run.
+                        await coverage_db.record(
+                            job.group_id, job.id, platform_id, tab, kw_type,
+                            keyword, outcome, stop=sweep_stopped,
+                            found=saved_count, new=new_count)
+                        resolved.add(tab)
 
                         stop_reason = ""
                         if getattr(sweep, "stopped", "") == "flood-wait":
@@ -1435,6 +1878,16 @@ class DiscoveryRunner:
                         prog.current_keyword = item.keyword
                         stats = {"units": 0, "found": 0, "new": 0}
                         fatal_kind = [""]
+                        # THE TABS THIS ITEM OWES, which is every tab the
+                        # platform sweeps unless a gap-closing run narrowed
+                        # it to the ones actually still missing.
+                        item_tabs = list(item.tabs or run.tabs)
+                        # Every tab below that reaches a verdict adds itself
+                        # here; whatever is left over after the loop never
+                        # ran, and is recorded as owed. This is the backstop
+                        # that makes an unaccounted-for tab impossible
+                        # rather than merely unlikely.
+                        resolved: set[str] = set()
 
                         # CONCURRENT ONLY WHEN IT IS SAFE AND WORTH IT: more than
                         # one tab, a factory to give each its own cap, and the
@@ -1447,14 +1900,14 @@ class DiscoveryRunner:
                         # tab concurrency for throughput would silently take the
                         # per-keyword half of that guarantee back.
                         concurrent = (
-                            len(run.tabs) > 1
+                            len(item_tabs) > 1
                             and make_discoverer is not None
                             and settings.discovery_tab_concurrency > 1
                             and not settings.discovery_sequential_keywords
                         )
                         if concurrent:
-                            prog.current_tab = "+".join(run.tabs)
-                            prog.current_step = f"Searching {len(run.tabs)} tabs..."
+                            prog.current_tab = "+".join(item_tabs)
+                            prog.current_step = f"Searching {len(item_tabs)} tabs..."
                             prog.item_started_at_ts = time.time()
                             sem = asyncio.Semaphore(settings.discovery_tab_concurrency)
 
@@ -1463,41 +1916,70 @@ class DiscoveryRunner:
                                     return await _sweep_tab(
                                         item.keyword, item.kw_type, item.parent,
                                         item.targets, tab,
-                                        stats, fatal_kind,
+                                        stats, fatal_kind, resolved,
                                         stagger=i * TAB_STAGGER_SEC, own_options=True,
                                     )
 
                             reasons = await asyncio.gather(
-                                *(_slot(i, t) for i, t in enumerate(run.tabs)),
+                                *(_slot(i, t) for i, t in enumerate(item_tabs)),
                                 return_exceptions=True,
                             )
                             for r in reasons:
                                 if isinstance(r, BaseException):
+                                    # NOT THE END OF IT. A tab that crashed
+                                    # here produced no sweep record and no
+                                    # ledger write, so it used to vanish
+                                    # into the gap between `keywords_done`
+                                    # and `keywords_total` with one log
+                                    # line as its only trace. It is simply
+                                    # absent from `resolved`, which the
+                                    # sweep below turns into an owed cell
+                                    # like any other.
                                     log.error(f"[{platform_id}] tab sweep crashed: {type(r).__name__}: {r}")
                             reason = next((r for r in reasons if isinstance(r, str) and r), "")
                         else:
                             reason = ""
-                            for tab in run.tabs:
+                            for tab in item_tabs:
                                 if job.cancel.is_set() or run.hard_stop:
                                     break
                                 reason = await _sweep_tab(
                                     item.keyword, item.kw_type, item.parent,
                                     item.targets, tab,
-                                    stats, fatal_kind)
+                                    stats, fatal_kind, resolved)
                                 if reason or fatal_kind[0]:
                                     break
+
+                        if fatal_kind[0] == "session":
+                            # THIS SESSION IS DONE, THE PLATFORM IS NOT. The
+                            # keyword it died on goes back on the queue for
+                            # another session; everything still queued was
+                            # never touched and stays there. The item takes
+                            # its unfinished tabs with it, so nothing is
+                            # written as missed here -- a replacement
+                            # session is about to try again, and only
+                            # giving up for good writes the gap.
+                            await self._requeue_keyword(
+                                job, run, item, stats, label, item_tabs)
+                            return True
+
+                        # EVERY TAB THIS ITEM OWED, ACCOUNTED FOR. On the
+                        # ordinary path this finds nothing. It exists for
+                        # the abnormal ones: a crash inside the gather
+                        # above, a stop noticed between tabs, a hard stop
+                        # about to end the platform. Whatever never reached
+                        # a verdict is recorded as owed, by name, and
+                        # outlives the job that failed to do it.
+                        if unresolved := [t for t in item_tabs if t not in resolved]:
+                            await coverage_db.miss(
+                                job.group_id, job.id, platform_id, unresolved,
+                                [item],
+                                "sweep ended before this tab ran"
+                                + (f" ({reason})" if reason else ""))
 
                         if fatal_kind[0] == "hard":
                             run.hard_stop = True
                             prog.note = f"stopped early: session {reason}"
                             return False
-                        if fatal_kind[0] == "session":
-                            # THIS SESSION IS DONE, THE PLATFORM IS NOT. The
-                            # keyword it died on goes back on the queue for
-                            # another session; everything still queued was
-                            # never touched and stays there.
-                            self._requeue_keyword(job, run, item, stats, label)
-                            return True
 
                         # BREATHING ROOM BEFORE THE NEXT KEYWORD. Only between
                         # keywords, never after the last one (a gap before
@@ -1556,9 +2038,9 @@ class DiscoveryRunner:
             sessions_engine.release_claim(platform_id, session_id)
             raise
 
-    def _requeue_keyword(
+    async def _requeue_keyword(
         self, job: DiscoveryJob, run: "_PlatformSweepRun", item: "_KeywordItem",
-        stats: dict, label: str,
+        stats: dict, label: str, item_tabs: Optional[list[str]] = None,
     ) -> None:
         """A keyword whose session died under it, put back for another
         session. See analysis/runner.py's _requeue for the identical
@@ -1574,19 +2056,28 @@ class DiscoveryRunner:
         already found", it means no more sessions will be spent chasing the
         rest.
 
-        A GIVE-UP COUNTS AS INCOMPLETE, not a silent "done". This keyword's
+        A GIVE-UP COUNTS AS BROKEN, not a silent "done". This keyword's
         own last word was a session dying on it, not a real answer -- if
         that also happened to be the only unattempted work left on this
         platform, `keywords_done` reaching `keywords_total` on the strength
         of a failed final attempt must not read as the sweep having gone
-        cleanly, so it feeds the same `run.incomplete`/`run.sweep_errors`
-        machinery an ordinary incomplete sweep does.
+        cleanly, so it feeds the same `record_stop`/`sweep_errors`
+        machinery an ordinary broken sweep does. Filed under its own
+        `session-failed` code rather than borrowing a platform's, so the
+        note names the actual problem (accounts, not the search).
         """
         if item.attempts >= _MAX_KEYWORD_ATTEMPTS:
-            run.incomplete += 1
-            note = f"{item.keyword!r} failed on every available session"
-            if note not in run.sweep_errors:
-                run.sweep_errors.append(note)
+            run.record_stop(
+                "session-failed", False,
+                f"{item.keyword!r} failed on every available session")
+            # GIVING UP IS THE ONE THING THAT MUST BE WRITTEN DOWN. This
+            # keyword leaves the queue for good here, so `_abandon` will
+            # never see it; without this it is the single path by which a
+            # configured keyword could go unsearched and unrecorded.
+            await coverage_db.miss(
+                job.group_id, job.id, run.platform_id,
+                item_tabs or item.tabs or run.tabs, [item],
+                f"failed on every available session after {item.attempts} attempt(s)")
             log.warning(
                 f"[{run.platform_id}] {item.keyword!r} took down {item.attempts} "
                 f"session(s) -- not re-queued again, whatever this attempt "

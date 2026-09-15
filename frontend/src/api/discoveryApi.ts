@@ -38,6 +38,43 @@ export interface StartDiscoveryBody {
   platform_limits_individual?: Record<string, number>;
   platform_limits_domain?: Record<string, number>;
   platform_tab_limits?: Record<string, Record<string, Record<string, number>>>;
+  // GAP-CLOSING PASS. Sweeps only the (platform, tab, keyword) cells this
+  // client's coverage ledger still lists as owed -- never searched, missed
+  // by an earlier run, or broken -- instead of the whole plan. Costs what
+  // the gaps cost rather than what the client costs, which is what makes
+  // closing them something the scheduler can just do rather than something
+  // an analyst has to notice and decide to do.
+  only_owed?: boolean;
+}
+
+// One (platform, tab, keyword) still needing a search, straight off
+// GET /discovery/coverage/{group_id}.
+export interface OwedCell {
+  platform: string;
+  tab: string;
+  kw_type: string;
+  search: string;
+  // The keyword an analyst recognises: `search` may be one of their
+  // curated permutations, which on its own means little to a reader.
+  parent: string;
+  // "" = planned but never attempted; "missed" = a sweep gave up before
+  // reaching it; "broken" = it was reached and could not complete.
+  outcome: string;
+  reason: string;
+  attempts: number;
+  attempted_at: string | null;
+  // Null with a non-null attempted_at is a keyword that has been tried and
+  // never once actually searched.
+  covered_at: string | null;
+}
+
+export interface CoverageReport {
+  group_id: string;
+  cells: number;
+  owed: number;
+  by_outcome: Record<string, number>;
+  by_platform: Record<string, Record<string, number>>;
+  items: OwedCell[];
 }
 
 export interface StartDiscoveryAccepted {
@@ -62,6 +99,15 @@ export interface CompletedSweepTelemetry {
   // indistinguishable in a duration alone -- these are what tell them apart.
   complete?: boolean;
   stopped?: string;
+  // WHAT THAT ENDING MEANS, which `complete` on its own does not say.
+  // `complete` is raw engine telemetry -- it is only true when the platform
+  // ran out of results -- so a sweep that stopped because it had collected
+  // exactly the configured `max_results` reports false while being a
+  // perfectly complete answer. That conflation is why every capped run used
+  // to warn "N sweep(s) did not run to completion". Read this instead:
+  // "satisfied" needs no comment, "truncated" means a time/page budget left
+  // results on the table, "broken" is the only one worth alarming about.
+  outcome?: "satisfied" | "truncated" | "broken";
   // The profile-visit reconciliation phase: the slowest part of a sweep, and
   // the one that costs the most in detection surface.
   resolved_visits?: number;
@@ -276,6 +322,16 @@ export const discoveryApi = {
 
   startDiscovery: (body: StartDiscoveryBody) =>
     post("/discovery/jobs", body).then(json<StartDiscoveryAccepted>),
+
+  // WHAT THIS CLIENT STILL OWES, read from the durable per-cell ledger
+  // rather than from a job. A job's progress is aggregate, in-memory and
+  // gone by morning; this answers "was every keyword actually searched"
+  // for a sweep that finished last week.
+  coverage: (groupId: string, platform?: string) =>
+    fetch(url(
+      `/discovery/coverage/${encodeURIComponent(groupId)}`
+      + (platform ? `?platform=${encodeURIComponent(platform)}` : ""),
+    )).then(json<CoverageReport>),
 
 // LONG POLL, NOT A TICK. Passing the `rev` from the previous response plus
 // a `wait` makes the backend hold the request open until the job actually
