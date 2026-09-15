@@ -78,12 +78,39 @@ function matches(host: string, suffixes: string[]): boolean {
  * live CDN URL stays in the list behind it, so a profile whose bytes have not
  * been cached yet -- caching runs behind the sweep -- still shows a picture.
  */
+// Meta stamps a signed URL's own expiry into it, as a hex unix timestamp.
+// Mirrors backend/shared/imagefetch.py::signed_expiry -- deliberately, so
+// both sides agree on when a link is dead.
+const OE = /[?&]oe=([0-9a-fA-F]{1,16})/;
+
+function isDeadLink(raw: string): boolean {
+  const m = OE.exec(raw);
+  if (!m) return false;            // unsigned: no stated lifetime, worth trying
+  const expiry = parseInt(m[1], 16);
+  return Number.isFinite(expiry) && expiry * 1000 < Date.now();
+}
+
 export function avatarSources(
   raw: string | null | undefined,
   sha?: string | null,
 ): string[] {
   const stored = sha ? [url(`/media/avatar/${sha}`)] : [];
   if (!raw) return stored;
+  // A LINK THAT IS ALREADY DEAD COSTS TWO ROUND TRIPS TO DISCOVER.
+  //
+  // Without this, a card with an expired Meta URL and no stored copy asks
+  // the proxy (which fetches the CDN, gets 403, and answers 403), then asks
+  // the CDN itself (403 again), and only then draws its fallback. Two
+  // doomed requests, one of them dragging our own server through a CDN
+  // round trip -- per card. On a grid where a third of the cards were blank
+  // that is ~66 pointless requests a page, and it is what made scrolling
+  // feel slow.
+  //
+  // The URL says when it died. Reading it costs a regex and saves both
+  // requests, so the fallback draws immediately instead of after two
+  // timeouts. Only applies when there is no stored copy: with one, `stored`
+  // is first and nothing here is reached.
+  if (!stored.length && isDeadLink(raw)) return [];
   // Telegram stores the picture itself rather than a link to one.
   // When we have a stored copy (sha), prefer it over the inline blob so the
   // card renders a permanent GridFS-backed URL and avoids the DOM overhead
