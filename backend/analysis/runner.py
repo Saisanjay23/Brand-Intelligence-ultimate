@@ -60,6 +60,7 @@ from backend.platforms import registry
 from backend.platforms.scan_options import ScanOptions
 from backend.sessions import manager as sessions_engine
 from backend.database.repositories import analysis_result_repository as results_db
+from backend.database.repositories import client_repository as clients_db
 from backend.shared.job_store import JobStore
 from backend.shared.logging import get_logger
 from backend.shared.models.row import Row
@@ -417,15 +418,17 @@ class AnalysisJob:
     target_name: str = ""
     official_feed: str = ""
     # The client this batch belongs to, when it has one -- only "Analyse
-    # Validated Profiles" (POST /discovery/profiles/analyse) supplies these,
-    # since that's the one analysis entry point with a real client behind
-    # it (group_id IS the client's client_id by convention; domain is
-    # forwarded separately since discovery has no client record to read it
-    # from either -- see discovery.py's own analyse_validated). A job
-    # started from pasted URLs has neither: analysis was built to run with
-    # no client record at all, by design (see this module's own docstring),
-    # so those rows fall back to a generic tag in _build_rows, matching
-    # this app's own "QUICK-ANALYSIS" precedent for a client-less batch.
+    # Validated Profiles" (POST /discovery/profiles/analyse) supplies an
+    # org_id, since that's the one analysis entry point with a real client
+    # behind it (group_id IS the client's client_id by convention -- see
+    # discovery.py's own analyse_validated). `start()` resolves `domain`
+    # itself from that client's own record the moment org_id is given, so
+    # it is always the domain the analyst typed when creating the client,
+    # not whatever a caller happened to pass. A job started from pasted
+    # URLs has neither: analysis was built to run with no client record at
+    # all, by design (see this module's own docstring), so those rows fall
+    # back to a generic tag in _build_rows, matching this app's own
+    # "QUICK-ANALYSIS" precedent for a client-less batch.
     org_id: str = ""
     domain: str = ""
     total: int = 0
@@ -531,6 +534,31 @@ class AnalysisRunner:
         a field it's already been told, and used again here as a fallback
         if the fresh scrape still comes back blank on that field (see
         `_populate`)."""
+        org_id = org_id.strip()
+        domain = domain.strip()
+        if org_id:
+            # The client's own domain, read fresh from its record -- the
+            # same value an analyst typed once when creating the client --
+            # so every batch tied to a client gets the export's Domain
+            # column right without every caller having to thread that value
+            # through by hand. This supersedes whatever `domain` the caller
+            # passed (the one caller that does, "Analyse Validated
+            # Profiles", was reading it off a locally-cached client list
+            # that can go stale the moment the client is edited). A client
+            # that no longer exists, or was never given a domain, leaves
+            # `domain` exactly what the caller passed -- see _build_rows'
+            # own fallback for what an empty `domain` becomes in the export.
+            try:
+                client = await clients_db.try_get(org_id)
+            except Exception as e:
+                client = None
+                log.warning(
+                    f"could not read client {org_id!r} to resolve its domain "
+                    f"({type(e).__name__}: {e}) -- falling back to whatever was passed in"
+                )
+            if client and client.get("domain"):
+                domain = client["domain"]
+
         skipped: list[dict] = []
         items: list[AnalysisItem] = []
         seen: set[str] = set()
@@ -555,13 +583,13 @@ class AnalysisRunner:
             items.append(AnalysisItem(
                 id=uuid.uuid4().hex[:12], raw_url=raw, url=url,
                 platform=platform, entity_id=entity_id,
-                org_id=org_id.strip(),
+                org_id=org_id,
             ))
 
         job = AnalysisJob(
             id=uuid.uuid4().hex[:12], target_name=target_name.strip(),
             official_feed=official_feed.strip(), items=items, total=len(items),
-            seed_by_url=seed_by_url or {}, org_id=org_id.strip(), domain=domain.strip(),
+            seed_by_url=seed_by_url or {}, org_id=org_id, domain=domain,
         )
         for it in items:
             entry = job.platform_progress.setdefault(it.platform, {

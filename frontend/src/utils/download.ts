@@ -35,7 +35,14 @@ export function rowsToCsv(rows: Record<string, unknown>[]): string {
   };
   const lines = [cols.map(esc).join(",")];
   for (const r of rows) lines.push(cols.map((c) => esc(r[c])).join(","));
-  return lines.join("\n");
+  // Leading UTF-8 BOM: without it, Excel opens a UTF-8 CSV using the
+  // system's ANSI code page instead of UTF-8, so any scraped non-ASCII
+  // text (Arabic/Chinese/Cyrillic, or even just an accented Latin name)
+  // renders as mojibake the moment the file is double-clicked open --
+  // the BOM is what makes Excel's own sniffer pick UTF-8. Every other
+  // UTF-8 CSV reader (Python's `utf-8-sig`, pandas, Node) already strips
+  // a leading BOM transparently, so this costs nothing there.
+  return "﻿" + lines.join("\n");
 }
 
 // Flat records -> TSV text, designed for clipboard copying and direct
