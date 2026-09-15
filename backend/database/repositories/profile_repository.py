@@ -715,6 +715,37 @@ async def set_has_logo(
     return res.matched_count > 0
 
 
+async def keep_avatar_for_image_url(image_url: str, sha: str) -> int:
+    """Attach a stored picture to every profile currently pointing at
+    `image_url`. Returns how many rows were given one.
+
+    WHY THIS IS KEYED ON THE URL. The media proxy fetches a picture on
+    behalf of a card that is being LOOKED AT right now, and all it is given
+    is the URL -- it has no idea which client or profile asked. It has the
+    bytes in its hands either way, and throwing them away was the last way
+    a picture could still be lost: the proxy downloaded it, served it, the
+    analyst saw it, and a week later the signed URL died and the card went
+    blank holding nothing.
+
+    Only ever fills a blank. A profile that already has `avatar_sha` is left
+    alone, because that digest may be a picture this URL no longer serves --
+    `save` invalidates the old one deliberately when an account changes its
+    photo, and re-pointing it at whatever the proxy happened to fetch would
+    undo that.
+    """
+    if not image_url or not sha:
+        return 0
+    res = await db()[PROFILES].update_many(
+        {
+            "profile_image_url": image_url,
+            "$or": [{"avatar_sha": {"$exists": False}},
+                    {"avatar_sha": {"$in": ["", None]}}],
+        },
+        {"$set": {"avatar_sha": sha}},
+    )
+    return int(res.modified_count or 0)
+
+
 async def set_avatar_sha(
     client_id: str, platform: str, sha: str, *, url: str, entity_id: str = "",
 ) -> bool:

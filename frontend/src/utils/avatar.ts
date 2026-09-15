@@ -101,6 +101,27 @@ export function avatarSources(
 
   const proxied = url(`/media/avatar?url=${encodeURIComponent(raw)}`);
   if (isKnownBlocked(host)) return [...stored, proxied];
-  if (matches(host, PROXYABLE_HOST_SUFFIXES)) return [...stored, raw, proxied];
+  if (matches(host, PROXYABLE_HOST_SUFFIXES)) {
+    // NO STORED COPY YET -> GO THROUGH THE PROXY FIRST, DELIBERATELY.
+    //
+    // This looks like the slower option and is the only one that keeps the
+    // picture. Meta signs its CDN URLs and they expire in days, so a card
+    // rendering straight from the CDN looks perfect this week and is blank
+    // the next -- and because the browser fetched those bytes, not us, we
+    // never had the chance to save them. A third of one client's cards went
+    // that way.
+    //
+    // The proxy stores what it serves (backend/api/media.py::_keep), so the
+    // act of an analyst LOOKING at a card is what makes its picture
+    // permanent. The cost is one hop, once, per picture: the next render
+    // has `sha` set and takes the first branch below, straight from our own
+    // store. The direct CDN URL stays as the fallback in case the proxy is
+    // unreachable.
+    //
+    // Once cached, none of this applies -- `stored` is first and neither
+    // the CDN nor the proxy is touched again.
+    if (!stored.length) return [proxied, raw];
+    return [...stored, raw, proxied];
+  }
   return [...stored, raw];
 }

@@ -57,7 +57,10 @@ import re
 
 from fastapi import APIRouter, Path, Query, Response
 
+import asyncio
+
 from backend.database.repositories import avatar_repository as avatars_db
+from backend.database.repositories import profile_repository as profiles_db
 from backend.shared.imagefetch import ImageFetchError, allowed as _allowed
 from backend.shared.imagefetch import close as _close_fetcher
 from backend.shared.imagefetch import fetch_image
@@ -107,11 +110,22 @@ def _err(status: int, detail: str) -> Response:
 async def avatar(
     url: str = Query(..., description="Absolute https URL of the image, on an allowlisted CDN host."),
 ) -> Response:
-    """Fetch `url` server-side and return the bytes from this origin.
+    """Fetch `url` server-side, return the bytes -- and KEEP them.
 
-    LIVE, NOT STORED. This is the fallback for a picture we have not cached
-    -- it re-fetches from the CDN on demand, so it works only while that
-    URL's signature is alive. `/media/avatar/{sha}` below is the durable one.
+    SERVING A PICTURE IS ALSO THE LAST CHANCE TO SAVE IT. This used to be
+    live-only: fetch on demand, serve, discard. That made it the final way
+    a picture could still be lost. The proxy downloaded the bytes, the
+    analyst looked at the card, and a week later the signed CDN URL expired
+    and the same card went blank -- holding nothing, having had the whole
+    image in memory.
+
+    So anything this route fetches is stored on the way out and attached to
+    whichever profiles are pointing at that URL without a picture of their
+    own. The bytes are already paid for; keeping them costs one GridFS
+    write, off the response path.
+
+    `/media/avatar/{sha}` is still the route that serves a kept picture.
+    This one is how a picture becomes kept.
     """
     if not _allowed(url):
         # 400, not 403: from the browser's side this is a malformed request
@@ -121,6 +135,12 @@ async def avatar(
         img = await fetch_image(url)
     except ImageFetchError as e:
         return _err(e.status, e.detail)
+
+    # BEHIND THE RESPONSE, never in front of it. The analyst is waiting for
+    # this image; keeping a copy must not add a database round trip to the
+    # time it takes to appear. A failure here costs the copy and never the
+    # picture on screen.
+    asyncio.create_task(_keep(url, img.data, img.content_type))
 
     return Response(
         content=img.data,
@@ -133,6 +153,26 @@ async def avatar(
             "Cross-Origin-Resource-Policy": "cross-origin",
         },
     )
+
+
+async def _keep(url: str, data: bytes, content_type: str) -> None:
+    """Store these bytes and attach them to any profile still pointing at
+    `url` with no picture of its own.
+
+    Content-addressed, so a picture thousands of profiles share is stored
+    once and this is a no-op for every one after the first.
+    """
+    try:
+        sha = await avatars_db.store(data, content_type)
+        if not sha:
+            return
+        kept = await profiles_db.keep_avatar_for_image_url(url, sha)
+        if kept:
+            log.info(
+                f"kept a profile picture served through the proxy -- {kept} card(s) "
+                f"will now render it from our own store, after its CDN link expires")
+    except Exception as e:                           # noqa: BLE001 - never fatal
+        log.warning(f"could not keep a proxied picture: {type(e).__name__}: {e}")
 
 
 @router.get("/media/avatar/{sha}",

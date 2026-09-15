@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from backend.shared.imagefetch import signed_expiry, url_is_live
 
 
@@ -174,3 +176,72 @@ class TestSearchIsTheOnlySafePictureSource:
         from backend.platforms.facebook import discovery_engine as F
 
         assert F.TRUST_PAGE_CONTEXT_AVATAR is False
+
+
+class TestLookingAtACardKeepsItsPicture:
+    """The last way a picture could still be lost, and the cheapest fix.
+
+    The media proxy fetched a picture on behalf of a card being looked at,
+    served it, and threw the bytes away -- "LIVE, NOT STORED", by design.
+    So the analyst saw the picture, we had the whole image in memory, and a
+    week later the signed CDN URL expired and that same card went blank
+    holding nothing.
+
+    Now the proxy keeps what it serves, and the front end deliberately
+    routes an uncached picture THROUGH the proxy rather than straight to the
+    CDN -- which looks like the slower option and is the only one where the
+    bytes pass through somewhere that can save them.
+    """
+
+    def test_an_uncached_picture_is_routed_through_the_proxy(self):
+        """Direct-to-CDN is faster and loses the picture: the browser gets
+        the bytes, we never do, and there is nothing to store."""
+        import re
+        from pathlib import Path
+
+        src = Path("frontend/src/utils/avatar.ts").read_text(encoding="utf-8")
+        # With no stored copy, the proxy must come first.
+        assert "if (!stored.length) return [proxied, raw];" in src
+        # ...and once stored, neither is touched again.
+        assert "return [...stored, raw, proxied];" in src
+
+    def test_the_proxy_keeps_what_it_serves(self):
+        from pathlib import Path
+
+        src = Path("backend/api/media.py").read_text(encoding="utf-8")
+        assert "_keep(url, img.data, img.content_type)" in src
+        # Off the response path -- the analyst is waiting for this image.
+        assert "asyncio.create_task(_keep(" in src
+        # And the old contract is gone.
+        assert "LIVE, NOT STORED" not in src
+
+    @pytest.mark.asyncio
+    async def test_it_only_ever_fills_a_blank(self, monkeypatch):
+        """A profile that already has a picture is left alone. Its digest
+        may be one this URL no longer serves -- `save` invalidates the old
+        one on purpose when an account changes its photo, and re-pointing it
+        at whatever the proxy happened to fetch would undo that."""
+        from backend.database.repositories import profile_repository as pdb
+
+        captured = {}
+
+        class _Coll:
+            async def update_many(self, q, u):
+                captured["query"] = q
+                class R:
+                    modified_count = 1
+                return R()
+
+        monkeypatch.setattr(pdb, "db", lambda: {pdb.PROFILES: _Coll()})
+        await pdb.keep_avatar_for_image_url("https://cdn/x.jpg", "abc123")
+
+        blank_clause = captured["query"]["$or"]
+        assert {"avatar_sha": {"$exists": False}} in blank_clause
+        assert {"avatar_sha": {"$in": ["", None]}} in blank_clause
+
+    @pytest.mark.asyncio
+    async def test_a_missing_url_or_digest_writes_nothing(self):
+        from backend.database.repositories import profile_repository as pdb
+
+        assert await pdb.keep_avatar_for_image_url("", "abc") == 0
+        assert await pdb.keep_avatar_for_image_url("https://cdn/x.jpg", "") == 0
