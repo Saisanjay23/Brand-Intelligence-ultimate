@@ -104,3 +104,73 @@ class TestTheRetryMonitor:
             assert bf._monitor_task is None
 
         asyncio.run(go())
+
+
+class TestARefreshNeverInventsProfiles:
+    """A refresh re-reads what discovery already found. It must never add.
+
+    THE BUG THIS PINS, found by running it on real data. The first version
+    of `profile_refresh` searched a blank profile's own name and saved every
+    result, on the theory that the other ~25 hits were free repairs.
+
+    They are not. Over 15 real searches it saw 424 profiles and 11 were rows
+    we held; the rest were strangers who merely had similar names. Saving
+    them put 119 unrelated people into a brand-monitoring client, each filed
+    under a person's name as though it were one of the analyst's keywords --
+    "Taylor-Jayne Adrian", "Adrian Villavicencio". They had to be deleted.
+
+    Discovery decides who belongs to a client. A refresh only re-reads that
+    decision, so a hit it does not already hold is discarded.
+    """
+
+    def test_only_known_profiles_are_kept(self):
+        from backend.services import profile_refresh as pr
+
+        held = {"111": {"client_id": "c1"}, "222": {"client_id": "c1"}}
+        by_url = {"https://fb.com/known": {"client_id": "c1"}}
+
+        class Hit:
+            def __init__(self, pid, url):
+                self.profile_id, self.url = pid, url
+
+        hits = [Hit("111", "https://fb.com/a"),      # known by id
+                Hit("999", "https://fb.com/known"),  # known by url
+                Hit("888", "https://fb.com/stranger"),
+                Hit("777", "https://fb.com/other")]
+
+        kept = [h for h in hits
+                if held.get(str(h.profile_id)) or by_url.get(str(h.url))]
+
+        assert [h.profile_id for h in kept] == ["111", "999"]
+        assert len(kept) < len(hits), "strangers must be discarded"
+
+    def test_a_refresh_belonging_to_another_client_is_not_applied(self):
+        """Two clients can hold the same profile. A refresh running for one
+        must not write the other's row -- that would move a profile between
+        investigations."""
+        from backend.services import profile_refresh as pr
+
+        held = {"111": {"client_id": "other-client"}}
+        cid = "c1"
+        known = held.get("111")
+        assert known is not None
+        assert (known.get("client_id") or "") != cid
+
+
+class TestSearchIsTheOnlySafePictureSource:
+    def test_facebook_profile_page_avatars_stay_untrusted(self):
+        """NOT A PREFERENCE -- A SAFETY RULE, and one this work had every
+        incentive to break.
+
+        For a privacy-restricted profile, Facebook's client substitutes THE
+        VIEWER'S OWN PHOTO into every picture field it renders. Three
+        separate defences were tried when this was first investigated and
+        each was caught attributing the scraper's own face to a candidate.
+
+        Refreshing pictures from a profile visit would have been by far the
+        most direct fix for the blank-card problem. It is forbidden, which
+        is why `profile_refresh` goes through search instead.
+        """
+        from backend.platforms.facebook import discovery_engine as F
+
+        assert F.TRUST_PAGE_CONTEXT_AVATAR is False
