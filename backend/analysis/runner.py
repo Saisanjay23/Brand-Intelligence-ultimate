@@ -287,8 +287,18 @@ def parse_direct_url(raw: str) -> Optional[tuple[str, str, str]]:
     except Exception:
         return None
     host = (parsed.netloc or "").lower().split(":")[0]
-    if host.startswith("www."):
-        host = host[4:]
+    # Every interchangeable front-end a profile URL gets copied from, not
+    # just "www.". `web.facebook.com/x`, `m.facebook.com/x` and
+    # `facebook.com/x` are one profile -- Facebook serves all three -- but
+    # only "www." was stripped, so a validated profile stored under any of
+    # the others missed _PLATFORM_HOSTS, returned None, and came back as
+    # "not a supported platform URL": never analysed, and never surfaced as
+    # a failure either. Stripping is safe because the dict lookup still has
+    # to match: an unrelated `m.example.com` simply stays unknown.
+    for _prefix in ("www.", "web.", "m.", "mobile."):
+        if host.startswith(_prefix):
+            host = host[len(_prefix):]
+            break
 
     platform = _PLATFORM_HOSTS.get(host, "")
     if not platform:
@@ -426,9 +436,10 @@ class AnalysisJob:
     # it is always the domain the analyst typed when creating the client,
     # not whatever a caller happened to pass. A job started from pasted
     # URLs has neither: analysis was built to run with no client record at
-    # all, by design (see this module's own docstring), so those rows fall
-    # back to a generic tag in _build_rows, matching this app's own
-    # "QUICK-ANALYSIS" precedent for a client-less batch.
+    # all, by design (see this module's own docstring), so OrgId falls back
+    # to a generic tag in _build_rows, matching this app's own
+    # "QUICK-ANALYSIS" precedent for a client-less batch. Domain does NOT
+    # get a stand-in -- it is the client's real domain or it is blank.
     org_id: str = ""
     domain: str = ""
     total: int = 0
@@ -546,8 +557,9 @@ class AnalysisRunner:
             # Profiles", was reading it off a locally-cached client list
             # that can go stale the moment the client is edited). A client
             # that no longer exists, or was never given a domain, leaves
-            # `domain` exactly what the caller passed -- see _build_rows'
-            # own fallback for what an empty `domain` becomes in the export.
+            # `domain` exactly what the caller passed -- and if that is
+            # empty too, the export's Domain column is empty, never a
+            # stand-in value. See _build_rows.
             try:
                 client = await clients_db.try_get(org_id)
             except Exception as e:
@@ -558,10 +570,32 @@ class AnalysisRunner:
                 )
             if client and client.get("domain"):
                 domain = client["domain"]
+            if not domain:
+                # The export's Domain column is blank for this whole batch.
+                # That is a blank cell in a takedown report, so it must not
+                # also be a blank in the log: name the client, so the fix
+                # ("give this client its domain") is obvious rather than
+                # something an analyst has to notice in Excel.
+                log.warning(
+                    f"client {org_id!r} has no domain on record -- the analysis "
+                    f"export's Domain column will be EMPTY for this batch"
+                )
 
         skipped: list[dict] = []
         items: list[AnalysisItem] = []
         seen: set[str] = set()
+
+        # Callers key `seed_by_url` by the url they hold (discovery passes
+        # the profile document's own `url`), but every lookup downstream is
+        # by `it.url` -- the NORMALIZED form parse_direct_url returns. For
+        # Facebook those differ: normalize_url adds the "www." a stored
+        # `facebook.com/adanigroup/` does not have, so the lookup missed and
+        # the whole seed was silently dropped -- taking `main_keyword` with
+        # it, which is why the export's AssetName fell back to the raw
+        # handle, and taking display_name/followers/location/bio/avatar too.
+        # Re-keyed here, once, so no caller has to know the normal form.
+        raw_seed: dict[str, dict] = seed_by_url or {}
+        seed_by_url = {}
 
         for raw in urls:
             raw = (raw or "").strip()
@@ -580,6 +614,10 @@ class AnalysisRunner:
                 skipped.append({"url": raw, "reason": "duplicate of another URL in this batch"})
                 continue
             seen.add(url)
+            # Accept either spelling: the url the caller handed us, or one
+            # already in normal form.
+            if (entry_seed := raw_seed.get(raw) or raw_seed.get(url)) is not None:
+                seed_by_url.setdefault(url, entry_seed)
             items.append(AnalysisItem(
                 id=uuid.uuid4().hex[:12], raw_url=raw, url=url,
                 platform=platform, entity_id=entity_id,
@@ -1401,18 +1439,26 @@ class AnalysisRunner:
             # The client's own client_id/domain -- what the analyst typed
             # when creating the client, forwarded through from "Analyse
             # Validated Profiles" (see job.org_id/domain's own comment).
-            # A job with no client behind it (pasted URLs) has neither, and
-            # falls back to the same generic tag / the platform id this
-            # column has always used for a client-less batch.
+            # A job with no client behind it (pasted URLs) has no org_id and
+            # falls back to the generic tag this column has always used.
             "OrgId": job.org_id or "ANALYSIS",
-            "Domain": job.domain or it.platform,
+            # ONLY ever the client's real domain, on every platform. This
+            # used to fall back to `it.platform`, so a client with no domain
+            # saved shipped a takedown report whose Domain column read
+            # "instagram" / "youtube" / "telegram" -- a plausible-looking
+            # value that was never a domain, and that changed row to row
+            # within one sheet. Blank when it is genuinely unknown; the
+            # warning start() logs is what says WHICH client to go fix.
+            "Domain": job.domain,
             "AssetType": platform_name,
-            # The main keyword first: a profile found by the permutation
-            # "gautam.adani.hq" must be reported under "Gautam Adani", the
-            # parent, which is also the only name the UI's keyword filter
-            # offers. Falls back to the handle for a pasted URL, which has
-            # no keyword behind it at all.
-            "AssetName": it.main_keyword or job.target_name or it.entity_id,
+            # The PARENT keyword, for individual and domain keywords
+            # alike: a profile found by the permutation "gautam.adani.hq"
+            # must be reported under "Gautam Adani", which is also the only
+            # name the UI's keyword filter offers. Blank when there is no
+            # keyword behind the row at all (a pasted URL with no
+            # target_name); it used to fall back to `entity_id`, which put
+            # the raw handle in a column an analyst reads as a keyword.
+            "AssetName": it.main_keyword or job.target_name,
             "Source": it.url,
             "RiskScore": compute_incident_risk_score(
                 has_logo=bool(it.has_logo), has_name_match=bool(it.has_name_match),

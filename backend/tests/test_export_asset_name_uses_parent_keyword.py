@@ -58,13 +58,15 @@ class TestAssetNameAndOriginalNamePreferTheParentKeyword:
         assert item.incident_row["AssetName"] == "Gautam Adani"
         assert item.legacy_row["Original Name"] == "Gautam Adani"
 
-    def test_pasted_url_with_nothing_known_falls_back_same_as_before(self):
-        """No client, no keyword, no typed name: AssetName still falls back
-        to the handle rather than a blank cell; Original Name -- which has
-        no handle-like fallback to reach for -- stays blank, unchanged from
-        before this fix."""
+    def test_pasted_url_with_nothing_known_is_blank_not_the_handle(self):
+        """No client, no keyword, no typed name: BOTH columns stay blank.
+
+        AssetName used to fall back to `entity_id`, which wrote the raw
+        handle into a column an analyst reads as "the keyword this was
+        reported under". A handle is not a keyword, and a plausible wrong
+        value in a takedown report is worse than an empty cell."""
         item = _populate()
-        assert item.incident_row["AssetName"] == "x"  # entity_id
+        assert item.incident_row["AssetName"] == ""
         assert item.legacy_row["Original Name"] == ""
 
     def test_original_feed_is_untouched_by_this(self):
