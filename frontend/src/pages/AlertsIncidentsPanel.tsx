@@ -450,7 +450,7 @@ export function AlertsIncidentsPanel() {
                 Live Security & Session Incidents Log
               </div>
               <div style={{ fontSize: "12px", color: "var(--text-muted)", marginTop: "2px" }}>
-                Real-time operational alerts: expired tokens, checkpoint challenges, and impersonator discoveries
+                Real-time operational alerts: expired tokens, checkpoint challenges, and impersonator discoveries (auto-expires weekly)
               </div>
             </div>
 

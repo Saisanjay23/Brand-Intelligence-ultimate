@@ -88,6 +88,7 @@ from backend.database.connection import close as mongo_close
 from backend.database.connection import ping as mongo_ping
 from backend.database.repositories import analysis_result_repository as analysis_results_db
 from backend.database.repositories import avatar_repository as avatars_db
+from backend.database.repositories import incident_repository as incidents_db
 from backend.database.repositories import logo_repository as logos_db
 from backend.database.repositories import evidence_repository as evidence_db
 from backend.database.repositories import coverage_repository as coverage_db
@@ -99,7 +100,12 @@ from backend.services import avatar_backfill
 from backend.services.scheduler_service import scheduler_engine
 from backend.sessions import manager as sessions_engine
 from backend.shared.errors import DomainError
-from backend.shared.logging import configure_logging, get_logger
+from backend.shared.logging import (
+    configure_logging,
+    get_logger,
+    start_log_retention_monitor,
+    stop_log_retention_monitor,
+)
 
 configure_logging()
 log = get_logger("main")
@@ -165,6 +171,7 @@ async def lifespan(app: FastAPI):
     scheduler_engine.stop_monitor()
     sessions_engine.stop_monitor()
     evidence_db.stop_retention_monitor()
+    stop_log_retention_monitor()
     avatar_backfill.stop_retry_monitor()
     await media_close()
     await mongo_close()
@@ -202,6 +209,8 @@ async def _bring_up_storage() -> None:
                 await telemetry_db.ensure_indexes()
                 await avatars_db.ensure_indexes()
                 await logos_db.ensure_indexes()
+                await incidents_db.ensure_indexes()
+                await incidents_db.purge_expired()
                 # The TTL indexes that delete analysis results after 24h.
                 # Without this call nothing ever expires and the collection
                 # grows forever, so it belongs with the other index
@@ -214,6 +223,7 @@ async def _bring_up_storage() -> None:
                     await registry.session_state(plat)
                 sessions_engine.start_monitor()
                 evidence_db.start_retention_monitor()
+                start_log_retention_monitor()
                 # KEEPS PROFILE PICTURES, rather than hoping the sweep
                 # caught them. A card showing a letter circle for a profile
                 # that visibly has a photo is the single most common "this
@@ -244,7 +254,7 @@ async def _bring_up_storage() -> None:
             else:
                 log.info(
                     "startup: mongo reachable, indexes ensured, session + "
-                    "evidence-retention + scheduler monitors running"
+                    "evidence-retention + log-retention + scheduler monitors running"
                     + (f" (after {attempt} attempts, {waited:.0f}s)" if attempt > 1 else ""))
                 return
         elif attempt == 1:

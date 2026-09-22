@@ -185,13 +185,24 @@ export function SchedulerPanel({ platforms }: { platforms: PlatformState[] }) {
     [clients, queuedIds, filter],
   );
 
+  // EVERY ENTRY LANDS IN EXACTLY ONE BUCKET, so the tiles add up to the
+  // queue length. They used to count only pending/done/failed/skipped,
+  // which left `running`, `stopped`, `cancelled` and `interrupted`
+  // counted nowhere: a queue of two showing "In queue 2 · Waiting 0 ·
+  // Done 1" with the second client simply absent from the summary. A
+  // client that is unaccounted for is exactly the one worth looking at.
   const counts = useMemo(() => {
-    const c = { pending: 0, done: 0, failed: 0, skipped: 0 };
+    const c = { pending: 0, running: 0, done: 0, failed: 0, skipped: 0, unfinished: 0 };
     for (const e of state.entries) {
       if (e.status === "pending") c.pending += 1;
+      else if (e.status === "running") c.running += 1;
       else if (e.status === "done") c.done += 1;
       else if (e.status === "failed") c.failed += 1;
       else if (e.status === "skipped") c.skipped += 1;
+      // Stopped by an analyst, cancelled from outside, or cut short by a
+      // restart. Not a success and not a failure -- work that did not
+      // finish, and the one heading an analyst should act on.
+      else c.unfinished += 1;
     }
     return c;
   }, [state.entries]);
@@ -337,12 +348,18 @@ export function SchedulerPanel({ platforms }: { platforms: PlatformState[] }) {
       {state.entries.length > 0 && (
         <div style={{ display: "flex", gap: "12px", marginBottom: "16px", flexWrap: "wrap" }}>
           {[
-            { label: "In queue", value: state.entries.length, color: "var(--text-main)" },
-            { label: "Waiting", value: counts.pending, color: "var(--text-muted)" },
-            { label: "Done", value: counts.done, color: "var(--success)" },
-            { label: "Failed", value: counts.failed, color: counts.failed ? "var(--danger)" : "var(--text-dim)" },
-            { label: "Skipped", value: counts.skipped, color: counts.skipped ? "var(--warn-yellow, #fdb71b)" : "var(--text-dim)" },
-          ].map((s) => (
+            { label: "In queue", value: state.entries.length, color: "var(--text-main)", always: true },
+            { label: "Waiting", value: counts.pending, color: "var(--text-muted)", always: true },
+            // Only while one is actually being swept -- an idle queue has
+            // no use for a tile that always reads zero.
+            { label: "Running", value: counts.running, color: "var(--accent, #7c5cff)", always: false },
+            { label: "Done", value: counts.done, color: "var(--success)", always: true },
+            { label: "Failed", value: counts.failed, color: counts.failed ? "var(--danger)" : "var(--text-dim)", always: true },
+            { label: "Skipped", value: counts.skipped, color: counts.skipped ? "var(--warn-yellow, #fdb71b)" : "var(--text-dim)", always: true },
+            // Shown only when there ARE unfinished entries -- but never
+            // hidden when there are, which is the whole point of it.
+            { label: "Unfinished", value: counts.unfinished, color: "var(--warn-yellow, #fdb71b)", always: false },
+          ].filter((s) => s.always || s.value > 0).map((s) => (
             <div key={s.label} style={{ flex: "1 1 120px", background: "var(--bg-surface)", border: "1px solid var(--border-subtle)", borderRadius: "12px", padding: "10px 14px" }}>
               <div style={{ fontSize: "10px", color: "var(--text-dim)", textTransform: "uppercase", letterSpacing: "1px" }}>{s.label}</div>
               <div style={{ fontSize: "17px", fontWeight: 700, color: s.color, marginTop: "2px" }}>{s.value}</div>

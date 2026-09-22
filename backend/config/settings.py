@@ -75,6 +75,10 @@ class Settings(BaseSettings):
     # Auto-delete evidence screenshots older than N days from Mongo GridFS
     # (evidence.files and evidence.chunks) to prevent unlimited storage growth.
     evidence_retention_days: int = 7
+    # Auto-delete log records and files older than N days (default 7 days / weekly expiry)
+    log_retention_days: int = 7
+    # Auto-delete live operational incidents older than N days (default 7 days / weekly expiry)
+    incident_retention_days: int = 7
 
     # alerts
     smtp_host: str = ""

@@ -1,18 +1,19 @@
-"""Incident persistence, the `incidents` collection, TTL-bounded. Kept in
-Mongo rather than memory: unlike the health tracker's rolling window, an
+"""Incident persistence, the `incidents` collection, TTL-bounded (weekly expiration).
+Kept in Mongo rather than memory: unlike the health tracker's rolling window, an
 incident is exactly the kind of thing a person comes back the next day to
 ask "why did last night's run fail", losing it on every restart would
-defeat the point. The TTL still bounds it automatically.
+defeat the point. The TTL bounds it to weekly retention (7 days) automatically.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
+from backend.config.settings import settings
 from backend.database.connection import db
 
 INCIDENTS = "incidents"
-RETENTION_DAYS = 14
+RETENTION_DAYS = getattr(settings, "incident_retention_days", 7)
 
 
 async def record(doc: dict) -> None:
@@ -80,6 +81,27 @@ async def clear_all() -> int:
     return res.deleted_count
 
 
+async def purge_expired(days: int = RETENTION_DAYS) -> int:
+    """Prune incidents older than `days` (default 7 days / weekly)."""
+    try:
+        cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
+        res = await db()[INCIDENTS].delete_many({"ts": {"$lt": cutoff}})
+        return int(res.deleted_count or 0)
+    except Exception:
+        return 0
+
+
 async def ensure_indexes() -> None:
-    await db()[INCIDENTS].create_index("ts", expireAfterSeconds=RETENTION_DAYS * 86400, name="ttl_ts")
+    coll = db()[INCIDENTS]
+    expected_ttl = RETENTION_DAYS * 86400
+    try:
+        info = await coll.index_information()
+        if "ttl_ts" in info and info["ttl_ts"].get("expireAfterSeconds") != expected_ttl:
+            await coll.drop_index("ttl_ts")
+    except Exception:
+        pass
+    try:
+        await coll.create_index("ts", expireAfterSeconds=expected_ttl, name="ttl_ts")
+    except Exception:
+        pass
 

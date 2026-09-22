@@ -128,6 +128,15 @@ function relativeLabel(isoString: string, now: number): string {
 // Today in the browser's own zone, for the date field's floor. Built from
 // the local calendar rather than `toISOString()`, which is UTC and would
 // forbid today for anyone east of Greenwich after their evening.
+// The backend writes its messages as lower-case fragments, which read
+// correctly in a log line and wrongly after a full stop -- "The last run
+// was interrupted. the backend restarted...". Capitalised at the point of
+// joining rather than at the source, so the log keeps its own voice.
+function sentence(text: string): string {
+  const t = (text || "").trim();
+  return t ? t.charAt(0).toUpperCase() + t.slice(1) : "";
+}
+
 function todayLocal(): string {
   const d = new Date();
   const pad = (n: number) => String(n).padStart(2, "0");
@@ -293,7 +302,7 @@ export function SchedulerSchedule({
             <AlertTriangleIcon size={14} color="var(--danger)" />
           </span>
           <span>
-            <strong>A scheduled run was missed.</strong> {missed.message}
+            <strong>A scheduled run was missed.</strong> {sentence(missed.message)}
           </span>
         </div>
       )}
@@ -307,8 +316,8 @@ export function SchedulerSchedule({
           borderRadius: "8px", color: "var(--warn-yellow, #fdb71b)",
           fontSize: "12px", lineHeight: 1.55,
         }}>
-          <strong>The last run was interrupted.</strong> {interrupted.message}. Anything it
-          found before then was saved — press Run to sweep whatever it did not reach.
+          <strong>The last run was interrupted.</strong> {sentence(interrupted.message)}.
+          Anything it found before then was saved — press Run to sweep whatever it did not reach.
         </div>
       )}
 

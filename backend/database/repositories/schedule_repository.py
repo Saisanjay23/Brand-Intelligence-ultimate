@@ -326,6 +326,21 @@ async def reconcile_interrupted() -> list[str]:
                     "anything already found was saved, but this run stopped "
                     "watching it")
                 e["finished_at"] = _now()
+                # AND ITS PLATFORM CHIPS, which were frozen mid-sweep. A
+                # platform still reading `running` under a run that ended
+                # half an hour ago is a small lie of exactly the kind this
+                # reconciliation exists to remove -- the row says
+                # "interrupted" while the chip next to it says the sweep
+                # is still going.
+                #
+                # `partial` rather than `failed`: that platform genuinely
+                # did some of its keywords and wrote what it found. It did
+                # not fail, and it did not finish, which is precisely what
+                # `partial` means everywhere else in this codebase.
+                e["platforms"] = {
+                    pid: ("partial" if status == "running" else status)
+                    for pid, status in (e.get("platforms") or {}).items()
+                }
         await db()[RUNS].update_one({"_id": doc["_id"]}, {"$set": {
             "status": RUN_INTERRUPTED,
             "message": "the backend restarted while this run was in progress",

@@ -719,6 +719,133 @@ class TestTick:
         assert rig.runner.calls == []
 
 
+# ------------------------------------------- closing out a dead run
+
+class FakeCollection:
+    """Enough of a Motor collection for `reconcile_interrupted`."""
+
+    def __init__(self, docs=None):
+        self.docs = {d["_id"]: d for d in (docs or [])}
+
+    def find(self, query=None, projection=None):
+        wanted = (query or {}).get("status")
+        matched = [d for d in self.docs.values()
+                   if wanted is None or d.get("status") == wanted]
+
+        class Cursor:
+            def __init__(self, rows): self.rows = rows
+            def sort(self, *a, **k): return self
+            def skip(self, *a, **k): return self
+            def limit(self, *a, **k): return self
+            def __aiter__(self):
+                async def gen():
+                    for r in self.rows:
+                        yield r
+                return gen()
+
+        return Cursor(matched)
+
+    async def find_one(self, query):
+        return self.docs.get(query.get("_id"))
+
+    async def update_one(self, query, update, upsert=False):
+        doc = self.docs.get(query.get("_id"))
+        if doc is None and upsert:
+            doc = {"_id": query.get("_id")}
+            self.docs[doc["_id"]] = doc
+        if doc is not None:
+            doc.update(update.get("$set") or {})
+
+
+class FakeDB:
+    def __init__(self, runs, schedule):
+        self._c = {"scheduler_runs": runs, "scheduler": schedule}
+
+    def __getitem__(self, name):
+        return self._c[name]
+
+
+class TestReconcileInterrupted:
+    """A run the process died inside has to be made HONEST on the way back
+    up. It cannot be resumed -- the discovery jobs it was driving lived in
+    the previous process's memory -- so the only thing left to get right is
+    what it SAYS.
+
+    These call the REAL repository function against a fake collection.
+    Mirroring the rewriting rule in the test instead would assert the
+    test's own copy of the rule and keep passing after the repository
+    changed, which is worse than no test.
+    """
+
+    async def _reconcile(self, monkeypatch, entries, status="running"):
+        from backend.database.repositories import schedule_repository as repo
+
+        runs = FakeCollection([{
+            "_id": "deadrun", "status": status, "entries": entries,
+            "current_id": "c2", "stopping": False,
+        }])
+        schedule = FakeCollection([{"_id": "default"}])
+        monkeypatch.setattr(repo, "db", lambda: FakeDB(runs, schedule))
+        closed = await repo.reconcile_interrupted()
+        return closed, runs.docs["deadrun"]
+
+    async def test_the_run_stops_claiming_to_be_live(self, monkeypatch):
+        closed, doc = await self._reconcile(monkeypatch, [
+            {"client_id": "c1", "status": "done", "platforms": {"facebook": "done"}},
+        ])
+        assert closed == ["deadrun"]
+        assert doc["status"] == "interrupted"
+        assert doc["finished_at"] is not None
+        assert doc["current_id"] == ""
+
+    async def test_a_finished_client_keeps_its_result(self, monkeypatch):
+        _, doc = await self._reconcile(monkeypatch, [
+            {"client_id": "c1", "status": "done", "found": 9,
+             "platforms": {"facebook": "done"}},
+        ])
+        e = doc["entries"][0]
+        # It really did finish before the crash. Nothing to rewrite.
+        assert e["status"] == "done"
+        assert e["found"] == 9
+        assert e["platforms"]["facebook"] == "done"
+
+    async def test_the_in_flight_client_says_interrupted(self, monkeypatch):
+        _, doc = await self._reconcile(monkeypatch, [
+            {"client_id": "c2", "status": "running",
+             "platforms": {"facebook": "running"}},
+        ])
+        e = doc["entries"][0]
+        assert e["status"] == "interrupted"
+        # And says what that means for the work, rather than leaving an
+        # analyst to guess whether anything was saved.
+        assert "was saved" in e["message"]
+
+    async def test_no_platform_is_left_reading_running(self, monkeypatch):
+        """A chip saying a sweep is still going, under a run that ended
+        half an hour ago, is the same small lie the run status was already
+        fixed for."""
+        _, doc = await self._reconcile(monkeypatch, [
+            {"client_id": "c2", "status": "running",
+             "platforms": {"facebook": "running", "twitter": "done",
+                           "instagram": "skipped"}},
+        ])
+        platforms = doc["entries"][0]["platforms"]
+        assert "running" not in platforms.values()
+        # `partial`, not `failed`: it genuinely swept some keywords and
+        # wrote what it found. It did not fail, and it did not finish.
+        assert platforms["facebook"] == "partial"
+        # The ones that had already settled are left exactly alone.
+        assert platforms["twitter"] == "done"
+        assert platforms["instagram"] == "skipped"
+
+    async def test_a_run_that_already_ended_is_not_touched(self, monkeypatch):
+        closed, doc = await self._reconcile(monkeypatch, [
+            {"client_id": "c1", "status": "done", "platforms": {}},
+        ], status="done")
+        assert closed == []
+        assert doc["status"] == "done"
+
+
 # ----------------------------------------------------- what gets swept
 
 class TestWhatIsSwept:
