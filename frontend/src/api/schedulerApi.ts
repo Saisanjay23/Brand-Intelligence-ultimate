@@ -128,19 +128,24 @@ const jsonInit = (method: string, body: unknown): RequestInit => ({
   body: JSON.stringify(body),
 });
 
-// The browser's own IANA zone, which is what the analyst means when they
-// type a time. Falls back to UTC on the rare browser that cannot say.
+// The browser's own IANA zone, defaulting to India IST (Asia/Kolkata).
 export function browserTimezone(): string {
   try {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Kolkata";
   } catch {
-    return "UTC";
+    return "Asia/Kolkata";
   }
 }
 
 export const schedulerApi = {
   // One read for the whole page. Safe to poll.
   getState: () => fetch(url("/scheduler")).then(json<SchedulerState>),
+
+  // Smart timezone detection based on VPN or IP egress location
+  detectTimezone: () =>
+    fetch(url("/scheduler/detect-timezone")).then(
+      json<{ timezone: string; ip?: string; city?: string; country?: string; source: string }>
+    ),
 
   // 422 on a schedule that could never fire -- a weekly with no days, a
   // one-time date already past, a bad timezone. The thrown Error carries

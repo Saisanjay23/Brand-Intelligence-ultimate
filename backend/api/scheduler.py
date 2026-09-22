@@ -33,11 +33,13 @@ from typing import Any, Optional
 from fastapi import APIRouter, Query, status
 from pydantic import BaseModel, Field
 
+from backend.config.settings import settings
 from backend.database.repositories import client_repository as clients_db
 from backend.database.repositories import schedule_repository as schedule_db
 from backend.services import schedule_math
 from backend.services.schedule_math import Schedule, ScheduleError
 from backend.services.scheduler_service import scheduler_engine
+from backend.shared import fast_http
 from backend.shared.errors import ConflictError, ValidationError
 from backend.shared.logging import get_logger
 
@@ -84,9 +86,8 @@ class ScheduleBody(BaseModel):
         description="Monday=0 ... Sunday=6. Required for mode 'weekly', "
                     "ignored otherwise.")
     tz: str = Field(
-        "UTC",
-        description="IANA timezone name, e.g. 'Asia/Kolkata'. The browser's "
-                    "own zone is what the UI sends.")
+        default_factory=lambda: settings.default_timezone,
+        description="IANA timezone name, e.g. 'Asia/Kolkata'. Defaults to India IST (Asia/Kolkata).")
 
 
 class QueueBody(BaseModel):
@@ -232,6 +233,52 @@ def _state_out(snap: dict, schedule: Schedule) -> dict:
         "last_fired_at": _iso(snap.get("last_fired_at")),
         "upcoming": [_iso(u) for u in upcoming],
         "run": _run_out(snap.get("run")),
+    }
+
+
+class DetectedTimezoneOut(BaseModel):
+    timezone: str = Field(description="Detected or fallback IANA timezone name")
+    ip: str = Field("", description="Public IP or VPN egress IP")
+    city: str = Field("", description="City of egress IP")
+    country: str = Field("", description="Country of egress IP")
+    source: str = Field("default_fallback", description="'vpn_ip_egress' | 'default_fallback'")
+
+
+@router.get("/detect-timezone", response_model=DetectedTimezoneOut,
+            summary="Smartly detect timezone from VPN or public IP egress")
+async def detect_timezone() -> dict:
+    """Inspects the machine's egress IP (e.g. through active VPN or direct connection)
+    to determine the geographic timezone, falling back to India IST (Asia/Kolkata).
+    """
+    for endpoint in ("https://ipinfo.io/json", "https://ipapi.co/json/"):
+        try:
+            res = await fast_http.fetch(endpoint, timeout=3.0)
+            if res.status == 200 and res.body:
+                import json
+                data = json.loads(res.body.decode("utf-8"))
+                tz = (data.get("timezone") or "").strip()
+                if tz:
+                    try:
+                        from zoneinfo import ZoneInfo
+                        ZoneInfo(tz)
+                        return {
+                            "timezone": tz,
+                            "ip": str(data.get("ip") or ""),
+                            "city": str(data.get("city") or ""),
+                            "country": str(data.get("country_name") or data.get("country") or ""),
+                            "source": "vpn_ip_egress",
+                        }
+                    except Exception:
+                        pass
+        except Exception:
+            continue
+
+    return {
+        "timezone": getattr(settings, "default_timezone", "Asia/Kolkata"),
+        "ip": "",
+        "city": "",
+        "country": "",
+        "source": "default_fallback",
     }
 
 

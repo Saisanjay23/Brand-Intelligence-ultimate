@@ -29,7 +29,7 @@ import { useEffect, useMemo, useState } from "react";
 import { toast } from "react-hot-toast";
 
 import type { Schedule, ScheduleMode, SchedulerRun } from "../api/schedulerApi";
-import { browserTimezone } from "../api/schedulerApi";
+import { browserTimezone, schedulerApi } from "../api/schedulerApi";
 import { saveSchedule } from "../services/scheduleRunner";
 import { AlertTriangleIcon } from "./AppIcons";
 
@@ -50,6 +50,20 @@ const MODES: { value: ScheduleMode; label: string; hint: string }[] = [
   { value: "once", label: "Once", hint: "One run, at a date and time you pick." },
   { value: "daily", label: "Daily", hint: "Every day at this time." },
   { value: "weekly", label: "Weekly", hint: "On the days you tick, at this time." },
+];
+
+const TIMEZONE_OPTIONS = [
+  { value: "Asia/Kolkata", label: "🇮🇳 India (IST · UTC+05:30)" },
+  { value: "UTC", label: "🌐 UTC (Coordinated Universal Time)" },
+  { value: "Asia/Singapore", label: "🇸🇬 Singapore (SGT · UTC+08:00)" },
+  { value: "Asia/Dubai", label: "🇦🇪 Dubai / UAE (GST · UTC+04:00)" },
+  { value: "Europe/London", label: "🇬🇧 London (GMT/BST · UTC+00/01)" },
+  { value: "Europe/Berlin", label: "🇩🇪 Berlin / Frankfurt (CET · UTC+01/02)" },
+  { value: "America/New_York", label: "🇺🇸 New York / Eastern (ET · UTC-05/04)" },
+  { value: "America/Chicago", label: "🇺🇸 Chicago / Central (CT · UTC-06/05)" },
+  { value: "America/Los_Angeles", label: "🇺🇸 Los Angeles / Pacific (PT · UTC-08/07)" },
+  { value: "Asia/Tokyo", label: "🇯🇵 Tokyo (JST · UTC+09:00)" },
+  { value: "Australia/Sydney", label: "🇦🇺 Sydney (AEST · UTC+10/11)" },
 ];
 
 const CARD: React.CSSProperties = {
@@ -187,10 +201,35 @@ export function SchedulerSchedule({
     return () => clearInterval(t);
   }, []);
 
-  const tz = draft.tz || browserTimezone();
+  const [detectingTz, setDetectingTz] = useState(false);
+  const [detectedInfo, setDetectedInfo] = useState<string | null>(null);
+
+  const tz = draft.tz || "Asia/Kolkata";
   const patch = (fields: Partial<Schedule>) => {
     setDraft((d) => ({ ...d, ...fields }));
     setDirty(true);
+  };
+
+  const handleSmartDetect = async () => {
+    setDetectingTz(true);
+    try {
+      const res = await schedulerApi.detectTimezone();
+      if (res.timezone) {
+        patch({ tz: res.timezone });
+        const locParts = [res.city, res.country].filter(Boolean);
+        const locStr = locParts.length > 0 ? ` [${locParts.join(", ")}]` : "";
+        const ipStr = res.ip ? ` · IP: ${res.ip}` : "";
+        const msg = `Smart detected: ${res.timezone}${locStr}${ipStr}`;
+        setDetectedInfo(msg);
+        toast.success(`Timezone detected: ${res.timezone}${locStr}`);
+      } else {
+        toast.error("Could not detect IP location, keeping current timezone");
+      }
+    } catch (err) {
+      toast.error(`Smart detection failed: ${(err as Error).message}`);
+    } finally {
+      setDetectingTz(false);
+    }
   };
 
   const toggleWeekday = (value: number) => {
@@ -388,6 +427,76 @@ export function SchedulerSchedule({
               </div>
             )}
 
+            {/* timezone */}
+            <div>
+              <span style={LABEL}>Timezone</span>
+              <div style={{ display: "flex", gap: "6px", alignItems: "center", flexWrap: "wrap" }}>
+                <select
+                  value={tz}
+                  disabled={disabled}
+                  onChange={(e) => {
+                    patch({ tz: e.target.value });
+                    setDetectedInfo(null);
+                  }}
+                  style={{ ...FIELD, width: "auto", minWidth: "190px" }}
+                >
+                  {TIMEZONE_OPTIONS.map((t) => (
+                    <option key={t.value} value={t.value}>
+                      {t.label}
+                    </option>
+                  ))}
+                  {!TIMEZONE_OPTIONS.some((o) => o.value === tz) && (
+                    <option value={tz}>{tz}</option>
+                  )}
+                </select>
+
+                <button
+                  type="button"
+                  disabled={disabled || tz === "Asia/Kolkata"}
+                  onClick={() => {
+                    patch({ tz: "Asia/Kolkata" });
+                    setDetectedInfo(null);
+                    toast.success("Timezone set to India IST (Asia/Kolkata)");
+                  }}
+                  style={{
+                    padding: "6px 10px",
+                    borderRadius: "8px",
+                    border: tz === "Asia/Kolkata" ? "1px solid var(--primary, #8838DD)" : "1px solid var(--border-color)",
+                    background: tz === "Asia/Kolkata" ? "rgba(136, 56, 221, 0.22)" : "var(--bg-inner)",
+                    color: tz === "Asia/Kolkata" ? "var(--text-main, #fff)" : "var(--text-muted)",
+                    fontSize: "12px",
+                    fontWeight: 600,
+                    cursor: disabled || tz === "Asia/Kolkata" ? "default" : "pointer",
+                  }}
+                  title="Quick-set to India Standard Time (IST)"
+                >
+                  🇮🇳 India (IST)
+                </button>
+
+                <button
+                  type="button"
+                  disabled={disabled || detectingTz}
+                  onClick={handleSmartDetect}
+                  style={{
+                    padding: "6px 12px",
+                    borderRadius: "8px",
+                    border: "1px solid rgba(136, 56, 221, 0.45)",
+                    background: "linear-gradient(135deg, rgba(136, 56, 221, 0.2), rgba(154, 80, 233, 0.3))",
+                    color: "var(--primary-hover, #B778FF)",
+                    fontSize: "12px",
+                    fontWeight: 600,
+                    cursor: disabled || detectingTz ? "not-allowed" : "pointer",
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "6px",
+                  }}
+                  title="Smartly detect timezone from current VPN egress or public IP location"
+                >
+                  {detectingTz ? "Detecting VPN/IP..." : "⚡ Smart Detect (VPN / IP)"}
+                </button>
+              </div>
+            </div>
+
             <div style={{ flex: 1, minWidth: "8px" }} />
 
             <div style={{ display: "flex", alignItems: "flex-end", gap: "8px", paddingTop: "14px" }}>
@@ -410,11 +519,22 @@ export function SchedulerSchedule({
             </div>
           </div>
 
-          {/* The timezone, said out loud. The server may be elsewhere. */}
+          {/* The timezone, said out loud. */}
           <div style={{ fontSize: "11.5px", color: "var(--text-dim)", marginTop: "10px", lineHeight: 1.6 }}>
-            Times are <strong style={{ color: "var(--text-muted)" }}>{tz}</strong> — the zone this
-            browser is in. The run happens on the server, so it does not need this page open; it
-            needs the tool itself to be running.
+            Runs fire at <strong style={{ color: "var(--text-main)" }}>{draft.at}</strong> ({tz}).
+            {tz === "Asia/Kolkata" && (
+              <span style={{ color: "var(--primary-hover, #B778FF)", marginLeft: "6px", fontWeight: 600 }}>
+                🇮🇳 India Standard Time (IST · UTC+05:30)
+              </span>
+            )}
+            {detectedInfo && (
+              <span style={{ color: "var(--accent-purple, #9A50E9)", marginLeft: "6px", fontWeight: 600 }}>
+                · {detectedInfo}
+              </span>
+            )}
+            <span style={{ marginLeft: "6px" }}>
+              — Scheduled runs execute on the backend server at this local time automatically.
+            </span>
           </div>
 
           {localProblem && (

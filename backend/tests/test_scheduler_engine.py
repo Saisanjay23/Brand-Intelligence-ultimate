@@ -888,3 +888,29 @@ class TestWhatIsSwept:
         await rig.engine.fire(trigger="manual")
         await rig.drive()
         assert rig.runner.calls[0][1]["individual_keywords"] == ["Acme"]
+
+
+class TestTimezoneDetection:
+    @pytest.mark.asyncio
+    async def test_detect_timezone_returns_valid_tz(self):
+        from backend.api.scheduler import detect_timezone
+        from zoneinfo import ZoneInfo
+
+        res = await detect_timezone()
+        assert "timezone" in res
+        assert ZoneInfo(res["timezone"]) is not None
+
+    @pytest.mark.asyncio
+    async def test_detect_timezone_falls_back_gracefully_when_network_fails(self, monkeypatch):
+        from backend.api.scheduler import detect_timezone
+        from backend.config.settings import settings
+        from backend.shared import fast_http
+
+        async def _fail(*a, **kw):
+            raise RuntimeError("network down")
+
+        monkeypatch.setattr(fast_http, "fetch", _fail)
+        res = await detect_timezone()
+        assert res["timezone"] == settings.default_timezone
+        assert res["source"] == "default_fallback"
+
