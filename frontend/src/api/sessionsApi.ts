@@ -23,7 +23,17 @@ export const sessionsApi = {
   updateSessionItem: (
     platform: string,
     sessionId: string,
-    body: { blob?: string; api_key?: string; identifier?: string },
+    body: {
+      blob?: string;
+      api_key?: string;
+      identifier?: string;
+      // Attach or replace login credentials on an account that already
+      // exists. Omitted fields are left alone server-side, so renaming an
+      // account cannot wipe the password that makes it self-healing.
+      username?: string;
+      password?: string;
+      two_factor_secret?: string;
+    },
   ) =>
     fetch(url(`/sessions/${platform}/${sessionId}`), {
       method: "PUT",
@@ -42,6 +52,13 @@ export const sessionsApi = {
   checkSessionItem: (platform: string, sessionId: string) =>
     post(`/sessions/${platform}/${sessionId}/check`, {}).then(
       json<{ ok: boolean; detail: string; conclusive: boolean; session: SessionInfo }>,
+    ),
+  // Sign ONE pooled account back in from its stored credentials. Waits
+  // for the real answer rather than returning immediately, because the
+  // operator pressed a button and needs to be told whether it worked.
+  reloginSessionItem: (platform: string, sessionId: string) =>
+    post(`/sessions/${platform}/${sessionId}/relogin`, {}).then(
+      json<{ ok: boolean; detail: string; session: SessionInfo }>,
     ),
   deleteSessionItem: (platform: string, sessionId: string) =>
     fetch(url(`/sessions/${platform}/${sessionId}`), { method: "DELETE" }).then(json<SessionInfo>),

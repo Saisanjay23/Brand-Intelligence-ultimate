@@ -45,6 +45,14 @@ class SessionUpdateIn(BaseModel):
     blob: str = ""
     api_key: str = ""
     identifier: Optional[str] = None
+    # Attach (or replace) login credentials on an account that already
+    # exists, so an operator can turn a cookie-only session into a
+    # self-healing one without deleting and re-adding it. Every field is
+    # optional and an omitted one is left alone -- a blank password must not
+    # silently wipe a working one.
+    username: Optional[str] = None
+    password: Optional[str] = None
+    two_factor_secret: Optional[str] = None
 
 
 class LoginIn(BaseModel):
@@ -100,6 +108,20 @@ async def add_cookies(platform_id: str, body: CookiesIn) -> dict:
     return await sessions_engine.save_cookies(platform_id, body.blob, body.identifier)
 
 
+@router.post("/{platform_id}/{session_id}/relogin")
+async def relogin_session_item(platform_id: str, session_id: str) -> dict:
+    """Sign ONE pooled account back in right now, from its stored
+    credentials.
+
+    Waits for the result rather than firing and forgetting: the operator
+    pressed a button and needs to be told whether it worked, not left
+    watching a row that may or may not change. Refused while a job is using
+    the account -- a second browser on one account from one IP is how
+    checkpoints are earned.
+    """
+    return await sessions_engine.relogin_now(platform_id, session_id)
+
+
 @router.post("/{platform_id}/credentials", response_model=SessionPool)
 async def add_credentials(platform_id: str, body: CredentialsIn) -> dict:
     return await sessions_engine.save_credentials(
@@ -116,7 +138,9 @@ async def add_api_key(platform_id: str, body: ApiKeyIn) -> dict:
 @router.put("/{platform_id}/{session_id}", response_model=SessionPool)
 async def update_session(platform_id: str, session_id: str, body: SessionUpdateIn) -> dict:
     return await sessions_engine.update_session_credentials(
-        platform_id, session_id, body.blob, body.api_key, body.identifier)
+        platform_id, session_id, body.blob, body.api_key, body.identifier,
+        username=body.username, password=body.password,
+        two_factor_secret=body.two_factor_secret)
 
 
 @router.post("/{platform_id}/login", response_model=LoginState)

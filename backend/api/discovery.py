@@ -1049,11 +1049,22 @@ async def _validated_docs(
 
 # Discovery-doc fields worth carrying into analysis as a starting point --
 # same names DISCOVERY_FIELDS writes them under (see profile_repository.py).
-# entity_type/username/discovery_source are deliberately left out: analysis
-# has no matching slot for them on Row (see shared/models/row.py) and would
-# have nowhere to go.
+# entity_type/discovery_source are deliberately left out: analysis has no
+# matching slot for them on Row (see shared/models/row.py) and would have
+# nowhere to go.
+#
+# `username` used to be excluded for that same reason and no longer is.
+# `Row.username` exists now, and on YouTube the handle IS the reportable
+# URL: `youtube.com/@NewGautamAdani-q3o` rather than
+# `youtube.com/channel/UCAOnNAx9wF8tkPtKH1a8VUw`. Carrying it means a
+# channel the API cannot answer for on the day of the run -- taken down,
+# renamed, or simply past the daily quota -- still EXPORTS under the
+# handle discovery already saw, instead of falling back to an id nobody
+# can read. Without it, the one row most likely to matter (a channel that
+# has just gone) is the one that loses its readable URL.
 _SEED_FIELDS = (
-    "entity_id", "display_name", "profile_image_url", "avatar_sha", "has_logo", "verified",
+    "entity_id", "username", "display_name", "profile_image_url", "avatar_sha",
+    "has_logo", "verified",
     "followers", "friends", "location", "bio", "created_at", "name_score",
 )
 

@@ -54,6 +54,51 @@ page visit, to the first post link already sitting in the grid DOM, to
 read that element directly. Skipped for private accounts and accounts with
 no posts, where there is nothing to visit.
 
+EVERY DATE IS ATTRIBUTED BEFORE IT IS RECORDED, and that is the rule this
+engine got wrong. The reported symptom was an account with no posts coming
+back dated TODAY -- not blank, not an error, a confident current date that
+then scored the account as active. Three separate paths could produce it,
+and all three shared one root cause: a timestamp was read from something
+this profile does not own.
+
+  1. The payload. `PROFILE_ENDPOINTS` matches the SUBSTRINGS "api/graphql"
+     and "graphql/query", and the two calls named above -- the viewer's own
+     feed and recommendations -- are served on exactly those paths. Their
+     media carry fresh `taken_at` values, and their nested children
+     (carousel items, clips metadata) carry the timestamp with no `user`
+     beside it, so `timeline_latest_post`'s old "no owner named, take it
+     anyway" fallback took today's date off somebody else's post. That
+     fallback is now confined to a container Instagram itself labels a
+     user timeline (discovery_engine.py).
+  2. The write. Even where the profile record said media_count = 0, the
+     assignment in `process()` had no guard, so it wrote the date AND
+     overwrote `posts_seen` with "yes" -- erasing the only field that
+     could have contradicted it. It now refuses, and notes the
+     contradiction instead of resolving it silently.
+  3. The DOM. `read_last_post_date`'s selectors ran over the whole
+     document and were reached whenever the post count was merely UNKNOWN.
+     A profile with no grid of its own still renders post tiles --
+     suggestions, an Explore rail -- whose dates are recent by
+     construction. It is now scoped to `main`, gated on a CONFIRMED post
+     count, and drops any tile or permalink that names a different author.
+
+A blank date is the honest outcome when none of that can be established.
+`shared/models/row.py::active_yes` already documents why: an account merely
+not dated reads inactive, and `last_post_date` is empty exactly when the
+date is unknown -- which only works if nothing writes a date it cannot
+attribute.
+
+LOGO / PROFILE PICTURE: the accurate answer is Instagram's own
+`has_anonymous_profile_picture`, a boolean it publishes on the same
+`data.user` object as the counts, and `InstagramUser.has_custom_pic` now
+leads with it. The asset-id markers in shared/avatars.py are kept as the
+fallback for the paths that have no payload (the DOM header read), but they
+cannot be the primary: Instagram ROTATED the anonymous avatar's id once
+already, the list still held only the old one, and from that moment every
+account with no picture was recorded as having a real one, silently, until
+somebody noticed the cards. The verdict is also tri-state now -- None where
+nothing settled it -- so "we did not look" can no longer read as "Yes".
+
 NOT COLLECTED at all: creation date. It lives behind the interactive "About
 this account" panel, so that column stays blank rather than guessed.
 """
@@ -69,7 +114,7 @@ from urllib.parse import quote, urlparse
 from backend.shared.models.row import Row
 from backend.platforms.scan_options import captures_screenshot
 from backend.stealth.mouse_movement import humanize_interaction
-from backend.shared.text import (MONTHS, name_score,
+from backend.shared.text import (MONTHS, _letters_only, name_score,
                                    normalized_host, parse_count,
                                    parse_normalized_url)
 from backend.shared.avatars import hd_picture_url, looks_like_placeholder
@@ -313,10 +358,20 @@ class Scraper:
     # pinned." Fixed the same way underneath as Twitter/Facebook were,
     # though: read several candidates and take the real max instead of
     # trusting grid position.
+    # SCOPED TO `main`, the profile's own content region. The unscoped
+    # version of this selector was a cross-account leak waiting to happen:
+    # a profile page also renders post links that are NOT this profile's --
+    # an Explore rail, a related-posts carousel, the "Suggested for you"
+    # block Instagram shows where an empty grid would be -- and every one
+    # of those tiles carries its own owner's publish date. Reading them and
+    # taking max() is one of the two ways a postless account was reported
+    # as having posted today. The alt-text owner check in
+    # `_parse_alt_date` is the second half of the same guard.
     JS_GRID_ALT_DATES = """
     () => {
+      const scope = document.querySelector('main') || document.body;
       const out = [];
-      for (const a of document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]')) {
+      for (const a of scope.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]')) {
         const img = a.querySelector('img[alt]');
         if (img) out.push(img.getAttribute('alt') || '');
       }
@@ -328,14 +383,31 @@ class Scraper:
     # guarantees at least one genuinely-newest, non-pinned post is checked
     # regardless of how many (0 to 3) are actually pinned right now.
     JS_GRID_POST_LINKS = """
-    () => Array.from(document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]'))
-      .slice(0, 3).map(a => a.getAttribute('href'))
+    () => {
+      const scope = document.querySelector('main') || document.body;
+      return Array.from(scope.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]'))
+        .slice(0, 3).map(a => a.getAttribute('href'));
+    }
     """
 
+    # The post's timestamp AND who published it. The second half is not
+    # decoration: this navigates to a permalink harvested from a page that
+    # can also show other people's posts, so the date is only usable once
+    # the page confirms whose post it is. Every `/<handle>/` link on the
+    # page is collected rather than one header selector, deliberately --
+    # Instagram restyles that header often, and a loose collection makes
+    # the check FAIL OPEN (no handles read means no rejection) instead of
+    # silently rejecting every real post the day the markup changes.
     JS_POST_TIME = """
     () => {
       const t = document.querySelector('time[datetime]');
-      return t ? t.getAttribute('datetime') : null;
+      const handles = new Set();
+      for (const a of document.querySelectorAll('a[href]')) {
+        const m = (a.getAttribute('href') || '').match(/^\\/([A-Za-z0-9._]+)\\/?$/);
+        if (m) handles.add(m[1].toLowerCase());
+      }
+      return { time: t ? t.getAttribute('datetime') : null,
+               handles: Array.from(handles).slice(0, 40) };
     }
     """
 
@@ -347,15 +419,48 @@ class Scraper:
     # here, which is why tier 2 below still exists.
     _RE_ALT_DATE = re.compile(r"\bon\s+([A-Za-z]+)\s+(\d{1,2}),\s+(\d{4})\b")
 
+    # The same alt text names the author ahead of the date. Captured so a
+    # tile that provably belongs to somebody else can be dropped.
+    _RE_ALT_AUTHOR = re.compile(
+        r"\b(?:shared\s+)?by\s+(.+?)\s+on\s+[A-Za-z]+\s+\d{1,2},\s+\d{4}\b")
+
+    @staticmethod
+    def _owner_mismatch(author: str, owners: tuple[str, ...]) -> bool:
+        """True only when `author` is a name we can read AND it matches
+        none of this profile's own names.
+
+        REJECTS ONLY ON POSITIVE EVIDENCE, and that asymmetry is the whole
+        design. An unreadable author, an alt text in another language, a
+        display name that has changed since the profile record was read --
+        each of those returns False, so the date is still used. The check
+        can therefore only ever remove a date belonging to a DIFFERENT
+        account; it can never blank out one that is genuinely this
+        account's because the markup moved.
+        """
+        got = _letters_only(author)
+        if not got:
+            return False
+        known = {_letters_only(o) for o in owners if o}
+        known.discard("")
+        if not known:
+            return False
+        return got not in known
+
     @classmethod
-    def _parse_alt_date(cls, text: str) -> str:
-        """WHAT: the date out of a post thumbnail's alt text. HOW:
-        Instagram writes a human-readable "Photo by X on August 19, 2026."
-        into the alt attribute, which is the only date the grid renders
-        anywhere. LINKED TO: the DOM tier of read_last_post(), used when
-        no timeline payload arrived."""
-        m = cls._RE_ALT_DATE.search(text or "")
+    def _parse_alt_date(cls, text: str, owners: tuple[str, ...] = ()) -> str:
+        """WHAT: the date out of a post thumbnail's alt text, when that
+        thumbnail is this profile's own post. HOW: Instagram writes a
+        human-readable "Photo by X on August 19, 2026." into the alt
+        attribute, which is the only date the grid renders anywhere --
+        both halves are read, and a tile whose X names a different account
+        is dropped (see `_owner_mismatch`). LINKED TO: the DOM tier of
+        read_last_post_date(), used when no timeline payload arrived."""
+        text = text or ""
+        m = cls._RE_ALT_DATE.search(text)
         if not m:
+            return ""
+        author = cls._RE_ALT_AUTHOR.search(text)
+        if author and cls._owner_mismatch(author.group(1), owners):
             return ""
         mon_name, day, year = m.groups()
         month = next(
@@ -374,10 +479,65 @@ class Scraper:
         # is not a real post date
         return dt.date().isoformat() if 2010 <= dt.year and dt <= now else ""
 
-    async def read_last_post_date(self, page, private: bool, has_posts: bool) -> str:
+    @staticmethod
+    def timeline_verdict(
+        posts_seen: str, have_date: bool, post_dates: list[str],
+    ) -> tuple[str, str]:
+        """Should a date read off the intercepted timeline be recorded?
+        -> (the date to record or "", a note to put on the row or "").
+
+        NEVER OVER A KNOWN "no posts", which is the whole point. Instagram's
+        own record said this account has published nothing, so a timestamp
+        that turned up on the same visit belongs to something else --
+        writing it is the reported bug, a postless account coming back
+        dated TODAY, scored active, sitting in an analyst's queue. The old
+        code also overwrote `posts_seen` with "yes" on the way past,
+        erasing the one field that could afterwards have contradicted the
+        date.
+
+        The contradiction is NOTED rather than swallowed. Two sources
+        disagreeing is a fact about this profile and belongs on the row; a
+        silent preference for one of them is how the disagreement stops
+        being visible at all. `timeline_latest_post` is the layer that
+        stops the stray timestamps arriving (discovery_engine.py) -- this
+        is the layer that refuses to write one even if a future payload
+        shape gets past it.
+
+        No `private` guard, deliberately. A private account this session
+        FOLLOWS really does serve its own timeline, and that date is
+        genuine. Privacy was never what made the old reading unsafe;
+        missing attribution was.
+        """
+        if not post_dates:
+            return "", ""
+        if posts_seen == "no":
+            return "", ("post timestamps seen on a profile Instagram reports "
+                        "as having no posts -- date not recorded")
+        if have_date:
+            return "", ""
+        return max(post_dates), ""
+
+    async def read_last_post_date(
+        self, page, private: bool, has_posts: bool,
+        owners: tuple[str, ...] = (),
+    ) -> str:
         """The real last-post date, robust to grid pinning (see
         JS_GRID_ALT_DATES' comment above for the live-confirmed gap this
         closes).
+
+        `has_posts` must be a CONFIRMED yes, not "not known to be no". It
+        used to be passed as `posts_seen != "no"`, which sent every profile
+        whose post count could not be read down these tiers -- and these
+        tiers read whatever post tiles the page happens to show. On an
+        account with nothing of its own to show, those tiles belong to
+        Instagram's suggestions, and their dates are recent by
+        construction. That is "last post = today on an account that never
+        posted", arriving through the DOM rather than the payload.
+
+        `owners` is every name this profile is known by (its handle and its
+        display name), used to drop a tile or a permalink that names a
+        different author. See `_owner_mismatch` for why it only ever
+        rejects on positive evidence.
 
         Tier 1, free, no extra navigation: every currently-rendered grid
         tile's own photo already carries its publish date in its
@@ -388,13 +548,15 @@ class Scraper:
         Tier 2, up to 3 extra page visits, only when tier 1 found no
         parseable date at all (an all-Reels account, most often). Visits
         the first 3 grid links. Instagram's own pin cap, and reads each
-        one's real `<time datetime>` element directly, taking the max.
-        Confirmed live: that page renders a
+        one's real `<time datetime>` element directly, taking the max --
+        but only from a page that does not name somebody else as the
+        author. Confirmed live: that page renders a
         `<time datetime="2026-07-23T16:00:21.000Z">` element with an exact
         UTC timestamp.
 
-        Returns "" on anything short of a clean read: a private/postless
-        account, no candidates, or failed navigations, never a guess.
+        Returns "" on anything short of a clean read: a private account, an
+        account not confirmed to have posts, no candidates, or failed
+        navigations, never a guess.
         """
         if private or not has_posts:
             return ""
@@ -403,7 +565,7 @@ class Scraper:
             alts = await page.evaluate(self.JS_GRID_ALT_DATES) or []
         except Exception:
             alts = []
-        dates = [d for d in (self._parse_alt_date(a) for a in alts) if d]
+        dates = [d for d in (self._parse_alt_date(a, owners) for a in alts) if d]
         if dates:
             return max(dates)
 
@@ -411,6 +573,8 @@ class Scraper:
             hrefs = await page.evaluate(self.JS_GRID_POST_LINKS) or []
         except Exception:
             hrefs = []
+        wanted = {_letters_only(o) for o in owners if o}
+        wanted.discard("")
         found: list[str] = []
         for href in hrefs:
             if not href:
@@ -423,7 +587,15 @@ class Scraper:
                 )
                 await humanize_interaction(page, scroll=False, moves=1)
                 await page.wait_for_timeout(1500)
-                iso = await page.evaluate(self.JS_POST_TIME)
+                res = await page.evaluate(self.JS_POST_TIME) or {}
+                iso = res.get("time") or ""
+                handles = {_letters_only(h) for h in (res.get("handles") or [])}
+                handles.discard("")
+                # A post published by this account always links back to it.
+                # No handles read at all -> cannot tell -> keep the date
+                # (fail open, the same rule as _owner_mismatch).
+                if wanted and handles and not (wanted & handles):
+                    continue
                 # the element's own datetime attribute is already a UTC ISO
                 # string ("...T...Z"), the date is just its first 10
                 # characters, no parsing needed
@@ -807,14 +979,37 @@ class Scraper:
                 except asyncio.TimeoutError:
                     pass
 
-            if not row.last_post_iso and post_dates:
-                row.last_post_iso = max(post_dates)
+            date, why = self.timeline_verdict(
+                row.posts_seen, bool(row.last_post_iso), post_dates)
+            if date:
+                row.last_post_iso = date
                 row.posts_seen = "yes"
                 row.mark("last_post", "graphql-timeline")
+            if why:
+                row.note(why)
 
+            # A CONFIRMED "yes", not "not known to be no" -- see
+            # read_last_post_date's own docstring. `owners` lets it drop a
+            # tile or permalink that names a different author: `wanted` is
+            # the handle from the URL (row.profile_id has been reassigned
+            # to the numeric pk by fill() at this point, which is why the
+            # pinned copy is used here too).
             if not row.last_post_iso:
+                if row.posts_seen == "":
+                    # SAID OUT LOUD, not skipped quietly. These tiers read
+                    # whatever post tiles the page shows, so they are only
+                    # safe once we know the account has tiles of its own.
+                    # Without that, a blank date here would be
+                    # indistinguishable from "we looked and there is
+                    # nothing", which is the confusion that let a
+                    # stranger's post become this profile's in the first
+                    # place.
+                    row.note("post count unreadable -- last-post date not "
+                             "attempted (an unowned tile cannot be dated "
+                             "to this account)")
                 last_post = await self.read_last_post_date(
-                    page, private, row.posts_seen != "no"
+                    page, private, row.posts_seen == "yes",
+                    (wanted, row.profile_name),
                 )
                 if last_post:
                     row.last_post_iso = last_post
@@ -869,8 +1064,18 @@ class Scraper:
             row.mark("friends", "api")
         if u.avatar:
             row.profile_pic_url = u.avatar
+        # The VERDICT is written whenever the payload settles it, which is
+        # not the same question as whether a URL came back. Instagram
+        # states `has_anonymous_profile_picture` directly (see
+        # InstagramUser.has_custom_pic), and it states it for accounts
+        # whose picture URL this visit never received -- that statement is
+        # the accurate answer and used to be discarded because it arrived
+        # without a URL beside it. None is left alone: unknown must not
+        # overwrite a verdict an earlier pass established.
+        if u.has_custom_pic is not None:
             row.has_custom_pic = u.has_custom_pic
-            row.mark("logo", "api")
+            row.mark("logo", "api-anonymous-flag" if u.anonymous_pic is not None
+                     else "api")
         if u.last_post_iso:
             row.last_post_iso = u.last_post_iso
             row.posts_seen = "yes"
@@ -938,6 +1143,13 @@ class Scraper:
             row.posts_seen = "yes" if val > 0 else "no"
             row.mark("posts", "dom-header")
 
+        # THE FALLBACK TIER, and the fragile one: a rendered header carries
+        # no `has_anonymous_profile_picture`, so this is left matching
+        # asset ids -- the check that has already gone stale once when
+        # Instagram rotated the anonymous avatar. Reached only when neither
+        # the direct API call nor interception produced a payload, and
+        # recorded as `dom-header` so a row decided this way is
+        # distinguishable from one Instagram answered itself.
         avatar = dom.get("avatar") or ""
         if avatar:
             row.profile_pic_url = hd_picture_url(avatar)

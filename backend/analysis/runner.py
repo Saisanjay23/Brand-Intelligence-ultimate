@@ -61,6 +61,7 @@ from backend.platforms.scan_options import ScanOptions
 from backend.sessions import manager as sessions_engine
 from backend.database.repositories import analysis_result_repository as results_db
 from backend.database.repositories import client_repository as clients_db
+from backend.shared import fast_http
 from backend.shared.job_store import JobStore
 from backend.shared.logging import get_logger
 from backend.shared.models.row import Row
@@ -206,6 +207,29 @@ _MAX_CLAIM_ROUNDS = 2
 # it either way, whereas holding the job open tells the analyst something is
 # still running when nothing is.
 _TEARDOWN_TIMEOUT_S = 10.0
+
+# ------------------------------------------------------------- the pre-flight
+#
+# How many dead-URL probes run at once, and the hard ceiling on how long the
+# whole pre-flight phase may delay a job.
+#
+# THE BUDGET IS THE IMPORTANT ONE. This phase sits in front of work an
+# analyst pressed a button for, and its only justification is that it SAVES
+# time. A rate-limited platform answering slowly would turn it into the
+# opposite, so the pass is abandoned at the ceiling and every URL it had not
+# answered for is handed to the browser exactly as if the pre-flight had
+# never run. A pre-flight that gives up costs nothing; one that delays a job
+# costs the thing it was added to provide.
+_PREFLIGHT_CONCURRENCY = 10
+_PREFLIGHT_BUDGET_S = 30.0
+_PREFLIGHT_TIMEOUT_S = 8.0
+
+# How many answered URLs a platform needs before "they were ALL gone" is
+# treated as suspicious rather than as a finding. See the control check in
+# `_preflight`. Three because two dead links in a two-link paste is an
+# ordinary Tuesday, and because the check only has to catch the case that
+# actually hurts -- a whole batch wrongly condemned at once.
+_PREFLIGHT_CONTROL_MIN = 3
 
 
 async def _close_quietly(what: str, close) -> None:
@@ -679,6 +703,15 @@ class AnalysisRunner:
             by_platform: dict[str, list[AnalysisItem]] = {}
             for it in job.items:
                 by_platform.setdefault(it.platform, []).append(it)
+
+            # DEAD URLS SETTLED BEFORE A SESSION IS LEASED. Mutates
+            # `by_platform`, removing whatever it proved gone -- see
+            # `_preflight` for the very narrow definition of "proved".
+            # Nothing below has to know it ran: a platform it emptied is
+            # simply not in the dict any more, and a platform it did not
+            # touch is unchanged.
+            await self._preflight(job, by_platform)
+
             # Every platform scraped CONCURRENTLY. Each is a fully separate
             # account and browser context on a fully separate host --
             # there is no shared-session risk running Twitter and Instagram
@@ -733,6 +766,135 @@ class AnalysisRunner:
             log.error(f"analysis job {job.id} failed: {job.message}")
         finally:
             job.finished_at_ts = time.time()
+
+    async def _preflight(
+        self, job: AnalysisJob, by_platform: dict[str, list[AnalysisItem]],
+    ) -> int:
+        """Settle the URLs a platform will say are gone, before paying for a
+        browser to find that out. Returns how many were settled.
+
+        WHAT "GONE" MEANS HERE, AND HOW NARROW IT IS. Only the signal each
+        platform was MEASURED to give for a missing profile and not for a
+        live one -- see fast_http._DEATH_SIGNALS, which records what each
+        one actually answered and why four of the six are excluded. X has to
+        answer 404 AND serve its own removal wording; Instagram has to serve
+        its own error page and no profile content. A 403 is a bot wall as
+        often as it is anything else; a 429 is rate limiting; a timeout is
+        the network. None of those settle anything, and every one of them
+        leaves the URL to the browser exactly as before.
+
+        THE ASYMMETRY IS THE WHOLE DESIGN. A URL wrongly left in the batch
+        costs one page load. A URL wrongly settled here is a profile
+        reported to an analyst as gone that NOBODY LOOKED AT -- in a record
+        that feeds a takedown, with an evidence screenshot that does not
+        exist. Those are not comparable costs, so this abstains on anything
+        short of the platform saying so itself, and the row it does write
+        names the evidence ("answered HTTP 404") rather than asserting a
+        verdict the tool did not witness.
+
+        The settled rows go through `_fail_item` like any other failure, so
+        they are saved, counted, and visible in the batch: a pre-flight must
+        never make a URL disappear.
+        """
+        if job.cancel.is_set():
+            return 0
+        if not settings.analysis_preflight_enabled:
+            return 0
+        if not fast_http.available():
+            log.info(f"analysis job {job.id}: pre-flight skipped -- "
+                     f"{fast_http.why_unavailable()}")
+            return 0
+
+        pairs = [
+            (it.url, pid)
+            for pid, items in by_platform.items()
+            if fast_http.preflight_supported(pid)
+            for it in items
+            if it.status == "pending"
+        ]
+        if not pairs:
+            return 0
+
+        started = time.time()
+        try:
+            results = await fast_http.preflight_many(
+                pairs, concurrency=_PREFLIGHT_CONCURRENCY,
+                timeout=_PREFLIGHT_TIMEOUT_S, budget=_PREFLIGHT_BUDGET_S,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:                        # noqa: BLE001 - never fatal
+            # AN OPTIMISATION MAY NOT FAIL A JOB. Whatever went wrong here,
+            # the batch runs exactly as it would have without this phase.
+            log.warning(
+                f"analysis job {job.id}: pre-flight failed "
+                f"({type(e).__name__}: {e}) -- every URL goes to the browser")
+            return 0
+
+        settled = 0
+        for pid in list(by_platform):
+            if not fast_http.preflight_supported(pid):
+                continue
+
+            # THE CONTROL: DID ANYTHING ON THIS PLATFORM COME BACK ALIVE?
+            #
+            # A 404 means "gone" only while the platform is answering
+            # normally. A client it has decided to block, or a network path
+            # that has been intercepted, can 404 EVERYTHING -- and that
+            # failure is silent, because each individual row looks exactly
+            # like a real finding. The batch itself is the cheapest control
+            # available: if some URLs answered alive and others 404, the
+            # platform is plainly answering per-profile and the 404s mean
+            # what they say. If EVERY checked URL came back dead, that is
+            # far more likely to be one blocked client than a whole paste of
+            # simultaneously-removed profiles, so nothing is settled and
+            # every URL gets its browser visit.
+            #
+            # Small batches are exempt: a one- or two-URL paste of genuinely
+            # dead links is ordinary, and there is no control to be had in
+            # it either way.
+            checked = [results[it.url] for it in by_platform[pid]
+                       if results.get(it.url) is not None]
+            dead_n = sum(1 for r in checked if r.is_dead)
+            if len(checked) >= _PREFLIGHT_CONTROL_MIN and dead_n == len(checked):
+                log.warning(
+                    f"analysis job {job.id}: every one of {dead_n} pre-flighted "
+                    f"{pid} URL(s) came back gone -- that looks more like this "
+                    f"client being blocked than a batch of dead profiles, so "
+                    f"none were settled and all get a real visit")
+                continue
+
+            live: list[AnalysisItem] = []
+            for it in by_platform[pid]:
+                res = results.get(it.url)
+                if job.cancel.is_set() or res is None or not res.is_dead:
+                    live.append(it)
+                    continue
+                await self._fail_item(job, it, (
+                    f"{registry.display_name(pid)} answered HTTP {res.status_code} "
+                    f"for this URL -- the profile is gone. Checked by pre-flight; "
+                    f"no browser visit was made, so there is no screenshot."
+                ))
+                job.completed += 1
+                job.platform_progress[pid]["completed"] += 1
+                settled += 1
+            if live:
+                by_platform[pid] = live
+            else:
+                # NOTHING LEFT FOR A SESSION TO DO. Dropped from the dict so
+                # `_run` does not claim a browser for an empty queue, and
+                # marked done here because `_scrape_platform` -- the only
+                # other thing that ever sets this -- is no longer going to
+                # run for it.
+                by_platform.pop(pid)
+                job.platform_progress[pid]["status"] = "done"
+
+        if settled:
+            log.info(
+                f"analysis job {job.id}: pre-flight settled {settled} of {len(pairs)} "
+                f"checked URL(s) as gone in {time.time() - started:.1f}s -- "
+                f"no browser worker was spent on them")
+        return settled
 
     async def _scrape_platform(
         self, job: AnalysisJob, platform_id: str, items: list[AnalysisItem],
@@ -1242,6 +1404,23 @@ class AnalysisRunner:
         #
         # The handle is still a last resort, but it is applied AFTER
         # everything that might know the actual name has had its turn.
+        # THE READABLE URL, WHERE THE VISIT FOUND A BETTER ONE. Only ever
+        # set by an engine that genuinely knows a second, more public URL
+        # for the same account -- today that is YouTube alone, where
+        # `/channel/UCAOnNAx9wF8tkPtKH1a8VUw` and
+        # `youtube.com/@NewGautamAdani-q3o` are the same channel and only
+        # the second is recognisable. Blank on every other platform, so
+        # this line does nothing there.
+        #
+        # SAFE TO DO HERE, AND ONLY HERE. `it.url` was the lookup key for
+        # `job.seed_by_url` a few lines up in `_scrape_one`, which has
+        # already run; everything downstream of this point either keys on
+        # `it.entity_id` as well (the avatar and logo writes) or is
+        # display: the export's IMPERSONATED and Source columns, and the
+        # UI. `entity_id` itself is untouched, so the profile's identity
+        # and its deduplication are unaffected.
+        if row.canonical_url and row.canonical_url != it.url:
+            it.url = row.canonical_url
         it.profile_name = row.profile_name
         it.followers = row.followers
         it.followers_exact = row.followers_exact

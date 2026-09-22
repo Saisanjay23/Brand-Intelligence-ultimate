@@ -21,6 +21,16 @@ pydantic-settings>=2.2
 aiohttp>=3.9
 python-multipart>=0.0.9
 httpx>=0.27.0
+# libcurl-impersonate bindings: HTTPS requests that replay a named Chrome
+# build's TLS/HTTP2 handshake. Used by backend/shared/fast_http.py for the
+# three jobs a browser is too expensive for -- avatar CDN fetches (Meta and
+# Twitter refuse a plain Python client on the handshake, whatever the
+# User-Agent says), zero-browser session liveness probes, and the dead-URL
+# pre-flight in front of an analysis batch. NOT a Playwright replacement:
+# search sweeps, profile scraping and evidence screenshots all still need a
+# real browser. Every caller falls back to its previous path if this fails
+# to import, since it ships compiled binaries.
+curl_cffi>=0.7.0
 
 # storage
 motor>=3.3

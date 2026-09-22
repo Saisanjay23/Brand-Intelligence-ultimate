@@ -26,7 +26,8 @@ from backend.shared.models.row import Row
 from backend.shared.text import name_score, normalized_host, parse_normalized_url
 from backend.platforms.youtube.discovery_engine import (RE_DEFAULT_PIC,
                                                          QuotaExceeded,
-                                                         YouTubeAPI)
+                                                         YouTubeAPI,
+                                                         channel_url)
 
 
 def normalize_url(url: str) -> str:
@@ -158,14 +159,15 @@ class Scraper:
         would otherwise have to report as a field we failed to read.
 
         `known` (whatever discovery already read for this URL, see
-        analysis/runner.py's `seed_by_url`) is accepted for interface
-        consistency with the other platforms, but there's nothing to skip
-        here: the `channels.list` call below is the ONLY source for the
+        analysis/runner.py's `seed_by_url`) does not let this SKIP any
+        work: the `channels.list` call below is the ONLY source for the
         uploads-playlist id the following `latest_upload()` call needs, so
         it stays mandatory even when every other field it would return
         (followers/created/location/pic) is already known. Runner.py's own
         `_populate` fallback covers those from `known` if this call ever
-        genuinely comes back without one.
+        genuinely comes back without one. What `known` IS used for is its
+        `entity_id` -- the permanent channel id -- as a second way to
+        resolve a URL whose handle no longer exists; see the lookup below.
 
         LINKED TO: fill() below for the mapping; api.latest_upload is in
         discovery_engine.py::YouTubeAPI."""
@@ -173,6 +175,27 @@ class Scraper:
         row = Row(url=url, target=target, original_feed=feed)
         kind, ref = channel_ref(url)
         row.entity_type = "channel"
+
+        # THE READABLE URL, SET BEFORE ANYTHING CAN FAIL. `fill()` below
+        # produces the authoritative one from the API's own `customUrl` and
+        # overwrites this -- but only on the path where a channel actually
+        # resolved. The rows that DON'T resolve are the ones that most need
+        # a URL a human can read: a channel that has just been taken down
+        # is the row an analyst is writing the report about, and it would
+        # otherwise export as `/channel/UCAOnNAx9wF8tkPtKH1a8VUw` purely
+        # because the account it names no longer answers.
+        #
+        # Three sources, in order of what they are worth: the handle
+        # already in the URL, the handle discovery stored (carried in
+        # `known` -- see api/discovery.py::_SEED_FIELDS), and nothing,
+        # which leaves this blank and the id URL standing. It never
+        # invents one.
+        if kind == "handle" and ref.startswith("@"):
+            row.username = ref[1:]
+        elif seed_handle := str((known or {}).get("username") or "").strip():
+            row.username = seed_handle.lstrip("@")
+        if row.username:
+            row.canonical_url = channel_url("", row.username)
 
         if not ref:
             row.status = "ERROR"
@@ -183,6 +206,25 @@ class Scraper:
         if kind == "id":
             found = await self.api.channels([ref])
             ch = found[0] if found else None
+
+        # THE STORED CHANNEL ID, BEFORE THE HANDLE, and this is what makes
+        # it safe for discovery to store the readable `@handle` URL rather
+        # than the `/channel/UC...` one. A handle belongs to its owner and
+        # they can change it; the UC id is permanent. Without this step, a
+        # channel that renamed its handle between the sweep that found it
+        # and the analysis that scored it would resolve to nothing and be
+        # recorded as GONE -- "may already be taken down", about an account
+        # that is still up and still impersonating.
+        #
+        # `known["entity_id"]` is discovery's own record of the id (see
+        # api/discovery.py::_SEED_FIELDS), so this costs one cheap
+        # `channels.list` unit and only runs when the URL alone could not
+        # answer.
+        seed_id = str((known or {}).get("entity_id") or "").strip()
+        if ch is None and seed_id.startswith("UC") and seed_id != ref:
+            found = await self.api.channels([seed_id])
+            ch = found[0] if found else None
+
         if ch is None:
             ch = await self.api.channel_by_handle(ref)
 
@@ -224,6 +266,42 @@ class Scraper:
         stats = ch.get("statistics") or {}
 
         row.profile_id = ch.get("id", "")
+
+        # THE PUBLIC URL, REWRITTEN TO THE HANDLE FORM. `channels.list` is
+        # the only response that carries `snippet.customUrl`, and this is
+        # the only place in the pipeline holding one for an analysed
+        # channel -- so if the handle is not taken here it is not taken at
+        # all for a channel that arrived as a pasted /channel/UC... link.
+        #
+        # `canonical_url` rather than overwriting `row.url` directly: the
+        # URL a row arrived under is what the caller looked it up by, and
+        # silently changing it mid-visit would move the key out from under
+        # code still holding the old one. The runner adopts this
+        # deliberately and only where an engine set it (see
+        # analysis/runner.py::_populate).
+        #
+        # `entity_id` is untouched and stays the UC id, which is what
+        # profile_repository dedups on -- so a channel stored under the id
+        # URL and re-read under the handle URL is still ONE profile, not
+        # two. That is not luck: that repository already keeps both shapes
+        # (see its `canonical_yt` and the `urls` array).
+        #
+        # THE API'S ANSWER WINS WHEN IT HAS ONE, AND ONLY THEN. Writing
+        # `channel_url(id, customUrl)` unconditionally would look
+        # equivalent and is not: with no `customUrl` in the response it
+        # returns the ID form, which would overwrite a perfectly good
+        # handle that process() had already taken from the URL or from
+        # discovery's record. A field this response did not carry must not
+        # be able to demote one that another source did.
+        if custom := str(snip.get("customUrl") or "").strip():
+            row.username = custom.lstrip("@").strip()
+            row.mark("username", "api")
+            row.canonical_url = channel_url(row.profile_id, custom)
+        elif not row.canonical_url:
+            # No handle from anywhere. The id URL is then the whole truth
+            # about this channel, not a fallback dressed up as one.
+            row.canonical_url = channel_url(row.profile_id)
+
         row.profile_name = (
             snip.get("title")
             or snip.get("channelTitle")

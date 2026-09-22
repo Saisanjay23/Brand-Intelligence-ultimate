@@ -385,9 +385,25 @@ export interface SessionItem {
   // count of 1 is a blip and 4 is a probably-burned account
   consecutive_failures?: number;
   quarantine_minutes?: number;
+  // NEVER POPULATED BY THE SERVER. The API's session serializer is an
+  // explicit allowlist and deliberately omits every credential value (see
+  // sessions/manager.py::_public) -- a password or a TOTP secret must not
+  // reach a browser. They stay declared only because the ADD form builds an
+  // object of this shape on its way out.
   username?: string;
   password?: string;
   two_factor_secret?: string;
+  // How this account authenticates, derived server-side from what is
+  // stored. "auto-login" means credentials are on file and the pool can
+  // sign it back in by itself.
+  auth_kind?: "cookies" | "api-key" | "auto-login";
+  // Is "Re-Login Now" meaningful for this row: credentials on file AND a
+  // platform with an implemented login flow.
+  can_relogin?: boolean;
+  relogin_running?: boolean;
+  // Consecutive failed automatic attempts. Once this reaches the
+  // configured ceiling the self-healer stops trying and waits for a person.
+  relogin_attempts?: number;
   // server-computed "could a job use this right now": not dead, and past
   // any cooldown. Distinct from `status` alone.
   available?: boolean;

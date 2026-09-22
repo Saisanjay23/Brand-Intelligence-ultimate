@@ -62,6 +62,13 @@ class ScanOptions:
     scrolls: int = 0  # newest post is in the first render
     concurrency: int = 1  # >1 is faster and more conspicuous
     keep_going: bool = False  # continue past a checkpoint
+    # Let the session look at the platform's home feed before starting work
+    # (see stealth/browser.py::Session._warmup). True for real sweeps, which
+    # is what every engine gets by default; the session HEALTH CHECK passes
+    # False, because a probe that warms first pays for two page loads to
+    # answer one question and puts an extra visit on an account that is
+    # already suspected of being unwell.
+    warmup: bool = True
     # The owning job's stop signal -- see `cancelled` above.
     cancel: Optional[Any] = None
 
@@ -100,6 +107,9 @@ class DiscoveryOptions:
 
     headful: bool = False
     timeout: int = 45
+    # Same meaning as ScanOptions.warmup above: discovery sweeps warm, the
+    # health check does not.
+    warmup: bool = True
     # The network/GraphQL response is the primary data source on every
     # platform that has one (run_strategies tries "network:..." before
     # "dom:...", see each engine's sweep(), shared/extraction.py); DOM

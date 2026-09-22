@@ -93,6 +93,29 @@ export function SessionPanel({ sessions, onChanged }: Props) {
   // the whole platform card the way a pool-wide action does
   const [checkingId, setCheckingId] = useState<string>("");
   const [checkResult, setCheckResult] = useState<{ id: string; ok: boolean; detail: string } | null>(null);
+  // Same per-row treatment as the live check above: a re-login opens a real
+  // browser and can take half a minute, so the row it belongs to says so
+  // rather than the whole platform card greying out.
+  const [reloggingId, setReloggingId] = useState<string>("");
+
+  const reloginOneSession = async (platform: string, sessionId: string) => {
+    setReloggingId(sessionId);
+    setCheckResult(null);
+    setGlobalError("");
+    try {
+      const res = await sessionsApi.reloginSessionItem(platform, sessionId);
+      setCheckResult({
+        id: sessionId,
+        ok: res.ok,
+        detail: res.ok ? "Signed back in — fresh cookies stored" : res.detail,
+      });
+      onChanged();
+    } catch (e) {
+      setGlobalError((e as Error).message);
+    } finally {
+      setReloggingId("");
+    }
+  };
 
   const checkOneSession = async (platform: string, sessionId: string) => {
     setCheckingId(sessionId);
@@ -452,6 +475,31 @@ export function SessionPanel({ sessions, onChanged }: Props) {
                               </div>
                               <div style={{ fontSize: "11px", color: "var(--text-muted, #98a2b3)", marginTop: "2px", display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
                                 <span>{ss.cookie_count > 0 ? `${ss.cookie_count} cookies` : s.kind === "api-key" || ss.is_api_key ? "API Key" : "Active"}</span>
+                                {/* How this account authenticates. Credentials on file mean
+                                    the pool can sign it back in by itself when it is found
+                                    logged out, which is the difference between an account
+                                    that needs a person and one that does not. */}
+                                {ss.auth_kind === "auto-login" ? (
+                                  <span
+                                    title={
+                                      ss.relogin_running
+                                        ? "Signing this account back in right now"
+                                        : (ss.relogin_attempts ?? 0) > 0
+                                          ? `Self-healing: ${ss.relogin_attempts} failed automatic attempt(s) so far`
+                                          : "Credentials are stored, so this account signs itself back in when it is found logged out"
+                                    }
+                                    style={{ color: "var(--success, #12B76A)", fontWeight: 600 }}
+                                  >
+                                    • 🤖 {ss.relogin_running ? "Re-logging in…" : "Auto-Login"}
+                                    {(ss.relogin_attempts ?? 0) > 0 && !ss.relogin_running
+                                      ? ` (${ss.relogin_attempts} failed)`
+                                      : ""}
+                                  </span>
+                                ) : !ss.is_api_key && s.kind !== "api-key" ? (
+                                  <span title="Cookies only. If this account is logged out, someone has to paste a fresh export by hand.">
+                                    • 🔒 Cookie Session
+                                  </span>
+                                ) : null}
                                 {cooldown && (
                                   <span style={{ color: "var(--text-secondary, #d8d8d8)" }}>
                                     • ⌛ {cooldown}
@@ -563,6 +611,30 @@ export function SessionPanel({ sessions, onChanged }: Props) {
                               >
                                 {checking ? "…" : "Check"}
                               </button>
+                              {ss.can_relogin && (
+                                <button
+                                  className="action-btn"
+                                  disabled={!!busyPlatform || !!reloggingId || !!ss.in_use || !!ss.relogin_running}
+                                  onClick={() => reloginOneSession(s.platform, ss.id)}
+                                  style={{
+                                    padding: "4px 8px",
+                                    borderRadius: "5px",
+                                    background: "var(--bg-surface-3, #344054)",
+                                    border: "1px solid var(--border-subtle, rgba(255,255,255,0.08))",
+                                    color: "var(--text-body, #ffffff)",
+                                    fontSize: "10px",
+                                    fontWeight: 600,
+                                    cursor: ss.in_use ? "not-allowed" : "pointer"
+                                  }}
+                                  title={
+                                    ss.in_use
+                                      ? "A job is using this account right now -- signing in at the same time risks a checkpoint"
+                                      : "Sign this account back in now using its stored username, password and 2FA secret"
+                                  }
+                                >
+                                  {reloggingId === ss.id ? "Signing in…" : "Re-Login"}
+                                </button>
+                              )}
                               <button
                                 className="action-btn"
                                 disabled={!!busyPlatform}
@@ -767,6 +839,15 @@ const SessionEditModal: FC<{
   const [cookieBlob, setCookieBlob] = useState<string>("");
   const [apiKey, setApiKey] = useState<string>("");
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+  // TWO WAYS TO AUTHENTICATE ONE ACCOUNT, and they are not variants of each
+  // other. Pasted cookies are a snapshot that goes stale and has to be
+  // replaced by hand; stored credentials let the pool sign the account back
+  // in by itself when it is found logged out.
+  const [authMode, setAuthMode] = useState<"cookies" | "credentials">("cookies");
+  const [username, setUsername] = useState<string>("");
+  const [password, setPassword] = useState<string>("");
+  const [twoFactorSecret, setTwoFactorSecret] = useState<string>("");
+  const [showPassword, setShowPassword] = useState<boolean>(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -777,7 +858,24 @@ const SessionEditModal: FC<{
         await sessionsApi.updateSessionItem(platform.platform, targetSession.id, {
           identifier: identifier.trim(),
           ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
-          ...(cookieBlob.trim() ? { blob: cookieBlob.trim() } : {})
+          ...(cookieBlob.trim() ? { blob: cookieBlob.trim() } : {}),
+          // Sent only when this form is actually editing credentials.
+          // Omitting a field leaves the stored one alone, which is what
+          // keeps "rename this account" from wiping its password.
+          ...(authMode === "credentials"
+            ? {
+                username: username.trim(),
+                password,
+                two_factor_secret: twoFactorSecret.replace(/\s+/g, ""),
+              }
+            : {}),
+        });
+      } else if (authMode === "credentials") {
+        await sessionsApi.saveCredentials(platform.platform, {
+          identifier: identifier.trim() || "Auto-Login Account",
+          username: username.trim(),
+          password,
+          two_factor_secret: twoFactorSecret.replace(/\s+/g, ""),
         });
       } else {
         if (platform.platform === "youtube" || platform.kind === "api-key") {
@@ -795,6 +893,11 @@ const SessionEditModal: FC<{
   };
 
   const isApiKeyType = platform.platform === "youtube" || platform.kind === "api-key" || targetSession?.isApiKey;
+  // Only offered where an automated login actually exists. `can_login` is
+  // the server's own answer (sessions/manager.py::LOGIN_FLOW), so a
+  // platform with no implemented flow never shows a tab that cannot work.
+  const supportsCredentials = !isApiKeyType && platform.can_login;
+  const credentialsMode = supportsCredentials && authMode === "credentials";
 
   return (
     <div style={{
@@ -853,6 +956,34 @@ const SessionEditModal: FC<{
 
         {/* Form */}
         <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+          {/* How this account authenticates. Hidden entirely for API-key
+              platforms and for any platform with no automated login flow,
+              because an option that cannot work is worse than no option. */}
+          {supportsCredentials && (
+            <div style={{ display: "flex", gap: "6px", padding: "4px", borderRadius: "8px", background: "var(--bg-surface-alt, #1d2939)", border: "1px solid var(--border-color, #344054)" }}>
+              {([["cookies", "Paste Cookies"], ["credentials", "Auto-Login Credentials"]] as const).map(([key, label]) => (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => setAuthMode(key)}
+                  style={{
+                    flex: 1,
+                    padding: "7px 10px",
+                    borderRadius: "6px",
+                    border: "none",
+                    cursor: "pointer",
+                    fontSize: "12px",
+                    fontWeight: 600,
+                    background: authMode === key ? "var(--primary, #8838dd)" : "transparent",
+                    color: authMode === key ? "#fff" : "var(--text-muted, #98a2b3)",
+                  }}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          )}
+
           {/* Field 1: Identifier / Keywords */}
           <div>
             <label style={{ display: "block", fontSize: "13px", fontWeight: 600, color: "var(--text-body, #f2f4f7)", marginBottom: "6px" }}>
@@ -867,8 +998,77 @@ const SessionEditModal: FC<{
             />
           </div>
 
-          {/* Field 2: Cookies / API Key */}
-          <div>
+          {/* Field 2a: stored login credentials */}
+          {credentialsMode && (
+            <>
+              <div>
+                <label style={{ display: "block", fontSize: "13px", fontWeight: 600, color: "var(--text-body, #f2f4f7)", marginBottom: "6px" }}>
+                  Username / Email / Handle
+                </label>
+                <input
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  placeholder="scraper.account@example.com"
+                  autoComplete="off"
+                  style={modalInputStyle}
+                  required={!isUpdate}
+                />
+              </div>
+              <div>
+                <label style={{ display: "block", fontSize: "13px", fontWeight: 600, color: "var(--text-body, #f2f4f7)", marginBottom: "6px" }}>
+                  Password
+                </label>
+                <div style={{ position: "relative" }}>
+                  <input
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    type={showPassword ? "text" : "password"}
+                    autoComplete="new-password"
+                    placeholder={isUpdate ? "Leave blank to keep the stored password" : ""}
+                    style={{ ...modalInputStyle, paddingRight: "56px" }}
+                    required={!isUpdate}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword((v) => !v)}
+                    style={{
+                      position: "absolute", right: "8px", top: "50%", transform: "translateY(-50%)",
+                      background: "transparent", border: "none", cursor: "pointer",
+                      color: "var(--text-muted, #98a2b3)", fontSize: "11px", fontWeight: 600,
+                    }}
+                  >
+                    {showPassword ? "Hide" : "Show"}
+                  </button>
+                </div>
+              </div>
+              <div>
+                <label style={{ display: "block", fontSize: "13px", fontWeight: 600, color: "var(--text-body, #f2f4f7)", marginBottom: "6px" }}>
+                  2FA Secret Key (TOTP) — optional
+                </label>
+                <input
+                  value={twoFactorSecret}
+                  onChange={(e) => setTwoFactorSecret(e.target.value)}
+                  placeholder="JBSWY3DPEHPK3PXP"
+                  autoComplete="off"
+                  spellCheck={false}
+                  style={{ ...modalInputStyle, fontFamily: "var(--font-mono, monospace)" }}
+                />
+                <p style={{ margin: "6px 0 0", fontSize: "11px", lineHeight: 1.45, color: "var(--text-muted, #98a2b3)" }}>
+                  The base32 secret shown when you set up your authenticator app (usually 16–32
+                  characters, spaces are fine). With it, this account can clear its own 2FA prompt
+                  and sign itself back in. Without it, a login that hits 2FA will stop and wait for you.
+                </p>
+              </div>
+              <p style={{ margin: 0, padding: "9px 11px", borderRadius: "8px", fontSize: "11px", lineHeight: 1.45, background: "var(--bg-surface-alt, #1d2939)", border: "1px solid var(--border-color, #344054)", color: "var(--text-muted, #98a2b3)" }}>
+                Stored so this account can sign itself back in when it is found logged out. Use a
+                dedicated scraper account, never a personal one — these are kept in the tool's own
+                database in readable form.
+              </p>
+            </>
+          )}
+
+          {/* Field 2b: Cookies / API Key */}
+          <div style={{ display: credentialsMode ? "none" : "block" }}>
             <label style={{ display: "block", fontSize: "13px", fontWeight: 600, color: "var(--text-body, #f2f4f7)", marginBottom: "6px" }}>
               {isApiKeyType ? "API Key" : "Paste JSON Cookies"}
             </label>
@@ -886,7 +1086,7 @@ const SessionEditModal: FC<{
                 onChange={(e) => setCookieBlob(e.target.value)}
                 placeholder='[{"name": "c_user", "value": "..."}]'
                 style={{ ...modalInputStyle, height: "140px", resize: "vertical", fontFamily: "var(--font-mono, monospace)", fontSize: "12px" }}
-                required={!isUpdate}
+                required={!isUpdate && !credentialsMode}
               />
             )}
           </div>
@@ -925,7 +1125,13 @@ const SessionEditModal: FC<{
                 cursor: "pointer"
               }}
             >
-              {isSubmitting ? "Saving..." : "Save Session"}
+              {isSubmitting
+                ? credentialsMode
+                  ? "Logging in and initializing persistent session…"
+                  : "Saving..."
+                : credentialsMode && !isUpdate
+                  ? "Save & Log In"
+                  : "Save Session"}
             </button>
           </div>
         </form>

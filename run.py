@@ -58,6 +58,7 @@ IMPORT_NAMES = {
     "openpyxl": "openpyxl",
     "apscheduler": "apscheduler",
     "pyotp": "pyotp",
+    "curl_cffi": "curl_cffi",
 }
 
 OK, BAD, WARN = "ok ", "FAIL", "-- "

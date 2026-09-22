@@ -15,11 +15,29 @@ units/day:
     search.list        100 units   -- expensive, used once per keyword page
     channels.list        1 unit    -- cheap, batched 50 ids at a time
     playlistItems.list   1 unit    -- cheap, how last-upload is read
-So discovery costs ~100 units per 50 results, and analysis is ~2 units per
+So discovery costs ~101 units per 50 results, and analysis is ~2 units per
 channel. Reading the newest upload through playlistItems instead of a dated
 search is a 100x saving, which is why it is done that way. No browser, so no
 session, no pacing and no detection surface, a sweep stops on an explicit
 end of results, a cap, or quota exhaustion, and says which.
+
+THE 101st UNIT is one `channels.list` call per search page, and it buys the
+URL. `search.list` returns a channel id and a snippet and no handle at all,
+so the only URL a sweep could build from it was
+`https://www.youtube.com/channel/UCAOnNAx9wF8tkPtKH1a8VUw` -- correct, and
+unreadable. YouTube's public identity for that same channel is
+`https://www.youtube.com/@NewGautamAdani-q3o`: it is what the channel page
+displays, what the share button copies, and the only one of the two an
+analyst can hold against a brand name at a glance. The handle lives on
+`snippet.customUrl`, which only `channels.list` returns.
+
+Worth spending because it is not a per-profile cost. One call covers 50
+ids for a single unit, against the 100 units the page that produced those
+ids already cost -- a 1% surcharge, not a multiplier, which is why the
+"One Pass or Two" objection that keeps per-profile enrichment out of the
+other engines' sweeps does not apply here. When the call fails or quota
+refuses it, the affected rows keep the id-shaped URL and the reason is
+logged rather than left to look like a design choice.
 """
 
 from __future__ import annotations
@@ -45,6 +63,41 @@ log = get_logger("youtube.api")
 
 BASE = "https://www.googleapis.com/youtube/v3"
 CHANNEL_URL = "https://www.youtube.com/channel/{cid}"
+# The form a human recognises and can paste into a browser. YouTube has
+# made the handle the public identity of a channel -- it is what the
+# channel page shows, what the platform's own share sheet copies, and what
+# an analyst sees when they open the account -- while `/channel/UC...` is
+# the internal id, correct but unreadable and impossible to eyeball against
+# a brand name.
+HANDLE_URL = "https://www.youtube.com/@{handle}"
+
+
+def channel_url(cid: str, custom_url: str = "") -> str:
+    """The public URL for a channel: the @handle form when YouTube gives
+    us one, the `/channel/<id>` form when it does not.
+
+    `custom_url` is `snippet.customUrl` from channels.list, which is the
+    handle (usually already carrying its "@"). Older channels that never
+    claimed a handle have no customUrl at all, and legacy ones can still
+    carry a `/c/`-era vanity string; both are handled by normalising the
+    leading "@" off and putting exactly one back.
+
+    NEVER RETURNS AN EMPTY STRING when it has an id to work with. A URL is
+    this row's identity everywhere downstream, so falling back to the id
+    form is mandatory -- a channel whose handle could not be read must
+    still be reachable, just less readably.
+
+    CASE IS PASSED THROUGH UNTOUCHED. The API is the only thing here that
+    knows the handle, so whatever case it reports is what gets stored.
+    YouTube routes handles case-insensitively, so a link built this way
+    resolves either way.
+    """
+    handle = (custom_url or "").strip().lstrip("@").strip()
+    if handle:
+        return HANDLE_URL.format(handle=handle)
+    return CHANNEL_URL.format(cid=cid) if cid else ""
+
+
 # YouTube's stock avatars come from this host; a real upload does not
 RE_DEFAULT_PIC = re.compile(r"/(default|no_avatar|blank)", re.I)
 
@@ -177,6 +230,46 @@ class YouTubeAPI:
                 maxResults=50,
             )
             out += data.get("items", [])
+        return out
+
+    async def handles(self, ids: list[str]) -> dict[str, str]:
+        """`{channel id: @handle}` for a batch of ids, skipping any the API
+        does not give a handle for.
+
+        WHY DISCOVERY PAYS FOR THIS AT ALL, when the rule everywhere else
+        in this codebase is that a sweep must not spend a per-profile call:
+        this is not a per-profile call. `channels.list` costs ONE unit for
+        up to 50 ids, against the 100 units the `search.list` page that
+        produced those ids already cost -- so a whole page of handles is a
+        1% surcharge on a page of results, not a multiplier.
+
+        `search.list` is the reason it is needed: its result carries the
+        channel id and the snippet, and no handle at all. Without this the
+        only URL a sweep can build is `/channel/UC...`, which is the id
+        form -- correct, but not what a channel calls itself and not what
+        an analyst can recognise.
+
+        NEVER RAISES. A quota refusal or an API error returns what was
+        resolved so far (possibly nothing), and the caller falls back to
+        the id form per channel. Losing the readable URL must not be able
+        to lose the sweep.
+        """
+        out: dict[str, str] = {}
+        if not ids:
+            return out
+        try:
+            for ch in await self.channels(ids):
+                cid = ch.get("id") or ""
+                custom = str(((ch.get("snippet") or {}).get("customUrl")) or "").strip()
+                if cid and custom:
+                    out[cid] = custom
+        except (QuotaExceeded, RuntimeError) as e:
+            # Named, not swallowed: a sweep quietly reverting to id-shaped
+            # URLs looks like a product decision rather than a failure.
+            log.warning(
+                f"youtube: channel handles unresolved for {len(ids)} id(s) "
+                f"({type(e).__name__}: {e}) -- those rows keep the "
+                f"/channel/<id> URL form")
         return out
 
     async def channel_by_handle(self, handle: str) -> Optional[dict]:
@@ -385,6 +478,19 @@ class Discovery:
                 # transient rate limiting from YouTube's backend
                 if token and out.pages > 1:
                     await asyncio.sleep(0.5)
+                # ONE extra unit for the whole page (see api.handles), spent
+                # before the Hits are built so each one is born with the URL
+                # it will keep. Doing it here rather than after the loop also
+                # means the `on_progress` stream below carries the readable
+                # URL, so a card never appears as /channel/UC... and then
+                # silently changes shape underneath the analyst.
+                page_ids = [
+                    cid for it in items
+                    if (cid := (it.get("id") or {}).get("channelId", ""))
+                    and cid not in by_id
+                ]
+                handle_by_id = await self.api.handles(page_ids)
+
                 page_hits: list[Hit] = []
                 for i, it in enumerate(items):
                     if self.a.max_results and len(by_id) >= self.a.max_results:
@@ -411,7 +517,7 @@ class Discovery:
                         name=(
                             snip.get("channelTitle") or snip.get("title") or ""
                         ).strip(),
-                        url=CHANNEL_URL.format(cid=cid),
+                        url=channel_url(cid, handle_by_id.get(cid, "")),
                         avatar=avatar,
                         has_custom_pic=bool(avatar) and not RE_DEFAULT_PIC.search(avatar),
                         entity_type="channel",

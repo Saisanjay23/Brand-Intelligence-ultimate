@@ -17,6 +17,11 @@ logs/
 runs/
 session/*.json
 session/*.session
+# Persistent browser profiles (stealth/browser.py). These hold the live
+# login for each pooled account -- cookies, localStorage, IndexedDB and the
+# device keys the platforms mint. Committing one publishes a working
+# session, so this belongs with .env rather than with build output.
+session/browser_profiles/
 
 # analysis-time evidence screenshots (settings.evidence_path) -- regenerable
 # scrape output, and potentially large: one PNG per analysed profile

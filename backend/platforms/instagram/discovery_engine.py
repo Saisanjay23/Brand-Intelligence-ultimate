@@ -175,6 +175,12 @@ class InstagramUser:
     # shared/completeness.py::missing_fields, which never checks location
     # on any platform for exactly this reason.
     city_name: str = ""
+    # Instagram's OWN answer to "does this account have a profile picture",
+    # published as `has_anonymous_profile_picture` on the same `data.user`
+    # object as everything else here. None means the payload did not carry
+    # the field (an older shape, or a DOM-only read), never "it has one".
+    # See `has_custom_pic` below for why this is the field that matters.
+    anonymous_pic: Optional[bool] = None
 
     @property
     def url(self) -> str:
@@ -183,10 +189,41 @@ class InstagramUser:
         return f"https://www.instagram.com/{self.username}/" if self.username else ""
 
     @property
-    def has_custom_pic(self) -> bool:
-        """Is `avatar` a real upload, not Instagram's own anonymous-user
-        placeholder (see DEFAULT_PIC_HINTS above)."""
-        return bool(self.avatar) and not looks_like_placeholder("instagram", self.avatar)
+    def has_custom_pic(self) -> Optional[bool]:
+        """Does this account use a picture somebody chose? Tri-state:
+        True real upload / False Instagram's anonymous avatar / None we
+        could not tell -- the contract shared/models/row.py documents, and
+        the reason None matters: `Row.logo_yes` renders None as "No"
+        without asserting it, and `profile_repository.save()` drops None
+        from its `$set`, so an unknown can never overwrite a verdict an
+        earlier pass established.
+
+        TIER 1 IS INSTAGRAM'S OWN STATEMENT, not a URL pattern. The
+        profile payload carries `has_anonymous_profile_picture`, a boolean
+        Instagram sets itself, and it is the only signal here that cannot
+        go stale. Tier 2, the asset-id markers in shared/avatars.py, is
+        kept for the paths that have no payload (the DOM header read, and
+        rows stored before this field was parsed) -- but it must not be
+        the primary, because it has already failed in production exactly
+        once in the way it is built to fail: Instagram ROTATED the
+        anonymous avatar's asset id, the list still held only the old one,
+        and from that moment every account with no picture was recorded as
+        having a real one. Nothing raised, nothing logged. That is what
+        `has_logo` looked like until somebody noticed the cards.
+
+        The tiers are ordered so the durable signal wins and the fragile
+        one can only ever be a fallback -- so the next rotation costs a
+        stale row or two rather than the whole column.
+        """
+        if self.anonymous_pic is True:
+            return False
+        if not self.avatar:
+            # Nothing was read. Not a claim that there is no picture.
+            return None
+        if looks_like_placeholder("instagram", self.avatar):
+            return False
+        # A real URL, and Instagram did not call it anonymous.
+        return True
 
 
 def user_to_row(u: "InstagramUser", keyword: str, *, source: str = "api") -> Row:
@@ -243,13 +280,63 @@ def _count(node: Any, *keys: str) -> Optional[int]:
     return None
 
 
-def _latest_post(node: dict) -> str:
-    """Newest timestamp among the profile's own recent media."""
+def _media_timestamp(d: dict) -> int:
+    """The publish timestamp of a MEDIA object, or 0 if `d` is not one.
+
+    TWO restrictions, and the first is the one that matters. The KEY must
+    be one of the two Instagram puts on a post/reel itself (`taken_at`,
+    `taken_at_timestamp`), so a neighbouring field that merely holds a
+    Unix time is not read as a post date -- `latest_reel_media`, the
+    account's newest STORY, is the dangerous one, because a story expires
+    within 24h and therefore always reads as today or yesterday. The
+    VALUE is then bounded to a plausible epoch range, which catches a
+    malformed or sentinel number.
+    """
+    ts = d.get("taken_at") or d.get("taken_at_timestamp")
+    if isinstance(ts, bool) or not isinstance(ts, int):
+        return 0
+    return ts if 1_000_000_000 < ts < 4_000_000_000 else 0
+
+
+def _media_owner(d: dict) -> str:
+    """The handle a media object names as its author, lowercased, or "" if
+    it names none. Both shapes Instagram ships: a nested `user` object
+    (timeline/feed edges) and a flat `owner` object (older GraphQL)."""
+    for key in ("user", "owner"):
+        obj = d.get(key)
+        if isinstance(obj, dict):
+            name = str(obj.get("username") or "").strip().lower()
+            if name:
+                return name
+    return ""
+
+
+def _latest_post(node: dict, posts: Optional[int] = None) -> str:
+    """Newest timestamp among the profile's own recent media.
+
+    `node` is already this profile's own record, so a media object nested
+    inside it needs no separate owner check -- but it does need TWO guards
+    that were missing, both of which produced a date for an account that
+    has never posted:
+
+      * `posts == 0` short-circuits. When Instagram's own record says the
+        media count is zero, no timestamp anywhere inside that record can
+        be a post of theirs. The profile payload still carries several --
+        a highlight cover, a tagged media preview, a suggested-account
+        rail -- and the newest of those is routinely today.
+      * `_media_timestamp` restricts the read to the two keys that live on
+        a post itself, so `latest_reel_media` (the newest STORY, which
+        expires in 24h and therefore always reads as today) can no longer
+        be mistaken for one.
+
+    A missing count (`posts is None`) is NOT treated as zero: unknown is
+    not "none", and the caller's later tiers are still allowed to try.
+    """
+    if posts == 0:
+        return ""
     best = 0
     for d in iter_dicts(node):
-        ts = d.get("taken_at_timestamp") or d.get("taken_at")
-        if isinstance(ts, int) and 1_000_000_000 < ts < 4_000_000_000:
-            best = max(best, ts)
+        best = max(best, _media_timestamp(d))
     if not best:
         return ""
     return datetime.fromtimestamp(best, timezone.utc).date().isoformat()
@@ -265,6 +352,13 @@ K_USERNAME = "user.username"
 K_USER_ID = "user.{id|pk|pk_id}"
 K_FULL_NAME = "user.full_name"
 K_AVATAR = "user.profile_pic_url"
+# Probed on PRESENCE, not truth. This field is legitimately False for most
+# accounts (they do have a picture), so `probe.check`'s falsy-means-missing
+# rule would report a rename on every healthy profile. What we need to know
+# is whether Instagram is still SHIPPING the key, because the moment it
+# stops, `has_custom_pic` silently drops back to matching asset ids -- the
+# tier that has already failed once (see InstagramUser.has_custom_pic).
+K_ANON_PIC = "user.has_anonymous_profile_picture"
 
 
 def user_from_node(node: dict, probe: Any = None) -> Optional[InstagramUser]:
@@ -296,6 +390,15 @@ def user_from_node(node: dict, probe: Any = None) -> Optional[InstagramUser]:
         if isinstance(first_link, dict):
             external_url = str(first_link.get("url") or "").strip()
     has_highlight_reels = bool(node.get("has_highlight_reels") or node.get("highlight_reel_count"))
+    anon = node.get("has_anonymous_profile_picture")
+    if is_profile_record(node):
+        # Probed only on the FULL profile record, never on a search-result
+        # node. A search node is legitimately slim -- it carries a handle,
+        # a name and a picture and nothing else -- so tallying a miss there
+        # would report a healthy engine as broken on every sweep, which is
+        # the one thing shared/schema_probe.py is built not to do.
+        (probe.hit if isinstance(anon, bool) else probe.miss)(K_ANON_PIC)
+    posts = _count(node, "edge_owner_to_timeline_media", "media_count")
 
     return InstagramUser(
         entity_id=str(pk),
@@ -303,17 +406,37 @@ def user_from_node(node: dict, probe: Any = None) -> Optional[InstagramUser]:
         full_name=(node.get("full_name") or "").strip(),
         followers=_count(node, "edge_followed_by", "follower_count"),
         following=_count(node, "edge_follow", "following_count"),
-        posts=_count(node, "edge_owner_to_timeline_media", "media_count"),
+        posts=posts,
         avatar=probe_avatar(probe, extract_instagram_hd_avatar(node)),
         biography=(node.get("biography") or "").strip(),
         verified=bool(node.get("is_verified")),
         private=bool(node.get("is_private")),
-        last_post_iso=_latest_post(node),
+        last_post_iso=_latest_post(node, posts),
         category=category,
         external_url=external_url,
         has_highlight_reels=has_highlight_reels,
         city_name=str(node.get("city_name") or "").strip(),
+        anonymous_pic=anon if isinstance(anon, bool) else None,
     )
+
+
+# What separates a FULL profile record from a bare mention of an account:
+# the record carries the profile's own statistics. Named here because two
+# callers depend on the same answer -- `profile_from` uses it to pick the
+# right node out of a payload, and `user_from_node` uses it to decide
+# whether a missing field is a rename worth reporting or just a slim search
+# result. They must not drift apart.
+PROFILE_RECORD_KEYS = (
+    "edge_followed_by",
+    "follower_count",
+    "edge_owner_to_timeline_media",
+    "media_count",
+    "biography",
+)
+
+
+def is_profile_record(node: Any) -> bool:
+    return isinstance(node, dict) and any(k in node for k in PROFILE_RECORD_KEYS)
 
 
 def profile_from(blob: Any, username: str = "") -> Optional[InstagramUser]:
@@ -322,18 +445,7 @@ def profile_from(blob: Any, username: str = "") -> Optional[InstagramUser]:
     best: Optional[InstagramUser] = None
     for d in iter_dicts(blob):
         # a profile node is the one carrying counts, not a bare mention
-        if "username" not in d:
-            continue
-        if not any(
-            k in d
-            for k in (
-                "edge_followed_by",
-                "follower_count",
-                "edge_owner_to_timeline_media",
-                "media_count",
-                "biography",
-            )
-        ):
+        if "username" not in d or not is_profile_record(d):
             continue
         user = user_from_node(d)
         if not user:
@@ -343,6 +455,52 @@ def profile_from(blob: Any, username: str = "") -> Optional[InstagramUser]:
         if best is None or (user.followers is not None and best.followers is None):
             best = user
     return best
+
+
+def _max_taken_at(blob: Any, want: str, *, accept_unowned: bool) -> int:
+    """Newest media timestamp in `blob` that can be attributed to `want`.
+
+    A media object that names a DIFFERENT author is always skipped. One
+    that names no author at all counts only when `accept_unowned` is set,
+    which is the caller's way of saying it already knows whose timeline
+    this payload is.
+    """
+    best = 0
+    for d in iter_dicts(blob):
+        ts = _media_timestamp(d)
+        if not ts:
+            continue
+        owner = _media_owner(d)
+        if owner:
+            if want and owner != want:
+                continue
+        elif not accept_unowned:
+            continue
+        best = max(best, ts)
+    return best
+
+
+# The GraphQL connection that IS a profile's own timeline. Named, because
+# the substring match in PROFILE_ENDPOINTS ("api/graphql", "graphql/query")
+# cannot tell that response apart from the ones the SAME endpoint serves
+# for the viewer's own home feed and recommendations -- which is how
+# somebody else's post, published today, became "this account's last post"
+# on accounts that had never posted at all.
+_TIMELINE_CONNECTION_HINT = "user_timeline"
+
+
+def _own_timeline_containers(blob: Any) -> Iterator[Any]:
+    """Every sub-object that Instagram itself labels a user timeline.
+
+    Matched on the GraphQL connection's own key name
+    (`xdt_api__v1__feed__user_timeline_graphql_connection`), which is the
+    payload saying what it is rather than us inferring it from what it
+    happens to contain.
+    """
+    for d in iter_dicts(blob):
+        for key, value in d.items():
+            if _TIMELINE_CONNECTION_HINT in key.lower():
+                yield value
 
 
 def timeline_latest_post(blob: Any, username: str = "") -> str:
@@ -370,14 +528,30 @@ def timeline_latest_post(blob: Any, username: str = "") -> str:
         That same response really does mention other accounts -- tagged
         users, co-authors and suggestions (live capture: `gautam.adani`,
         `pritiadani`, `cmo_keralam` alongside the profile's own
-        `adaniparivar`). None of them owned a `taken_at` node in that
-        capture, but nothing guarantees that, and attributing someone
-        else's post date to this profile would make a dormant impersonator
-        look active -- the exact failure mode the Twitter and Facebook
-        engines already scope against. So a node counts only when its own
-        `user.username` matches; the unscoped reading is kept solely as a
-        fallback for payloads that carry no owner at all, and never
-        overrides a scoped one.
+        `adaniparivar`). So a node counts only when its own `user.username`
+        matches.
+
+    WHY AN UNOWNED NODE IS NO LONGER ENOUGH ON ITS OWN
+        This used to fall back to "the newest timestamp anywhere in the
+        payload" whenever no node named an owner. That fallback is what
+        produced the reported bug: TODAY'S DATE ON AN ACCOUNT WITH NO
+        POSTS. `PROFILE_ENDPOINTS` matches on the substrings "api/graphql"
+        and "graphql/query", and the modern web client answers a profile
+        visit with several responses on those same paths -- including the
+        VIEWER'S OWN home feed and recommendations, which this module's
+        consumer (analysis_engine.py) has documented as firing on every
+        visit since the beginning. Their media carry fresh `taken_at`
+        values; their carousel children and clips sub-objects carry the
+        timestamp WITHOUT a nested `user`, so they looked unowned, and the
+        newest of them is by construction from today. A profile that had
+        never posted therefore came back "last posted today, active" --
+        confident, plausible and wrong, which is worse than blank.
+
+        The fallback is kept only where it is actually safe: inside a
+        container Instagram has NAMED as a user timeline, where an unowned
+        node has nowhere else to have come from. Everywhere else, an
+        unattributable timestamp now yields "" and the caller's later,
+        owner-checked tiers get their turn.
 
     WHY max() AND NOT THE FIRST EDGE
         Instagram pins up to 3 posts to the top of a profile. Confirmed in
@@ -387,21 +561,16 @@ def timeline_latest_post(blob: Any, username: str = "") -> str:
         the grid-alt reader in analysis_engine.py reached independently.
     """
     want = (username or "").lower().strip("/")
-    scoped, unscoped = 0, 0
-    for d in iter_dicts(blob):
-        ts = d.get("taken_at") or d.get("taken_at_timestamp")
-        if not isinstance(ts, int) or not (1_000_000_000 < ts < 4_000_000_000):
-            continue
-        owner = ""
-        user = d.get("user")
-        if isinstance(user, dict):
-            owner = str(user.get("username") or "").lower()
-        if want and owner:
-            if owner == want:
-                scoped = max(scoped, ts)
-            continue
-        unscoped = max(unscoped, ts)
-    best = scoped or unscoped
+
+    # Tier 1: a media object that NAMES this profile as its author.
+    best = _max_taken_at(blob, want, accept_unowned=not want)
+
+    # Tier 2: unowned media, but only inside a container the payload
+    # itself labels as a user's own timeline.
+    if not best and want:
+        for container in _own_timeline_containers(blob):
+            best = max(best, _max_taken_at(container, want, accept_unowned=True))
+
     if not best:
         return ""
     return datetime.fromtimestamp(best, timezone.utc).date().isoformat()

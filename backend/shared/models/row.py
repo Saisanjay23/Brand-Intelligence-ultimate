@@ -21,6 +21,26 @@ class Row:
     url: str
     target: str
     original_feed: str = ""
+    # THE URL THIS PROFILE SHOULD BE SHOWN AND EXPORTED AS, when the visit
+    # discovered a better one than the caller had. Blank means "the one you
+    # gave me is the one to use", which is every platform but YouTube
+    # today.
+    #
+    # YouTube is the case that needs it: a channel has two real URLs, the
+    # `/channel/UC...` id form and the `@handle` form, and only the second
+    # is what the platform shows, what a share link copies, and what an
+    # analyst can recognise as a brand. The handle is published on ONE API
+    # response (`channels.list`, `snippet.customUrl`), which the analysis
+    # visit already makes -- so this is where it becomes knowable for a
+    # channel that arrived as a pasted id link.
+    #
+    # DELIBERATELY NOT `url` ITSELF. `url` is the key the caller looked
+    # this profile up by and is still holding; an engine rewriting it
+    # mid-visit would move that key underneath them. This is a separate,
+    # opt-in field, adopted by whoever decides it is safe to adopt (see
+    # analysis/runner.py::_populate), and identity still rests on
+    # `profile_id`/`entity_id`, which does not change either way.
+    canonical_url: str = ""
 
     status: str = "PENDING"
     entity_type: str = "profile"

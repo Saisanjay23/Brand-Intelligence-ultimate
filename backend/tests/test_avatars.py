@@ -143,7 +143,39 @@ class TestEngineProperties:
         from backend.platforms.instagram.discovery_engine import InstagramUser
         assert InstagramUser(avatar=IG_ANON_CURRENT).has_custom_pic is False
         assert InstagramUser(avatar="https://cdn/real.jpg").has_custom_pic is True
-        assert InstagramUser(avatar="").has_custom_pic is False
+
+    def test_instagram_prefers_instagrams_own_statement(self):
+        """`has_anonymous_profile_picture` OUTRANKS the asset-id markers.
+
+        The markers are a list of ids that has already gone stale once:
+        Instagram rotated the anonymous avatar, the list still held only
+        the old id, and every account with no picture was recorded as
+        having a real one. This is that exact case -- an anonymous avatar
+        wearing an id nobody has added to the list yet -- and Instagram's
+        own boolean settles it regardless.
+        """
+        from backend.platforms.instagram.discovery_engine import InstagramUser
+        rotated = "https://scontent.cdninstagram.com/v/t51.2885-19/999_n.jpg"
+        assert InstagramUser(avatar=rotated).has_custom_pic is True  # markers alone
+        assert InstagramUser(avatar=rotated, anonymous_pic=True).has_custom_pic is False
+        assert InstagramUser(avatar=rotated, anonymous_pic=False).has_custom_pic is True
+
+    def test_instagram_no_picture_read_is_unknown_not_a_verdict(self):
+        """No avatar came back -> None, the tri-state contract in
+        shared/models/row.py and test_logo_unknown_vs_absent.py.
+
+        False is a claim that the platform's stock avatar was RECOGNISED.
+        Nothing was recognised here, because nothing was read. None still
+        renders "No" through `Row.logo_yes`, and unlike False it is
+        dropped by `profile_repository.save`, so a sweep that failed to
+        read a picture cannot overwrite a verdict an earlier one
+        established.
+        """
+        from backend.platforms.instagram.discovery_engine import InstagramUser
+        assert InstagramUser(avatar="").has_custom_pic is None
+        # ...unless Instagram itself says there is no picture, which is a
+        # verdict even with no URL beside it.
+        assert InstagramUser(avatar="", anonymous_pic=True).has_custom_pic is False
 
     def test_twitter(self):
         from backend.platforms.twitter.discovery_engine import TwitterUser

@@ -118,6 +118,130 @@ async def check_token_expiries() -> list[dict[str, Any]]:
     return warnings
 
 
+# How many pooled sessions one liveness pass will probe at once. Small on
+# purpose: these are real accounts on real platforms, and the value here is
+# in noticing a death early, not in finishing the sweep quickly.
+_PROBE_CONCURRENCY = 4
+
+
+async def probe_pool_liveness(platform_ids: Optional[list[str]] = None) -> dict[str, Any]:
+    """A ZERO-BROWSER liveness pass over the pooled cookie sessions.
+
+    WHAT THIS ADDS THAT `check_token_expiries` DOES NOT. That function reads
+    stored `expires` timestamps, which catches a session whose cookies are
+    about to run out on schedule. It cannot catch the other half: a session
+    the platform killed early -- a password change, a security checkpoint, a
+    rotation on their side -- whose cookies still have a month of nominal
+    life left. That one sits in the pool looking perfectly healthy until a
+    sweep tries to use it, which is the failure this service exists to get
+    in front of.
+
+    WHY THIS DOES NOT BREAK `build_canary_report`'S RULE. That function's
+    docstring is emphatic that nothing in this module logs in, and the
+    reason it gives is exact: it used to call `check_all_once()` off a GET
+    the Alerts panel fires on mount, so merely opening a tab started
+    authenticated page loads across six platforms. Nothing here does that.
+    This opens no browser and holds no session; it sends one ordinary HTTPS
+    request per account through shared/fast_http.py, on the two platforms
+    whose logged-out state is a server redirect, and it is NOT wired into
+    `build_canary_report` -- it is a function a scheduler or an operator
+    calls deliberately.
+
+    WHAT IT DOES WITH A "DEAD" ANSWER: escalates, never decides. A dead
+    verdict over plain HTTP is indistinguishable from a bot wall or a rate
+    limit (see fast_http.SessionVerdict), so this hands the account to
+    `sessions.manager.check_item`, the authoritative browser check, which
+    records the verdict and raises the incident if it agrees. A live answer
+    is left alone entirely -- this pass is an early-warning trigger, not a
+    health ledger, and it must not be able to reset another path's
+    consecutive-failure ladder.
+    """
+    from backend.sessions import manager as sessions_engine
+    from backend.shared import fast_http
+
+    probed: list[dict[str, Any]] = []
+    escalated: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+
+    wanted = platform_ids or [p for p in CRITICAL_COOKIES if fast_http.probe_for(p)]
+    sem = asyncio.Semaphore(_PROBE_CONCURRENCY)
+
+    async def one(platform_id: str, item: dict) -> None:
+        session_id = item.get("id") or ""
+        identifier = item.get("identifier") or session_id
+        async with sem:
+            try:
+                verdict = await fast_http.check_session_alive(
+                    platform_id, item.get("cookies") or [])
+            except Exception as e:                    # noqa: BLE001 - never fatal
+                skipped.append({"platform": platform_id, "identifier": identifier,
+                                "reason": f"{type(e).__name__}: {e}"})
+                return
+
+            entry = {"platform": platform_id, "session_id": session_id,
+                     "identifier": identifier, "alive": verdict.alive,
+                     "reason": verdict.reason}
+            probed.append(entry)
+
+            if verdict.alive is not False:
+                # Live, or unprovable. Either way there is nothing to do:
+                # the 30-minute monitor owns the health record.
+                return
+
+            log.warning(
+                f"canary: {platform_id} session '{identifier}' failed its HTTP "
+                f"liveness probe ({verdict.reason}) -- escalating to the browser check")
+            try:
+                result = await sessions_engine.check_item(platform_id, session_id)
+            except Exception as e:                    # noqa: BLE001 - never fatal
+                # In use by a running job (ConflictError), deleted between
+                # the list and the check (NotFoundError), or the browser
+                # itself failed. None of those are this function's to
+                # resolve, and none of them are a verdict.
+                skipped.append({"platform": platform_id, "identifier": identifier,
+                                "reason": f"escalation did not run: {type(e).__name__}: {e}"})
+                return
+            escalated.append({"platform": platform_id, "identifier": identifier,
+                              "confirmed_dead": not result.get("ok", True),
+                              "detail": result.get("detail", "")})
+
+    jobs = []
+    for platform_id in wanted:
+        if not fast_http.probe_for(platform_id):
+            skipped.append({"platform": platform_id,
+                            "reason": "no HTTP-provable session signal on this platform"})
+            continue
+        try:
+            items = await sessions_db.list_pool(platform_id)
+        except Exception as e:                        # noqa: BLE001
+            log.warning(f"canary: could not list pool for {platform_id}: {e}")
+            skipped.append({"platform": platform_id, "reason": f"pool unreadable: {e}"})
+            continue
+        for item in items:
+            if (item.get("status") or "ready") in ("expired", "checkpointed", "unreadable"):
+                continue        # already dead, handled by failure monitoring
+            if not item.get("cookies"):
+                continue        # nothing to probe with
+            if sessions_engine._session_in_use(platform_id, item.get("id") or ""):
+                # The same rule the browser sweep follows: the account being
+                # scraped this second is off limits. One extra request is far
+                # lighter than a second browser, but it is still traffic on an
+                # account that is already busy, and it could only escalate to a
+                # check `check_item` would refuse anyway.
+                continue
+            jobs.append(one(platform_id, item))
+
+    if jobs:
+        await asyncio.gather(*jobs, return_exceptions=True)
+
+    return {
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "probed": probed,
+        "escalated": escalated,
+        "skipped": skipped,
+    }
+
+
 async def build_canary_report() -> dict[str, Any]:
     """The session-pool health overview -- BUILT ENTIRELY FROM STORED STATE.
 

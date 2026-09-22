@@ -227,6 +227,69 @@ class Settings(BaseSettings):
     # moment the healer is suspected of costing more than it recovers.
     adaptive_healer_enabled: bool = True
 
+    # --- persistent browser profiles & self-healing login ----------------
+    # KEEP EACH ACCOUNT'S BROWSER PROFILE ON DISK between runs, under
+    # session_blob_path/browser_profiles/<platform>_<session_id>.
+    #
+    # What that buys is everything a cookie jar cannot carry: localStorage,
+    # IndexedDB, the device keys Meta and X mint per browser, and the
+    # machine id Chrome itself writes. Replaying cookies into a blank
+    # profile every run is a logged-in account arriving on a brand-new
+    # device every single time, which is exactly the shape a "new device"
+    # challenge exists to catch.
+    #
+    # Off returns the browser to a fresh ephemeral context per run, which is
+    # what it did before this existed. Nothing else changes: cookies are
+    # still injected from the database either way.
+    browser_persistent_profiles: bool = True
+    # Delete a profile directory that has not been opened in this many days.
+    # A Chrome profile is not small, and one per pooled account per platform
+    # accumulates quietly. 0 disables the sweep.
+    browser_profile_retention_days: int = 30
+    # LOOK AT THE HOME FEED BEFORE GOING TO WORK. A real session starts
+    # somewhere ordinary; ours used to open cold on a search URL or a
+    # stranger's profile. One short home-feed view per session, at most once
+    # every browser_warmup_min_gap_minutes, and never on a health check.
+    # Failure is always non-fatal -- warming is a courtesy, not a step.
+    browser_warmup_enabled: bool = True
+    browser_warmup_min_gap_minutes: float = 15.0
+    # RE-LOG IN BY ITSELF when a pooled account with stored credentials is
+    # found expired or checkpointed. Off leaves the existing quarantine and
+    # alert path exactly as it is.
+    session_auto_relogin: bool = True
+    # The floor between two automated login attempts on ONE account. This is
+    # the single most important number here: a re-login that keeps failing
+    # is a scripted password attempt every half hour on an account the
+    # platform is already unhappy with, which is how an account stops being
+    # recoverable at all. Deliberately hours, not minutes.
+    session_relogin_cooldown_minutes: float = 180.0
+    # Consecutive automated attempts before this account stops trying and
+    # waits for a person. Self-healing that cannot heal must stop.
+    session_relogin_max_attempts: int = 3
+
+    # --- curl_cffi accelerator (shared/fast_http.py) ---------------------
+    # THREE SWITCHES, NOT ONE, because the three uses carry very different
+    # risk. All default on; each can be turned off on its own without a code
+    # change, and turning one off returns that path to exactly the behaviour
+    # it had before fast_http existed.
+    #
+    # The master switch. Off means shared/fast_http.py answers "unavailable"
+    # to everything, so avatars go back to aiohttp, session checks go back to
+    # the browser, and analysis pre-flights nothing.
+    fast_http_enabled: bool = True
+    # Let a cookie health check try one impersonated HTTPS request before
+    # launching Chromium. Only a POSITIVE "still logged in" short-circuits;
+    # anything else, including a positive-looking failure, still runs the
+    # browser check (see fast_http.SessionVerdict). Turn this off if session
+    # health verdicts are ever suspected of disagreeing with reality.
+    session_fast_check_enabled: bool = True
+    # Let an analysis batch ask the platform whether a profile URL still
+    # exists before a browser worker is given it. Only a 404/410 from a
+    # platform that reliably serves one settles the row; every other answer
+    # is handed to the browser exactly as before. Turn this off to make every
+    # pasted URL get a real visit no matter what HTTP says.
+    analysis_preflight_enabled: bool = True
+
     # Browser-facing CORS. "*" is the historical default (this engine was
     # designed to sit behind a trusted internal path), but it is also what
     # lets any page in any browser on the network drive the whole API.

@@ -23,7 +23,12 @@ WHAT ACTUALLY HELPS & HAS BEEN HARDENED
 
 from __future__ import annotations
 
+import asyncio
+import random
+import shutil
 import sys
+import time
+from pathlib import Path
 
 # Patchright first, vanilla Playwright as the fallback.
 #
@@ -57,6 +62,8 @@ except ImportError:
         STEALTH_DRIVER = "playwright"
     except ImportError:
         sys.exit("pip install patchright  (or: pip install playwright && playwright install chromium)")
+
+from typing import Optional
 
 from backend.shared.logging import get_logger
 from backend.platforms.scan_options import cancelled
@@ -101,6 +108,151 @@ BLOCKED_TRACKERS = (
 )
 
 
+# ---------------------------------------------------------- browser profiles
+#
+# ONE DIRECTORY PER POOLED ACCOUNT, REUSED FOR EVER.
+#
+# A cookie jar is not a device. Replaying cookies into a blank context makes
+# every run arrive as a brand-new browser -- no localStorage, no IndexedDB,
+# none of the device keys Meta and X mint and then expect to see again, and a
+# fresh Chrome machine id each time. That is precisely the shape a "new
+# device, was this you?" challenge exists to catch, and it is a shape a real
+# account never produces. `launch_persistent_context` keeps all of it on
+# disk, so the second run looks like the same laptop as the first.
+#
+# WHAT MAKES THIS SAFE, AND WHY THE LEASE BELOW IS NOT OPTIONAL. Chromium
+# takes an exclusive lock on a user-data-dir: a second launch against a
+# directory already open either fails outright or silently drops to a
+# throwaway profile. Sessions in this tool are normally kept apart by the
+# claim system in sessions/manager.py (see `_session_in_use`), but that is a
+# guarantee about ACCOUNTS, not about directories -- and two callers can
+# still land on the same one: anything that builds a Session without a
+# session id would share a directory with every other such caller on that
+# platform, and a health check picked a moment before a job claims the same
+# account can overlap it by a hair.
+#
+# So the directory itself is leased, in-process, for the life of the Session.
+# A caller that cannot get the lease is not refused and does not wait: it
+# runs on an ephemeral profile, exactly as this module did before
+# persistence existed. Losing persistence costs stealth; blocking or
+# crashing a sweep costs the run, and those are not the same price.
+_profile_leases: set[str] = set()
+
+
+def _lease_profile(path: Path) -> bool:
+    """Claim a profile directory for this process. Lock-free on purpose:
+    this module runs on one event loop and there is no await between the
+    test and the add -- the same reasoning `holds_session` relies on."""
+    key = str(path).lower()
+    if key in _profile_leases:
+        return False
+    _profile_leases.add(key)
+    return True
+
+
+def _release_profile(path: Path) -> None:
+    _profile_leases.discard(str(path).lower())
+
+
+def profiles_root() -> Path:
+    from backend.config.settings import settings
+
+    return Path(settings.session_blob_path) / "browser_profiles"
+
+
+def profile_dir_for(platform: str, session_id: str) -> Path:
+    """Where one account's browser lives. Both halves are sanitised: they
+    become a path segment, and one of them is operator-typed."""
+    safe = "".join(c if (c.isalnum() or c in "-_") else "_"
+                   for c in f"{platform or 'unknown'}_{session_id}")
+    return profiles_root() / safe[:120]
+
+
+def prune_stale_profiles(max_age_days: float) -> int:
+    """Delete profile directories nothing has opened in `max_age_days`.
+
+    A Chrome profile is tens to hundreds of megabytes and there is one per
+    pooled account per platform, so left alone this grows without limit on a
+    machine nobody is watching. Deleting one costs that account its device
+    identity once, which is a stealth cost and not a correctness one: the
+    cookies live in the database and the next run rebuilds the profile.
+    """
+    if max_age_days <= 0:
+        return 0
+    root = profiles_root()
+    if not root.is_dir():
+        return 0
+    cutoff = time.time() - (max_age_days * 86400)
+    removed = 0
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return 0
+    for child in children:
+        try:
+            if not child.is_dir():
+                continue
+            if str(child).lower() in _profile_leases:
+                continue        # open right now
+            if child.stat().st_mtime >= cutoff:
+                continue
+            shutil.rmtree(child, ignore_errors=True)
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def reset_profile(platform: str, session_id: str) -> bool:
+    """Throw away one account's stored browser identity.
+
+    Called when the credentials underneath a session are REPLACED -- a
+    freshly pasted cookie jar, a completed re-login. Without it the old
+    profile keeps its own copy of the previous login in localStorage and
+    IndexedDB, and the operator's new paste would be layered over a device
+    that still remembers being signed in as the old one.
+
+    Refuses while the profile is open, because deleting a directory out from
+    under a running Chromium is how a sweep dies mid-page.
+    """
+    path = profile_dir_for(platform, session_id)
+    if str(path).lower() in _profile_leases:
+        log.info(f"not resetting {path.name}: a session is using it right now")
+        return False
+    if not path.exists():
+        return False
+    shutil.rmtree(path, ignore_errors=True)
+    log.info(f"reset browser profile {path.name} -- new credentials, new device")
+    return True
+
+
+# Where a real session would start. Only the four browser-driven,
+# cookie-backed platforms appear: YouTube and Telegram never open a browser.
+# Flags that apply ONLY to a persistent profile. Kept apart from
+# LAUNCH_ARGS so the fingerprint every run presents stays identical whether
+# the profile is on disk or not: neither of these is visible to JavaScript,
+# they only bound what Chrome writes into the directory.
+PERSISTENT_ARGS = [
+    # ~80 MB of HTTP cache per profile instead of Chrome's default, which
+    # grows with the disk. One directory per pooled account per platform
+    # adds up quickly on a machine nobody is watching.
+    "--disk-cache-size=83886080",
+    "--media-cache-size=16777216",
+]
+
+PLATFORM_HOME = {
+    "facebook": "https://www.facebook.com/",
+    "twitter": "https://x.com/home",
+    "instagram": "https://www.instagram.com/",
+    "tiktok": "https://www.tiktok.com/",
+}
+
+# When each profile last had its feed warmed. In-process only, so a restart
+# warms once more than strictly needed -- the harmless direction, and far
+# cheaper than a database read from inside the browser layer.
+_last_warm: dict[str, float] = {}
+
+
 class Session:
     """A browser context carrying one account's cookies."""
 
@@ -134,6 +286,7 @@ class Session:
         load_images: bool = False,
         timezone_id: str = DEFAULT_TIMEZONE_ID,
         session_id: str = "",
+        platform: str = "",
     ):
         self.o = options
         self.cookies = cookies
@@ -158,6 +311,29 @@ class Session:
         # wait, rather than each engine, is what was taught to listen.
         self.human = Human(stop=lambda: cancelled(self.o))
         self.ctx = self.browser = self._pw = None
+        # Set by start() when this session got a persistent profile, and
+        # read by stop() so the lease is always handed back by whoever took
+        # it. None means the run is on an ephemeral context, which is both
+        # the fallback and what every run did before profiles existed.
+        self._profile: Optional[Path] = None
+        self._persistent = False
+        # An explicit platform id wins; otherwise it is read off the
+        # subclass's module (backend.platforms.<id>.discovery_engine), which
+        # is what lets every engine keep its current constructor untouched.
+        self._platform = platform or self._platform_from_module()
+
+    @classmethod
+    def _platform_from_module(cls) -> str:
+        parts = (cls.__module__ or "").split(".")
+        if len(parts) >= 3 and parts[0] == "backend" and parts[1] == "platforms":
+            return parts[2]
+        return ""
+
+    @property
+    def platform(self) -> str:
+        """Which platform this session belongs to, or "" for the bare
+        `Session` used outside a platform adapter."""
+        return self._platform
 
     async def start(self):
         self._pw = await async_playwright().start()
@@ -173,7 +349,6 @@ class Session:
                 "running on vanilla playwright -- the driver announces itself over CDP "
                 "(measured: isAutomatedWithCDP=true). `pip install patchright` to close it."
             )
-        self.browser = await self._pw.chromium.launch(**opts)
 
         # Chrome always carries the BASE language behind the region locale:
         # a real en-US install reports navigator.languages ['en-US', 'en'],
@@ -200,7 +375,48 @@ class Session:
             "timezone_id": self.timezone_id,
             "viewport": self.viewport,
         }
-        self.ctx = await self.browser.new_context(**ctx_opts)
+        # PERSISTENT FIRST, EPHEMERAL IF ANYTHING AT ALL GOES WRONG.
+        #
+        # Everything below this point is identical for both kinds of
+        # context, which is the property that keeps discovery and analysis
+        # out of this decision entirely: they are handed a BrowserContext
+        # either way and cannot tell which one they got.
+        profile = self._wanted_profile()
+        if profile is not None and _lease_profile(profile):
+            self._profile = profile
+            try:
+                profile.mkdir(parents=True, exist_ok=True)
+                self.ctx = await self._pw.chromium.launch_persistent_context(
+                    user_data_dir=str(profile),
+                    headless=opts["headless"],
+                    args=LAUNCH_ARGS + PERSISTENT_ARGS,
+                    **({"executable_path": opts["executable_path"]}
+                       if "executable_path" in opts else {}),
+                    **ctx_opts,
+                )
+                self._persistent = True
+                log.info(f"browser profile {profile.name} (persistent)")
+            except Exception as e:                    # noqa: BLE001
+                # A stale SingletonLock from a process that was killed, a
+                # corrupt profile, a permissions problem on the directory.
+                # None of these are worth failing a sweep for, and all of
+                # them are survivable by simply not being persistent.
+                log.warning(
+                    f"could not open persistent profile {profile.name} "
+                    f"({type(e).__name__}: {e}) -- running on a fresh context instead")
+                _release_profile(profile)
+                self._profile = None
+                self.ctx = None
+
+        if self.ctx is None:
+            self.browser = await self._pw.chromium.launch(**opts)
+            self.ctx = await self.browser.new_context(**ctx_opts)
+        else:
+            # BACKWARD COMPATIBILITY. A persistent context has no separate
+            # Browser object, but `stop()` and anything else reaching for
+            # `.browser` must keep working. Pointing it at the context is
+            # safe because stop() closes by identity, not by name.
+            self.browser = self.ctx
 
         # No hardware arguments any more: hardwareConcurrency/deviceMemory
         # are reported honestly, because an init script cannot reach Web
@@ -209,10 +425,101 @@ class Session:
         await self.ctx.add_init_script(build_init_js())
         from backend.sessions.cookies import normalize_cookies
 
+        # STORED COOKIES ARE ALWAYS INJECTED, persistent profile or not.
+        #
+        # It is tempting to skip this when the profile already carries a
+        # login, on the grounds that the profile's jar is newer. It is not
+        # worth it. The database is kept current by `sync_cookies` at every
+        # stop and at four explicit points in the two runners, so the two
+        # normally agree -- and where they DISAGREE, the database is the
+        # operator's intent: a freshly pasted jar, or a completed re-login.
+        # Trusting the profile there would mean pasting new cookies and
+        # watching nothing change, which is a far worse bug than writing a
+        # value that was already correct. `reset_profile` handles the other
+        # direction, wiping the device when the credentials under it change.
+        #
+        # This also means the cookie behaviour of a persistent run is
+        # byte-for-byte what it was before profiles existed.
         safe_cookies = normalize_cookies(self.cookies)
         await self.ctx.add_cookies(safe_cookies)
         await self.ctx.route("**/*", self._filter)
+        await self._warmup()
         return self.ctx
+
+    def _wanted_profile(self) -> Optional[Path]:
+        """The directory this session should reuse, or None to run
+        ephemeral.
+
+        None whenever there is nothing stable to key on. A Session with no
+        session id cannot have a profile of its own -- it would have to
+        share one with every other anonymous caller on that platform, which
+        is the collision the lease exists to prevent, except permanent.
+        """
+        from backend.config.settings import settings
+
+        if not settings.browser_persistent_profiles:
+            return None
+        if not self.session_id or not self.platform:
+            return None
+        return profile_dir_for(self.platform, self.session_id)
+
+    async def _warmup(self) -> None:
+        """Look at the home feed before going to work.
+
+        WHY. A real session does not open cold on a search results URL or a
+        stranger's profile; it starts somewhere ordinary and moves. One
+        short home-feed view also lets the platform do the token exchange it
+        expects a returning browser to do, which is the thing a cookie
+        replay never performs.
+
+        NEVER FATAL, AND NEVER A VERDICT. Every failure here is swallowed:
+        a warm-up that hits a checkpoint has still told us nothing the
+        health check does not already own, and turning it into an error
+        would let a courtesy page load fail a sweep. It is also skipped
+        outright for health checks (options.warmup=False) -- paying for two
+        page loads to answer one question, on an account already suspected
+        of being unwell, is the opposite of careful.
+        """
+        from backend.config.settings import settings
+
+        if not settings.browser_warmup_enabled:
+            return
+        if not getattr(self.o, "warmup", True):
+            return
+        if cancelled(self.o):
+            return
+        home = PLATFORM_HOME.get(self.platform)
+        if not home or self.ctx is None:
+            return
+
+        key = f"{self.platform}:{self.session_id or 'ephemeral'}"
+        gap = max(0.0, settings.browser_warmup_min_gap_minutes) * 60.0
+        last = _last_warm.get(key, 0.0)
+        if gap and (time.time() - last) < gap:
+            return
+        _last_warm[key] = time.time()
+
+        page = None
+        try:
+            page = await self.ctx.new_page()
+            await page.goto(home, wait_until="domcontentloaded", timeout=12000)
+            await asyncio.sleep(random.uniform(2.0, 3.8))
+            if cancelled(self.o):
+                return
+            # A wheel event, not a scrollTo: this is what makes the feed
+            # actually render its next slice, which is what triggers the
+            # token exchange worth being here for.
+            await page.mouse.wheel(0, random.randint(150, 320))
+            await asyncio.sleep(random.uniform(0.8, 1.5))
+        except Exception as e:                        # noqa: BLE001 - courtesy
+            log.debug(f"warm-up for {self.platform} did not complete (non-fatal): "
+                      f"{type(e).__name__}: {e}")
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:                     # noqa: BLE001
+                    pass
 
     async def _filter(self, route, request):
         url = request.url.lower()
@@ -277,16 +584,29 @@ class Session:
         """
         await self.sync_cookies()
 
-        for obj, meth in (
-            (self.ctx, "close"),
-            (self.browser, "close"),
-            (self._pw, "stop"),
-        ):
+        # CLOSED BY IDENTITY, NOT BY NAME. On a persistent context
+        # `self.browser IS self.ctx`, so walking the pair blindly would
+        # close the same object twice -- harmless today only because the
+        # second call is swallowed, which is a bad thing to depend on.
+        closers = [(self.ctx, "close")]
+        if self.browser is not None and self.browser is not self.ctx:
+            closers.append((self.browser, "close"))
+        closers.append((self._pw, "stop"))
+        for obj, meth in closers:
             if obj:
                 try:
                     await getattr(obj, meth)()
                 except Exception:
                     pass
+
+        # THE LEASE GOES BACK EVEN IF EVERY CLOSE ABOVE FAILED. A directory
+        # left leased is a session that can never use its own profile again
+        # for the life of the process, which degrades silently -- exactly
+        # the kind of failure that gets noticed months later, if ever.
+        if self._profile is not None:
+            _release_profile(self._profile)
+            self._profile = None
+        self._persistent = False
 
     async def pause(self, mult: float = 1.0):
         """Between-profile pacing, jittered and fatigued.

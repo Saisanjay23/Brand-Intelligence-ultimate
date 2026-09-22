@@ -64,6 +64,7 @@ from backend.database.repositories import profile_repository as profiles_db
 from backend.shared.imagefetch import ImageFetchError, allowed as _allowed
 from backend.shared.imagefetch import close as _close_fetcher
 from backend.shared.imagefetch import fetch_image
+from backend.shared.fast_http import close as _close_fast_http
 from backend.shared.logging import get_logger
 
 router = APIRouter(tags=["media"])
@@ -91,9 +92,11 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 async def close() -> None:
-    """Called from main.py's lifespan shutdown. Delegates: the session it
-    closes belongs to shared/imagefetch.py now."""
+    """Called from main.py's lifespan shutdown. Delegates: the sessions it
+    closes belong to shared/imagefetch.py (aiohttp) and shared/fast_http.py
+    (curl_cffi), the two clients an avatar fetch can go out through."""
     await _close_fetcher()
+    await _close_fast_http()
 
 
 def _err(status: int, detail: str) -> Response:

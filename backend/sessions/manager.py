@@ -21,6 +21,7 @@ from typing import NamedTuple, Optional
 from backend.config.settings import settings
 from backend.database.repositories import session_repository as sessions_db
 from backend.sessions.cookies import load_cookies, normalize_cookies
+from backend.shared import fast_http
 from backend.shared.errors import ConflictError, NotFoundError, ValidationError
 from backend.shared.logging import get_logger
 
@@ -231,7 +232,20 @@ def _public(s: dict, plat: object = None, health: Optional[dict] = None) -> dict
             "last_check_ok": bool(health.get("ok")) if fresh else None,
             "expires_at": _required_cookie_expiry(s, getattr(plat, "required_cookies", ()) or ()),
         }
+    # HOW THIS ACCOUNT AUTHENTICATES, never WHAT WITH. The values -- a
+    # password, a TOTP secret, a cookie -- are credentials and none of them
+    # appear here; only the presence of stored credentials does, which is
+    # what the Sessions panel needs to show a self-healing badge and to
+    # decide whether "Re-Login Now" is offered at all.
+    _platform_id = s.get("platform", "")
+    _can_login = bool(s.get("username")) and bool(s.get("password"))
+    _recovery = relogin_state(_platform_id, s["id"])
     return {**extra,
+        "auth_kind": ("auto-login" if _can_login
+                      else "api-key" if s.get("api_key") else "cookies"),
+        "can_relogin": _can_login and _platform_id in LOGIN_FLOW,
+        "relogin_running": _recovery["running"],
+        "relogin_attempts": _recovery["attempts"],
         "id": s["id"], "identifier": s["identifier"], "status": s["status"],
         "rate_limited_until": s["rate_limited_until"], "last_used": s["last_used"],
         "use_count": s.get("use_count", 0),
@@ -1058,7 +1072,11 @@ async def save_credentials(
 
     async def _do_login():
         try:
-            cookies = await run_auto_login(platform_id, username, password, two_factor_secret)
+            result = await run_auto_login(
+                platform_id, username, password, two_factor_secret,
+                session_id=item["id"],
+            )
+            cookies = result.cookies
             if cookies:
                 missing = [n for n in p.required_cookies if n not in {c["name"] for c in cookies}]
                 if missing:
@@ -1115,11 +1133,24 @@ async def save_api_key(platform_id: str, key: str, identifier: str = "") -> dict
     return await status(platform_id)
 
 
-async def update_session_credentials(platform_id: str, session_id: str, blob: str = "", api_key: str = "", identifier: Optional[str] = None) -> dict:
+async def update_session_credentials(
+    platform_id: str, session_id: str, blob: str = "", api_key: str = "",
+    identifier: Optional[str] = None, username: Optional[str] = None,
+    password: Optional[str] = None, two_factor_secret: Optional[str] = None,
+) -> dict:
     p = _get_platform(platform_id)
     fields: dict = {}
     if identifier is not None and identifier.strip():
         fields["identifier"] = identifier.strip()
+    # LOGIN CREDENTIALS, WHEN SUPPLIED, AND ONLY THEN. None means "not sent",
+    # which is different from "", and the difference matters: a form that
+    # leaves the password box empty because the operator is only renaming
+    # the account must not wipe the password that makes it self-healing.
+    # Sending an explicit "" is how you deliberately clear one.
+    for _name, _value in (("username", username), ("password", password),
+                          ("two_factor_secret", two_factor_secret)):
+        if _value is not None:
+            fields[_name] = _value.strip()
     if p.uses_api_key:
         if not api_key or not api_key.strip():
             raise ValidationError("empty API key")
@@ -1128,6 +1159,17 @@ async def update_session_credentials(platform_id: str, session_id: str, blob: st
         os.environ[p.api_key_env] = fields["api_key"]
     elif not p.env_keys:
         if not blob:
+            # Credentials on their own are a complete update: attaching a
+            # username and password to an account whose cookies are already
+            # good is exactly how a cookie-only session becomes self-healing.
+            if fields:
+                res = await sessions_db.update_session_credentials(
+                    platform_id, session_id, **fields)
+                if not res:
+                    raise NotFoundError(
+                        f"session {session_id!r} not found in {platform_id} pool")
+                log.info(f"{platform_id}: updated {session_id} ({', '.join(sorted(fields))})")
+                return await status(platform_id)
             raise ValidationError("empty cookie JSON")
         cookies = load_cookies(blob, p.cookie_domain)
         if not cookies:
@@ -1139,6 +1181,20 @@ async def update_session_credentials(platform_id: str, session_id: str, blob: st
     res = await sessions_db.update_session_credentials(platform_id, session_id, **fields)
     if not res:
         raise NotFoundError(f"session {session_id!r} not found in {platform_id} pool")
+    if "cookies" in fields:
+        # THE DEVICE GOES WITH THE CREDENTIALS. A persistent browser profile
+        # keeps its own copy of the previous login in localStorage and
+        # IndexedDB, so pasting a fresh export over a profile that still
+        # remembers being signed in as the old session is a browser holding
+        # two identities at once. Dropping the profile costs this account
+        # its device history once and is rebuilt on the next run.
+        #
+        # Deliberately NOT done by `refresh_cookies`, which writes the LIVE
+        # jar mid-run: those are the same credentials, rotated, and wiping
+        # the device on every sweep would defeat the entire point.
+        from backend.stealth.browser import reset_profile
+
+        reset_profile(platform_id, session_id)
     log.info(f"{platform_id}: updated session credentials for {session_id}")
     return await status(platform_id)
 
@@ -1235,7 +1291,9 @@ async def launch_login(platform_id: str, timeout_s: int = 300, identifier: str =
 
 # ---------- background health monitor ----------
 
-async def verify_session_item(platform_id: str, cookies: list[dict]) -> tuple[bool, str, bool]:
+async def verify_session_item(
+    platform_id: str, cookies: list[dict], session_id: str = "",
+) -> tuple[bool, str, bool]:
     """Exercises the platform's own check_session() against ONE specific
     set of cookies, the same live check an analysis job runs at its own
     start, just invoked here without a job attached.
@@ -1248,14 +1306,68 @@ async def verify_session_item(platform_id: str, cookies: list[dict]) -> tuple[bo
     checkpoint wall. Only a conclusive result is trustworthy evidence that
     the SESSION (not the network) is the problem; a transient connectivity
     blip must never be recorded as "this session is now expired."
+
+    A FAST HTTP PRE-CHECK RUNS FIRST, AND IT IS ALLOWED TO END THIS CALL IN
+    EXACTLY ONE DIRECTION.
+
+    `shared/fast_http.check_session_alive` costs ~150ms against a Chromium
+    launch plus a context plus a navigation plus a 2.5s settle, and on
+    Facebook and Instagram it reads the SAME server-side redirect the
+    browser check ends up reading. When it comes back positively confirming
+    a live session, that is the answer and the browser is not launched.
+
+    WHEN IT SAYS DEAD, THE BROWSER STILL RUNS. This is deliberate and it is
+    not timidity. The two verdicts are not symmetrical:
+
+        a wrong "alive"  costs one stale row in the pool, which the next
+                         real job corrects the moment it uses the session --
+                         every runner already calls mark_session_failed on a
+                         failed visit.
+        a wrong "dead"   quarantines a working account. Enough of those and
+                         the pool is empty, every sweep returns nothing, and
+                         nothing in the product distinguishes that from "the
+                         client has no impersonators".
+
+    A login wall served to a datacenter IP, a bot challenge, a rate limit --
+    all of them look exactly like a dead session over plain HTTP, and none
+    of them are. So the HTTP probe may shorten the happy path and may never
+    condemn an account on its own; only the browser check does that, exactly
+    as it did before this pre-check existed.
     """
     from backend.platforms import registry
     from backend.platforms.scan_options import ScanOptions
 
+    if settings.session_fast_check_enabled:
+        try:
+            verdict = await fast_http.check_session_alive(platform_id, cookies)
+        except Exception as e:                       # noqa: BLE001 - never fatal
+            verdict = fast_http.SessionVerdict(None, f"{type(e).__name__}: {e}")
+        if verdict.alive is True:
+            log.info(
+                f"{platform_id}: session confirmed live over HTTP "
+                f"({verdict.reason}) -- no browser needed")
+            return True, "", True
+        if verdict.alive is False:
+            # Not acted on by itself. Logged because it is real evidence and
+            # the browser check that follows is about to agree or disagree
+            # with it, and an operator comparing the two lines is how a
+            # probe that has drifted gets noticed.
+            log.info(
+                f"{platform_id}: HTTP probe says the session is dead "
+                f"({verdict.reason}) -- confirming in a browser before acting")
+
     plat = registry.get(platform_id)
-    options = ScanOptions(evidence=None, delay=0, concurrency=1, headful=False)
+    # warmup=False: a probe that warms first pays for two page loads to
+    # answer one question, and puts an extra visit on an account already
+    # suspected of being unwell. See stealth/browser.py::Session._warmup.
+    options = ScanOptions(
+        evidence=None, delay=0, concurrency=1, headful=False, warmup=False)
     try:
-        scraper = plat.scraper()(options, cookies)
+        # `session_id` decides which persistent browser profile this check
+        # opens. Passing it means the probe arrives on the SAME device the
+        # account works from -- a check that logs in from a blank profile is
+        # itself the "new device" event it is trying to detect.
+        scraper = plat.scraper()(options, cookies, session_id=session_id)
     except Exception as e:
         return False, f"could not construct scraper: {type(e).__name__}: {e}", False
     try:
@@ -1323,7 +1435,8 @@ async def _verify_credential_item(platform_id: str, item: dict) -> tuple[bool, s
     else:
         return False, f"{platform_id} is not a credential-authed platform", False
 
-    options = ScanOptions(evidence=None, delay=0, concurrency=1, headful=False)
+    options = ScanOptions(
+        evidence=None, delay=0, concurrency=1, headful=False, warmup=False)
     try:
         scraper = plat.scraper()(options, [])
     except Exception as e:
@@ -1342,6 +1455,191 @@ async def _verify_credential_item(platform_id: str, item: dict) -> tuple[bool, s
             await scraper.stop()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------- self-healing login
+#
+# WHEN AN ACCOUNT WITH STORED CREDENTIALS IS FOUND LOGGED OUT, SIGN IT BACK IN.
+#
+# THE THREE GUARDS BELOW ARE THE WHOLE FEATURE. Automated re-login without
+# them is not self-healing, it is a scripted password attempt every thirty
+# minutes against an account the platform is already unhappy with -- which
+# is how an account stops being recoverable at all, permanently, by the tool
+# that was trying to rescue it. In order of importance:
+#
+#   NOT WHILE IT IS IN USE   a job holding this account means a browser is
+#                            already open on it. A second one from the same
+#                            IP is this module's most-repeated warning.
+#   A COOLDOWN IN HOURS      the floor between two attempts on ONE account.
+#                            The monitor wakes every 30 minutes; without
+#                            this, a permanently wrong password becomes 48
+#                            login attempts a day.
+#   AN ATTEMPT CEILING       self-healing that cannot heal must stop and let
+#                            a person look. A CAPTCHA, a checkpoint or a
+#                            changed password will never be fixed by trying
+#                            again, and each retry makes it worse.
+#
+# Both counters are in-process. A restart forgives them, which is the
+# forgiving direction and acceptable: the cooldown's real job is to stop a
+# tight loop inside one long-running process, and an operator restarting the
+# service is a person paying attention.
+_relogin_attempts: dict[str, int] = {}
+_relogin_last: dict[str, float] = {}
+_relogin_running: set[str] = set()
+
+
+def relogin_state(platform_id: str, session_id: str) -> dict:
+    """What the self-healer currently thinks about one account. Read by the
+    Sessions panel so "it is not retrying" is visible rather than mysterious."""
+    key = f"{platform_id}:{session_id}"
+    return {
+        "attempts": _relogin_attempts.get(key, 0),
+        "last_attempt": _relogin_last.get(key, 0.0),
+        "running": key in _relogin_running,
+    }
+
+
+def _relogin_blocked(platform_id: str, session_id: str, *, force: bool) -> str:
+    """Why this account may not be re-logged-in right now, or "" for go.
+
+    `force` is an operator pressing the button: it waives the cooldown and
+    the attempt ceiling, because a person who has just fixed the password is
+    exactly the case those two exist to wait for. It does NOT waive the
+    in-use check, which is about not getting the account challenged.
+    """
+    key = f"{platform_id}:{session_id}"
+    if key in _relogin_running:
+        return "a re-login is already running for this account"
+    if _session_in_use(platform_id, session_id):
+        return "a job is using this account right now"
+    if force:
+        return ""
+    if not settings.session_auto_relogin:
+        return "automatic re-login is switched off"
+    waited = _now() - _relogin_last.get(key, 0.0)
+    cooldown = max(0.0, settings.session_relogin_cooldown_minutes) * 60.0
+    if _relogin_last.get(key) and waited < cooldown:
+        return (f"cooling off -- {(cooldown - waited) / 60:.0f} more minute(s) "
+                "before another automatic attempt")
+    if _relogin_attempts.get(key, 0) >= max(1, settings.session_relogin_max_attempts):
+        return (f"gave up after {_relogin_attempts[key]} automatic attempt(s) -- "
+                "this needs a person")
+    return ""
+
+
+async def _perform_relogin(platform_id: str, session_id: str, item: dict) -> tuple[bool, str]:
+    """One attempt. Returns (recovered, detail). Never raises."""
+    from backend.stealth.auto_login import run_auto_login
+
+    key = f"{platform_id}:{session_id}"
+    identifier = item.get("identifier") or session_id
+    p = _get_platform(platform_id)
+    _relogin_running.add(key)
+    _relogin_last[key] = _now()
+    try:
+        log.info(
+            f"[SESSION_RECOVERY] {platform_id} session '{identifier}' is logged out -- "
+            "starting automated re-login")
+        result = await run_auto_login(
+            platform_id,
+            str(item.get("username") or ""),
+            str(item.get("password") or ""),
+            str(item.get("two_factor_secret") or ""),
+            session_id=session_id,
+        )
+        cookies = normalize_cookies(result.cookies, p.cookie_domain)
+        missing = [n for n in p.required_cookies if n not in {c["name"] for c in cookies}]
+        if missing:
+            detail = (f"signed in but {', '.join(missing)} never appeared -- "
+                      "the login probably stopped at a checkpoint")
+            _relogin_attempts[key] = _relogin_attempts.get(key, 0) + 1
+            log.warning(f"[SESSION_RECOVERY] {platform_id}/{identifier}: {detail}")
+            return False, detail
+
+        # Written through the REPOSITORY, not through this module's own
+        # `update_session_credentials`: that one resets the browser profile,
+        # which is the last thing wanted here. The login just happened
+        # INSIDE that profile, and the device it established is the point.
+        await sessions_db.update_session_credentials(
+            platform_id, session_id, cookies=cookies)
+        _relogin_attempts.pop(key, None)
+        log.info(
+            f"[SESSION_RECOVERY] {platform_id} session '{identifier}' recovered -- "
+            f"{len(cookies)} fresh cookie(s), back in the pool")
+        return True, ""
+    except Exception as e:                            # noqa: BLE001 - never fatal
+        _relogin_attempts[key] = _relogin_attempts.get(key, 0) + 1
+        detail = f"{type(e).__name__}: {e}"
+        log.error(
+            f"[SESSION_RECOVERY] {platform_id}/{identifier}: automated re-login "
+            f"failed ({detail}) -- leaving the existing quarantine in place")
+        try:
+            await sessions_db.update_item(
+                platform_id, session_id,
+                last_error=f"automatic re-login failed: {detail}")
+        except Exception:                             # noqa: BLE001
+            pass
+        return False, detail
+    finally:
+        _relogin_running.discard(key)
+
+
+async def maybe_auto_relogin(platform_id: str, session_id: str) -> bool:
+    """Start a background re-login for a logged-out account, if it is allowed.
+
+    Returns whether one was STARTED, not whether it worked -- the caller is
+    the health monitor, which must not sit and wait for a browser to finish
+    a sign-in before checking the next account in its batch.
+
+    A failed attempt changes nothing: the quarantine the caller already
+    applied stays exactly as it was, which is the fallback the plan asks for
+    and also simply what happens when nothing here succeeds.
+    """
+    if platform_id not in LOGIN_FLOW:
+        return False
+    if not settings.session_auto_relogin:
+        return False
+    try:
+        item = await sessions_db.get_item(platform_id, session_id)
+    except Exception:                                 # noqa: BLE001
+        return False
+    if not item or not (item.get("username") and item.get("password")):
+        return False        # a cookie-only account: nothing to sign in with
+    if blocked := _relogin_blocked(platform_id, session_id, force=False):
+        log.info(
+            f"[SESSION_RECOVERY] {platform_id}/{item.get('identifier') or session_id}: "
+            f"not re-logging in -- {blocked}")
+        return False
+
+    async def _bg() -> None:
+        await _perform_relogin(platform_id, session_id, item)
+
+    asyncio.create_task(_bg())
+    return True
+
+
+async def relogin_now(platform_id: str, session_id: str) -> dict:
+    """The Sessions panel's "Re-Login Now" button: one attempt, right now,
+    waiting for the answer so the operator sees a real result rather than a
+    row that may or may not change later.
+
+    Waives the cooldown and the attempt ceiling (a person pressing this has
+    usually just fixed whatever was wrong) but never the in-use check.
+    """
+    item = await sessions_db.get_item(platform_id, session_id)
+    if item is None:
+        raise NotFoundError(f"{platform_id}: session {session_id!r} not in pool")
+    if platform_id not in LOGIN_FLOW:
+        raise ConflictError(f"{platform_id} does not support automated login")
+    if not (item.get("username") and item.get("password")):
+        raise ConflictError(
+            f"{item.get('identifier') or session_id} has no stored credentials -- "
+            "add a username and password to enable automated login")
+    if blocked := _relogin_blocked(platform_id, session_id, force=True):
+        raise ConflictError(blocked)
+
+    ok, detail = await _perform_relogin(platform_id, session_id, item)
+    return {"ok": ok, "detail": detail, "session": await status(platform_id)}
 
 
 async def _record_item_result(
@@ -1380,6 +1678,13 @@ async def _record_item_result(
     # a session's failure count after the first strike.
     await mark_session_failed(platform_id, session_id, "expired", detail=detail)
     log.warning(f"{platform_id}/{identifier}: session went bad -- {detail}")
+    # QUARANTINE FIRST, THEN TRY TO HEAL. Deliberately after
+    # mark_session_failed, not instead of it: the account is out of the pool
+    # from this instant either way, so a re-login that fails, is refused, or
+    # never starts leaves exactly the behaviour this module had before --
+    # quarantined, with an incident raised. Recovery can only ever put a
+    # session BACK; it cannot keep a broken one in circulation.
+    await maybe_auto_relogin(platform_id, session_id)
 
 
 async def _record_platform_summary(platform_id: str) -> None:
@@ -1445,7 +1750,7 @@ async def verify_session(platform_id: str) -> tuple[bool, str, Optional[tuple[st
     if not picked:
         return False, "no available sessions in the pool to check", None, True
     session_id, identifier, cookies = picked[0]
-    ok, detail, conclusive = await verify_session_item(platform_id, cookies)
+    ok, detail, conclusive = await verify_session_item(platform_id, cookies, session_id)
     return ok, detail, (session_id, identifier), conclusive
 
 
@@ -1490,7 +1795,8 @@ async def check_item(platform_id: str, session_id: str) -> dict:
     else:
         if not item.get("cookies"):
             return {"ok": False, "detail": "no cookies saved for this account yet", "conclusive": True}
-        ok, detail, conclusive = await verify_session_item(platform_id, item["cookies"])
+        ok, detail, conclusive = await verify_session_item(
+            platform_id, item["cookies"], session_id)
 
     await _record_item_result(platform_id, session_id, item["identifier"], ok, detail, conclusive)
     await _record_platform_summary(platform_id)
@@ -1521,7 +1827,8 @@ async def check_all_once() -> dict[str, dict]:
                     continue
                 ok, detail, conclusive = await _verify_credential_item(platform_id, item)
             else:
-                ok, detail, conclusive = await verify_session_item(platform_id, cookies)
+                ok, detail, conclusive = await verify_session_item(
+                    platform_id, cookies, session_id)
             await _record_item_result(platform_id, session_id, identifier, ok, detail, conclusive)
             results.append({"identifier": identifier, "ok": ok, "detail": detail})
         out[platform_id] = {"checked": len(results), "results": results}
@@ -1573,8 +1880,24 @@ async def _monitor_loop() -> None:
     while True:
         try:
             await check_all_once()
-            from backend.services.session_canary_service import check_token_expiries
+            from backend.services.session_canary_service import (
+                check_token_expiries, probe_pool_liveness,
+            )
             await check_token_expiries()
+            # THE HALF `check_all_once` ABOVE CANNOT COVER. That sweep opens
+            # a real browser, so it is rationed: BATCH_SIZE sessions per
+            # platform per pass, skipping any proven fresh within
+            # PROVEN_FRESH_S. A pool bigger than the batch therefore cycles
+            # over several passes, and a session the platform killed early
+            # -- a password change, a checkpoint, a rotation on their side --
+            # sits in the pool looking healthy until its turn comes round.
+            #
+            # This pass costs one ordinary HTTPS request per account and so
+            # can cover EVERY session every time. It decides nothing on its
+            # own: a dead answer is handed to `check_item`, the same browser
+            # check, just started sooner than the rotation would have. Its
+            # own try/except keeps it from costing the sweep above it.
+            await probe_pool_liveness()
             # CAN WE STILL LOG IN is only half the question; the other half
             # is whether scraping still works once we have. A dead parser is
             # silent where a dead session is loud, so it gets checked on the
@@ -1586,6 +1909,20 @@ async def _monitor_loop() -> None:
             await engine_health_service.check_once()
             if purged := await purge_stale_dead_sessions():
                 log.info(f"session cleanup: purged {purged} stale dead session(s)")
+            # Disk housekeeping for the persistent browser profiles. One per
+            # pooled account per platform, tens to hundreds of megabytes
+            # each, on a machine nobody is watching. Synchronous file IO, so
+            # it runs in a thread rather than stalling the loop this shares
+            # with every running sweep.
+            try:
+                from backend.stealth.browser import prune_stale_profiles
+
+                pruned = await asyncio.to_thread(
+                    prune_stale_profiles, settings.browser_profile_retention_days)
+                if pruned:
+                    log.info(f"session cleanup: removed {pruned} unused browser profile(s)")
+            except Exception as e:                    # noqa: BLE001 - housekeeping
+                log.warning(f"browser profile cleanup skipped: {type(e).__name__}: {e}")
         except Exception as e:
             log.error(f"session monitor sweep failed: {type(e).__name__}: {e}")
         # Jittered so the sweep does not fire on the same wall-clock offset
