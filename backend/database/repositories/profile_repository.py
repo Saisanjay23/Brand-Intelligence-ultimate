@@ -471,6 +471,7 @@ async def save(
     client_id: str, platform: str, phase: str, fields: dict,
     *, url: str, entity_id: str = "", keyword: str = "", matched_keyword: str = "",
     initial_status: str = "pending", retry_pending: bool = False,
+    rank: int = 0,
 ) -> bool:
     """Upsert one profile. Returns True when newly seen.
 
@@ -489,6 +490,27 @@ async def save(
     a hand-typed URL is itself the analyst's approval, so it should reach
     analysis without an extra click, but that must never silently
     override a decision an earlier sweep's card already got).
+
+    `rank` is WHERE THE PLATFORM PUT THIS PROFILE in its own results for
+    the keyword that found it -- 1 for the first hit, 2 for the second. It
+    is stored as `search_rank` and is what the discovery grid orders by.
+
+    WHY IT HAS TO BE STORED RATHER THAN INFERRED. The grid used to read
+    platform order off ascending `_id`, because insertion order and platform
+    order were the same thing while one account swept one keyword at a time.
+    Sharding the keyword list across several accounts broke that: three
+    workers write concurrently, so `_id` order became an interleaving of
+    three keywords and the grid stopped reflecting what any platform
+    actually returned. A position that is recorded cannot be scrambled by
+    who happened to write first.
+
+    WRITTEN WITH $min, NOT $set. A profile can be found by several keywords
+    (2.3% of this dataset), and `$set` would leave it wherever the LAST
+    sweep to touch it happened to rank it -- so a profile that came first
+    for one keyword would sink because a later, unrelated keyword found it
+    fortieth. `$min` keeps its best showing, which is the honest answer to
+    "how prominent is this profile", and is stable regardless of the order
+    sweeps happen to run in. 0 means "not known" and writes nothing at all.
 
     `retry_pending` says "this job is going to visit this URL again", and
     exists solely to stop `analysis_attempts` being spent twice for the
@@ -550,6 +572,13 @@ async def save(
         "$currentDate": {"last_seen": True},
         "$addToSet": {"urls": add_urls},
     }
+    # Deliberately NOT routed through the `owned` allowlist above: Mongo
+    # refuses an update that names one field under two operators, and this
+    # one needs $min rather than $set (see the docstring). Discovery-phase
+    # only -- an analysis pass re-reads a profile it was handed and has no
+    # search results to have a position in.
+    if phase != PHASE_ANALYSIS and isinstance(rank, int) and rank > 0:
+        update["$min"] = {"search_rank": rank}
     # phase only ever advances, a sweep that rediscovers an
     # already-scored profile must not demote it back to "discovery"
     if phase == PHASE_ANALYSIS:
@@ -858,9 +887,9 @@ async def save_many(
     """Each item is `{**fields, "url":..., "entity_id":..., "keyword":...}`.
     -> (saved, newly seen). One bad row never sinks the batch.
 
-    `retry_pending` and `matched_keyword` may ride along on an item like the
-    other control keys: popped here so they reach `save` as arguments and
-    never land in the document itself.
+    `retry_pending`, `matched_keyword` and `rank` may ride along on an item
+    like the other control keys: popped here so they reach `save` as
+    arguments and never land in the document itself.
     """
     saved = new = 0
     for item in items:
@@ -870,10 +899,11 @@ async def save_many(
         keyword = item.pop("keyword", "")
         matched_keyword = item.pop("matched_keyword", "")
         retry_pending = bool(item.pop("retry_pending", False))
+        rank = int(item.pop("rank", 0) or 0)
         try:
             if await save(client_id, platform, phase, item, url=url, entity_id=entity_id,
                           keyword=keyword, matched_keyword=matched_keyword,
-                          retry_pending=retry_pending):
+                          retry_pending=retry_pending, rank=rank):
                 new += 1
             saved += 1
         except Exception as e:
@@ -1060,6 +1090,49 @@ def _build_query(
     return q
 
 
+def build_sort_spec(
+    phase: Optional[str], status: Optional[str], sort_field: str, sort_dir: int,
+) -> list[tuple[str, int]]:
+    """The grid's row order, as data rather than three lines buried in a
+    query builder -- so the rule can be read, and tested, without a database.
+
+    THREE KEYS, IN THIS ORDER, AND EACH EARNS ITS PLACE:
+
+      logo_similarity  a profile wearing the client's own logo goes to the
+                       very top. That is the entire point of matching logos,
+                       and it outranks position because a visual match is
+                       stronger evidence than a search engine's opinion.
+                       Descending puts a MISSING value last, which is what
+                       keeps unmatched profiles below matched ones. Inert
+                       until somebody uploads a reference logo.
+
+      search_rank      where the PLATFORM itself put this profile for the
+                       keyword that found it. `_id` used to stand in for
+                       this and stopped being able to when discovery began
+                       sharding keywords across several accounts -- three
+                       workers writing at once interleave their results, so
+                       insertion order mixes keywords. A recorded position
+                       cannot be scrambled by who wrote first.
+
+      _id / last_seen  the original key, kept as the final tie-break so rows
+                       with equal rank -- or no rank at all -- fall back to
+                       exactly the order they had before any of this.
+
+    THE REJECTED VIEW IS EXCLUDED, as it always was: its ordering exists so
+    the profile an analyst JUST rejected sits at the top, and floating an
+    old logo match or a low search position over that would defeat the one
+    thing that view is for.
+    """
+    if phase == PHASE_DISCOVERY and status == "rejected":
+        return [(sort_field, sort_dir)]
+    if phase == PHASE_DISCOVERY:
+        return [("logo_similarity", -1), ("search_rank", 1), (sort_field, sort_dir)]
+    # Analysis views sort by recency and have no search position of their
+    # own -- an analysis pass re-reads a profile it was handed rather than
+    # finding it in a result list.
+    return [("logo_similarity", -1), (sort_field, sort_dir)]
+
+
 async def find(
     client_id: str, *, platform: Optional[str] = None, status: Optional[str] = None,
     phase: Optional[str] = None, limit: int = 100, offset: int = 0,
@@ -1136,9 +1209,8 @@ async def find(
     # The rejected view is excluded on purpose: its ordering exists so the
     # profile an analyst JUST rejected is at the top, and floating an old
     # logo match over that would defeat the one thing that view is for.
-    sort_spec = [(sort_field, sort_dir)]
-    if not (phase == PHASE_DISCOVERY and status == "rejected"):
-        sort_spec = [("logo_similarity", -1), (sort_field, sort_dir)]
+    sort_spec = build_sort_spec(phase, status, sort_field, sort_dir)
+
 
     # ALLOW DISK USE FOR THE SORT -- the difference between a slow page and
     # a broken one.
@@ -1538,8 +1610,15 @@ async def ensure_indexes() -> None:
         # blocking in-memory sort of the client's whole filtered set. Leading
         # with the equality fields the query always carries lets Mongo walk
         # this index in order and take the page directly.
-        ([("client_id", 1), ("status", 1), ("logo_similarity", -1), ("_id", 1)],
-         "client_status_logo_id"),
+        # `search_rank` sits between them now -- the position the platform
+        # itself gave a profile, which is what the grid orders by since
+        # keyword sharding stopped ascending _id from meaning that. Without
+        # it in the index, every listing went back to a blocking in-memory
+        # sort of the client's whole filtered set, which is exactly what
+        # this index was added to stop.
+        ([("client_id", 1), ("status", 1), ("logo_similarity", -1),
+          ("search_rank", 1), ("_id", 1)],
+         "client_status_logo_rank_id"),
         # The same, for the analysis views, which sort by last_seen instead.
         ([("client_id", 1), ("phase", 1), ("logo_similarity", -1), ("last_seen", -1)],
          "client_phase_logo_seen"),

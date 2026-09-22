@@ -635,6 +635,72 @@ class PlatformSweep:
     # >1 means the keyword list was split across accounts -- see
     # _MAX_SESSIONS_PER_PLATFORM.
     workers: int = 0
+    # WHAT EACH WORKER IS DOING, ONE SLOT EACH.
+    #
+    # `current_keyword` / `current_tab` above are a SINGLE field, and with
+    # more than one worker every one of them wrote to it -- so the chip
+    # named whichever coroutine happened to write last and a sweep that was
+    # working perfectly read as if it were skipping keywords at random.
+    # That flicker is the reason parallel keyword sweeping was kept off by
+    # default, not the parallelism itself.
+    #
+    # One slot per worker fixes it at the source: each worker owns an index
+    # and never writes outside it, so nothing races and the UI can show
+    # three accounts doing three different things, truthfully.
+    #
+    # Empty for a single-worker sweep, which keeps the old fields as the
+    # only thing anything has to read in the case that is still the norm.
+    worker_slots: list[dict] = field(default_factory=list)
+
+    def note_worker(
+        self, index: int, *, account: str = "", keyword: str = "",
+        tab: str = "", step: str = "",
+    ) -> None:
+        """Record what one worker is on, and keep the legacy fields honest.
+
+        WITH ONE WORKER this writes `current_keyword`/`current_tab`/
+        `current_step` exactly as the code it replaces did -- byte for byte
+        the same values -- so every existing reader, the UI chip included,
+        is completely unaffected by this existing.
+
+        WITH SEVERAL it stops writing them a keyword at all, because there
+        is no longer one true answer and the old behaviour was to pick a
+        random one. The summary that replaces it is the honest statement:
+        how many accounts, and how far through the list they are between
+        them.
+        """
+        while len(self.worker_slots) <= index:
+            self.worker_slots.append({})
+        self.worker_slots[index] = {
+            "account": account, "keyword": keyword, "tab": tab,
+            "step": step, "started_at_ts": time.time(),
+        }
+
+        active = [s for s in self.worker_slots if s.get("keyword")]
+        if len(self.worker_slots) <= 1:
+            self.current_keyword = keyword
+            self.current_tab = tab
+            self.current_step = step
+            self.item_started_at_ts = time.time()
+            return
+        self.current_keyword = ""
+        self.current_tab = ""
+        self.current_step = (
+            f"{len(active) or self.workers} accounts sweeping in parallel "
+            f"-- {self.keywords_done}/{self.keywords_total} done"
+        )
+        # The OLDEST thing still in flight, so the elapsed timer beside the
+        # chip keeps meaning "how long has the slowest of these been going",
+        # rather than resetting every time any worker moves on.
+        starts = [s["started_at_ts"] for s in active if s.get("started_at_ts")]
+        self.item_started_at_ts = min(starts) if starts else None
+
+    def clear_workers(self) -> None:
+        self.worker_slots = []
+        self.current_keyword = ""
+        self.current_tab = ""
+        self.current_step = ""
+        self.item_started_at_ts = None
 
     def to_dict(self) -> dict:
         return {
@@ -649,6 +715,7 @@ class PlatformSweep:
             "started_at_ts": self.started_at_ts,
             "finished_at_ts": self.finished_at_ts,
             "workers": self.workers,
+            "worker_slots": self.worker_slots,
         }
 
 
@@ -1141,6 +1208,7 @@ class DiscoveryRunner:
 
         want = _sessions_wanted(platform_id, len(items))
         prog.workers = 0
+        prog.worker_slots = []
         setup_error = ""
         worker_error = ""
         rounds = 0
@@ -1174,12 +1242,18 @@ class DiscoveryRunner:
                         f"{len(claimed)} sessions in parallel")
 
                 prog.workers = len(claimed)
+                # Sized up front so a worker that has not reached its first
+                # keyword yet still occupies a slot -- otherwise the summary
+                # counts only the ones that got going first and reads as if
+                # the sweep were smaller than it is.
+                prog.worker_slots = [{} for _ in claimed]
                 results = await asyncio.gather(
                     *(self._keyword_worker(job, run, plat_obj, session_item, worker_index)
                       for worker_index, session_item in enumerate(claimed)),
                     return_exceptions=True,
                 )
                 prog.workers = 0
+                prog.worker_slots = []
                 for result in results:
                     if isinstance(result, BaseException):
                         # A worker's SETUP failed (its own session was
@@ -1198,17 +1272,11 @@ class DiscoveryRunner:
             # The platform fell over with work still queued. Whatever it
             # never reached is owed, by name.
             await self._abandon(job, run, prog.note)
-            prog.current_keyword = ""
-            prog.current_tab = ""
-            prog.current_step = ""
-            prog.item_started_at_ts = None
+            prog.clear_workers()
             prog.finished_at_ts = time.time()
             return
 
-        prog.current_keyword = ""
-        prog.current_tab = ""
-        prog.current_step = ""
-        prog.item_started_at_ts = None
+        prog.clear_workers()
         prog.finished_at_ts = time.time()
 
         if job.cancel.is_set():
@@ -1571,10 +1639,9 @@ class DiscoveryRunner:
                                 "cancelled before this tab was reached")
                             resolved.add(tab)
                             return ""
-                        prog.current_keyword = keyword
-                        prog.current_tab = tab
-                        prog.current_step = f"Searching {tab.upper()} tab..."
-                        prog.item_started_at_ts = time.time()
+                        prog.note_worker(
+                            worker_index, account=label, keyword=keyword, tab=tab,
+                            step=f"Searching {tab.upper()} tab...")
                         t0 = time.time()
                         cap = _resolve_cap(
                             platform_id, tab, kw_type, run.max_results,
@@ -1648,9 +1715,24 @@ class DiscoveryRunner:
                             # delivered, and the post-sweep save picks it up
                             # exactly as it would for an engine that never
                             # streamed at all.
+                            # WHERE THE PLATFORM PUT EACH OF THESE, counted
+                            # from the start of THIS keyword's results.
+                            # `delivered` already holds everything streamed
+                            # for this keyword, so its size is how many came
+                            # before -- which makes the numbering continuous
+                            # across every streamed batch and the final save
+                            # below, without either needing to know about
+                            # the other.
+                            #
+                            # Recorded rather than inferred from insert order
+                            # because sharding the keyword list across
+                            # accounts means several workers write at once;
+                            # see profile_repository.save's `rank`.
+                            _base = len(delivered)
                             field_rows = [
-                                row_to_fields(r, parent, keyword, targets=targets)
-                                for r in fresh
+                                {**row_to_fields(r, parent, keyword, targets=targets),
+                                 "rank": _base + i + 1}
+                                for i, r in enumerate(fresh)
                             ]
                             saved, new = await profiles_db.save_many(
                                 job.group_id, platform_id, profiles_db.PHASE_DISCOVERY,
@@ -1770,9 +1852,17 @@ class DiscoveryRunner:
                             # about whether it impersonates Gautam Adani. See
                             # shared/keywords.py's module docstring; this is the
                             # PARENT/CHILDREN split it exists to express.
+                            # Continues the numbering the streaming path
+                            # above started: `hits` is what streaming did NOT
+                            # already bank, and `delivered` is what it did,
+                            # so these carry on from there in the engine's
+                            # own order. For a platform that never streams,
+                            # `delivered` is empty and this is simply 1..N.
+                            _base = len(delivered)
                             rows = [
-                                row_to_fields(h, parent, keyword, targets=targets)
-                                for h in hits
+                                {**row_to_fields(h, parent, keyword, targets=targets),
+                                 "rank": _base + i + 1}
+                                for i, h in enumerate(hits)
                             ]
                             saved, new = await profiles_db.save_many(
                                 job.group_id, platform_id, profiles_db.PHASE_DISCOVERY,

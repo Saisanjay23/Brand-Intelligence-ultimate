@@ -158,3 +158,54 @@ class TestCapResolution:
                             {"individual": {"twitter": 30}}, {}) == 30
         assert _resolve_cap("twitter", "people", "individual", 100, {}, {}) == 100
         assert _resolve_cap("twitter", "people", "individual", 0, {}, {}) == 0
+
+
+# -------------------------------------- a status code is a number, not text
+
+
+class TestStatusCodesAreNotSubstrings:
+    """THE DEFECT THIS PINS, found by reading and reproduced before the fix.
+
+    "401" and "403" used to sit in the plain token tuple, matched with `in`.
+    That matches those three digits ANYWHERE in the text -- and the text is
+    error messages, which routinely carry entity ids:
+
+        "could not resolve entity 100403123456789"  -> "expired"
+        "profile 401234567890123 has no name"       -> "expired"
+
+    Both are ordinary extraction failures on a perfectly good session. Both
+    took that account out of the pool via mark_session_failed(..., "expired")
+    and then told whoever looked that its cookies had expired -- so the fix
+    they would reach for (paste a fresh export) was for a problem that never
+    existed, while the real one went uninvestigated.
+
+    A Facebook id is 15-16 digits, so about one in eighty contains "403" by
+    chance. This is the same class of mistake `_URL_RE` already guards
+    against for "login" in a URL path, applied to the numbers.
+    """
+
+    @pytest.mark.parametrize("message", [
+        "could not resolve entity 100403123456789",
+        "RuntimeError: profile 401234567890123 has no name",
+        "TimeoutError: Timeout 40300ms exceeded",
+        "read 42977 bytes",
+    ])
+    def test_an_id_that_merely_contains_a_status_code_is_not_a_dead_session(
+            self, message):
+        assert classify_failure(message) is None, (
+            f"{message!r} quarantines a healthy session")
+
+    @pytest.mark.parametrize("message,expected", [
+        ("http-403", "expired"),
+        ("http-401", "expired"),
+        ("HTTP 401 Unauthorized", "expired"),
+        ("youtube search 403: keyInvalid", "expired"),
+        ("403 Forbidden", "expired"),
+        ("http-429", "rate_limited"),
+    ])
+    def test_a_real_status_code_still_reads_as_one(self, message, expected):
+        assert classify_failure(message) == expected
+
+    def test_transient_codes_are_bounded_the_same_way(self):
+        assert is_transient("Server answered 503") is True
+        assert is_transient("entity 150312345678 has no name") is False

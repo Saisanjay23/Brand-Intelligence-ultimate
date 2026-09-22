@@ -39,6 +39,20 @@ DEAD_STATES = {"expired", "checkpointed", "unreadable"}
 # quarantined an account that was never actually broken.
 PENDING_STATES = {"running_login"}
 
+# Background tasks this module starts and nobody awaits. HELD ON PURPOSE:
+# asyncio keeps only a WEAK reference to a running task, so a bare
+# create_task can be collected mid-flight and the work simply stops, with
+# no error anywhere -- a re-login that vanishes between "starting" and any
+# outcome at all. Discarding on completion keeps the set from growing.
+_background: set = set()
+
+
+def _spawn(coro) -> None:
+    task = asyncio.create_task(coro)
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+
+
 # where a manual login starts, and the cookie that proves it worked
 LOGIN_FLOW = {
     "facebook": ("https://www.facebook.com/login", "c_user"),
@@ -239,13 +253,39 @@ def _public(s: dict, plat: object = None, health: Optional[dict] = None) -> dict
     # decide whether "Re-Login Now" is offered at all.
     _platform_id = s.get("platform", "")
     _can_login = bool(s.get("username")) and bool(s.get("password"))
-    _recovery = relogin_state(_platform_id, s["id"])
+    _recovery = relogin_state(s)
+    # DOES THIS ACCOUNT HAVE A BROWSER OF ITS OWN YET? Persistent profiles
+    # are otherwise entirely invisible: they change how the platform sees
+    # the account and leave no trace anywhere an operator looks. One stat
+    # per row per poll, against a handful of rows.
+    _has_profile = False
+    if _platform_id and s.get("id"):
+        try:
+            from backend.stealth.browser import profile_dir_for
+
+            _has_profile = profile_dir_for(_platform_id, s["id"]).is_dir()
+        except Exception:                             # noqa: BLE001 - cosmetic
+            _has_profile = False
     return {**extra,
+        "has_browser_profile": _has_profile,
         "auth_kind": ("auto-login" if _can_login
                       else "api-key" if s.get("api_key") else "cookies"),
         "can_relogin": _can_login and _platform_id in LOGIN_FLOW,
         "relogin_running": _recovery["running"],
         "relogin_attempts": _recovery["attempts"],
+        # SO THE PANEL CAN SAY WHETHER SELF-HEALING HAS EVER WORKED HERE.
+        # "3 failed attempts" reads completely differently on an account
+        # that has recovered itself eleven times before than on one that
+        # has never once managed it, and the row could not tell you which
+        # it was.
+        #
+        # Epoch seconds, 0 for never -- the same shape as `last_used` and
+        # `rate_limited_until` beside them, which the panel already renders
+        # with `new Date(x * 1000)`. (_as_iso is for the health cache's
+        # datetimes and would raise on a float.)
+        "relogin_last_attempt": _recovery["last_attempt"],
+        "relogin_last_success": _recovery["last_success"],
+        "relogin_total_successes": _recovery["total_successes"],
         "id": s["id"], "identifier": s["identifier"], "status": s["status"],
         "rate_limited_until": s["rate_limited_until"], "last_used": s["last_used"],
         "use_count": s.get("use_count", 0),
@@ -919,7 +959,7 @@ async def mark_session_failed(
                 "ts": datetime.now(timezone.utc),
             })
             from backend.services import email_service
-            asyncio.create_task(
+            _spawn(
                 email_service.send_session_failure_alert(
                     platform=platform_id,
                     identifier=identifier,
@@ -1103,9 +1143,11 @@ async def save_credentials(
                 last_error=f"auto-login failed: {type(e).__name__}: {e}",
             )
 
-    # Fire and forget
-    import asyncio
-    asyncio.create_task(_do_login())
+    # Fire and forget -- but HELD, see _spawn. This one is the whole point
+    # of the "Save credentials" button: if the task is collected before the
+    # browser finishes, the row sits on "running_login" for ever and no
+    # error is ever written anywhere.
+    _spawn(_do_login())
     
     return await status(platform_id)
 
@@ -1483,29 +1525,53 @@ async def _verify_credential_item(platform_id: str, item: dict) -> tuple[bool, s
 # forgiving direction and acceptable: the cooldown's real job is to stop a
 # tight loop inside one long-running process, and an operator restarting the
 # service is a person paying attention.
-_relogin_attempts: dict[str, int] = {}
-_relogin_last: dict[str, float] = {}
+# A RE-LOGIN IN FLIGHT, IN THIS PROCESS. The only piece of re-login state
+# that stays in memory, and it stays there on purpose.
+#
+# Everything else the self-healer knows -- how many attempts have failed,
+# when the last one started, when it last worked -- now lives on the
+# session row, because losing it to a restart loses the cooldown and the
+# attempt ceiling with it (see session_repository._to_item).
+#
+# This one must NOT follow it. It is a lock, not a record. Persisted, a
+# process killed mid-login would leave it set for ever, and the account
+# could never be retried by anything -- the self-healer would skip it and
+# the "Re-Login Now" button would refuse, permanently, with no way back
+# except editing the database. In memory it clears itself by definition:
+# the process that held the lock is the process that died.
 _relogin_running: set[str] = set()
 
 
-def relogin_state(platform_id: str, session_id: str) -> dict:
+def relogin_state(row: dict) -> dict:
     """What the self-healer currently thinks about one account. Read by the
-    Sessions panel so "it is not retrying" is visible rather than mysterious."""
-    key = f"{platform_id}:{session_id}"
+    Sessions panel so "it is not retrying" is visible rather than
+    mysterious.
+
+    Takes the stored row rather than looking anything up: the counters are
+    fields on it now, and the caller already has it.
+    """
+    key = f"{row.get('platform', '')}:{row.get('id', '')}"
     return {
-        "attempts": _relogin_attempts.get(key, 0),
-        "last_attempt": _relogin_last.get(key, 0.0),
+        "attempts": int(row.get("relogin_attempts") or 0),
+        "last_attempt": float(row.get("relogin_last_attempt") or 0.0),
+        "last_success": float(row.get("relogin_last_success") or 0.0),
+        "total_successes": int(row.get("relogin_total_successes") or 0),
         "running": key in _relogin_running,
     }
 
 
-def _relogin_blocked(platform_id: str, session_id: str, *, force: bool) -> str:
+def _relogin_blocked(platform_id: str, session_id: str, item: dict, *,
+                     force: bool) -> str:
     """Why this account may not be re-logged-in right now, or "" for go.
 
     `force` is an operator pressing the button: it waives the cooldown and
     the attempt ceiling, because a person who has just fixed the password is
     exactly the case those two exist to wait for. It does NOT waive the
     in-use check, which is about not getting the account challenged.
+
+    The cooldown and the ceiling are read off `item`, which is the stored
+    row, so they survive a restart -- see session_repository._to_item for
+    why that matters more than it sounds like it does.
     """
     key = f"{platform_id}:{session_id}"
     if key in _relogin_running:
@@ -1516,13 +1582,15 @@ def _relogin_blocked(platform_id: str, session_id: str, *, force: bool) -> str:
         return ""
     if not settings.session_auto_relogin:
         return "automatic re-login is switched off"
-    waited = _now() - _relogin_last.get(key, 0.0)
+    last = float(item.get("relogin_last_attempt") or 0.0)
+    attempts = int(item.get("relogin_attempts") or 0)
+    waited = _now() - last
     cooldown = max(0.0, settings.session_relogin_cooldown_minutes) * 60.0
-    if _relogin_last.get(key) and waited < cooldown:
+    if last and waited < cooldown:
         return (f"cooling off -- {(cooldown - waited) / 60:.0f} more minute(s) "
                 "before another automatic attempt")
-    if _relogin_attempts.get(key, 0) >= max(1, settings.session_relogin_max_attempts):
-        return (f"gave up after {_relogin_attempts[key]} automatic attempt(s) -- "
+    if attempts >= max(1, settings.session_relogin_max_attempts):
+        return (f"gave up after {attempts} automatic attempt(s) -- "
                 "this needs a person")
     return ""
 
@@ -1535,7 +1603,11 @@ async def _perform_relogin(platform_id: str, session_id: str, item: dict) -> tup
     identifier = item.get("identifier") or session_id
     p = _get_platform(platform_id)
     _relogin_running.add(key)
-    _relogin_last[key] = _now()
+    # STAMPED BEFORE THE BROWSER OPENS. The cooldown runs from the start of
+    # an attempt, so a login that takes two minutes cannot let a second one
+    # through behind it -- and a process killed mid-login still leaves the
+    # cooldown written down rather than looking like it never tried.
+    await _record_relogin(platform_id, session_id, "started")
     try:
         log.info(
             f"[SESSION_RECOVERY] {platform_id} session '{identifier}' is logged out -- "
@@ -1552,7 +1624,7 @@ async def _perform_relogin(platform_id: str, session_id: str, item: dict) -> tup
         if missing:
             detail = (f"signed in but {', '.join(missing)} never appeared -- "
                       "the login probably stopped at a checkpoint")
-            _relogin_attempts[key] = _relogin_attempts.get(key, 0) + 1
+            await _record_relogin(platform_id, session_id, "failed")
             log.warning(f"[SESSION_RECOVERY] {platform_id}/{identifier}: {detail}")
             return False, detail
 
@@ -1560,15 +1632,21 @@ async def _perform_relogin(platform_id: str, session_id: str, item: dict) -> tup
         # `update_session_credentials`: that one resets the browser profile,
         # which is the last thing wanted here. The login just happened
         # INSIDE that profile, and the device it established is the point.
+        #
+        # storage_state rides along. run_auto_login has always captured it
+        # -- a modern login keeps state in localStorage that a cookie-only
+        # capture drops -- and it was being thrown away one line after
+        # being collected, while this module's docstring said it was kept.
         await sessions_db.update_session_credentials(
-            platform_id, session_id, cookies=cookies)
-        _relogin_attempts.pop(key, None)
+            platform_id, session_id, cookies=cookies,
+            storage_state=result.storage_state or {})
+        await _record_relogin(platform_id, session_id, "ok")
         log.info(
             f"[SESSION_RECOVERY] {platform_id} session '{identifier}' recovered -- "
             f"{len(cookies)} fresh cookie(s), back in the pool")
         return True, ""
     except Exception as e:                            # noqa: BLE001 - never fatal
-        _relogin_attempts[key] = _relogin_attempts.get(key, 0) + 1
+        await _record_relogin(platform_id, session_id, "failed")
         detail = f"{type(e).__name__}: {e}"
         log.error(
             f"[SESSION_RECOVERY] {platform_id}/{identifier}: automated re-login "
@@ -1584,6 +1662,24 @@ async def _perform_relogin(platform_id: str, session_id: str, item: dict) -> tup
         _relogin_running.discard(key)
 
 
+async def _record_relogin(platform_id: str, session_id: str, outcome: str) -> None:
+    """Write the attempt down, and never let that write break the attempt.
+
+    A failed bookkeeping write must not turn a re-login that WORKED into an
+    exception -- but it must not pass silently either, because the counter
+    it failed to write is a safety rail, and a rail nobody knows is missing
+    is worse than one that is visibly gone.
+    """
+    try:
+        await sessions_db.record_relogin_attempt(platform_id, session_id, outcome)
+    except Exception as e:                            # noqa: BLE001
+        log.error(
+            f"[SESSION_RECOVERY] {platform_id}/{session_id}: could not record the "
+            f"{outcome!r} attempt ({type(e).__name__}: {e}) -- the cooldown and "
+            f"attempt ceiling for this account are now unreliable until the next "
+            f"successful write")
+
+
 async def maybe_auto_relogin(platform_id: str, session_id: str) -> bool:
     """Start a background re-login for a logged-out account, if it is allowed.
 
@@ -1594,27 +1690,60 @@ async def maybe_auto_relogin(platform_id: str, session_id: str) -> bool:
     A failed attempt changes nothing: the quarantine the caller already
     applied stays exactly as it was, which is the fallback the plan asks for
     and also simply what happens when nothing here succeeds.
+
+    EVERY WAY OUT OF HERE SAYS WHICH ONE IT TOOK. This used to have four
+    silent `return False` paths -- platform without a login flow, the
+    feature switched off, the row unreadable, no stored credentials -- and
+    between them they produced the single most confusing thing this module
+    can do: a session goes bad, the log says so, and then nothing. Not
+    "tried and failed", not "refused": nothing. An operator reading that
+    cannot tell a broken auto-login from one that was never attempted, and
+    the difference is the whole of what to do next. A not-attempted must
+    never be able to pass for an attempted-and-found-nothing.
     """
+    who = f"{platform_id}/{session_id}"
+
+    def _no(reason: str) -> bool:
+        log.info(f"[SESSION_RECOVERY] {who}: no automatic re-login -- {reason}")
+        return False
+
     if platform_id not in LOGIN_FLOW:
-        return False
+        return _no(f"{platform_id} has no automated login flow")
     if not settings.session_auto_relogin:
-        return False
+        return _no("automatic re-login is switched off (session_auto_relogin)")
     try:
         item = await sessions_db.get_item(platform_id, session_id)
-    except Exception:                                 # noqa: BLE001
-        return False
-    if not item or not (item.get("username") and item.get("password")):
-        return False        # a cookie-only account: nothing to sign in with
-    if blocked := _relogin_blocked(platform_id, session_id, force=False):
-        log.info(
-            f"[SESSION_RECOVERY] {platform_id}/{item.get('identifier') or session_id}: "
-            f"not re-logging in -- {blocked}")
-        return False
+    except Exception as e:                            # noqa: BLE001
+        return _no(f"could not read the session row -- {type(e).__name__}: {e}")
+    if not item:
+        return _no("no such session in the pool")
+
+    identifier = item.get("identifier") or session_id
+    who = f"{platform_id}/{identifier}"
+    if not (item.get("username") and item.get("password")):
+        # ON THE ROW, not only in the log. This one is not a transient
+        # refusal, it is a standing fact about the account, and it is
+        # fixable by the person reading the Sessions panel -- which is
+        # where they will be looking after it went red.
+        missing = "username and password" if not (
+            item.get("username") or item.get("password")
+        ) else ("password" if item.get("username") else "username")
+        try:
+            await sessions_db.update_item(
+                platform_id, session_id,
+                last_error=f"logged out, and no automatic re-login is possible: "
+                           f"this account has no stored {missing}")
+        except Exception:                             # noqa: BLE001
+            pass
+        return _no(f"no stored {missing} -- this is a cookies-only account")
+
+    if blocked := _relogin_blocked(platform_id, session_id, item, force=False):
+        return _no(blocked)
 
     async def _bg() -> None:
         await _perform_relogin(platform_id, session_id, item)
 
-    asyncio.create_task(_bg())
+    _spawn(_bg())
     return True
 
 
@@ -1635,7 +1764,7 @@ async def relogin_now(platform_id: str, session_id: str) -> dict:
         raise ConflictError(
             f"{item.get('identifier') or session_id} has no stored credentials -- "
             "add a username and password to enable automated login")
-    if blocked := _relogin_blocked(platform_id, session_id, force=True):
+    if blocked := _relogin_blocked(platform_id, session_id, item, force=True):
         raise ConflictError(blocked)
 
     ok, detail = await _perform_relogin(platform_id, session_id, item)

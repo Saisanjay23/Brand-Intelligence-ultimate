@@ -83,6 +83,36 @@ const embeddedStyles = `
 }
 `;
 
+// What the self-healer has actually done to this account, in a sentence.
+//
+// The attempt count on its own was misleading in both directions: "3 failed
+// attempts" reads as a burned account when it may be one that has recovered
+// itself a dozen times and hit a bad afternoon, and a bare "Auto-Login"
+// badge reads as working when self-healing may never once have succeeded
+// here. Both halves are stored on the session row now, so this can say
+// which it is rather than leave it to be assumed.
+function selfHealingStory(ss: {
+  relogin_attempts?: number;
+  relogin_last_success?: number;
+  relogin_total_successes?: number;
+}): string {
+  const failed = ss.relogin_attempts ?? 0;
+  const wins = ss.relogin_total_successes ?? 0;
+  const when = ss.relogin_last_success
+    ? new Date(ss.relogin_last_success * 1000).toLocaleString()
+    : "";
+  const history = wins
+    ? `Has signed itself back in ${wins} time(s), most recently ${when}.`
+    : "Has never yet managed to sign itself back in.";
+  if (failed > 0) {
+    return `${failed} failed automatic attempt(s) since it last worked. ${history}`;
+  }
+  return wins
+    ? history
+    : "Credentials are stored, so this account signs itself back in when it is found logged out.";
+}
+
+
 export function SessionPanel({ sessions, onChanged }: Props) {
   const [modal, setModal] = useState<ModalState>({ isOpen: false, mode: "create" });
   const [activeTabs, setActiveTabs] = useState<Record<string, "pool" | "controls">>({});
@@ -204,7 +234,7 @@ export function SessionPanel({ sessions, onChanged }: Props) {
           </span>
           <button
             onClick={() => setGlobalError("")}
-            style={{ background: "transparent", border: "none", color: "#fff", cursor: "pointer", fontSize: "14px", fontWeight: 700, marginLeft: "auto" }}
+            style={{ background: "transparent", border: "none", color: "var(--text-main, #fff)", cursor: "pointer", fontSize: "14px", fontWeight: 700, marginLeft: "auto" }}
           >
             ✕
           </button>
@@ -212,12 +242,7 @@ export function SessionPanel({ sessions, onChanged }: Props) {
       )}
 
       {/* Grid of Uniform Platform Modules */}
-      <div style={{
-        display: "grid",
-        gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
-        gap: "16px",
-        alignItems: "stretch"
-      }}>
+      <div className="session-grid-layout">
         {sessions.map((s) => {
           const tab = activeTabs[s.platform] || "pool";
           const poolCount = s.sessions?.length || 0;
@@ -484,9 +509,7 @@ export function SessionPanel({ sessions, onChanged }: Props) {
                                     title={
                                       ss.relogin_running
                                         ? "Signing this account back in right now"
-                                        : (ss.relogin_attempts ?? 0) > 0
-                                          ? `Self-healing: ${ss.relogin_attempts} failed automatic attempt(s) so far`
-                                          : "Credentials are stored, so this account signs itself back in when it is found logged out"
+                                        : selfHealingStory(ss)
                                     }
                                     style={{ color: "var(--success, #12B76A)", fontWeight: 600 }}
                                   >
@@ -495,11 +518,28 @@ export function SessionPanel({ sessions, onChanged }: Props) {
                                       ? ` (${ss.relogin_attempts} failed)`
                                       : ""}
                                   </span>
-                                ) : !ss.is_api_key && s.kind !== "api-key" ? (
-                                  <span title="Cookies only. If this account is logged out, someone has to paste a fresh export by hand.">
+                                ) : s.kind === "cookies" ? (
+                                  <span title="Cookies only. If this account is logged out, someone has to paste a fresh export by hand. Add a username and password under Edit to let it sign itself back in.">
                                     • 🔒 Cookie Session
                                   </span>
                                 ) : null}
+                                {/* The persistent browser profile is otherwise
+                                    invisible: it changes how the platform sees this
+                                    account and leaves no trace anywhere an operator
+                                    looks. Only meaningful where a browser is used at
+                                    all, so API-key and MTProto rows never show it. */}
+                                {s.kind === "cookies" && (
+                                  <span
+                                    title={
+                                      ss.has_browser_profile
+                                        ? "This account has its own browser profile on disk -- it keeps the same localStorage, IndexedDB and device keys between runs instead of arriving as a brand-new browser every time."
+                                        : "No browser profile yet. One is created the first time a sweep uses this account."
+                                    }
+                                    style={{ color: ss.has_browser_profile ? "var(--text-secondary, #d8d8d8)" : "var(--text-muted, #98a2b3)" }}
+                                  >
+                                    • 💾 {ss.has_browser_profile ? "Device kept" : "No device yet"}
+                                  </span>
+                                )}
                                 {cooldown && (
                                   <span style={{ color: "var(--text-secondary, #d8d8d8)" }}>
                                     • ⌛ {cooldown}

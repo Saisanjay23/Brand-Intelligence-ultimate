@@ -81,6 +81,7 @@ from backend.api.discovery import router as discovery_router
 from backend.api.health import router as health_router
 from backend.api.media import close as media_close
 from backend.api.media import router as media_router
+from backend.api.scheduler import router as scheduler_router
 from backend.api.sessions import router as sessions_router
 from backend.config.settings import settings
 from backend.database.connection import close as mongo_close
@@ -91,9 +92,11 @@ from backend.database.repositories import logo_repository as logos_db
 from backend.database.repositories import evidence_repository as evidence_db
 from backend.database.repositories import coverage_repository as coverage_db
 from backend.database.repositories import profile_repository as profiles_db
+from backend.database.repositories import schedule_repository as schedule_db
 from backend.database.repositories import session_repository as sessions_db
 from backend.database.repositories import telemetry_repository as telemetry_db
 from backend.services import avatar_backfill
+from backend.services.scheduler_service import scheduler_engine
 from backend.sessions import manager as sessions_engine
 from backend.shared.errors import DomainError
 from backend.shared.logging import configure_logging, get_logger
@@ -155,6 +158,11 @@ async def lifespan(app: FastAPI):
     storage_task = asyncio.create_task(_bring_up_storage())
     yield
     storage_task.cancel()
+    # Stops the TICK loop only. A sweep in flight is left to its own
+    # cancellation: the process is going down either way, and the run it
+    # was driving is closed out as `interrupted` by the next startup
+    # rather than pretended about here.
+    scheduler_engine.stop_monitor()
     sessions_engine.stop_monitor()
     evidence_db.stop_retention_monitor()
     avatar_backfill.stop_retry_monitor()
@@ -200,6 +208,7 @@ async def _bring_up_storage() -> None:
                 # guarantees rather than in a code path an operator has to
                 # remember to run.
                 await analysis_results_db.ensure_indexes()
+                await schedule_db.ensure_indexes()
                 from backend.platforms import registry
                 for plat in registry.PLATFORMS.values():
                     await registry.session_state(plat)
@@ -214,6 +223,17 @@ async def _bring_up_storage() -> None:
                 # hourly gets hundreds of attempts inside the window -- no
                 # realistic outage survives that.
                 avatar_backfill.start_retry_monitor()
+                # THE SCHEDULED SWEEP'S CLOCK. Started here, with the
+                # other monitors, because it needs Mongo: the schedule,
+                # the queue and every run record live there. Starting it
+                # before the database is reachable would mean a 02:00
+                # fire that reads an empty schedule and concludes,
+                # wrongly and silently, that nothing was scheduled.
+                #
+                # This is also what closes out any run the previous
+                # process died inside -- see
+                # `schedule_repository.reconcile_interrupted`.
+                scheduler_engine.start()
             except Exception as e:
                 # Reachable but not usable (auth, a replica-set election
                 # mid-flight). Same treatment as unreachable: say so, and
@@ -224,7 +244,7 @@ async def _bring_up_storage() -> None:
             else:
                 log.info(
                     "startup: mongo reachable, indexes ensured, session + "
-                    "evidence-retention monitors running"
+                    "evidence-retention + scheduler monitors running"
                     + (f" (after {attempt} attempts, {waited:.0f}s)" if attempt > 1 else ""))
                 return
         elif attempt == 1:
@@ -239,7 +259,9 @@ async def _bring_up_storage() -> None:
                 "giving up on automatic recovery. The API stays up and /health/ready "
                 "keeps reporting the truth, but the session monitor, evidence "
                 "retention and the parser-drift canary are NOT running. Restart the "
-                "process once the database is back.")
+                "process once the database is back. SCHEDULED SWEEPS ARE NOT "
+                "RUNNING EITHER -- nothing will fire at its set time until this "
+                "process is restarted with the database reachable.")
             return
         await asyncio.sleep(delay)
         waited += delay
@@ -266,6 +288,11 @@ app = FastAPI(
             "Profile URLs in, scraped and scored profiles out, with evidence "
             "screenshots. Results are saved for 24 hours and then deleted "
             "automatically; an analyst can delete them sooner."},
+        {"name": "scheduler", "description":
+            "When the client queue sweeps itself, who is in it, and how "
+            "every run went. The schedule is a wall clock plus a timezone, "
+            "not a UTC instant, so it holds its local time across a "
+            "daylight-saving change."},
         {"name": "sessions", "description":
             "The per-platform credentials discovery and analysis scrape with. "
             "Nothing can be scraped for a platform with no usable session."},
@@ -302,6 +329,8 @@ app.include_router(reports_router)
 app.include_router(discovery_router)
 app.include_router(analysis_router)
 app.include_router(sessions_router)
+# When the client queue runs, who is in it, and how every run went.
+app.include_router(scheduler_router)
 app.include_router(alerts_router)
 # Serves remote avatars from this origin -- see backend/api/media.py for why
 # Instagram's CDN cannot be embedded directly.

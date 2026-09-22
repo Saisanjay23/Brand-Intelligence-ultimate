@@ -113,37 +113,62 @@ class Settings(BaseSettings):
     # different risk profiles (a sweep is many short requests, an analysis
     # visit is one long one) and different pools may be sized differently.
     discovery_max_parallel_sessions: int = 3
-    # ONE KEYWORD AT A TIME, IN THE ORDER THEY WERE CONFIGURED. Overrides
-    # both discovery_max_parallel_sessions and discovery_tab_concurrency:
-    # each platform claims exactly one session, and that session sweeps
-    # keyword 1 through every tab (facebook: people, then pages, then
-    # groups) before keyword 2 begins.
+    # ONE KEYWORD AT A TIME, IN THE ORDER THEY WERE CONFIGURED. When on,
+    # this overrides both discovery_max_parallel_sessions and
+    # discovery_tab_concurrency: each platform claims exactly one session,
+    # and that session sweeps keyword 1 through every tab (facebook: people,
+    # then pages, then groups) before keyword 2 begins.
     #
-    # DEFAULT ON, because "one by one" is a correctness property here, not a
-    # pacing preference. Three things depend on it:
+    # DEFAULT OFF SINCE 2026-09-22 -- keyword sharding is now the normal
+    # path. The engine for it was always here (see discovery/runner.py's
+    # `_keyword_worker` and its shared queue, with failover between workers
+    # and its own test module); what kept this switched on was the first of
+    # the three reasons below, and that one has been fixed rather than
+    # traded away. The other two are now accepted costs, deliberately:
     #
-    #   readable progress   the progress chip names ONE keyword and ONE tab.
-    #                       With parallel workers it named whichever
-    #                       coroutine wrote to it last, so a sweep that was
-    #                       working perfectly read as if it were skipping
-    #                       keywords at random.
-    #   result ordering     the discovery grid sorts by ascending _id, i.e.
-    #                       insertion order, precisely so page 1 is what the
+    #   readable progress   FIXED. The progress record carried ONE
+    #                       `current_keyword` field, so with three workers
+    #                       the chip named whichever coroutine wrote last
+    #                       and a perfectly healthy sweep read as if it were
+    #                       skipping keywords at random. There is now one
+    #                       telemetry slot per worker (PlatformSweep.
+    #                       note_worker), so the UI shows all three accounts
+    #                       and what each is on, truthfully. No guessing.
+    #
+    #   result ordering     ACCEPTED. The discovery grid sorts by ascending
+    #                       _id, i.e. insertion order, so page 1 is what the
     #                       platform's own search returned first (see
     #                       profile_repository.list_profiles). Parallel
-    #                       workers interleave their writes, which destroys
-    #                       that ordering for every keyword involved.
-    #   footprint           N simultaneous searches under N pooled accounts
-    #                       is N times the concurrent load on one platform.
+    #                       workers interleave their writes, so a sharded
+    #                       sweep's grid mixes keywords instead of finishing
+    #                       one before starting the next. The sort was left
+    #                       alone on purpose: changing it would reorder every
+    #                       discovery view for every analyst, sharded or not,
+    #                       which is a far larger change than the one being
+    #                       made here.
     #
-    # FAILOVER IS NOT LOST. A single worker whose session dies mid-keyword
-    # still re-queues that keyword and _sweep_platform claims a replacement
-    # session for it on its next round (see _MAX_CLAIM_ROUNDS) -- recovery
-    # is the round loop's job, never the worker count's.
+    #   footprint           ACCEPTED, AND THE ONE TO WATCH. N simultaneous
+    #                       searches under N pooled accounts is N times the
+    #                       concurrent load on one platform -- and this tool
+    #                       has NO per-session proxy support, so all N leave
+    #                       from ONE IP. Per-account load does drop (six
+    #                       searches each instead of eighteen), but three
+    #                       accounts visibly active together from one address
+    #                       is a correlation signal that one account working
+    #                       alone does not produce. Both of those are true at
+    #                       once; the first is the reason this is on, the
+    #                       second is the reason to turn it off again if
+    #                       accounts start getting challenged.
     #
-    # Turn OFF only when total sweep throughput matters more than any of the
-    # above and the pool is genuinely healthy.
-    discovery_sequential_keywords: bool = True
+    # FAILOVER IS NOT LOST EITHER WAY. A worker whose session dies mid-
+    # keyword re-queues that keyword; with several workers a surviving one
+    # picks it up immediately, and with one, _sweep_platform claims a
+    # replacement on its next round (see _MAX_CLAIM_ROUNDS).
+    #
+    # TURN BACK ON (DISCOVERY_SEQUENTIAL_KEYWORDS=true) if accounts start
+    # drawing checkpoints, or whenever strict keyword-by-keyword ordering
+    # matters more than sweep time.
+    discovery_sequential_keywords: bool = False
     # THE MEDIAN GAP BETWEEN ONE KEYWORD SWEEP AND THE NEXT, in seconds, on
     # the same session. Discovery had no such gap at all: keywords ran
     # back-to-back, so a 15-keyword client hit Facebook with 45 searches
@@ -241,6 +266,21 @@ class Settings(BaseSettings):
     # Off returns the browser to a fresh ephemeral context per run, which is
     # what it did before this existed. Nothing else changes: cookies are
     # still injected from the database either way.
+    # THE TIMEZONE EVERY BROWSER CONTEXT CLAIMS, as an IANA id.
+    #
+    # It has to match the country this host actually leaves from. Blank
+    # means Asia/Kolkata, which is right while the traffic is Indian and
+    # WRONG the moment the host runs behind a VPN -- every session then
+    # announces Kolkata from a foreign exit, and a claimed timezone that
+    # disagrees with the egress IP is a stronger tell than any of the
+    # things this module spends its other knobs hiding.
+    #
+    # ipinfo.io/json reports the `timezone` of whatever address you are
+    # actually leaving from; that is the value to put here.
+    #
+    # One host has one egress, so this is not per-platform and cannot be.
+    # See stealth/timezone.py.
+    browser_timezone_id: str = ""
     browser_persistent_profiles: bool = True
     # Delete a profile directory that has not been opened in this many days.
     # A Chrome profile is not small, and one per pooled account per platform

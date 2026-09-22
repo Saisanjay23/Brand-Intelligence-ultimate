@@ -634,7 +634,7 @@ function ProfileTable({
             <tr
               key={p.id}
               onClick={() => onToggleSelected(p.id)}
-              style={{ cursor: "pointer", background: selected.has(p.id) ? "rgba(0, 229, 255, 0.06)" : undefined }}
+              style={{ cursor: "pointer", background: selected.has(p.id) ? "rgba(154, 80, 233, 0.12)" : undefined }}
             >
               <td><PlatformIcon platform={p.platform} size={16} /></td>
               <td>

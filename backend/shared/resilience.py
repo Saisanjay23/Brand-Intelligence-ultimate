@@ -50,13 +50,40 @@ from typing import Optional
 # already used this style, and every platform's own error text was written
 # to match it.
 _CHECKPOINT_TOKENS = ("checkpoint", "challenge", "verify your", "suspicious login")
-_AUTH_TOKENS = ("401", "403", "login", "not authenticated", "credential", "api key")
-_RATE_LIMIT_TOKENS = ("429", "rate limit", "rate-limit", "too many requests", "floodwait", "quota")
+_AUTH_TOKENS = ("login", "not authenticated", "credential", "api key")
+_RATE_LIMIT_TOKENS = ("rate limit", "rate-limit", "too many requests", "floodwait", "quota")
 _TRANSIENT_TOKENS = (
     "timeout", "timed out", "navigation failed", "econnreset", "econnrefused",
     "connection reset", "connection aborted", "net::err", "temporarily unavailable",
-    "503", "502", "504",
 )
+
+# HTTP STATUS CODES ARE MATCHED AS NUMBERS, NOT AS SUBSTRINGS.
+#
+# These used to sit in the plain token tuples above, so "401" and "403" were
+# looked for with `in`. That matches any text that happens to contain those
+# three digits anywhere -- and the text this runs over is error messages,
+# which routinely carry entity ids:
+#
+#     "could not resolve entity 100403123456789"   -> classified "expired"
+#     "profile 401234567890123 has no name"        -> classified "expired"
+#
+# Both are ordinary extraction failures on a perfectly good session, and
+# both took that account OUT OF THE POOL with `mark_session_failed(...,
+# "expired")` -- then told whoever looked that its cookies had expired, so
+# the fix they would reach for (paste a fresh export) was for a problem that
+# never existed. A Facebook id is 15-16 digits, so roughly one in eighty
+# contains "403" by chance.
+#
+# The lookarounds are the whole fix: a status code is a number on its own,
+# never a run of digits inside a longer one. "http-403", "HTTP 401
+# Unauthorized" and "youtube search 403: ..." all still match, because what
+# surrounds them is not a digit.
+#
+# This is the same class of mistake `_URL_RE` below already guards against
+# (a URL carrying "login" in its path), applied to the numbers.
+_AUTH_STATUS_RE = re.compile(r"(?<!\d)(401|403)(?!\d)")
+_RATE_LIMIT_STATUS_RE = re.compile(r"(?<!\d)429(?!\d)")
+_TRANSIENT_STATUS_RE = re.compile(r"(?<!\d)(502|503|504)(?!\d)")
 
 
 # A URL IS NOT EVIDENCE. Every token below is matched as a plain substring
@@ -98,9 +125,10 @@ def classify_failure(err: BaseException | str) -> Optional[str]:
     text = _evidence(err)
     if any(tok in text for tok in _CHECKPOINT_TOKENS):
         return "checkpointed"
-    if any(tok in text for tok in _AUTH_TOKENS):
+    if any(tok in text for tok in _AUTH_TOKENS) or _AUTH_STATUS_RE.search(text):
         return "expired"
-    if any(tok in text for tok in _RATE_LIMIT_TOKENS):
+    if (any(tok in text for tok in _RATE_LIMIT_TOKENS)
+            or _RATE_LIMIT_STATUS_RE.search(text)):
         return "rate_limited"
     return None
 
@@ -111,7 +139,8 @@ def is_transient(err: BaseException | str) -> bool:
     (see `classify_failure`) or isn't network-shaped at all (a parser bug
     retrying would just hit again identically)."""
     text = str(err).lower()
-    return any(tok in text for tok in _TRANSIENT_TOKENS)
+    return (any(tok in text for tok in _TRANSIENT_TOKENS)
+            or bool(_TRANSIENT_STATUS_RE.search(text)))
 
 
 # ------------------------------------------------------- sweep outcomes

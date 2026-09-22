@@ -1032,6 +1032,7 @@ async def user_cards(page) -> list[TikTokUser]:
 
 async def search_users(
     keywords: list[str], timeout_s: float = 45.0, max_results: int = 0,
+    probe: Any = None,
 ) -> dict[str, list[TikTokUser]]:
     """{keyword: name-matched accounts} from TikTok's Users tab.
 
@@ -1044,7 +1045,7 @@ async def search_users(
     try:
         async with anonymous_context() as ctx:
             for kw in keywords:
-                out[kw] = await _users_for(ctx, kw, timeout_s, max_results)
+                out[kw] = await _users_for(ctx, kw, timeout_s, max_results, probe)
                 log.info(f"tiktok/users {kw!r}: {len(out[kw])} account(s)")
     except Exception as e:
         log.warning(f"tiktok/users: account search unavailable -- {type(e).__name__}: {e}")
@@ -1052,7 +1053,7 @@ async def search_users(
 
 
 async def search_users_in(ctx, keywords: list[str], timeout_s: float = 45.0,
-                           max_results: int = 0,
+                           max_results: int = 0, probe: Any = None,
                           ) -> dict[str, list[TikTokUser]]:
     """`search_users` against a context the caller already owns -- used when
     a sweep is ALREADY running anonymously and must not try to take the
@@ -1060,7 +1061,7 @@ async def search_users_in(ctx, keywords: list[str], timeout_s: float = 45.0,
     out: dict[str, list[TikTokUser]] = {}
     for kw in keywords:
         try:
-            out[kw] = await _users_for(ctx, kw, timeout_s, max_results)
+            out[kw] = await _users_for(ctx, kw, timeout_s, max_results, probe)
         except Exception as e:
             log.warning(f"tiktok/users {kw!r}: {type(e).__name__}: {e}")
             out[kw] = []
@@ -1070,9 +1071,35 @@ async def search_users_in(ctx, keywords: list[str], timeout_s: float = 45.0,
 
 async def _users_for(
     ctx, keyword: str, timeout_s: float, max_results: int = 0,
+    probe: Any = None,
 ) -> list[TikTokUser]:
     """One keyword's Users tab, read off `/api/search/user/full/`, scrolled
-    to the end of the list the same way the Top tab is."""
+    to the end of the list the same way the Top tab is.
+
+    `probe` IS A PARAMETER FOR A REASON, and it used to be a NameError.
+
+    The payload fold below called `iter_users(blob, probe)` against a name
+    that was never bound here -- not a parameter, not a local, not a module
+    global. Python only raises on the line when it runs, and that line runs
+    only inside `for text in bodies`, so the failure was invisible until
+    TikTok actually served the XHR it exists to read:
+
+        no payload served  -> the loop body never runs -> DOM cards returned
+        payload served     -> NameError -> the broad `except` below logs a
+                              warning and returns [], discarding `ordered`
+                              and every card already parsed into it
+
+    So the richer the data TikTok returned, the more certainly all of it
+    was thrown away -- and the caller (_merge_user_accounts) reads an empty
+    list as "this keyword matched no accounts" and merges nothing. The Users
+    tab is where the NAME-MATCHED accounts come from, the ones this module
+    ranks first and an analyst actually acts on; the Top tab's incidental
+    video authors are what was left.
+
+    Threaded through from `sweep()` rather than defaulted away, so a rename
+    in the Users payload is reported by the same drift detector as the rest
+    of the engine instead of being the one path nothing watches.
+    """
     page = await ctx.new_page()
     bodies: list[str] = []
 
@@ -1157,7 +1184,15 @@ async def _users_for(
 
         return list(ordered.values())
     except Exception as e:
-        log.warning(f"tiktok/users {keyword!r}: {type(e).__name__}: {e}")
+        # NAMES WHAT WAS LOST, not just that something went wrong. This
+        # handler returning [] is indistinguishable from "no accounts
+        # matched" to every caller, so the count it is discarding is the
+        # one fact that tells the two apart -- and it is the fact the
+        # NameError above hid for as long as it did.
+        log.warning(
+            f"tiktok/users {keyword!r}: {type(e).__name__}: {e} -- "
+            f"discarding {len(ordered)} account(s) already parsed; this "
+            f"keyword will read as having matched no accounts")
         return []
     finally:
         try:
@@ -1451,7 +1486,7 @@ class Discovery:
             # was needed -- directly delaying every keyword behind it under
             # the default discovery_sequential_keywords=True.
             if out.stopped != "cap:results":
-                await self._merge_user_accounts(out)
+                await self._merge_user_accounts(out, probe)
 
             if self.a.max_results:
                 out.hits = out.hits[: self.a.max_results]
@@ -1474,7 +1509,7 @@ class Discovery:
                     f"has changed; see iter_users/user_from_node")
         return out
 
-    async def _merge_user_accounts(self, out: "Sweep") -> None:
+    async def _merge_user_accounts(self, out: "Sweep", probe: Any = None) -> None:
         """Fold the Users-tab accounts into this sweep, ahead of the video
         authors. Best-effort: a failure here leaves the Top-tab results
         exactly as they were."""
@@ -1485,11 +1520,12 @@ class Discovery:
                 # context -- taking the lock again would deadlock.
                 found = (await search_users_in(
                     self.ctx, [out.keyword], max_results=self.a.max_results,
+                    probe=probe,
                 )).get(out.keyword) or []
             else:
                 # search_users takes the lock itself, via anonymous_context
                 found = (await search_users(
-                    [out.keyword], max_results=self.a.max_results,
+                    [out.keyword], max_results=self.a.max_results, probe=probe,
                 )).get(out.keyword) or []
         except Exception as e:
             log.warning(f"tiktok/users {out.keyword!r}: skipped -- {type(e).__name__}: {e}")

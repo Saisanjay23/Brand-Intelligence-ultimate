@@ -93,8 +93,8 @@ const EditableCell = ({ value, onChange, placeholder = "", readOnly = false }: {
       }}
       onFocus={(e) => {
         if (!readOnly) {
-          e.target.style.background = "rgba(0, 229, 255, 0.08)";
-          e.target.style.border = "1px solid var(--cyan, #00E5FF)";
+          e.target.style.background = "rgba(154, 80, 233, 0.08)";
+          e.target.style.border = "1px solid var(--purple, #9A50E9)";
         }
       }}
       onBlur={(e) => {
@@ -209,11 +209,11 @@ function AnalysisProgressBanner({
               borderRadius: "50%",
               background:
                 jobData.status === "running"
-                  ? "var(--cyan, #00F0FF)"
+                  ? "var(--purple, #9A50E9)"
                   : jobData.status === "done"
                   ? "var(--success, #12B76A)"
                   : "var(--danger, #E95053)",
-              boxShadow: jobData.status === "running" ? "0 0 10px var(--cyan, #00F0FF)" : "none",
+              boxShadow: jobData.status === "running" ? "0 0 10px rgba(154, 80, 233, 0.6)" : "none",
             }}
           />
           <span style={{ fontSize: "14px", fontWeight: 700, color: "var(--text-main, #fff)" }}>
@@ -238,9 +238,9 @@ function AnalysisProgressBanner({
         <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", fontFamily: "var(--font-mono)", fontSize: "12px" }}>
           <span
             style={{
-              background: "rgba(0, 229, 255, 0.1)",
-              border: "1px solid rgba(0, 229, 255, 0.25)",
-              color: "var(--cyan, #00F0FF)",
+              background: "rgba(154, 80, 233, 0.12)",
+              border: "1px solid rgba(154, 80, 233, 0.3)",
+              color: "var(--purple, #9A50E9)",
               padding: "3px 9px",
               borderRadius: "6px",
               fontWeight: 700,
@@ -288,7 +288,7 @@ function AnalysisProgressBanner({
         style={{
           width: "100%",
           height: "6px",
-          background: "var(--bg-primary, #080F1E)",
+          background: "var(--bg-surface-3, rgba(255,255,255,0.1))",
           borderRadius: "3px",
           overflow: "hidden",
           marginBottom: "16px",
@@ -298,8 +298,8 @@ function AnalysisProgressBanner({
           style={{
             width: `${pct}%`,
             height: "100%",
-            background: "linear-gradient(90deg, var(--cyan, #00F0FF), var(--primary-color, #8838DD))",
-            boxShadow: loading ? "0 0 10px rgba(0, 240, 255, 0.5)" : "none",
+            background: "linear-gradient(90deg, #9A50E9, #8838DD)",
+            boxShadow: loading ? "0 0 10px rgba(154, 80, 233, 0.5)" : "none",
             transition: "width 0.3s ease",
           }}
         />
@@ -334,8 +334,8 @@ function AnalysisProgressBanner({
                 style={{
                   fontSize: "10px",
                   fontWeight: 700,
-                  color: "var(--cyan, #00F0FF)",
-                  border: "1px solid rgba(0, 240, 255, 0.35)",
+                  color: "var(--purple, #9A50E9)",
+                  border: "1px solid rgba(154, 80, 233, 0.35)",
                   borderRadius: "4px",
                   padding: "1px 5px",
                 }}
@@ -352,7 +352,7 @@ function AnalysisProgressBanner({
                   prog.status === "done"
                     ? "var(--success, #12B76A)"
                     : prog.status === "running"
-                    ? "var(--cyan, #00F0FF)"
+                    ? "var(--purple, #9A50E9)"
                     : prog.status === "failed"
                     ? "var(--danger, #E95053)"
                     : "var(--text-muted)",
@@ -376,8 +376,8 @@ function AnalysisProgressBanner({
               fontSize: "12px",
               padding: "5px 10px",
               borderRadius: "6px",
-              background: it.status === "running" ? "rgba(0, 240, 255, 0.08)" : "rgba(0, 0, 0, 0.15)",
-              border: it.status === "running" ? "1px solid rgba(0, 240, 255, 0.3)" : "1px solid transparent",
+              background: it.status === "running" ? "rgba(154, 80, 233, 0.1)" : "rgba(0, 0, 0, 0.15)",
+              border: it.status === "running" ? "1px solid rgba(154, 80, 233, 0.35)" : "1px solid transparent",
             }}
           >
             <PlatformIcon platform={it.platform} size={13} />
@@ -392,7 +392,7 @@ function AnalysisProgressBanner({
                   it.status === "done"
                     ? "var(--success, #12B76A)"
                     : it.status === "running"
-                    ? "var(--cyan, #00F0FF)"
+                    ? "var(--purple, #9A50E9)"
                     : it.status === "error"
                     ? "var(--danger, #E95053)"
                     : "var(--text-muted)",
@@ -458,6 +458,9 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
     url: string;
     profileName: string;
   } | null>(null);
+
+  // Toggle for Risk Score Table (closed by default, opens when clicked)
+  const [showScoreGuide, setShowScoreGuide] = useState<boolean>(false);
 
   // Inline edits state
   const [edits, setEdits] = useAnalysisField("edits");
@@ -704,58 +707,62 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
       return (
         <span
           style={{
-            background: "rgba(233, 80, 83, 0.2)",
+            background: "rgba(233, 80, 83, 0.15)",
             color: "var(--danger, #E95053)",
-            border: "1px solid rgba(233, 80, 83, 0.4)",
-            padding: "2px 8px",
+            border: "1.5px solid rgba(233, 80, 83, 0.5)",
+            padding: "3px 9px",
             borderRadius: "12px",
             fontSize: "11px",
-            fontWeight: 700,
+            fontWeight: 800,
             display: "inline-flex",
             alignItems: "center",
-            gap: "4px",
+            gap: "5px",
+            boxShadow: "0 0 8px rgba(233, 80, 83, 0.2)",
           }}
         >
-          ● High ({score})
+          <span style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--danger, #E95053)", boxShadow: "0 0 6px var(--danger, #E95053)" }} />
+          High ({score})
         </span>
       );
     }
-    if (score >= 4) {
+    if (score >= 5) {
       return (
         <span
           style={{
-            background: "rgba(247, 144, 9, 0.2)",
+            background: "rgba(247, 144, 9, 0.15)",
             color: "var(--warning, #F79009)",
-            border: "1px solid rgba(247, 144, 9, 0.4)",
-            padding: "2px 8px",
+            border: "1.5px solid rgba(247, 144, 9, 0.5)",
+            padding: "3px 9px",
             borderRadius: "12px",
             fontSize: "11px",
-            fontWeight: 700,
+            fontWeight: 800,
             display: "inline-flex",
             alignItems: "center",
-            gap: "4px",
+            gap: "5px",
           }}
         >
-          ● Medium ({score})
+          <span style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--warning, #F79009)" }} />
+          Medium ({score})
         </span>
       );
     }
     return (
       <span
         style={{
-          background: "rgba(18, 183, 106, 0.2)",
+          background: "rgba(18, 183, 106, 0.15)",
           color: "var(--success, #12B76A)",
-          border: "1px solid rgba(18, 183, 106, 0.4)",
-          padding: "2px 8px",
+          border: "1.5px solid rgba(18, 183, 106, 0.5)",
+          padding: "3px 9px",
           borderRadius: "12px",
           fontSize: "11px",
-          fontWeight: 700,
+          fontWeight: 800,
           display: "inline-flex",
           alignItems: "center",
-          gap: "4px",
+          gap: "5px",
         }}
       >
-        ● Low ({score})
+        <span style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--success, #12B76A)" }} />
+        Low ({score})
       </span>
     );
   };
@@ -765,7 +772,7 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
       {/* ─── Ephemeral Memory Notification Banner ─── */}
       <div
         style={{
-          background: "linear-gradient(90deg, rgba(136, 56, 221, 0.12) 0%, rgba(0, 240, 255, 0.05) 100%)",
+          background: "linear-gradient(90deg, rgba(136, 56, 221, 0.16) 0%, rgba(154, 80, 233, 0.08) 100%)",
           border: "1px solid rgba(136, 56, 221, 0.32)",
           borderRadius: "12px",
           padding: "14px 20px",
@@ -801,9 +808,9 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
               <span>Analysis — Multi-Platform Profile Scraper</span>
               <span
                 style={{
-                  background: "rgba(0, 240, 255, 0.12)",
-                  color: "#00F0FF",
-                  border: "1px solid rgba(0, 240, 255, 0.35)",
+                  background: "rgba(154, 80, 233, 0.15)",
+                  color: "#B778FF",
+                  border: "1px solid rgba(154, 80, 233, 0.4)",
                   fontSize: "10px",
                   padding: "2px 8px",
                   borderRadius: "20px",
@@ -813,10 +820,10 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
                   display: "inline-flex",
                   alignItems: "center",
                   gap: "5px",
-                  boxShadow: "0 0 10px rgba(0, 240, 255, 0.15)",
+                  boxShadow: "0 0 10px rgba(154, 80, 233, 0.2)",
                 }}
               >
-                <span style={{ width: "5px", height: "5px", borderRadius: "50%", background: "#00F0FF", boxShadow: "0 0 6px #00F0FF" }} />
+                <span style={{ width: "5px", height: "5px", borderRadius: "50%", background: "#B778FF", boxShadow: "0 0 6px #B778FF" }} />
                 RAM Session
               </span>
             </div>
@@ -853,12 +860,12 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
       <div
         className="home-card"
         style={{
-          background: "linear-gradient(180deg, var(--bg-card, #1D2939) 0%, rgba(16, 24, 40, 0.95) 100%)",
+          background: "var(--bg-card, #1D2939)",
           border: "1px solid var(--border-color, #344054)",
           borderRadius: "14px",
           padding: "24px",
           marginBottom: "24px",
-          boxShadow: "0 10px 30px rgba(0, 0, 0, 0.35)",
+          boxShadow: "0 10px 30px rgba(0, 0, 0, 0.25)",
         }}
       >
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "16px", flexWrap: "wrap", gap: "10px" }}>
@@ -922,7 +929,7 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
           disabled={loading}
           style={{
             width: "100%",
-            background: "var(--bg-primary, #080F1E)",
+            background: "var(--bg-input, var(--bg-surface))",
             border: "1px solid var(--border-color, #344054)",
             borderRadius: "10px",
             color: "var(--text-main, #fff)",
@@ -934,16 +941,16 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
             outline: "none",
             boxSizing: "border-box",
             marginBottom: "14px",
-            boxShadow: "inset 0 2px 8px rgba(0, 0, 0, 0.4)",
+            boxShadow: "inset 0 2px 6px rgba(0, 0, 0, 0.2)",
             transition: "border-color 0.2s ease, box-shadow 0.2s ease",
           }}
           onFocus={(e) => {
             e.currentTarget.style.borderColor = "var(--primary-color, #8838DD)";
-            e.currentTarget.style.boxShadow = "0 0 0 2px rgba(136, 56, 221, 0.25), inset 0 2px 8px rgba(0, 0, 0, 0.4)";
+            e.currentTarget.style.boxShadow = "0 0 0 2px rgba(136, 56, 221, 0.25), inset 0 2px 6px rgba(0, 0, 0, 0.2)";
           }}
           onBlur={(e) => {
             e.currentTarget.style.borderColor = "var(--border-color, #344054)";
-            e.currentTarget.style.boxShadow = "inset 0 2px 8px rgba(0, 0, 0, 0.4)";
+            e.currentTarget.style.boxShadow = "inset 0 2px 6px rgba(0, 0, 0, 0.2)";
           }}
         />
 
@@ -957,10 +964,9 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
               flexWrap: "wrap",
               marginBottom: "18px",
               padding: "10px 14px",
-              background: "rgba(8, 15, 30, 0.6)",
-              border: "1px solid rgba(255, 255, 255, 0.06)",
+              background: "var(--bg-surface, rgba(8, 15, 30, 0.6))",
+              border: "1px solid var(--border-color, rgba(255, 255, 255, 0.06))",
               borderRadius: "10px",
-              fontSize: "12px",
             }}
           >
             <span style={{ fontWeight: 600, color: "var(--text-dim, #98a2b3)", marginRight: "4px" }}>
@@ -1110,6 +1116,120 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
             boxShadow: "0 8px 24px rgba(0, 0, 0, 0.25)",
           }}
         >
+          {/* ── Risk Scoring Basis Table (Compact, without top boxes) ── */}
+          <div
+            style={{
+              background: "var(--bg-surface, rgba(255, 255, 255, 0.03))",
+              border: "1px solid var(--border-color, rgba(255, 255, 255, 0.08))",
+              borderRadius: "10px",
+              padding: "12px 16px",
+              marginBottom: "20px",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                marginBottom: showScoreGuide ? "10px" : "0",
+                cursor: "pointer",
+                userSelect: "none",
+              }}
+              onClick={() => setShowScoreGuide((v) => !v)}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <span style={{ fontSize: "13px", fontWeight: 700, color: "var(--text-main)" }}>
+                  ⚖️ Risk Score Assignment Basis (1–9)
+                </span>
+                <span style={{ fontSize: "10px", fontWeight: 700, textTransform: "uppercase", padding: "1px 7px", borderRadius: "999px", background: "rgba(154, 80, 233, 0.15)", color: "var(--purple-bright, #B778FF)" }}>
+                  Decision Matrix
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setShowScoreGuide((v) => !v);
+                }}
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  color: "var(--purple-bright, #B778FF)",
+                  fontSize: "11.5px",
+                  fontWeight: 600,
+                  cursor: "pointer",
+                }}
+              >
+                {showScoreGuide ? "▴ Hide" : "▾ View Scoring Table"}
+              </button>
+            </div>
+
+            {showScoreGuide && (
+              <div style={{ overflowX: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "11.5px" }}>
+                  <thead>
+                    <tr style={{ background: "var(--bg-surface-3, rgba(255,255,255,0.04))", color: "var(--text-muted)", textAlign: "left", borderBottom: "1px solid var(--border-color)" }}>
+                      <th style={{ padding: "7px 10px", width: "55px" }}>Score</th>
+                      <th style={{ padding: "7px 10px", width: "130px" }}>Threat Level</th>
+                      <th style={{ padding: "7px 10px" }}>On What Basis Assigned (Required Criteria)</th>
+                      <th style={{ padding: "7px 10px", width: "80px" }}>Priority</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr style={{ borderBottom: "1px solid var(--border-subtle, rgba(255,255,255,0.03))" }}>
+                      <td style={{ padding: "6px 10px", fontWeight: 800, color: "var(--danger, #E95053)" }}>9</td>
+                      <td style={{ padding: "6px 10px" }}><span style={{ color: "var(--danger, #E95053)", fontWeight: 700 }}>Critical Threat</span></td>
+                      <td style={{ padding: "6px 10px", color: "var(--text-main)" }}><strong>Logo Match</strong> + <strong>Name Match</strong> + <strong>Active</strong> (posted ≤180d) + <strong>Location Match</strong></td>
+                      <td style={{ padding: "6px 10px" }}><span style={{ background: "rgba(233,80,83,0.15)", color: "var(--danger)", padding: "1px 6px", borderRadius: "4px", fontWeight: 700 }}>High</span></td>
+                    </tr>
+                    <tr style={{ borderBottom: "1px solid var(--border-subtle, rgba(255,255,255,0.03))" }}>
+                      <td style={{ padding: "6px 10px", fontWeight: 800, color: "var(--danger, #E95053)" }}>8</td>
+                      <td style={{ padding: "6px 10px" }}><span style={{ color: "var(--danger, #E95053)", fontWeight: 700 }}>High Threat</span></td>
+                      <td style={{ padding: "6px 10px", color: "var(--text-main)" }}><strong>Logo Match</strong> + <strong>Name Match</strong> + <strong>Active</strong> (posted ≤180d, no location)</td>
+                      <td style={{ padding: "6px 10px" }}><span style={{ background: "rgba(233,80,83,0.15)", color: "var(--danger)", padding: "1px 6px", borderRadius: "4px", fontWeight: 700 }}>High</span></td>
+                    </tr>
+                    <tr style={{ borderBottom: "1px solid var(--border-subtle, rgba(255,255,255,0.03))" }}>
+                      <td style={{ padding: "6px 10px", fontWeight: 800, color: "var(--warning, #F79009)" }}>7</td>
+                      <td style={{ padding: "6px 10px" }}><span style={{ color: "var(--warning, #F79009)", fontWeight: 700 }}>High Suspicious</span></td>
+                      <td style={{ padding: "6px 10px", color: "var(--text-main)" }}><strong>Logo Match</strong> + <strong>Name Match</strong> + (Location confirmed OR Dormant post &gt;180d)</td>
+                      <td style={{ padding: "6px 10px" }}><span style={{ background: "rgba(233,80,83,0.15)", color: "var(--danger)", padding: "1px 6px", borderRadius: "4px", fontWeight: 700 }}>High</span></td>
+                    </tr>
+                    <tr style={{ borderBottom: "1px solid var(--border-subtle, rgba(255,255,255,0.03))" }}>
+                      <td style={{ padding: "6px 10px", fontWeight: 800, color: "var(--warning, #F79009)" }}>6</td>
+                      <td style={{ padding: "6px 10px" }}><span style={{ color: "var(--warning, #F79009)", fontWeight: 700 }}>Medium Threat</span></td>
+                      <td style={{ padding: "6px 10px", color: "var(--text-main)" }}><strong>Logo Match</strong> + <strong>Name Match</strong> only (no location and no post history)</td>
+                      <td style={{ padding: "6px 10px" }}><span style={{ background: "rgba(233,80,83,0.15)", color: "var(--danger)", padding: "1px 6px", borderRadius: "4px", fontWeight: 700 }}>High</span></td>
+                    </tr>
+                    <tr style={{ borderBottom: "1px solid var(--border-subtle, rgba(255,255,255,0.03))" }}>
+                      <td style={{ padding: "6px 10px", fontWeight: 800, color: "var(--warning, #F79009)" }}>5</td>
+                      <td style={{ padding: "6px 10px" }}><span style={{ color: "var(--warning, #F79009)", fontWeight: 700 }}>Suspicious Active</span></td>
+                      <td style={{ padding: "6px 10px", color: "var(--text-main)" }}><strong>Name Match only</strong> (no logo) + <strong>Active</strong> (posted ≤180d)</td>
+                      <td style={{ padding: "6px 10px" }}><span style={{ background: "rgba(233,80,83,0.15)", color: "var(--danger)", padding: "1px 6px", borderRadius: "4px", fontWeight: 700 }}>High</span></td>
+                    </tr>
+                    <tr style={{ borderBottom: "1px solid var(--border-subtle, rgba(255,255,255,0.03))" }}>
+                      <td style={{ padding: "6px 10px", fontWeight: 800, color: "var(--success, #12B76A)" }}>4</td>
+                      <td style={{ padding: "6px 10px" }}><span style={{ color: "var(--success, #12B76A)", fontWeight: 700 }}>Low-Medium</span></td>
+                      <td style={{ padding: "6px 10px", color: "var(--text-main)" }}><strong>Name Match only</strong> + <strong>Dormant</strong> post history (&gt;180d)</td>
+                      <td style={{ padding: "6px 10px" }}><span style={{ background: "rgba(18,183,106,0.15)", color: "var(--success)", padding: "1px 6px", borderRadius: "4px", fontWeight: 700 }}>Low</span></td>
+                    </tr>
+                    <tr style={{ borderBottom: "1px solid var(--border-subtle, rgba(255,255,255,0.03))" }}>
+                      <td style={{ padding: "6px 10px", fontWeight: 800, color: "var(--success, #12B76A)" }}>3</td>
+                      <td style={{ padding: "6px 10px" }}><span style={{ color: "var(--success, #12B76A)", fontWeight: 700 }}>Candidate Match</span></td>
+                      <td style={{ padding: "6px 10px", color: "var(--text-main)" }}><strong>Name Match only</strong> + No post history detected</td>
+                      <td style={{ padding: "6px 10px" }}><span style={{ background: "rgba(18,183,106,0.15)", color: "var(--success)", padding: "1px 6px", borderRadius: "4px", fontWeight: 700 }}>Low</span></td>
+                    </tr>
+                    <tr>
+                      <td style={{ padding: "6px 10px", fontWeight: 800, color: "var(--text-muted)" }}>2</td>
+                      <td style={{ padding: "6px 10px" }}><span style={{ color: "var(--text-muted)", fontWeight: 700 }}>Baseline / Floor</span></td>
+                      <td style={{ padding: "6px 10px", color: "var(--text-main)" }}>Candidate keyword match, but <strong>Name does not match brand</strong> (baseline for analyst inspection)</td>
+                      <td style={{ padding: "6px 10px" }}><span style={{ background: "rgba(18,183,106,0.15)", color: "var(--success)", padding: "1px 6px", borderRadius: "4px", fontWeight: 700 }}>Low</span></td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
           {/* Format Toggle & Export Toolbar */}
           <div
             style={{
@@ -1124,7 +1244,7 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
             }}
           >
             {/* Format Mode Tabs */}
-            <div style={{ display: "flex", alignItems: "center", gap: "6px", background: "var(--bg-primary, #080F1E)", padding: "4px", borderRadius: "8px" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "6px", background: "var(--bg-surface-2, rgba(0,0,0,0.2))", padding: "4px", borderRadius: "8px" }}>
               <button
                 type="button"
                 onClick={() => setFormatMode("incident")}
@@ -1255,7 +1375,7 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
                 placeholder="Search username, url, bio, location..."
                 style={{
                   width: "100%",
-                  background: "var(--bg-primary, #080F1E)",
+                  background: "var(--bg-input, var(--bg-surface))",
                   border: "1px solid var(--border-color, #344054)",
                   borderRadius: "6px",
                   color: "var(--text-main, #fff)",
@@ -1272,7 +1392,7 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
               value={platformFilter}
               onChange={(e) => setPlatformFilter(e.target.value)}
               style={{
-                background: "var(--bg-primary, #080F1E)",
+                background: "var(--bg-input, var(--bg-surface))",
                 border: "1px solid var(--border-color, #344054)",
                 color: "var(--text-main, #fff)",
                 padding: "7px 12px",
@@ -1296,7 +1416,7 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
               value={riskFilter}
               onChange={(e) => setRiskFilter(e.target.value)}
               style={{
-                background: "var(--bg-primary, #080F1E)",
+                background: "var(--bg-input, var(--bg-surface))",
                 border: "1px solid var(--border-color, #344054)",
                 color: "var(--text-main, #fff)",
                 padding: "7px 12px",
@@ -1325,8 +1445,8 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
           <div style={{
             display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap",
             marginBottom: "12px", padding: "8px 12px", borderRadius: "8px",
-            background: "var(--bg-inner, #0F1729)",
-            border: "1px solid var(--border-subtle, rgba(255,255,255,0.06))",
+            background: "var(--bg-surface, rgba(255,255,255,0.03))",
+            border: "1px solid var(--border-color, rgba(255,255,255,0.06))",
           }}>
             <span style={{ fontSize: "11px", color: "var(--text-dim)" }}>
               🕒 Saved for {retentionHours}h, then deleted automatically
@@ -1382,7 +1502,7 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
           </div>
 
           {/* ─── Interactive Table View ─── */}
-          <div style={{ overflowX: "auto", border: "1px solid var(--border-color, #344054)", borderRadius: "10px", boxShadow: "0 4px 20px rgba(0,0,0,0.15)" }}>
+          <div className="analysis-table-container">
             {/* NOT width:"100%" -- an 11-column table pinned to 100% of the
                 scroll wrapper's width has nowhere to grow, so the browser
                 squeezes every column down to fit instead, cutting long
@@ -1394,14 +1514,14 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
                 columns actually need; the wrapper scrolls to it instead. */}
             <table style={{ width: "max-content", minWidth: "100%", borderCollapse: "collapse", fontSize: "12.5px", textAlign: "left" }}>
               <thead>
-                <tr style={{ background: "var(--bg-primary, #080F1E)", color: "var(--text-dim, #98a2b3)", borderBottom: "2px solid var(--border-color, #344054)" }}>
-                  <th style={{ padding: "12px 10px", width: "34px", textAlign: "center" }} title="Select rows to delete" />
-                  <th style={{ padding: "12px 14px", fontWeight: 700, fontSize: "10.5px", letterSpacing: "0.06em", textTransform: "uppercase", textAlign: "center" }}>Screenshot</th>
+                <tr style={{ color: "var(--text-dim, #98a2b3)", borderBottom: "2px solid var(--border-color, #344054)" }}>
+                  <th className="sticky-col-0" style={{ padding: "12px 10px", width: "38px", minWidth: "38px", maxWidth: "38px", textAlign: "center" }} title="Select rows to delete" />
+                  <th className="sticky-col-1" style={{ padding: "12px 10px", width: "140px", minWidth: "140px", maxWidth: "140px", fontWeight: 700, fontSize: "10.5px", letterSpacing: "0.06em", textTransform: "uppercase", textAlign: "center" }}>Screenshot</th>
                   {formatMode === "incident" ? (
                     <>
                       <th style={{ padding: "12px 14px", fontWeight: 700, fontSize: "10.5px", letterSpacing: "0.06em", textTransform: "uppercase", whiteSpace: "nowrap" }}>Platform</th>
                       <th style={{ padding: "12px 14px", fontWeight: 700, fontSize: "10.5px", letterSpacing: "0.06em", textTransform: "uppercase", whiteSpace: "nowrap" }}>Profile / Account</th>
-                      <th style={{ padding: "12px 14px", fontWeight: 700, fontSize: "10.5px", letterSpacing: "0.06em", textTransform: "uppercase", whiteSpace: "nowrap" }}>Risk Rating</th>
+                      <th style={{ padding: "12px 14px", fontWeight: 700, fontSize: "10.5px", letterSpacing: "0.06em", textTransform: "uppercase", whiteSpace: "nowrap" }} title="Scored 1-9 on Logo Match, Name Match, Activity, and Location">Risk Rating</th>
                       <th style={{ padding: "12px 14px", fontWeight: 700, fontSize: "10.5px", letterSpacing: "0.06em", textTransform: "uppercase", whiteSpace: "nowrap" }}>Asset Name</th>
                       <th style={{ padding: "12px 14px", fontWeight: 700, fontSize: "10.5px", letterSpacing: "0.06em", textTransform: "uppercase", whiteSpace: "nowrap" }}>Active</th>
                       <th style={{ padding: "12px 14px", fontWeight: 700, fontSize: "10.5px", letterSpacing: "0.06em", textTransform: "uppercase", whiteSpace: "nowrap" }}>Name Match</th>
@@ -1423,7 +1543,7 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
                       <th style={{ padding: "12px 14px", fontWeight: 700, fontSize: "10.5px", letterSpacing: "0.06em", textTransform: "uppercase", whiteSpace: "nowrap" }}>Name (Yes / No)</th>
                       <th style={{ padding: "12px 14px", fontWeight: 700, fontSize: "10.5px", letterSpacing: "0.06em", textTransform: "uppercase", whiteSpace: "nowrap" }}>Location</th>
                       <th style={{ padding: "12px 14px", fontWeight: 700, fontSize: "10.5px", letterSpacing: "0.06em", textTransform: "uppercase", whiteSpace: "nowrap" }}>Last Post (DD-MM-YYYY) (Optional)</th>
-                      <th style={{ padding: "12px 14px", fontWeight: 700, fontSize: "10.5px", letterSpacing: "0.06em", textTransform: "uppercase", whiteSpace: "nowrap" }}>Risk Score</th>
+                      <th style={{ padding: "12px 14px", fontWeight: 700, fontSize: "10.5px", letterSpacing: "0.06em", textTransform: "uppercase", whiteSpace: "nowrap" }} title="Scored 1-9 on Logo Match, Name Match, Activity, and Location">Risk Score</th>
                       <th style={{ padding: "12px 14px", fontWeight: 700, fontSize: "10.5px", letterSpacing: "0.06em", textTransform: "uppercase", whiteSpace: "nowrap" }}>priority</th>
                       <th style={{ padding: "12px 14px", fontWeight: 700, fontSize: "10.5px", letterSpacing: "0.06em", textTransform: "uppercase", whiteSpace: "nowrap" }}>Date</th>
                       <th style={{ padding: "12px 14px", fontWeight: 700, fontSize: "10.5px", letterSpacing: "0.06em", textTransform: "uppercase", whiteSpace: "nowrap" }}>Comments</th>
@@ -1458,13 +1578,13 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
                           background: it.status === "error" ? "rgba(233, 80, 83, 0.05)" : "transparent",
                           transition: "background 0.15s ease",
                         }}
-                        onMouseEnter={(e) => { if (it.status !== "error") e.currentTarget.style.background = "rgba(0, 229, 255, 0.03)"; }}
+                        onMouseEnter={(e) => { if (it.status !== "error") e.currentTarget.style.background = "rgba(154, 80, 233, 0.05)"; }}
                         onMouseLeave={(e) => { if (it.status !== "error") e.currentTarget.style.background = "transparent"; }}
                       >
                         {/* Row selection. Disabled until the row has
                             settled -- there is nothing saved to delete
                             before then (see `selectable`). */}
-                        <td style={{ padding: "10px", textAlign: "center", verticalAlign: "middle" }}>
+                        <td className="sticky-col-0" style={{ padding: "10px", width: "38px", minWidth: "38px", maxWidth: "38px", textAlign: "center", verticalAlign: "middle" }}>
                           <input
                             type="checkbox"
                             checked={!!it.result_id && selected.includes(it.result_id)}
@@ -1478,7 +1598,7 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
                         {/* Screenshot -- a large enough thumbnail to actually
                             read at a glance, full-size preview on hover
                             (click also works, for touch devices). */}
-                        <td style={{ padding: "10px 14px", textAlign: "center" }}>
+                        <td className="sticky-col-1" style={{ padding: "10px", width: "140px", minWidth: "140px", maxWidth: "140px", textAlign: "center" }}>
                           {screenshotUrl ? (
                             <img
                               src={screenshotUrl}
@@ -1487,15 +1607,15 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
                               onMouseLeave={() => setPreviewScreenshot(null)}
                               onClick={() => setPreviewScreenshot({ url: screenshotUrl, profileName: it.profile_name || it.entity_id })}
                               style={{
-                                width: "128px", height: "96px", objectFit: "cover", objectPosition: "top",
+                                width: "120px", height: "90px", objectFit: "cover", objectPosition: "top",
                                 borderRadius: "8px", cursor: "zoom-in", border: "1px solid var(--border-color, #344054)",
                                 boxShadow: "0 2px 8px rgba(0,0,0,0.25)", transition: "transform 0.15s ease, box-shadow 0.15s ease",
                               }}
-                              onMouseOver={(e) => { e.currentTarget.style.transform = "scale(1.04)"; e.currentTarget.style.boxShadow = "0 4px 16px rgba(0,229,255,0.25)"; }}
+                              onMouseOver={(e) => { e.currentTarget.style.transform = "scale(1.04)"; e.currentTarget.style.boxShadow = "0 4px 16px rgba(154,80,233,0.3)"; }}
                               onMouseOut={(e) => { e.currentTarget.style.transform = "none"; e.currentTarget.style.boxShadow = "0 2px 8px rgba(0,0,0,0.25)"; }}
                             />
                           ) : (
-                            <div style={{ width: "128px", height: "96px", display: "flex", alignItems: "center", justifyContent: "center", background: "var(--bg-primary, #080F1E)", borderRadius: "8px", border: "1px dashed var(--border-color, #344054)", margin: "0 auto" }}>
+                            <div style={{ width: "120px", height: "90px", display: "flex", alignItems: "center", justifyContent: "center", background: "var(--bg-surface, rgba(0,0,0,0.15))", borderRadius: "8px", border: "1px dashed var(--border-color, #344054)", margin: "0 auto" }}>
                               <span style={{ color: "var(--text-muted)", fontSize: "11px" }}>No capture</span>
                             </div>
                           )}
@@ -1549,7 +1669,7 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
                                       href={it.url}
                                       target="_blank"
                                       rel="noopener noreferrer"
-                                      style={{ fontWeight: 600, color: "var(--cyan, #00F0FF)", textDecoration: "none", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                                      style={{ fontWeight: 600, color: "var(--primary-link, #9A50E9)", textDecoration: "none", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
                                     >
                                       {it.profile_name || it.entity_id || "Profile Link"}
                                     </a>
@@ -1585,7 +1705,7 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
                             <td style={{ padding: "0" }}><EditableCell value={String(row["Original Name"] || "")} onChange={(v) => handleEdit(it.id, "Original Name", v)} /></td>
                             <td style={{ padding: "0" }}><EditableCell value={String(row["Original feed"] || "")} onChange={(v) => handleEdit(it.id, "Original feed", v)} /></td>
                             <td style={{ padding: "10px 14px", maxWidth: "200px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                              <a href={it.url} target="_blank" rel="noopener noreferrer" style={{ color: "var(--cyan, #00F0FF)", textDecoration: "none" }}>{it.url}</a>
+                              <a href={it.url} target="_blank" rel="noopener noreferrer" style={{ color: "var(--primary-link, #9A50E9)", textDecoration: "none" }}>{it.url}</a>
                             </td>
                             <td style={{ padding: "0" }}><EditableCell value={String(row["Profile name"] || "")} onChange={(v) => handleEdit(it.id, "Profile name", v)} /></td>
                             <td style={{ padding: "0" }}><EditableCell value={String(row["Created Date"] || "")} onChange={(v) => handleEdit(it.id, "Created Date", v)} /></td>

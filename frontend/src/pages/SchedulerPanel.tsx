@@ -6,15 +6,16 @@
 // client across to add it, drag entries within it to reorder, press Run and
 // the engine works down the list, one client's discovery sweep at a time.
 //
-// The queue and the run loop itself live in services/scheduleRunner.ts, NOT
-// in this component: a run outlives this panel (an analyst is expected to go
-// watch Live Results while it works), so the state has to outlive it too.
-// This file is a view over that store and nothing more.
+// The queue, the schedule and the run loop all live on the SERVER
+// (backend/services/scheduler_service.py). This file is a view over them
+// and nothing more -- services/scheduleRunner.ts is the client that polls
+// it.
 //
-// Everything the previous version of this file talked to -- schedulerApi,
-// jobsApi, a server-side round-robin engine -- was deleted with the old
-// backend. Sequencing happens here now, over the one route that survives:
-// POST /discovery/jobs and its poll.
+// THAT IS WHAT MAKES THE CLOCK WORK. The run loop used to be plain JS in
+// this tab, which meant a run scheduled for two in the morning happened
+// only if somebody left a browser open -- and if they had not, nothing ran
+// and nothing said so. Now the tab is optional: closing it, reloading it,
+// or shutting the laptop does not touch a run in progress.
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { toast } from "react-hot-toast";
 
@@ -28,6 +29,7 @@ import {
   keywordsOf,
   reorder,
   resetStatuses,
+  setDirectory,
   start,
   stop,
   subscribe,
@@ -37,6 +39,7 @@ import {
   type PlatformOutcome,
   type ScheduleEntry,
 } from "../services/scheduleRunner";
+import { SchedulerSchedule } from "../components/SchedulerSchedule";
 import { PlayIcon, StopIcon, SearchIcon, AlertTriangleIcon } from "../components/AppIcons";
 import { PlatformIcon } from "../components/PlatformIcon";
 import { SchedulerRunScope } from "../components/SchedulerRunScope";
@@ -53,8 +56,15 @@ const STATUS_LOOK: Record<EntryStatus, { color: string; label: string; dot: stri
   failed: { color: "var(--danger, #e95053)", label: "failed", dot: "●" },
   skipped: { color: "var(--warn-yellow, #fdb71b)", label: "skipped", dot: "●" },
   // Cancelled from outside this scheduler (another tab, a direct API call).
-  // Terminal on purpose -- see the comment in scheduleRunner.ts's poll loop.
+  // Terminal on purpose: re-queueing it would restart the very job that
+  // was just cancelled, on every lap, burning a platform session each time.
   cancelled: { color: "var(--warn-yellow, #fdb71b)", label: "cancelled", dot: "●" },
+  // An analyst pressed Stop while this client was being swept.
+  stopped: { color: "var(--warn-yellow, #fdb71b)", label: "stopped", dot: "●" },
+  // The backend restarted mid-sweep. Whatever this client had already
+  // found was saved -- the run simply stopped watching it. Says so rather
+  // than claiming either success or failure, because neither is true.
+  interrupted: { color: "var(--warn-yellow, #fdb71b)", label: "interrupted", dot: "●" },
 };
 
 // A sweep's outcome is per platform, and the row's single word cannot say
@@ -83,6 +93,10 @@ const PANE: React.CSSProperties = {
   display: "flex",
   flexDirection: "column",
   minHeight: "calc(100vh - 270px)",
+  minWidth: 0,
+  maxWidth: "100%",
+  boxSizing: "border-box",
+  overflow: "hidden",
 };
 
 const PANE_TITLE: React.CSSProperties = {
@@ -146,6 +160,12 @@ export function SchedulerPanel({ platforms }: { platforms: PlatformState[] }) {
     loadClients();
   }, [loadClients]);
 
+  // The queue lives on the server and knows only client ids. The store
+  // needs the directory to put a name and a keyword count against each one.
+  useEffect(() => {
+    setDirectory(clients);
+  }, [clients]);
+
   const queuedIds = useMemo(
     () => new Set(state.entries.map((e) => e.client_id)),
     [state.entries],
@@ -202,9 +222,13 @@ export function SchedulerPanel({ platforms }: { platforms: PlatformState[] }) {
   const handleRun = async () => {
     setBusy(true);
     try {
-      // start() now auto-resets all entries to a clean slate, so there is
-      // no need to call resetStatuses() separately.
       await start();
+    } catch (e) {
+      // A 409 here means a run is ALREADY going -- most likely the
+      // scheduled one that just fired. Saying so is the difference
+      // between a button that looks broken and one that is telling the
+      // analyst something they need to know.
+      toast.error((e as Error).message || "could not start the run");
     } finally {
       setBusy(false);
     }
@@ -218,17 +242,17 @@ export function SchedulerPanel({ platforms }: { platforms: PlatformState[] }) {
     : `Run queue (${counts.pending})`;
 
   return (
-    <div style={{ color: "var(--text-main, #f2f4f7)", width: "100%", margin: 0, padding: 0 }}>
+    <div style={{ color: "var(--text-main, #f2f4f7)", width: "100%", maxWidth: "100%", margin: 0, padding: 0, boxSizing: "border-box" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "18px", flexWrap: "wrap", gap: "12px" }}>
         <div>
           <h1 style={{ fontSize: "22px", fontWeight: 700, color: "var(--text-primary, #fff)", margin: 0, letterSpacing: "-0.3px" }}>
             🔁 Scheduler
           </h1>
           <p style={{ fontSize: "13px", color: "var(--text-muted, #98a2b3)", margin: "4px 0 0 0", maxWidth: "960px" }}>
-            Drag clients from the left into the run queue, then press Run. Discovery sweeps them one
-            at a time, top to bottom — never two at once, so no two clients compete for the same
-            platform session. You can keep working elsewhere while it runs; leaving this tab does not
-            stop it (a full page reload does).
+            Drag clients from the left into the run queue, then press Run — or set a time below and
+            let it run itself. Discovery sweeps them one at a time, top to bottom — never two at
+            once, so no two clients compete for the same platform session. The run happens on the
+            server: closing this tab, reloading, or shutting the laptop does not stop it.
           </p>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
@@ -268,6 +292,47 @@ export function SchedulerPanel({ platforms }: { platforms: PlatformState[] }) {
         </div>
       </div>
 
+      {/* THE BACKEND IS THE SCHEDULER NOW, so losing it is not a cosmetic
+          problem: nothing is going to fire while this is showing. Said
+          plainly rather than leaving the last good queue on screen looking
+          current -- a stale-but-happy queue is the lie an analyst believes.
+
+          ABOVE the schedule card, deliberately. Below it, the warning did
+          not cover the most reassuring thing on the page -- a green "Next
+          run Fri, 02:00" line that is, at that moment, a stale promise
+          nothing is going to keep. */}
+      {state.error && (
+        <div style={{
+          display: "flex", gap: "8px", alignItems: "flex-start", marginBottom: "16px",
+          padding: "9px 12px", background: "rgba(233,80,83,0.10)",
+          border: "1px solid rgba(233,80,83,0.3)", borderRadius: "8px",
+          color: "var(--danger)", fontSize: "12px", lineHeight: 1.55,
+        }}>
+          <span style={{ marginTop: "1px", flexShrink: 0 }}>
+            <AlertTriangleIcon size={14} color="var(--danger)" />
+          </span>
+          <span>
+            <strong>Cannot reach the backend.</strong> {state.error}. Nothing below is guaranteed to
+            be current, and no scheduled run will fire until the tool is reachable again.
+          </span>
+        </div>
+      )}
+
+      {/* WHEN this queue runs by itself. Above the queue because it is the
+          thing an analyst sets once and then relies on. */}
+      <SchedulerSchedule
+        schedule={state.schedule}
+        nextRunAt={state.nextRunAt}
+        upcoming={state.upcoming}
+        lastFiredAt={state.lastFiredAt}
+        wallClockShift={state.wallClockShift}
+        catchUpGraceMinutes={state.catchUpGraceMinutes}
+        lastRun={state.lastRun}
+        running={state.running}
+        disabled={state.running}
+        stale={Boolean(state.error)}
+      />
+
       {/* Summary strip -- only once there is something to summarise. */}
       {state.entries.length > 0 && (
         <div style={{ display: "flex", gap: "12px", marginBottom: "16px", flexWrap: "wrap" }}>
@@ -286,7 +351,7 @@ export function SchedulerPanel({ platforms }: { platforms: PlatformState[] }) {
         </div>
       )}
 
-      <div style={{ display: "grid", gridTemplateColumns: "320px 1fr", gap: "18px", alignItems: "start", width: "100%" }}>
+      <div className="scheduler-grid-layout">
         {/* ─────────────────────────── saved clients ─────────────────────── */}
         <div style={PANE}>
           <div style={PANE_TITLE}>Saved clients ({available.length})</div>
@@ -406,7 +471,7 @@ export function SchedulerPanel({ platforms }: { platforms: PlatformState[] }) {
               <span style={{ fontSize: "12px" }}>They will be swept in the order you drop them.</span>
             </div>
           ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: "8px", overflowY: "auto", maxHeight: "calc(100vh - 350px)", minHeight: "350px" }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: "8px", overflowY: "auto", maxHeight: "calc(100vh - 350px)", minHeight: "350px", width: "100%", minWidth: 0, maxWidth: "100%", boxSizing: "border-box" }}>
               {state.entries.map((entry, i) => (
                 <QueueRow
                   key={entry.client_id}
@@ -451,8 +516,8 @@ function PlatformChips({ entry }: { entry: ScheduleEntry }) {
   const details = entry.platform_details ?? {};
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: "4px", marginTop: "6px" }}>
-      <div style={{ display: "flex", gap: "5px", flexWrap: "wrap", alignItems: "center" }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: "6px", marginTop: "6px", maxWidth: "100%", minWidth: 0, boxSizing: "border-box" }}>
+      <div style={{ display: "flex", gap: "5px", flexWrap: "wrap", alignItems: "center", maxWidth: "100%" }}>
         {ids.map((pid) => {
           const outcome = entry.platforms[pid];
           const look = PLATFORM_LOOK[outcome] ?? PLATFORM_LOOK.skipped;
@@ -467,9 +532,10 @@ function PlatformChips({ entry }: { entry: ScheduleEntry }) {
                   : `${pid}: ${look.label}${hasCounts ? ` (${detail!.found} found, ${detail!.new} new)` : ""}`
               }
               style={{
-                display: "inline-flex", alignItems: "center", gap: "5px",
+                display: "inline-flex", alignItems: "center", gap: "4px",
                 background: look.bg, color: look.fg, borderRadius: "999px",
-                padding: "2px 8px", fontSize: "10.5px", fontWeight: 700,
+                padding: "2px 7px", fontSize: "10px", fontWeight: 700,
+                flexShrink: 0,
               }}
             >
               <PlatformIcon platform={pid} size={11} />
@@ -488,27 +554,18 @@ function PlatformChips({ entry }: { entry: ScheduleEntry }) {
             </span>
           );
         })}
-        {/* THE NUMBER THAT ACTUALLY ANSWERS THE QUESTION. "2 platforms
-            still owing" says a platform did not finish cleanly; it cannot
-            say whether a keyword went unsearched, which is the only thing
-            that matters in impersonation monitoring -- an unsearched
-            permutation is an impersonator nobody looked for. `entry.owed`
-            is read from the backend's durable per-cell ledger after the
-            sweep settles, so it counts real (platform, tab, keyword)
-            searches still outstanding. -1 means the coverage read failed
-            and is shown as unknown rather than as zero: a failed read must
-            never be able to impersonate a clean bill of health. */}
+        {/* Searches still owing */}
         {entry.owed > 0 ? (
           <span
             title="Keyword searches this client still owes. The Scheduler runs one gap-closing pass over these automatically after the queue finishes."
-            style={{ fontSize: "10.5px", color: "var(--warn-yellow, #fdb71b)", fontWeight: 700 }}
+            style={{ fontSize: "10.5px", color: "var(--warn-yellow, #fdb71b)", fontWeight: 700, flexShrink: 0 }}
           >
             {entry.owed} search{entry.owed === 1 ? "" : "es"} still owing
           </span>
         ) : entry.owed < 0 && owing > 0 ? (
           <span
             title="Coverage could not be read, so what this client still owes is unknown."
-            style={{ fontSize: "10.5px", color: "var(--warn-yellow, #fdb71b)", fontWeight: 700 }}
+            style={{ fontSize: "10.5px", color: "var(--warn-yellow, #fdb71b)", fontWeight: 700, flexShrink: 0 }}
           >
             {owing} platform{owing === 1 ? "" : "s"} unfinished
           </span>
@@ -521,8 +578,8 @@ function PlatformChips({ entry }: { entry: ScheduleEntry }) {
         return (outcome === "failed" || outcome === "partial") && details[pid]?.note;
       }) && (
         <div style={{
-          display: "flex", flexDirection: "column", gap: "2px",
-          marginTop: "2px", paddingLeft: "2px",
+          display: "flex", flexDirection: "column", gap: "3px",
+          marginTop: "3px", paddingLeft: "2px", maxWidth: "100%", minWidth: 0, boxSizing: "border-box",
         }}>
           {ids
             .filter((pid) => {
@@ -537,12 +594,15 @@ function PlatformChips({ entry }: { entry: ScheduleEntry }) {
                   color: entry.platforms[pid] === "failed"
                     ? "var(--danger, #e95053)"
                     : "var(--warn-yellow, #fdb71b)",
-                  display: "inline-flex", alignItems: "center", gap: "4px",
-                  lineHeight: 1.5,
+                  display: "inline-flex", alignItems: "flex-start", gap: "5px",
+                  lineHeight: 1.4,
+                  wordBreak: "break-word",
+                  overflowWrap: "anywhere",
+                  maxWidth: "100%",
                 }}
               >
-                <PlatformIcon platform={pid} size={10} />
-                {details[pid].note}
+                <span style={{ marginTop: "2px", flexShrink: 0 }}><PlatformIcon platform={pid} size={10} /></span>
+                <span style={{ flex: 1, minWidth: 0, wordBreak: "break-word", overflowWrap: "anywhere" }}>{details[pid].note}</span>
               </span>
             ))}
         </div>
@@ -604,83 +664,109 @@ function QueueRow({
         onDrop(e, entry.client_id);
       }}
       style={{
-        display: "flex", alignItems: "center", gap: "10px", padding: "9px 11px",
+        display: "flex",
+        flexDirection: "column",
+        gap: "6px",
+        padding: "10px 12px",
         borderRadius: "8px",
         background: isCurrent ? "rgba(124, 92, 255, 0.08)" : "var(--bg-inner)",
         border: `1px solid ${
           over ? "var(--accent, #7c5cff)" : isCurrent ? "var(--accent, #7c5cff)" : "var(--border-subtle)"
         }`,
         cursor: isCurrent ? "default" : "grab",
+        width: "100%",
+        minWidth: 0,
+        maxWidth: "100%",
+        boxSizing: "border-box",
+        position: "relative",
       }}
     >
-      <span style={{ fontSize: "11px", color: "var(--text-dim)", fontFamily: "var(--font-mono)", minWidth: "18px" }}>
-        {index + 1}.
-      </span>
+      {/* ── CARD HEADER: Index, Client Title, Status Pill, Elapsed, and Pinned X Button ── */}
+      <div style={{ display: "flex", alignItems: "center", gap: "8px", width: "100%", minWidth: 0, boxSizing: "border-box" }}>
+        <span style={{ fontSize: "11px", color: "var(--text-dim)", fontFamily: "var(--font-mono)", minWidth: "18px", flexShrink: 0 }}>
+          {index + 1}.
+        </span>
 
-      <span style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontSize: "13px", fontWeight: 600, color: "var(--text-primary, #fff)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+        <div style={{ fontSize: "13px", fontWeight: 600, color: "var(--text-primary, #fff)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: "0 1 auto", minWidth: 0 }}>
           {entry.name}
         </div>
-        <div style={{ fontSize: "11px", color: "var(--text-dim)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {pendingStop
-            ? `${entry.message} — finishing the sweep in flight before stopping`
-            : entry.message || `${entry.keywords.length} keyword${entry.keywords.length === 1 ? "" : "s"}`}
-          {entry.status === "done" && entry.found > 0 && (
-            <span style={{ color: "var(--success)" }}> · {entry.found} found, {entry.new_profiles} new</span>
-          )}
-        </div>
-        <PlatformChips entry={entry} />
 
-        {/* What this client will actually sweep. Editable while it sits in
-            the queue AND while a run is in progress -- a change lands on the
-            client record, and the runner re-reads that record when the
-            client's turn comes up, so an edit made mid-queue still applies.
-            Disabled only for the entry being swept right now, whose request
-            has already gone. */}
-        {client && (
-          <div style={{ marginTop: "8px" }}>
-            <SchedulerRunScope
-              client={client}
-              platforms={platforms}
-              disabled={isCurrent}
-            />
-          </div>
+        {/* Status Pill */}
+        <span
+          style={{
+            fontSize: "11px", fontWeight: 700, color: look.color, whiteSpace: "nowrap",
+            display: "inline-flex", alignItems: "center", gap: "4px", flexShrink: 0,
+            background: "rgba(255, 255, 255, 0.04)", padding: "1px 6px", borderRadius: "4px",
+          }}
+        >
+          <span style={entry.status === "running" ? { animation: "pulse 1.2s ease-in-out infinite" } : undefined}>
+            {look.dot}
+          </span>
+          {look.label}
+        </span>
+
+        {/* Elapsed Timer */}
+        {elapsed && (
+          <span style={{ fontSize: "11px", color: "var(--text-dim)", fontFamily: "var(--font-mono)", whiteSpace: "nowrap", flexShrink: 0 }}>
+            ⏱️ {elapsed}
+          </span>
         )}
-      </span>
 
-      {elapsed && (
-        <span style={{ fontSize: "11px", color: "var(--text-dim)", fontFamily: "var(--font-mono)", whiteSpace: "nowrap" }}>
-          {elapsed}
-        </span>
+        {/* Spacer pushes the X mark to the right */}
+        <div style={{ flex: 1, minWidth: "6px" }} />
+
+        {/* ── REMOVE / DEQUEUE BUTTON (✕) ──
+            Always anchored at the top-right corner of the card,
+            with flexShrink: 0 so it can NEVER be pushed out of bounds */}
+        <button
+          style={{
+            ...SMALL_BTN,
+            padding: "2px 8px",
+            color: isCurrent ? "var(--text-dim)" : "#ff6b6b",
+            borderColor: isCurrent ? "var(--border-color)" : "rgba(239,68,68,0.4)",
+            cursor: isCurrent ? "not-allowed" : "pointer",
+            opacity: isCurrent ? 0.4 : 1,
+            flexShrink: 0,
+            fontSize: "12px",
+            lineHeight: 1.4,
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            marginLeft: "auto",
+          }}
+          disabled={isCurrent}
+          onClick={() => dequeue(entry.client_id)}
+          title={isCurrent ? "Stop the run before removing the client being swept" : "Remove from the queue"}
+        >
+          ✕
+        </button>
+      </div>
+
+      {/* ── SUBTITLE / PROGRESS MESSAGE ── */}
+      <div style={{ fontSize: "11px", color: "var(--text-dim)", overflowWrap: "anywhere", wordBreak: "break-word", paddingLeft: "26px", lineHeight: 1.4, minWidth: 0, maxWidth: "100%" }}>
+        {pendingStop
+          ? `${entry.message} — finishing the sweep in flight before stopping`
+          : entry.message || `${entry.keywords.length} keyword${entry.keywords.length === 1 ? "" : "s"}`}
+        {entry.status === "done" && entry.found > 0 && (
+          <span style={{ color: "var(--success)", fontWeight: 600 }}> · {entry.found} found, {entry.new_profiles} new</span>
+        )}
+      </div>
+
+      {/* ── PLATFORM SWEEP CHIPS & NOTES ── */}
+      <div style={{ paddingLeft: "26px", width: "100%", maxWidth: "100%", minWidth: 0, boxSizing: "border-box" }}>
+        <PlatformChips entry={entry} />
+      </div>
+
+      {/* ── CONFIGURABLE RUN SCOPE ── */}
+      {client && (
+        <div style={{ marginTop: "4px", paddingLeft: "26px", width: "100%", maxWidth: "100%", minWidth: 0, boxSizing: "border-box" }}>
+          <SchedulerRunScope
+            client={client}
+            platforms={platforms}
+            disabled={isCurrent}
+          />
+        </div>
       )}
-
-      <span
-        style={{
-          fontSize: "11px", fontWeight: 700, color: look.color, whiteSpace: "nowrap",
-          display: "inline-flex", alignItems: "center", gap: "5px", minWidth: "68px",
-        }}
-      >
-        <span style={entry.status === "running" ? { animation: "pulse 1.2s ease-in-out infinite" } : undefined}>
-          {look.dot}
-        </span>
-        {look.label}
-      </span>
-
-      <button
-        style={{
-          ...SMALL_BTN,
-          padding: "2px 7px",
-          color: isCurrent ? "var(--text-dim)" : "#ff6b6b",
-          borderColor: isCurrent ? "var(--border-color)" : "rgba(239,68,68,0.4)",
-          cursor: isCurrent ? "not-allowed" : "pointer",
-          opacity: isCurrent ? 0.4 : 1,
-        }}
-        disabled={isCurrent}
-        onClick={() => dequeue(entry.client_id)}
-        title={isCurrent ? "Stop the run before removing the client being swept" : "Remove from the queue"}
-      >
-        ✕
-      </button>
     </div>
   );
 }

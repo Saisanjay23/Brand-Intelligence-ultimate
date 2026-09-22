@@ -134,6 +134,20 @@ export interface PlatformSweepState {
   // keyword list was split across accounts -- see
   // _MAX_SESSIONS_PER_PLATFORM in backend/discovery/runner.py.
   workers?: number;
+  // What each pooled account is sweeping right now, one entry per worker.
+  // Empty for the ordinary single-session sweep, where current_keyword /
+  // current_tab above still say everything there is to say. Present and
+  // populated only when the keyword list was sharded across accounts --
+  // at which point those two fields are deliberately blank, because with
+  // three workers there is no single "current" keyword and naming one was
+  // the flicker that kept sharding switched off.
+  worker_slots?: {
+    account?: string;
+    keyword?: string;
+    tab?: string;
+    step?: string;
+    started_at_ts?: number;
+  }[];
 }
 
 export interface DiscoveryJobState {

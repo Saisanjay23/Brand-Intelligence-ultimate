@@ -403,7 +403,28 @@ export interface SessionItem {
   relogin_running?: boolean;
   // Consecutive failed automatic attempts. Once this reaches the
   // configured ceiling the self-healer stops trying and waits for a person.
+  //
+  // STORED ON THE SESSION ROW, not in the server's memory. It used to be
+  // the latter, so a backend restart reset it to 0 and this panel then
+  // reported "no failed attempts" for an account that had already burned
+  // through its ceiling.
   relogin_attempts?: number;
+  // epoch seconds the last automatic attempt started, and the last one
+  // that WORKED; 0 for never. Same shape as last_used beside them.
+  //
+  // The pair is what makes the attempt count readable: "3 failed" means
+  // something very different on an account that has healed itself eleven
+  // times than on one that has never once managed it.
+  relogin_last_attempt?: number;
+  relogin_last_success?: number;
+  // lifetime successful self-heals; survives a password change, because it
+  // is a fact about the account rather than about the current credentials
+  relogin_total_successes?: number;
+  // Whether this account has a persistent browser profile on disk yet --
+  // its own localStorage, IndexedDB and device keys, rather than arriving
+  // as a brand-new browser every run. Written on the first sweep that uses
+  // the account.
+  has_browser_profile?: boolean;
   // server-computed "could a job use this right now": not dead, and past
   // any cooldown. Distinct from `status` alone.
   available?: boolean;

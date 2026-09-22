@@ -41,7 +41,7 @@ type Phase = "discovery" | "analysis";
 
 const STATUS_COLOR: Record<PlatformSweepState["status"], string> = {
   pending: "var(--text-dim)",
-  running: "var(--cyan)",
+  running: "var(--purple, #9A50E9)",
   done: "var(--success)",
   partial: "var(--warn-yellow)",
   failed: "var(--danger)",
@@ -81,8 +81,15 @@ function PlatformInFlightItem({
   job: DiscoveryJobState;
   running: boolean;
 }) {
-  const kw = p.current_keyword || currentKeywordOf(job, p);
-  const tab = p.current_tab ? p.current_tab.toUpperCase() : undefined;
+  // SHARDED SWEEPS SHOW EVERY ACCOUNT, NOT A GUESS AT ONE. With several
+  // workers the server deliberately stops filling current_keyword (there is
+  // no single answer), so falling back to currentKeywordOf -- which derives
+  // a keyword from keywords_done and assumes strict ordering -- would put a
+  // confidently wrong keyword on screen. Slots are the truth in that case.
+  const slots = (p.worker_slots ?? []).filter((s) => s.keyword);
+  const sharded = slots.length > 1;
+  const kw = sharded ? undefined : p.current_keyword || currentKeywordOf(job, p);
+  const tab = !sharded && p.current_tab ? p.current_tab.toUpperCase() : undefined;
   const isRunning = p.status === "running";
   const itemElapsed = useLiveTimer(p.item_started_at_ts, isRunning);
 
@@ -93,11 +100,11 @@ function PlatformInFlightItem({
         alignItems: "center",
         gap: "8px",
         fontSize: "12px",
-        background: isRunning ? "rgba(0, 229, 255, 0.08)" : "var(--bg-surface)",
+        background: isRunning ? "rgba(154, 80, 233, 0.12)" : "var(--bg-surface)",
         padding: "6px 14px",
         borderRadius: "16px",
-        border: `1px solid ${isRunning ? "rgba(0, 229, 255, 0.4)" : "var(--border-color)"}`,
-        boxShadow: isRunning ? "0 0 10px rgba(0, 229, 255, 0.15)" : "none",
+        border: `1px solid ${isRunning ? "rgba(154, 80, 233, 0.45)" : "var(--border-color)"}`,
+        boxShadow: isRunning ? "0 0 10px rgba(154, 80, 233, 0.25)" : "none",
         flexWrap: "wrap",
       }}
     >
@@ -114,8 +121,8 @@ function PlatformInFlightItem({
           style={{
             fontSize: "10px",
             fontWeight: 700,
-            color: "var(--cyan)",
-            border: "1px solid rgba(0, 229, 255, 0.35)",
+            color: "var(--purple, #9A50E9)",
+            border: "1px solid rgba(154, 80, 233, 0.35)",
             borderRadius: "4px",
             padding: "1px 5px",
           }}
@@ -124,28 +131,53 @@ function PlatformInFlightItem({
         </span>
       )}
       {kw && (
-        <span style={{ fontSize: "11.5px", color: "var(--cyan)", fontWeight: 600, background: "rgba(0, 229, 255, 0.1)", padding: "1px 7px", borderRadius: "10px" }}>
+        <span style={{ fontSize: "11.5px", color: "var(--purple, #9A50E9)", fontWeight: 600, background: "rgba(154, 80, 233, 0.12)", padding: "1px 7px", borderRadius: "10px" }}>
           "{kw}"
         </span>
       )}
+      {/* One pill per account. Deliberately shows the ACCOUNT as well as the
+          keyword: when three are sweeping at once, "which account is on
+          this" is the question an operator actually has, and it is the only
+          place in the UI that can answer it. */}
+      {sharded &&
+        slots.map((s, i) => (
+          <span
+            key={i}
+            title={`${s.account || `Account ${i + 1}`}: ${s.step || "working"}`}
+            style={{
+              fontSize: "11px",
+              color: "var(--purple, #9A50E9)",
+              fontWeight: 600,
+              background: "rgba(154, 80, 233, 0.12)",
+              padding: "1px 7px",
+              borderRadius: "10px",
+              whiteSpace: "nowrap",
+            }}
+          >
+            <span style={{ opacity: 0.65 }}>{s.account || `#${i + 1}`}</span>{" "}
+            "{s.keyword}"
+            {s.tab ? <span style={{ opacity: 0.65 }}> · {s.tab.toUpperCase()}</span> : null}
+          </span>
+        ))}
       {tab && isRunning && (
         <span
           style={{
             fontSize: "10px",
             fontWeight: 800,
             color: "#fff",
-            background: "linear-gradient(135deg, var(--cyan), var(--purple))",
+            background: "linear-gradient(135deg, #9A50E9, #7727CD)",
             padding: "1px 6px",
             borderRadius: "4px",
-            letterSpacing: "0.5px",
+            boxShadow: "0 2px 6px rgba(154, 80, 233, 0.35)",
+            letterSpacing: "0.04em",
           }}
         >
-          {tab}
+          [{tab}]
         </span>
       )}
-      {isRunning && itemElapsed > 0 && (
-        <span style={{ fontFamily: "var(--font-mono)", fontSize: "11px", color: "var(--cyan-bright, #00f0ff)", fontWeight: 700 }}>
-          ⏱️ {itemElapsed.toFixed(1)}s in flight
+      {isRunning && (
+        <span style={{ fontFamily: "var(--font-mono)", fontSize: "11px", color: "var(--purple, #9A50E9)", fontWeight: 700 }}>
+          ⏱️ {formatElapsed(itemElapsed)}
         </span>
       )}
       {p.note && <span style={{ fontSize: "11px", color: "var(--text-dim)", marginLeft: "4px" }}>{p.note}</span>}
@@ -177,8 +209,8 @@ function DiscoveryBannerBox({
       className="dashboard-card-box"
       style={{
         marginTop: "16px",
-        borderLeft: "4px solid var(--cyan)",
-        background: "rgba(0, 229, 255, 0.04)",
+        borderLeft: "4px solid var(--purple, #9A50E9)",
+        background: "rgba(154, 80, 233, 0.06)",
         padding: "16px 20px",
         transition: "all 0.3s ease",
       }}
@@ -186,12 +218,12 @@ function DiscoveryBannerBox({
       {/* Top Header Row with Timers, ETA, & Progress */}
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "10px", flexWrap: "wrap", gap: "10px" }}>
         <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-          <DiscoverIcon size={18} color="var(--cyan)" />
+          <DiscoverIcon size={18} color="var(--purple, #9A50E9)" />
           <span style={{ fontWeight: 700, color: "var(--text-main)", fontSize: "14px" }}>
             {running ? "Live Discovery Sweep Progress" : "Recent Discovery Status"}
           </span>
           {running ? (
-            <span className="rail-pill" style={{ background: "var(--cyan)", color: "#000", fontWeight: 700, animation: "pulse 1.5s infinite" }}>
+            <span className="rail-pill" style={{ background: "var(--purple, #9A50E9)", color: "#fff", fontWeight: 700, animation: "pulse 1.5s infinite" }}>
               RUNNING
             </span>
           ) : (
@@ -221,9 +253,9 @@ function DiscoveryBannerBox({
         <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", fontFamily: "var(--font-mono)", fontSize: "12px" }}>
           <span
             style={{
-              background: "rgba(0, 229, 255, 0.1)",
-              border: "1px solid rgba(0, 229, 255, 0.25)",
-              color: "var(--cyan)",
+              background: "rgba(154, 80, 233, 0.12)",
+              border: "1px solid rgba(154, 80, 233, 0.3)",
+              color: "var(--purple, #9A50E9)",
               padding: "3px 9px",
               borderRadius: "6px",
               fontWeight: 700,
@@ -280,8 +312,8 @@ function DiscoveryBannerBox({
         <div
           style={{
             height: "100%", width: `${pct}%`,
-            background: "linear-gradient(90deg, var(--cyan), var(--purple))",
-            boxShadow: running ? "0 0 10px rgba(0, 229, 255, 0.5)" : "none",
+            background: "linear-gradient(90deg, #9A50E9, #7727CD)",
+            boxShadow: running ? "0 0 10px rgba(154, 80, 233, 0.5)" : "none",
             transition: "width 0.4s ease",
           }}
         />
@@ -309,7 +341,7 @@ function DiscoveryBannerBox({
             style={{
               background: "transparent",
               border: "none",
-              color: "var(--cyan)",
+              color: "var(--purple, #9A50E9)",
               fontSize: "11.5px",
               fontWeight: 600,
               cursor: "pointer",
@@ -356,7 +388,7 @@ function DiscoveryBannerBox({
                   <span style={{ color: "var(--text-muted)", fontSize: "10px" }}>{h.timestamp}</span>
                   <PlatformIcon platform={h.platform} size={12} />
                   <span style={{ fontWeight: 600, color: "var(--text-main)" }}>{h.display_name}</span>
-                  <span style={{ color: "var(--cyan)" }}>"{h.keyword}"</span>
+                  <span style={{ color: "var(--purple, #9A50E9)" }}>"{h.keyword}"</span>
                   <span
                     style={{
                       fontSize: "9.5px",
@@ -392,13 +424,13 @@ function TileProgressRow({ p }: { p: PlatformSweepState }) {
     <div style={{ marginTop: "4px", width: "100%" }}>
       <div style={{ display: "flex", alignItems: "center", gap: "5px", fontSize: "10px", fontFamily: "var(--font-mono)", color: STATUS_COLOR[p.status] }}>
         <StatusDot status={p.status} />
-        <DiscoverIcon size={10} color="var(--cyan)" />
+        <DiscoverIcon size={10} color="var(--purple, #9A50E9)" />
         <span style={{ flex: 1 }} />
         <span>{p.keywords_done}/{p.keywords_total}</span>
       </div>
       {p.status === "running" && (
         <div style={{ height: "3px", background: "var(--bg-inner)", borderRadius: "999px", overflow: "hidden", marginTop: "3px" }}>
-          <div style={{ height: "100%", width: `${pct || 4}%`, background: "linear-gradient(90deg, var(--cyan), var(--purple))" }} />
+          <div style={{ height: "100%", width: `${pct || 4}%`, background: "linear-gradient(90deg, #9A50E9, #7727CD)" }} />
         </div>
       )}
     </div>
@@ -445,29 +477,24 @@ export function LiveResultsView({
     };
   }, [clientId, platforms, refreshKey, liveKey]);
 
-  if (!clientId) {
-    return (
-      <div style={{ padding: "60px 20px", textAlign: "center", color: "var(--text-dim)" }}>
-        Select or create a client on the Clients tab first -- Live Results is scoped to one client's discovered profiles.
-      </div>
-    );
-  }
-
   const jobPlatformById = new Map((job?.platforms || []).map((p) => [p.platform, p]));
 
   return (
     <div style={{ animation: "fadeUp 0.4s ease" }}>
-      <h2 style={{ fontSize: "18px", fontWeight: 700, marginBottom: "4px" }}>{clientName || clientId}</h2>
-      <div style={{ fontSize: "12px", color: "var(--text-dim)", marginBottom: "16px" }}>Live discovery results</div>
+      <h2 style={{ fontSize: "18px", fontWeight: 700, marginBottom: "4px" }}>
+        {clientId ? (clientName || clientId) : "Live Results & Direct Analysis"}
+      </h2>
+      <div style={{ fontSize: "12px", color: "var(--text-dim)", marginBottom: "16px" }}>
+        {clientId ? "Live discovery & profile analysis" : "Select a client for Discovery sweeps, or scrape and analyze URLs directly below."}
+      </div>
 
-      {/* Phase tabs -- Discovery / Analysis, same two-tile row the original
-          app used (styles/styles.css's platform-rail-grid at 2 columns). */}
+      {/* Phase tabs -- Discovery / Analysis */}
       <div className="platform-rail-grid" style={{ gridTemplateColumns: "repeat(2, 1fr)", marginBottom: "16px" }}>
         {(["discovery", "analysis"] as const).map((ph) => (
           <div key={ph} className={`platform-rail-item ${phase === ph ? "active" : ""}`} onClick={() => setPhase(ph)}>
             <div className="rail-card-head">
               <span style={{ display: "flex", alignItems: "center" }}>
-                {ph === "discovery" ? <DiscoverIcon size={16} color="var(--cyan)" /> : <AnalyseIcon size={16} color="#7c5cff" />}
+                {ph === "discovery" ? <DiscoverIcon size={16} color="var(--purple, #9A50E9)" /> : <AnalyseIcon size={16} color="var(--purple, #9A50E9)" />}
               </span>
               <span style={{ fontSize: "12px", fontWeight: 500, color: "var(--text-primary)" }}>
                 {ph === "discovery" ? "Discovery" : "Analysis"}
@@ -477,21 +504,19 @@ export function LiveResultsView({
         ))}
       </div>
 
-      {/* Platform rail -- readiness, discovered-profile count, and (while a
-          sweep is live or was just run) a small live progress row, per
-          platform. Clicking one scopes the grid below to just that
-          platform; clicking the active one clears back to "All Platforms". */}
-      <div className="platform-rail-grid" style={{ gridTemplateColumns: `repeat(${platforms.length || 1}, 1fr)` }}>
-        {platforms.map((p) => {
-          const count = counts[p.platform] || 0;
-          const sweep = jobPlatformById.get(p.platform);
-          return (
-            <div
-              key={p.platform}
-              className={`platform-rail-item ${platform === p.platform ? "active" : ""}`}
-              onClick={() => setPlatform((prev) => (prev === p.platform ? "" : p.platform))}
-              title={platform === p.platform ? "Click to clear filter -- show every platform" : `Filter Discovery to ${p.name} only`}
-            >
+      {/* Platform rail -- only when a client is selected */}
+      {clientId && (
+        <div className="platform-rail-grid">
+          {platforms.map((p) => {
+            const count = counts[p.platform] || 0;
+            const sweep = jobPlatformById.get(p.platform);
+            return (
+              <div
+                key={p.platform}
+                className={`platform-rail-item ${platform === p.platform ? "active" : ""}`}
+                onClick={() => setPlatform((prev) => (prev === p.platform ? "" : p.platform))}
+                title={platform === p.platform ? "Click to clear filter -- show every platform" : `Filter Discovery to ${p.name} only`}
+              >
               <div className="rail-card-head">
                 <PlatformIcon platform={p.platform} size={18} />
                 <span style={{ fontSize: "12px", fontWeight: 500 }}>{p.name}</span>
@@ -505,10 +530,11 @@ export function LiveResultsView({
                 </span>
               </div>
               {sweep && sweep.status !== "pending" && <TileProgressRow p={sweep} />}
-            </div>
-          );
-        })}
-      </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
 
       {/* "Recent Discovery Status" Banner Box */}
       {job && (
@@ -521,13 +547,32 @@ export function LiveResultsView({
       )}
 
       {phase === "discovery" && (
-        <DiscoveryProfileGrid
-          groupId={clientId}
-          platform={platform || undefined}
-          refreshKey={refreshKey}
-          liveKey={liveKey}
-          onAnalyseStarted={onAnalyseStarted}
-        />
+        clientId ? (
+          <DiscoveryProfileGrid
+            groupId={clientId}
+            platform={platform || undefined}
+            refreshKey={refreshKey}
+            liveKey={liveKey}
+            onAnalyseStarted={onAnalyseStarted}
+          />
+        ) : (
+          <div style={{ padding: "50px 20px", textAlign: "center", color: "var(--text-dim)", background: "var(--bg-surface)", border: "1px solid var(--border-color)", borderRadius: "12px", marginTop: "16px" }}>
+            <p style={{ fontSize: "14px", color: "var(--text-main)", marginBottom: "10px", fontWeight: 600 }}>
+              Select a client on the Clients tab to run or view Discovery sweeps.
+            </p>
+            <p style={{ fontSize: "12px", color: "var(--text-muted)", marginBottom: "16px" }}>
+              To scrape and analyze suspicious profiles immediately without selecting a client:
+            </p>
+            <button
+              type="button"
+              onClick={() => setPhase("analysis")}
+              className="btn-cyber-primary"
+              style={{ display: "inline-flex", alignItems: "center", gap: "8px", margin: "0 auto", padding: "8px 18px", fontSize: "13px" }}
+            >
+              <AnalyseIcon size={14} color="#fff" /> Open Direct URL Analysis →
+            </button>
+          </div>
+        )
       )}
 
       {phase === "analysis" && (

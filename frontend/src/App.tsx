@@ -6,6 +6,7 @@ import { AppLayout } from "./layouts/AppLayout";
 import { AdminPanel } from "./pages/AdminPanel";
 import { HomeView } from "./pages/HomeView";
 import { LiveResultsView } from "./pages/LiveResultsView";
+import { GlobalSearchModal } from "./components/GlobalSearchModal";
 import { useDiscoveryJobPoll } from "./hooks/useDiscoveryJobPoll";
 import { usePlatformState } from "./hooks/usePlatformState";
 import { useRefreshOnFocus } from "./hooks/useRefreshOnFocus";
@@ -23,6 +24,18 @@ export default function App() {
   );
   const [recentClients, setRecentClients] = useState<RecentClient[]>([]);
   const [allClients, setAllClients] = useState<Client[]>([]);
+  const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setGlobalSearchOpen((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
   const [clientId, setClientId] = useState("");
   const [clientName, setClientName] = useState("");
   const [error, setError] = useState("");
@@ -215,6 +228,16 @@ export default function App() {
       )}
 
       {page === "admin" && <AdminPanel sessions={sessions} platforms={platforms} onChanged={refreshPlatformState} />}
+      {globalSearchOpen && (
+        <GlobalSearchModal
+          clients={allClients}
+          onSelectClient={(id, name) => {
+            onClient(id, name);
+            setGlobalSearchOpen(false);
+          }}
+          onClose={() => setGlobalSearchOpen(false)}
+        />
+      )}
       <Toaster
         position="bottom-right"
         toastOptions={{

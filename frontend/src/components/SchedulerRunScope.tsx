@@ -210,13 +210,18 @@ export function SchedulerRunScope({ client, platforms, disabled }: Props) {
 
   return (
     <div
+      className="scheduler-scope-compact"
       style={{
         display: "flex",
         flexDirection: "column",
-        gap: "8px",
-        marginTop: "6px",
+        gap: "6px",
+        marginTop: "4px",
         opacity: busy ? 0.75 : 1,
         transition: "opacity 0.15s ease",
+        width: "100%",
+        maxWidth: "100%",
+        minWidth: 0,
+        boxSizing: "border-box",
       }}
     >
       {/* ROW 1: PLATFORMS */}

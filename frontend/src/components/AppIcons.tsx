@@ -76,9 +76,9 @@ export function BrandLogoIcon({ size = 28, color, className, style }: IconProps)
     >
       <defs>
         <linearGradient id="brandLogoGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-          <stop offset="0%" stopColor="#00F0FF" />
-          <stop offset="50%" stopColor="#7C5CFF" />
-          <stop offset="100%" stopColor="#4F46E5" />
+          <stop offset="0%" stopColor="#B778FF" />
+          <stop offset="50%" stopColor="#8838DD" />
+          <stop offset="100%" stopColor="#6324AA" />
         </linearGradient>
       </defs>
       <path
@@ -90,10 +90,10 @@ export function BrandLogoIcon({ size = 28, color, className, style }: IconProps)
         strokeLinecap="round"
         strokeLinejoin="round"
       />
-      <circle cx="16" cy="16" r="6" stroke="#00F0FF" strokeWidth="1.2" strokeDasharray="2 2" strokeOpacity="0.8" />
-      <circle cx="16" cy="16" r="2" fill="#00F0FF" />
-      <line x1="16" y1="8" x2="16" y2="24" stroke="#7C5CFF" strokeWidth="1.2" strokeLinecap="round" strokeOpacity="0.7" />
-      <line x1="8" y1="16" x2="24" y2="16" stroke="#7C5CFF" strokeWidth="1.2" strokeLinecap="round" strokeOpacity="0.7" />
+      <circle cx="16" cy="16" r="6" stroke="#B778FF" strokeWidth="1.2" strokeDasharray="2 2" strokeOpacity="0.8" />
+      <circle cx="16" cy="16" r="2" fill="#B778FF" />
+      <line x1="16" y1="8" x2="16" y2="24" stroke="#8838DD" strokeWidth="1.2" strokeLinecap="round" strokeOpacity="0.7" />
+      <line x1="8" y1="16" x2="24" y2="16" stroke="#8838DD" strokeWidth="1.2" strokeLinecap="round" strokeOpacity="0.7" />
     </svg>
   );
 }

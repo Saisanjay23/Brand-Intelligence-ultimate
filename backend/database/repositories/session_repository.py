@@ -118,6 +118,50 @@ def _to_item(doc: dict) -> dict:
         "username": doc.get("username", ""),
         "password": doc.get("password", ""),
         "two_factor_secret": doc.get("two_factor_secret", ""),
+        # WHAT THE SELF-HEALER HAS TRIED, AND WHEN. These four used to live
+        # in three module-level dicts in sessions/manager.py and nowhere
+        # else, which meant a backend restart forgot every one of them --
+        # and the two that matter are not bookkeeping, they are the safety
+        # rails:
+        #
+        #   * the COOLDOWN is enforced against relogin_last_attempt. Lost
+        #     on restart, a three-hour cooldown becomes no cooldown, and
+        #     restarts are not rare.
+        #   * the ATTEMPT CEILING is enforced against relogin_attempts.
+        #     Lost on restart, "gave up after 3 attempts, this needs a
+        #     person" silently becomes three more attempts.
+        #
+        # Which is precisely the thing stealth/auto_login.py's own docstring
+        # warns about: a scripted password attempt every half hour, on an
+        # account a platform is already unhappy with, is how an account
+        # stops being recoverable at all. The rails were real but only for
+        # as long as the process happened to stay up.
+        #
+        # The Sessions panel showed the same number, so after a restart it
+        # reported "0 failed attempts" for an account that had burned
+        # through its ceiling -- a clean zero that meant "we forgot", not
+        # "nothing happened".
+        #
+        # consecutive failed automatic attempts since this account last
+        # signed itself in; reset by a success and by new credentials
+        "relogin_attempts": int(doc.get("relogin_attempts") or 0),
+        # epoch seconds the last automatic attempt STARTED (not finished --
+        # the cooldown runs from the start, so a slow login cannot let a
+        # second one through behind it)
+        "relogin_last_attempt": float(doc.get("relogin_last_attempt") or 0),
+        # epoch seconds this account last successfully signed itself back
+        # in. Nothing recorded this before, so "has self-healing ever
+        # actually worked here?" was unanswerable.
+        "relogin_last_success": float(doc.get("relogin_last_success") or 0),
+        # lifetime successful self-heals. NOT reset by new credentials: it
+        # is a fact about the account, not about the current password.
+        "relogin_total_successes": int(doc.get("relogin_total_successes") or 0),
+        # localStorage/IndexedDB captured at the last automatic sign-in.
+        # The pool authenticates on cookies alone and this is not fed back
+        # into a context yet -- it is kept because a modern login does not
+        # live in cookies alone, and a capture that was thrown away cannot
+        # be gone back for. Not returned to the API (see manager._public).
+        "storage_state": doc.get("storage_state") or {},
     }
 
 
@@ -160,6 +204,8 @@ async def add_item(platform: str, cookies: list[dict], identifier: str) -> dict:
         "rate_limited_until": 0.0, "last_used": _NEW_SESSION_LAST_USED(),
         "username": "", "password": "", "two_factor_secret": "",
         "credentials_updated_at": _now(),
+        "relogin_attempts": 0, "relogin_last_attempt": 0.0,
+        "relogin_last_success": 0.0, "relogin_total_successes": 0,
     }
     await db()[SESSIONS].insert_one(doc)
     await _forget_health(platform, session_id)
@@ -209,8 +255,19 @@ async def update_session_credentials(platform: str, session_id: str, **credentia
         "credentials_updated_at": _now(),
         # whatever went wrong last time was the old credentials' problem
         "last_error": "",
+        # AND SO WAS THE FAILED-ATTEMPT LADDER. An operator who has just
+        # fixed the password is exactly who the cooldown and the ceiling
+        # were making wait, so new credentials clear both -- otherwise a
+        # corrected password sits behind a three-hour cooldown it did
+        # nothing to earn.
+        #
+        # relogin_last_success and relogin_total_successes deliberately
+        # survive: they are facts about the account, not about the password
+        # that was just replaced.
+        "relogin_attempts": 0,
+        "relogin_last_attempt": 0.0,
     }
-    for k in ("cookies", "api_key", "identifier", "api_id", "api_hash", "phone", "session_blob", "username", "password", "two_factor_secret"):
+    for k in ("cookies", "api_key", "identifier", "api_id", "api_hash", "phone", "session_blob", "username", "password", "two_factor_secret", "storage_state"):
         if k in credentials and credentials[k] is not None:
             fields[k] = credentials[k]
     res = await db()[SESSIONS].update_one({"_id": _doc_id(platform, session_id)}, {"$set": fields})
@@ -218,6 +275,35 @@ async def update_session_credentials(platform: str, session_id: str, **credentia
         return None
     await _forget_health(platform, session_id)
     return await get_item(platform, session_id)
+
+
+async def record_relogin_attempt(
+    platform: str, session_id: str, outcome: str) -> None:
+    """Write down that the self-healer tried, and how it went.
+
+    `outcome` is "started", "ok" or "failed".
+
+    STARTED IS ITS OWN EVENT, written before the browser opens. The
+    cooldown runs from the moment an attempt begins, so that a login taking
+    two minutes cannot let a second attempt through behind it -- and so
+    that a process killed mid-login still leaves the cooldown stamped
+    rather than looking like nothing ever happened.
+
+    $inc, not read-then-write: two attempts racing must not lose a count,
+    and a counter that quietly under-reports is the one thing a ceiling
+    cannot survive.
+    """
+    now = _now()
+    if outcome == "started":
+        update: dict = {"$set": {"relogin_last_attempt": now}}
+    elif outcome == "ok":
+        update = {"$set": {"relogin_attempts": 0, "relogin_last_success": now},
+                  "$inc": {"relogin_total_successes": 1}}
+    elif outcome == "failed":
+        update = {"$inc": {"relogin_attempts": 1}}
+    else:
+        raise ValueError(f"unknown re-login outcome {outcome!r}")
+    await db()[SESSIONS].update_one({"_id": _doc_id(platform, session_id)}, update)
 
 
 async def update_item(platform: str, session_id: str, **fields) -> bool:

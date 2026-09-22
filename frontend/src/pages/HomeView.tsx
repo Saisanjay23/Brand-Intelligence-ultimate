@@ -11,7 +11,6 @@ import {
 import { PlatformIcon } from "../components/PlatformIcon";
 import { KeywordLogoCell } from "../components/KeywordLogoCell";
 import { logosApi, type ClientLogo } from "../api/logosApi";
-import { GlobalSearchModal } from "../components/GlobalSearchModal";
 import { confirmAction } from "../utils/confirmAction";
 import {
   createClient as createDirectoryClient,
@@ -693,8 +692,8 @@ function RuleBasedGeneratorModal({
                       padding: "10px 12px",
                       borderRadius: "8px",
                       marginBottom: "4px",
-                      background: "rgba(0, 229, 255, 0.06)",
-                      border: "1px solid rgba(0, 229, 255, 0.15)",
+                      background: "rgba(154, 80, 233, 0.08)",
+                      border: "1px solid rgba(154, 80, 233, 0.25)",
                     }}
                   >
                     <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
@@ -1293,9 +1292,9 @@ function KeywordTabs({
           onClick={() => setGenOpen(true)}
           disabled={disabled || (!nameKeywords.length && !domainKeywords.length)}
           style={{
-            background: "linear-gradient(135deg, rgba(0, 229, 255, 0.15), rgba(136, 56, 221, 0.15))",
-            border: "1px solid rgba(0, 229, 255, 0.4)",
-            color: "var(--cyan, #00E5FF)",
+            background: "linear-gradient(135deg, rgba(154, 80, 233, 0.18), rgba(136, 56, 221, 0.22))",
+            border: "1px solid rgba(154, 80, 233, 0.45)",
+            color: "var(--purple, #9A50E9)",
             padding: "6px 12px",
             borderRadius: "8px",
             fontSize: "11.5px",
@@ -1317,7 +1316,7 @@ function KeywordTabs({
           onChange={onNameGroups}
           parentPlaceholder="Type an executive/individual name and press Enter…"
           childPlaceholder="Add a search term for this name and press Enter…"
-          accent="var(--cyan, #00E5FF)"
+          accent="var(--purple, #9A50E9)"
           disabled={disabled}
           clientId={clientId}
           kind="individual"
@@ -1426,9 +1425,9 @@ function PlatformLimitsEditor({
                           type="button"
                           onClick={() => setFbExpanded((v) => !v)}
                           style={{
-                            background: "rgba(0, 229, 255, 0.12)",
-                            border: "1px solid rgba(0, 229, 255, 0.3)",
-                            color: "var(--cyan)",
+                            background: "rgba(154, 80, 233, 0.14)",
+                            border: "1px solid rgba(154, 80, 233, 0.35)",
+                            color: "var(--purple, #9A50E9)",
                             fontSize: "10.5px",
                             padding: "2px 7px",
                             borderRadius: "6px",
@@ -1582,20 +1581,8 @@ export function HomeView({
   const [loadingClients, setLoadingClients] = useState(true);
   const [mode, setMode] = useState<Mode>(clientId ? "select" : "create");
   const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<WorkspaceTab>("overview");
-  const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
   const [sidebarFilter, setSidebarFilter] = useState<"all" | "active" | "empty">("all");
   const [sidebarSearch, setSidebarSearch] = useState("");
-
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        setGlobalSearchOpen((v) => !v);
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
 
   const [editing, setEditing] = useState(false);
   const [activeClient, setActiveClient] = useState<Client | null>(null);
@@ -2097,14 +2084,6 @@ export function HomeView({
     sweepKeywordTypes.size === 1 ? [...sweepKeywordTypes][0] : "";
   return (
     <div className="clients-workspace-layout">
-      {globalSearchOpen && (
-        <GlobalSearchModal
-          clients={clients}
-          onSelectClient={(id) => selectSavedClient(id)}
-          onClose={() => setGlobalSearchOpen(false)}
-        />
-      )}
-
       {/* LEFT SIDEBAR: Client Directory */}
       <div className="clients-sidebar-card">
         <div className="clients-sidebar-header">
@@ -2134,7 +2113,14 @@ export function HomeView({
             onChange={(e) => setSidebarSearch(e.target.value)}
             placeholder="Search clients..."
           />
-          <span className="client-search-shortcut">Ctrl K</span>
+          <span
+            className="client-search-shortcut"
+            style={{ cursor: "pointer" }}
+            onClick={() => window.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true }))}
+            title="Search clients globally (Ctrl+K)"
+          >
+            Ctrl K
+          </span>
         </div>
 
         <div className="client-filter-pills">
@@ -2620,7 +2606,7 @@ export function HomeView({
                         onClick={handleRunAnalysis}
                         title="Analyse this client's currently validated profiles now -- results are memory-only, shown on the Analysis tab"
                       >
-                        <AnalyseIcon size={17} color="#00F0FF" />
+                        <AnalyseIcon size={17} color="#9A50E9" />
                         <span>
                           {analysisPlatformName
                             ? `Analyse (${analysisPlatformName})`

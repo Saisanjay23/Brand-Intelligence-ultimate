@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useRef, useEffect } from "react";
 import type { Client } from "../api/types";
 import type { RecentClient } from "../services/recentClients";
 import {
@@ -53,6 +53,29 @@ export function Header({
 }: Props) {
   const [openDropdown, setOpenDropdown] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
+  const dropdownRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!openDropdown) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+        setOpenDropdown(false);
+        setSearchQuery("");
+      }
+    };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setOpenDropdown(false);
+        setSearchQuery("");
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [openDropdown]);
 
   const label = clientName || clientId;
   const initial = label ? label.charAt(0).toUpperCase() : "C";
@@ -121,18 +144,19 @@ export function Header({
           )}
         </div>
 
-        <div
-          className="client-selector-chip"
-          onClick={() => setOpenDropdown(!openDropdown)}
-        >
-          <span className="client-avatar-sm">{initial}</span>
-          <span style={{ fontSize: "13px", fontWeight: 600 }}>
-            {label || "Set Client"}
-          </span>
-          <span style={{ fontSize: "9px", color: "var(--text-dim)" }}>▼</span>
-        </div>
+        <div ref={dropdownRef} style={{ position: "relative" }}>
+          <div
+            className="client-selector-chip"
+            onClick={() => setOpenDropdown(!openDropdown)}
+          >
+            <span className="client-avatar-sm">{initial}</span>
+            <span style={{ fontSize: "13px", fontWeight: 600 }}>
+              {label || "Set Client"}
+            </span>
+            <span style={{ fontSize: "9px", color: "var(--text-dim)" }}>▼</span>
+          </div>
 
-        {openDropdown && (() => {
+          {openDropdown && (() => {
           // Combine allClients and recentClients without duplicates
           const clientMap = new Map<string, { client_id: string; name: string }>();
           for (const c of allClients) {
@@ -294,6 +318,7 @@ export function Header({
             </div>
           );
         })()}
+        </div>
       </div>
     </header>
   );
