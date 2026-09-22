@@ -35,6 +35,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from backend.config.settings import settings
 from backend.database.connection import db
 from backend.shared.logging import get_logger
 
@@ -88,7 +89,11 @@ def _default_doc() -> dict:
             "at": "02:00",
             "on_date": "",
             "weekdays": [],
-            "tz": "UTC",
+            # The org default (see `settings.default_timezone`), not a
+            # guess from IP or a VPN exit node -- a VPN exists specifically
+            # to make the apparent location NOT the real one, so IP-based
+            # detection would be least reliable exactly when it is in use.
+            "tz": settings.default_timezone,
         },
         # Ordered client ids. Order IS the sweep order.
         "queue": [],

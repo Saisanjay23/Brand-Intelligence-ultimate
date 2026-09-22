@@ -35,11 +35,12 @@ sends the same convention.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from backend.config.settings import settings
 from backend.shared.logging import get_logger
 
 log = get_logger("services.schedule_math")
@@ -103,7 +104,10 @@ class Schedule:
     at: str = "02:00"                       # "HH:MM", local to `tz`
     on_date: str = ""                       # "YYYY-MM-DD", MODE_ONCE only
     weekdays: tuple[int, ...] = ()          # Mon=0..Sun=6, MODE_WEEKLY only
-    tz: str = "UTC"                         # IANA name, e.g. "Asia/Kolkata"
+    # IANA name, e.g. "Asia/Kolkata". Defaults to the org's home zone
+    # (`settings.default_timezone`), never to a guess from IP or a VPN
+    # exit node -- see that setting's own comment for why.
+    tz: str = field(default_factory=lambda: settings.default_timezone)
 
     # ---------------------------------------------------------- validation
 
@@ -168,7 +172,7 @@ class Schedule:
             at=str(raw.get("at") or "02:00"),
             on_date=str(raw.get("on_date") or ""),
             weekdays=weekdays,
-            tz=str(raw.get("tz") or "UTC"),
+            tz=str(raw.get("tz") or settings.default_timezone),
         )
 
 
@@ -198,16 +202,17 @@ def resolve_zone(name: str, *, strict: bool = False) -> ZoneInfo:
     """An IANA zone name -> a tzinfo.
 
     `strict` is for the save path, where an analyst is there to correct it.
-    Everywhere else an unknown zone falls back to UTC and SAYS SO at error
-    level: a scheduler that refuses to start because a timezone database is
-    missing is worse than one that fires at the wrong hour and complains
-    loudly about it.
+    Everywhere else an unknown zone falls back to the org default
+    (`settings.default_timezone`) and SAYS SO at error level: a scheduler
+    that refuses to start because a timezone database is missing is worse
+    than one that fires at a wrong-but-sane hour and complains loudly
+    about it.
 
     Unknown zones are a real possibility on Windows, where `zoneinfo` has
     no system database of its own and reads the `tzdata` package instead.
     """
     try:
-        return ZoneInfo(str(name).strip() or "UTC")
+        return ZoneInfo(str(name).strip() or settings.default_timezone)
     except (ZoneInfoNotFoundError, ValueError, KeyError):
         if strict:
             raise ScheduleError(
@@ -215,10 +220,21 @@ def resolve_zone(name: str, *, strict: bool = False) -> ZoneInfo:
                 "'Asia/Kolkata' or 'Europe/London'. On Windows this also "
                 "means the `tzdata` package is missing.") from None
         log.error(
-            f"schedule: unknown timezone {name!r} -- falling back to UTC, so runs "
-            "will fire at the UTC reading of the configured time. Install `tzdata` "
-            "or correct the timezone in the Scheduler.")
-        return ZoneInfo("UTC")
+            f"schedule: unknown timezone {name!r} -- falling back to "
+            f"{settings.default_timezone}, so runs will fire at that zone's "
+            "reading of the configured time. Install `tzdata` or correct the "
+            "timezone in the Scheduler.")
+        try:
+            return ZoneInfo(settings.default_timezone)
+        except (ZoneInfoNotFoundError, ValueError, KeyError):
+            # The org default ITSELF is unreadable (a bad env override, or
+            # tzdata missing entirely). One more fallback, to the one zone
+            # that never needs a database: UTC is fixed-offset by
+            # definition and `zoneinfo` always knows it.
+            log.error(
+                f"schedule: the org default timezone {settings.default_timezone!r} "
+                "is also unreadable -- falling back to UTC.")
+            return ZoneInfo("UTC")
 
 
 # -------------------------------------------------- wall clock -> instant

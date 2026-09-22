@@ -33,6 +33,26 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8000
 
+    # The Scheduler's org-wide default timezone -- what a NEW schedule
+    # starts as before an analyst has picked one, and what a stored
+    # schedule falls back to if its own zone is ever unreadable (a typo,
+    # a `tzdata` gap on a differently-provisioned host).
+    #
+    # NOT auto-detected from IP or a VPN exit node, on purpose. A VPN's
+    # whole job is to make the apparent location NOT the real one, so
+    # "smart" IP-based detection would be at its least reliable exactly
+    # when an analyst is using one -- the opposite of smart. It would also
+    # mean sending this process's IP to a third-party geolocation service
+    # on every schedule save, which is an odd thing to add to a security
+    # intelligence tool's network footprint for what a one-line default
+    # already solves. A fixed org default, editable per schedule in the
+    # UI, is both more predictable and more honest about what it knows.
+    #
+    # Env-overridable rather than a bare literal so a deployment for a
+    # different team is one variable away from its own correct default,
+    # not a code change.
+    default_timezone: str = "Asia/Kolkata"
+
     # storage, one database, not one-per-platform -- see
     # database/connection.py's module docstring for why
     mongo_uri: str = "mongodb://localhost:27017"

@@ -80,10 +80,11 @@ class TestParsing:
         with pytest.raises(ScheduleError):
             resolve_zone("Mars/Olympus_Mons", strict=True)
 
-    def test_unknown_zone_falls_back_to_utc_when_not_strict(self):
+    def test_unknown_zone_falls_back_to_default_tz_when_not_strict(self):
         # A scheduler that refuses to start because of one bad zone is
-        # worse than one that fires on UTC and complains.
-        assert resolve_zone("Mars/Olympus_Mons").key == "UTC"
+        # worse than one that fires on the org default and complains.
+        from backend.config.settings import settings
+        assert resolve_zone("Mars/Olympus_Mons").key == settings.default_timezone
 
 
 # ------------------------------------------------------------ validation
