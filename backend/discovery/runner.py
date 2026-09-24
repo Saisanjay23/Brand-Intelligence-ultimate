@@ -44,6 +44,7 @@ from backend.services import avatar_cache
 from backend.platforms.scan_options import DiscoveryOptions
 from backend.sessions import manager as sessions_engine
 from backend.shared import keywords as kw_groups
+from backend.shared import logo_verdict
 from backend.shared import resilience
 from backend.shared.job_store import JobStore
 from backend.shared.logging import get_logger
@@ -167,6 +168,10 @@ _MAX_SESSIONS_PER_PLATFORM: dict[str, int] = {
 # killing accounts as it goes.
 _MAX_KEYWORD_ATTEMPTS = 2
 
+# How long a keyword that broke with no results waits before its one
+# same-run retry, when nothing else is queued to fill the gap.
+_RETRY_BACKOFF_S = 30.0
+
 # How many times a platform may go back to the pool for REPLACEMENT sessions
 # after everything it had claimed died. Round 1 is the ordinary claim; round
 # 2 exists for a session coming free (another job finished, or the monitor
@@ -237,6 +242,25 @@ def _worker_semaphore() -> asyncio.Semaphore:
         sem = asyncio.Semaphore(max(1, settings.discovery_max_browser_workers))
         _worker_slots[loop] = sem
     return sem
+
+
+async def _claim_rounds_for(platform_id: str) -> int:
+    """How many times this sweep may go back to the pool for replacements.
+
+    At least `_MAX_CLAIM_ROUNDS`, and otherwise one per pooled account.
+    With sequential keywords (the default) each round claims ONE session, so
+    a flat cap of 2 meant a job used at most two accounts: once both died,
+    every keyword still queued was abandoned as missed while the pool still
+    held healthy accounts that were never asked. The pool itself is the
+    real bound -- a round whose claim finds no healthy session ends the loop
+    -- and `_MAX_KEYWORD_ATTEMPTS` still stops any one keyword from walking
+    through every account."""
+    try:
+        total = int((await asyncio.wait_for(
+            sessions_engine.pool_summary(platform_id), timeout=3)).get("total") or 0)
+    except Exception:
+        total = 0
+    return max(_MAX_CLAIM_ROUNDS, total)
 
 
 def _sessions_wanted(platform_id: str, keyword_count: int) -> int:
@@ -456,6 +480,26 @@ def _resolve_cap(
     return _effective_cap(max_results, type_cap, tab_cap)
 
 
+def _tally(stats: dict, tab: str, key: str, n: int) -> None:
+    """Count one keyword-attempt's contribution, in total AND per tab.
+
+    The per-tab split is what lets a retry keep what already succeeded: a
+    keyword whose session died on its second tab is requeued for that tab
+    alone, so only that tab's counters may be rolled back -- see
+    `_requeue_keyword`."""
+    stats[key] = stats.get(key, 0) + n
+    per = stats.setdefault("by_tab", {}).setdefault(tab, {"units": 0, "found": 0, "new": 0})
+    per[key] = per.get(key, 0) + n
+
+
+def _enrichable(row: Row) -> tuple:
+    """The fields a sweep can still improve on a row it has already
+    streamed (Facebook's resolve phase fills names and pictures in after
+    the edge was parsed). Compared before and after the sweep to decide
+    which streamed rows need saving again."""
+    return (row.profile_name or "", row.profile_pic_url or "", row.has_custom_pic)
+
+
 def row_to_fields(
     row: Row, keyword: str, matched_keyword: str = "",
     targets: tuple = (),
@@ -470,7 +514,13 @@ def row_to_fields(
     Empty means "just the parent", which is what a childless keyword
     produces anyway and what every caller that predates permutations gets.
     """
-    src = ",".join(sorted({v.split(":", 1)[-1] for v in row.src.values()})) or "search"
+    # `logo` is excluded: it names the EVIDENCE behind the logo verdict (see
+    # shared/logo_verdict.py), stored as `logo_source`, not an extraction
+    # tier this row came through.
+    src = ",".join(sorted({
+        v.split(":", 1)[-1] for k, v in row.src.items() if k != "logo"
+    })) or "search"
+    logo_ev = logo_verdict.row_evidence(row)
 
     # GRADED HERE, AGAINST THE WHOLE KEYWORD SET, IN ONE PASS.
     #
@@ -520,6 +570,11 @@ def row_to_fields(
         "discovery_source": src,
         "profile_image_url": row.profile_pic_url,
         "has_logo": row.has_custom_pic,
+        # How much that verdict should be believed, so a later, weaker
+        # reading can never overwrite it -- see profile_repository.save.
+        # None (dropped by save) when the verdict itself is unknown.
+        "logo_strength": logo_ev.strength if logo_ev.known else None,
+        "logo_source": logo_ev.source if logo_ev.known else None,
         "verified": row.verified,
         "name_score": score,
         # Both from the SAME winning term -- see the note above. Taken from
@@ -762,6 +817,28 @@ class DiscoveryJob:
     # collected mid-flight, which would cache nothing under exactly the
     # load where it matters. Settled in `_run`'s finally.
     avatar_tasks: list[Any] = field(default_factory=list)
+    # How many of those batches have landed, and whether any are still
+    # running after the sweep itself finished. A landed batch can CHANGE a
+    # saved card -- the pixel check corrects `has_logo` -- so both feed the
+    # live fingerprint (api/discovery.py), and a client keeps listening
+    # until `avatars_settling` goes false rather than stopping at "done"
+    # and leaving a card showing the verdict the pixels already overturned.
+    avatar_updates: int = 0
+    avatars_settling: bool = False
+
+    def track_avatar_task(self, task: Any) -> None:
+        """Hold a spawned avatar batch and count it when it lands."""
+        if task is None:
+            return
+        self.avatar_tasks.append(task)
+
+        def _landed(_t: Any, job: "DiscoveryJob" = self) -> None:
+            job.avatar_updates += 1
+
+        try:
+            task.add_done_callback(_landed)
+        except Exception:
+            pass
 
     @property
     def keywords(self) -> list[str]:
@@ -800,6 +877,8 @@ class DiscoveryJob:
             "keywords": self.keywords, "message": self.message,
             "total": self.total, "completed": self.completed,
             "found": self.found, "new": self.new,
+            "avatar_updates": self.avatar_updates,
+            "avatars_settling": self.avatars_settling,
             "started_at": self.started_at, "finished_at": self.finished_at,
             "started_at_ts": self.started_at_ts, "finished_at_ts": self.finished_at_ts,
             "elapsed_seconds": round(elapsed, 1),
@@ -1073,7 +1152,11 @@ class DiscoveryRunner:
             job.finished_at_ts = time.time()
             # `_settle_avatars` CANCELS these rather than awaiting them when
             # the job was stopped, so this stays fast on the cancel path.
-            await self._settle_avatars(job)
+            job.avatars_settling = bool(job.avatar_tasks)
+            try:
+                await self._settle_avatars(job)
+            finally:
+                job.avatars_settling = False
             # HOW THIS RUN WENT, INTO THE ROLLING RECORD. Written in one
             # batch here rather than per sweep: it is bookkeeping, a sweep
             # takes seconds to minutes, and nothing reading it cares about
@@ -1212,9 +1295,10 @@ class DiscoveryRunner:
         setup_error = ""
         worker_error = ""
         rounds = 0
+        max_rounds = await _claim_rounds_for(platform_id)
 
         try:
-            while rounds < _MAX_CLAIM_ROUNDS and run.queue and not job.cancel.is_set() and not run.hard_stop:
+            while rounds < max_rounds and run.queue and not job.cancel.is_set() and not run.hard_stop:
                 rounds += 1
                 try:
                     plat_obj, claimed = await self._claim_sessions(platform_id, want)
@@ -1669,6 +1753,9 @@ class DiscoveryRunner:
                         # counts each profile exactly once however many
                         # times it is seen.
                         delivered: set[str] = set()
+                        # What each streamed row looked like WHEN it was
+                        # streamed -- see the enrichment save after the sweep.
+                        streamed_as: dict[str, tuple] = {}
 
                         async def _stream(found_count: int, page_num: int, rows: list) -> None:
                             """NEVER RAISES, whatever the engine hands it.
@@ -1739,6 +1826,8 @@ class DiscoveryRunner:
                                 field_rows,
                             )
                             delivered.update(r.url for r in fresh)
+                            for r in fresh:
+                                streamed_as[r.url] = _enrichable(r)
                             # The same counters the post-sweep path bumps,
                             # so the progress rail climbs while the sweep is
                             # still running instead of jumping at the end --
@@ -1748,12 +1837,10 @@ class DiscoveryRunner:
                             prog.new += new
                             job.found += saved
                             job.new += new
-                            stats["found"] += saved
-                            stats["new"] += new
-                            task = avatar_cache.spawn(
-                                job.group_id, platform_id, field_rows)
-                            if task is not None:
-                                job.avatar_tasks.append(task)
+                            _tally(stats, tab, "found", saved)
+                            _tally(stats, tab, "new", new)
+                            job.track_avatar_task(avatar_cache.spawn(
+                                job.group_id, platform_id, field_rows))
 
                         try:
                             if _accepts_progress(disc.sweep):
@@ -1764,7 +1851,7 @@ class DiscoveryRunner:
                             dur = time.time() - t0
                             log.error(f"[{platform_id}] {keyword!r}/{tab}: {type(e).__name__}: {e}")
                             prog.keywords_done += 1
-                            stats["units"] += 1
+                            _tally(stats, tab, "units", 1)
                             job.history.append(CompletedSweep(
                                 platform=platform_id,
                                 display_name=prog.display_name,
@@ -1880,15 +1967,41 @@ class DiscoveryRunner:
                             # sweep rather than inside it -- see the original
                             # method's own reasoning for why this is a spawned
                             # task, not an await.
-                            task = avatar_cache.spawn(job.group_id, platform_id, rows)
-                            if task is not None:
-                                job.avatar_tasks.append(task)
+                            job.track_avatar_task(
+                                avatar_cache.spawn(job.group_id, platform_id, rows))
                             prog.found += saved
                             prog.new += new
                             job.found += saved
                             job.new += new
-                            stats["found"] += saved
-                            stats["new"] += new
+                            _tally(stats, tab, "found", saved)
+                            _tally(stats, tab, "new", new)
+                        # ROWS THE ENGINE IMPROVED AFTER STREAMING THEM.
+                        # Facebook streams a nameless edge the moment it is
+                        # parsed, then its resolve phase visits the profile
+                        # and fills the name in on the SAME hit -- after the
+                        # card was already saved. The save above skips every
+                        # delivered URL, so that name never reached the
+                        # database and the card stayed "Unnamed Profile" for
+                        # a profile the sweep had in fact identified.
+                        # Re-saved here as an enrichment only: save() never
+                        # blanks a field, so nothing streamed can be lost,
+                        # and the counters are not touched -- these profiles
+                        # were already counted when they were streamed.
+                        enriched = [
+                            h for h in (sweep.hits or [])
+                            if h.url in streamed_as and _enrichable(h) != streamed_as[h.url]
+                        ]
+                        if enriched:
+                            try:
+                                await profiles_db.save_many(
+                                    job.group_id, platform_id, profiles_db.PHASE_DISCOVERY,
+                                    [row_to_fields(h, parent, keyword, targets=targets)
+                                     for h in enriched],
+                                )
+                            except Exception as e:                     # noqa: BLE001
+                                log.error(
+                                    f"[{platform_id}] {keyword!r}/{tab}: enrichment save "
+                                    f"failed ({type(e).__name__}: {e})")
                         sweep_complete = bool(getattr(sweep, "complete", True))
                         sweep_stopped = str(getattr(sweep, "stopped", "") or "")
                         # CLASSIFIED, NOT JUST COUNTED. `record_stop`
@@ -1901,7 +2014,7 @@ class DiscoveryRunner:
                             sweep_stopped, sweep_complete,
                             str(getattr(sweep, "error", "") or ""))
                         prog.keywords_done += 1
-                        stats["units"] += 1
+                        _tally(stats, tab, "units", 1)
                         job.history.append(CompletedSweep(
                             platform=platform_id,
                             display_name=prog.display_name,
@@ -1960,6 +2073,21 @@ class DiscoveryRunner:
                                 )
                                 fatal_kind[0] = "session"
                                 stop_reason = session_reason
+                                # NOT DONE after all: the whole point of the
+                                # requeue is that another session re-runs this
+                                # tab, and `_requeue_keyword` only re-runs the
+                                # tabs missing from `resolved`.
+                                resolved.discard(tab)
+                            elif (outcome == resilience.BROKEN and saved_count == 0
+                                    and not job.cancel.is_set()):
+                                # BROKEN WITH NOTHING TO SHOW, AND NOT THE
+                                # SESSION'S FAULT (a stall, a parse error, an
+                                # HTTP 5xx). Recorded as owed, which used to be
+                                # its last word until the NEXT run -- so one
+                                # flaky page load was a keyword unsearched for
+                                # a day. It gets one more attempt in this run;
+                                # see the retry after the tab loop.
+                                stats.setdefault("retry_tabs", []).append(tab)
                         return stop_reason
 
                     while run.queue and not job.cancel.is_set() and not run.hard_stop:
@@ -2039,6 +2167,37 @@ class DiscoveryRunner:
                                 if reason or fatal_kind[0]:
                                     break
 
+                        retry_tabs = [t for t in (stats.get("retry_tabs") or [])
+                                      if t in resolved]
+                        if (retry_tabs and not fatal_kind[0]
+                                and item.attempts < _MAX_KEYWORD_ATTEMPTS
+                                and not job.cancel.is_set() and not run.hard_stop):
+                            # ONE SAME-RUN RETRY for a tab that broke with
+                            # zero results (see `_sweep_tab`). Its progress
+                            # unit is handed back so the retry's own unit does
+                            # not double-count, and it goes to the BACK of the
+                            # queue so every other keyword runs first -- which
+                            # is also the backoff. On a queue with nothing
+                            # else in it, a short explicit pause stands in.
+                            prog.keywords_done = max(0, prog.keywords_done - len(retry_tabs))
+                            # Any tab that never reached a verdict at all (a
+                            # crash in the gather) rides along rather than
+                            # being written off as missed.
+                            item.tabs = tuple(retry_tabs + [
+                                t for t in item_tabs if t not in resolved])
+                            run.queue.append(item)
+                            log.info(
+                                f"[{platform_id}] {item.keyword!r} broke with no results on "
+                                f"{', '.join(retry_tabs)} -- retrying once later in this run")
+                            if len(run.queue) == 1:
+                                try:
+                                    await asyncio.wait_for(job.cancel.wait(), timeout=_RETRY_BACKOFF_S)
+                                except asyncio.TimeoutError:
+                                    pass
+                                except Exception:
+                                    pass
+                            continue
+
                         if fatal_kind[0] == "session":
                             # THIS SESSION IS DONE, THE PLATFORM IS NOT. The
                             # keyword it died on goes back on the queue for
@@ -2049,7 +2208,7 @@ class DiscoveryRunner:
                             # session is about to try again, and only
                             # giving up for good writes the gap.
                             await self._requeue_keyword(
-                                job, run, item, stats, label, item_tabs)
+                                job, run, item, stats, label, item_tabs, resolved)
                             return True
 
                         # EVERY TAB THIS ITEM OWED, ACCOUNTED FOR. On the
@@ -2131,6 +2290,7 @@ class DiscoveryRunner:
     async def _requeue_keyword(
         self, job: DiscoveryJob, run: "_PlatformSweepRun", item: "_KeywordItem",
         stats: dict, label: str, item_tabs: Optional[list[str]] = None,
+        resolved: Optional[set[str]] = None,
     ) -> None:
         """A keyword whose session died under it, put back for another
         session. See analysis/runner.py's _requeue for the identical
@@ -2156,6 +2316,13 @@ class DiscoveryRunner:
         `session-failed` code rather than borrowing a platform's, so the
         note names the actual problem (accounts, not the search).
         """
+        # ONLY THE TABS THAT DID NOT FINISH. A tab that reached a verdict
+        # under this session (satisfied, truncated or broken) is recorded in
+        # the ledger and its rows are saved; re-sweeping it spends a page
+        # load under a fresh account for nothing, and writing it "missed" on
+        # a give-up overwrote a satisfied cell with a gap that did not exist.
+        done = set(resolved or ())
+        owed = [t for t in (item_tabs or item.tabs or run.tabs) if t not in done]
         if item.attempts >= _MAX_KEYWORD_ATTEMPTS:
             run.record_stop(
                 "session-failed", False,
@@ -2164,24 +2331,34 @@ class DiscoveryRunner:
             # keyword leaves the queue for good here, so `_abandon` will
             # never see it; without this it is the single path by which a
             # configured keyword could go unsearched and unrecorded.
-            await coverage_db.miss(
-                job.group_id, job.id, run.platform_id,
-                item_tabs or item.tabs or run.tabs, [item],
-                f"failed on every available session after {item.attempts} attempt(s)")
+            if owed:
+                await coverage_db.miss(
+                    job.group_id, job.id, run.platform_id,
+                    owed, [item],
+                    f"failed on every available session after {item.attempts} attempt(s)")
             log.warning(
                 f"[{run.platform_id}] {item.keyword!r} took down {item.attempts} "
                 f"session(s) -- not re-queued again, whatever this attempt "
                 f"completed stands")
             return
         prog = run.prog
-        if stats["units"]:
-            prog.keywords_done = max(0, prog.keywords_done - stats["units"])
-        if stats["found"]:
-            prog.found = max(0, prog.found - stats["found"])
-            job.found = max(0, job.found - stats["found"])
-        if stats["new"]:
-            prog.new = max(0, prog.new - stats["new"])
-            job.new = max(0, job.new - stats["new"])
+        # Roll back only what the UNFINISHED tabs contributed; the finished
+        # ones keep their credit because they are not being run again.
+        by_tab = stats.get("by_tab") or {}
+        undo = {k: stats.get(k, 0) for k in ("units", "found", "new")}
+        for t in done:
+            for k in undo:
+                undo[k] -= (by_tab.get(t) or {}).get(k, 0)
+        if undo["units"] > 0:
+            prog.keywords_done = max(0, prog.keywords_done - undo["units"])
+        if undo["found"] > 0:
+            prog.found = max(0, prog.found - undo["found"])
+            job.found = max(0, job.found - undo["found"])
+        if undo["new"] > 0:
+            prog.new = max(0, prog.new - undo["new"])
+            job.new = max(0, job.new - undo["new"])
+        if done and owed:
+            item.tabs = tuple(owed)
         run.queue.append(item)
         log.info(
             f"[{run.platform_id}] session {label} failed on {item.keyword!r} -- "

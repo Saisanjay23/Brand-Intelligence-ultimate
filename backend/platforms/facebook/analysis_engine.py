@@ -146,6 +146,8 @@ class Harvest:
         self.ents: list[dict] = []  # dicts that ARE this profile (id == pid)
         self.dom: dict[str, Any] = {}  # header fields read straight off the page
         self._scopes: dict[str, "Harvest"] = {}
+        self.pid: str = ""  # set on a scoped view, see scoped()
+        self._parent: Optional["Harvest"] = None
 
     # ---------- collection ----------
 
@@ -234,6 +236,11 @@ class Harvest:
 
         v = Harvest()
         v.html, v.text, v.dom = self.html, self.text, self.dom
+        # The id this view is scoped to, kept so readers that must check
+        # ownership inside a payload (a post's `actors`, an address tile)
+        # can do so. "" for an unverifiable id -- see the docstring.
+        v.pid = pid if (pid and pid.isdigit()) else ""
+        v._parent = self
         if pid and pid.isdigit():
             for blob in self.mentioning(pid):
                 for d in iter_dicts(blob):
@@ -423,7 +430,13 @@ def read_name(row: Row, h: Harvest) -> None:
                     False,
                 )
             )
-    cands += [("graphql-loose", v, True) for v in h.gql_strs(K_NAME)]
+    # The unscoped tier reads ANY payload's name keys -- a suggested page, a
+    # commenter, the viewer. Only allowed when this profile's own entity
+    # could not be found at all (no `ents`), and labelled so the row says
+    # how weak it is; with the entity in hand it could only ever supply a
+    # stranger's name.
+    if not h.ents:
+        cands += [("graphql-loose", v, True) for v in h.gql_strs(K_NAME)]
     for tag, c, trusted in cands:
         c = (c or "").strip()
         if not c or (not trusted and c.lower() in GENERIC_NAMES):
@@ -517,21 +530,15 @@ def read_counts(row: Row, h: Harvest) -> None:
         row.followers_exact = "yes"
         row.mark("followers", "graphql")
         return
-    ints = [n for n in h.gql_ints(K_FOLLOWERS) if 0 <= n < MAX_FOLLOWERS]
-    if ints:
-        row.followers = max(ints)
-        row.followers_exact = "yes"
-        row.mark("followers", "graphql-loose")
-        return
-    if m := RE_FOLLOWERS.search(h.text.get("main", "")):
-        val, exact = parse_count(m.group(1))
-        if val is not None:
-            row.followers = val
-            row.followers_exact = "yes" if exact else "no"
-            row.mark("followers", "page-text")
-            if not exact:
-                row.note(f"followers rounded ({m.group(1).strip()})")
-            return
+    # NO UNSCOPED TIERS HERE ANY MORE. There used to be two: the largest
+    # `follower_count` in ANY payload on the page ("graphql-loose"), and the
+    # first "N followers" anywhere in the page text. A profile page also
+    # carries suggested Pages, sponsored units and the viewer's own chrome,
+    # each with its own count -- so both could hand this profile somebody
+    # else's audience, and `max()` preferred the biggest stranger. The header
+    # chips above (the entity's own social context, and the DOM counter line
+    # JS_HEADER isolates beside the name) are where this profile's number
+    # actually is; when neither has one, blank is the honest answer.
     followers_from_friends(row, chips)
     if row.followers is None and row.friends is None and h.ents:
         # Every tier above came up empty on a profile we DID successfully
@@ -558,7 +565,22 @@ def read_counts(row: Row, h: Harvest) -> None:
         row.mark("followers", "not-published")
 
 
-def _post_stamps(roots) -> list[int]:
+def _authored_by(post: dict, owner: str) -> bool:
+    """Did `owner` publish this post? Read off the post's own `actors`.
+
+    Confirmed live (2026-09-24, a Page, a company Page and a personal
+    profile): every post object carrying `post_id` + `creation_time` names
+    its publisher in `actors[].id`. A friend's post on a timeline, a shared
+    post's original, a suggested post -- all name somebody else, and none of
+    them is evidence of when THIS account last posted. A post with no
+    `actors` at all cannot be attributed and is not counted."""
+    actors = post.get("actors")
+    if not isinstance(actors, list):
+        return False
+    return any(isinstance(a, dict) and str(a.get("id") or "") == owner for a in actors)
+
+
+def _post_stamps(roots, owner: str = "") -> list[int]:
     """WHAT: the post timestamps under `roots` -> a list of epoch ints.
     HOW: only dicts carrying a `post_id` sibling count, which is what
     scopes this to genuine posts. LINKED TO: read_last_post() picks the
@@ -591,6 +613,8 @@ def _post_stamps(roots) -> list[int]:
     for root in roots:
         for d in iter_dicts(root):
             if "post_id" not in d:
+                continue
+            if owner and not _authored_by(d, owner):
                 continue
             for key in K_POST_TIME:
                 v = d.get(key)
@@ -634,19 +658,38 @@ def read_last_post(row: Row, h: Harvest) -> None:
     #    reached when 1-2 come up empty, and "created_time" is still
     #    excluded from K_POST_TIME (the confirmed comment field), so the
     #    specific leak that motivated this rewrite stays closed even here.
-    stamps, tag = _post_stamps(h.ents), "graphql"
+    # OWNER-SCOPED IN EVERY TIER. A post counts only when its own `actors`
+    # name this profile (see _authored_by) -- which is what makes the
+    # unscoped tier below safe to have at all.
+    #
+    # THE THIRD TIER IS GONE. It regex-scanned every payload AND the page's
+    # own HTML for any `publish_time`/`creation_time` and took the newest.
+    # A Facebook page carries the notification flyout, stories, ads and
+    # suggested posts, whose timestamps are from today by construction -- so
+    # a dormant or never-posted profile came back "last post: today, active".
+    # That is the same failure instagram/analysis_engine.py documents fixing,
+    # reached by a different road. A blank date is honest; a stranger's date
+    # is not.
+    owner = getattr(h, "pid", "") or ""
+    if not owner:
+        row.note("id unresolved -- last-post date not attributed")
+        if RE_NO_POSTS.search(h.all_text()):
+            row.posts_seen = "no"
+            row.mark("last_post", "no-posts-notice")
+        return
+    stamps, tag = _post_stamps(h.ents, owner), "graphql"
     if not stamps:
+        parent = getattr(h, "_parent", None) or h
         raw_parsed = []
-        for t in h.raw:
+        for t in parent.raw:
+            if owner not in t:
+                continue
             try:
                 raw_parsed.append(json.loads(t))
             except (json.JSONDecodeError, ValueError):
                 continue
-        stamps = _post_stamps(h.gql) + _post_stamps(raw_parsed)
-        tag = "graphql-unscoped"
-    if not stamps:
-        stamps = find_ints(h.gql_raw() + h.html.get("main", ""), K_POST_TIME)
-        tag = "payload-regex-ungated"
+        stamps = _post_stamps(parent.gql, owner) + _post_stamps(raw_parsed, owner)
+        tag = "graphql-owner-scoped"
     dts = [epoch_to_dt(t) for t in stamps]
     dts = [d for d in dts if d]
     if dts:
@@ -695,10 +738,26 @@ POST_LINK_SELECTOR = (
 )
 
 JS_POST_TIMES = """
-() => {
+(owners) => {
+  // SCOPED TO THE PROFILE'S OWN FEED, and to posts it authored. The whole
+  // document also carries the notification flyout and suggested content,
+  // whose permalinks carry their own (recent) dates. An article whose header
+  // links to a DIFFERENT profile is dropped; one whose author link cannot be
+  // read is kept (reject only on positive evidence, the rule
+  // instagram/analysis_engine.py::_owner_mismatch uses).
+  const want = (owners || []).map(o => (o || '').toLowerCase()).filter(Boolean);
+  const root = document.querySelector('[role="main"]') || document.body;
+  const authorOf = (a) => {
+    const art = a.closest('[role="article"], [aria-posinset]');
+    if (!art) return '';
+    const h = art.querySelector('h2 a[href], h3 a[href], h4 a[href], strong a[href]');
+    return h ? (h.getAttribute('href') || '').toLowerCase() : '';
+  };
   const out = [];
   const sel = 'a[href*="/posts/"], a[href*="story_fbid"], a[href*="/videos/"], a[href*="/reel/"], a[href*="permalink"]';
-  for (const a of document.querySelectorAll(sel)) {
+  for (const a of root.querySelectorAll(sel)) {
+    const author = authorOf(a);
+    if (author && want.length && !want.some(w => author.includes(w))) continue;
     const al = a.getAttribute('aria-label') || a.getAttribute('title') || '';
     if (al) out.push(al);
     const inner = a.querySelector('[aria-label]');
@@ -742,11 +801,13 @@ def parse_aria_date(label: str) -> Optional[str]:
     return None
 
 
-async def dom_last_post(page) -> str:
-    """Newest post date read off post-permalink aria-labels. '' when the
-    page shows no dated post."""
+async def dom_last_post(page, owners: tuple[str, ...] = ()) -> str:
+    """Newest post date read off post-permalink aria-labels, from articles
+    this profile authored (see JS_POST_TIMES). '' when the page shows no
+    dated post of its own. `owners` is every form this profile's URL can
+    take -- its numeric id and its vanity slug."""
     try:
-        labels = await page.evaluate(JS_POST_TIMES)
+        labels = await page.evaluate(JS_POST_TIMES, [o for o in owners if o])
     except Exception:
         return ""
     dates = [d for d in (parse_aria_date(x) for x in labels or []) if d]
@@ -785,16 +846,64 @@ def read_location(row: Row, h: Harvest) -> None:
     for v in h.ent_strs(K_LOCATION):
         if is_place(v):
             row.location = v.strip()
+            row.mark("location", "graphql")
             return
+    if v := _map_linked_address(h):
+        row.location = v
+        row.mark("location", "graphql-address-tile")
+        return
     for rx in (RE_LIVES_IN, RE_FROM):
         if m := rx.search(h.all_text()):
             if is_place(m.group(1)):
                 row.location = m.group(1).strip(" ,·|")
+                row.mark("location", "about-text")
                 return
-    for v in h.gql_strs(K_LOCATION):
-        if is_place(v):
-            row.location = v.strip()
-            return
+    # The unscoped `gql_strs(K_LOCATION)` tier that used to end this is gone:
+    # it read `current_city_name`/`city_name` out of ANY payload on the page,
+    # which on Facebook includes the viewer's own profile chrome and every
+    # suggested person -- a plausible city, attached to the wrong account.
+
+
+_MAP_HOSTS = ("bing.com/maps", "google.com/maps", "maps.google.", "maps.apple.com")
+
+
+def _map_linked_address(h: Harvest) -> str:
+    """A Page's street address, read from its own intro tile.
+
+    Confirmed live (2026-09-24, facebook.com/cyfirma.jp): the address in a
+    Page's "Details" card is a `profile_tile_items` entry whose text carries
+    a range linking to a MAPS url (`bing.com/maps/...&pc=FACEBK`). No other
+    tile is linked to a map, so that link is what identifies the address --
+    not the pin icon, not the tile's position, not the wording. Read only
+    from payloads that mention this profile's own id, so another entity's
+    tile cannot be picked up. The tile has no field-type label of its own,
+    which is exactly why every earlier tier here missed it: the engine
+    returned a blank location for a Page that showed its full address.
+    """
+    pid = getattr(h, "pid", "") or ""
+    if not pid:
+        return ""
+    parent = getattr(h, "_parent", None) or h
+    for blob in parent.mentioning(pid):
+        for d in iter_dicts(blob):
+            tile = d.get("tile_item")
+            if not isinstance(tile, dict):
+                continue
+            subtitle = tile.get("item_subtitle")
+            text = subtitle.get("text") if isinstance(subtitle, dict) else None
+            if not isinstance(text, dict):
+                continue
+            value = text.get("text")
+            if not isinstance(value, str) or not value.strip():
+                continue
+            for rng in text.get("ranges") or []:
+                ent = rng.get("entity") if isinstance(rng, dict) else None
+                if not isinstance(ent, dict):
+                    continue
+                link = str(ent.get("external_url") or ent.get("url") or "")
+                if any(host in link for host in _MAP_HOSTS):
+                    return value.strip()
+    return ""
 
 
 def read_pic(row: Row, h: Harvest) -> None:
@@ -821,11 +930,13 @@ def read_pic(row: Row, h: Harvest) -> None:
             r'property=["\']og:image["\'][^>]+content=["\']' r'([^"\']+)', main
         ):
             url, tag = m.group(1).replace("&amp;", "&"), "og:image"
-    if not url:
-        for v in h.gql_strs(K_PIC):
-            if v.startswith("http") and "fbcdn" in v:
-                url, tag = v, "graphql-loose"
-                break
+    # No unscoped "first fbcdn URL in any payload" tier: on a profile page
+    # that is as likely to be a suggested friend's, an advertiser's or a
+    # commenter's picture as this profile's -- a real photo attached to the
+    # wrong account reads as "Logo: Yes", the most expensive false positive
+    # in the rubric. A picture read from the DOM or og:image is only ever
+    # OBSERVED evidence (shared/logo_verdict.py), and a recognised stock
+    # avatar from any stage outranks it.
     if url:
         row.mark("logo", tag)
         # whatever the source, fbcdn signs the crop range up to `cstp`, not
@@ -917,6 +1028,19 @@ async def read_profile_adaptive(row: Row, h: Harvest) -> None:
                 json_path=path_name,
                 sample_value=val_name,
             )
+
+
+def _is_page_profile(h: Harvest) -> bool:
+    """A Page in Facebook's new Pages experience, which renders through the
+    same `User` profile stack as a person (so `__typename` says "User").
+    Confirmed live 2026-09-24: such a profile's own entity carries
+    `delegate_page: {id: <page id>, category_name: ...}`; a personal profile
+    carries `delegate_page: null`."""
+    for d in h.ents:
+        dp = d.get("delegate_page")
+        if isinstance(dp, dict) and dp.get("id"):
+            return True
+    return False
 
 
 # Scraper
@@ -1421,7 +1545,7 @@ class Scraper:
                 not hs.ents and re.search(r'"__typename"\s*:\s*"Group"', h.all_html())
             ):
                 row.entity_type = "group"
-            elif (hs.ent_scalar("__typename") or "").lower() == "page" or (
+            elif _is_page_profile(hs) or (hs.ent_scalar("__typename") or "").lower() == "page" or (
                 not hs.ents
                 and re.search(
                     r'"__typename"\s*:\s*"Page"|Page transparency', h.all_html()
@@ -1450,11 +1574,24 @@ class Scraper:
             # page is still the timeline that was just visited, is what
             # makes it work.
             if not row.last_post_iso and row.posts_seen != "no":
-                iso = await dom_last_post(page)
+                iso = await dom_last_post(page, (pid, profile_id(url)))
                 if iso:
                     row.last_post_iso = iso
                     row.posts_seen = "yes"
                     row.mark("last_post", "dom-aria")
+            # "No posts available" is painted by the FEED, which lands after
+            # the profile payload `visit()` waits for -- so the text captured
+            # there often predates it. Confirmed live 2026-09-24: the same
+            # post-less Page read "no posts" on one visit and nothing on the
+            # next. By now the screenshot has waited for the feed to paint,
+            # so the page is read once more before the question is left open.
+            if not row.last_post_iso and not row.posts_seen:
+                try:
+                    if RE_NO_POSTS.search(await page.inner_text("body")):
+                        row.posts_seen = "no"
+                        row.mark("last_post", "no-posts-notice")
+                except Exception:
+                    pass
 
             # The main profile page rarely carries a location. Facebook Pages
             # put their city/country on the About tab instead, so this visit

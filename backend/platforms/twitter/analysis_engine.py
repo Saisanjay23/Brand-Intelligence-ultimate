@@ -36,6 +36,7 @@ from backend.platforms.scan_options import captures_screenshot
 from backend.shared.text import name_score, normalized_host, parse_normalized_url
 from backend.stealth.mouse_movement import humanize_interaction
 from backend.platforms.twitter.discovery_engine import (ABOUT_QUERY,
+                                                         REPOSTS_QUERY,
                                                          RE_CHECKPOINT,
                                                          RE_GONE, RE_LOGIN,
                                                          TWEETS_QUERIES,
@@ -46,6 +47,7 @@ from backend.platforms.twitter.discovery_engine import (ABOUT_QUERY,
                                                          about_account_from,
                                                          iter_users,
                                                          latest_post,
+                                                         latest_repost,
                                                          parse_lines)
 
 BAD_SEGMENTS = {
@@ -507,6 +509,22 @@ class Scraper:
                     row.last_post_iso = iso
                     row.mark("last_post", "replies-tab")
 
+            # And the /reposts tab, for an account whose output is ONLY
+            # reposts -- its Posts and Replies tabs are both empty while its
+            # header counts every repost (see latest_repost). Same gate, so a
+            # zero-post or protected account never pays for it.
+            if (
+                not row.last_post_iso
+                and row.posts_seen == "yes"
+                and "protected" not in row.notes.lower()
+            ):
+                iso = await self.reposts_tab_last_post(
+                    url, wanted, found[0].entity_id if found else "")
+                if iso:
+                    row.last_post_iso = iso
+                    row.mark("last_post", "reposts-tab")
+                    row.note("last activity is a repost -- no original posts or replies visible")
+
             # The About panel. Visited when it can actually add something:
             # the profile carried no free-text location of its own (blank on
             # 52% of stored rows), so X's inferred country is the only
@@ -583,8 +601,13 @@ class Scraper:
             row.mark("bio", "graphql")
         if u.avatar:
             row.profile_pic_url = hd_picture_url(u.avatar)
+        # The verdict is written whenever the payload settles it -- X's own
+        # `default_profile_image` flag can do that even when no URL came
+        # back. None is left alone: unknown must never read as a verdict.
+        if u.has_custom_pic is not None:
             row.has_custom_pic = u.has_custom_pic
-            row.mark("logo", "graphql")
+            row.mark("logo", "graphql-default-flag" if u.default_pic is not None
+                     else "graphql")
         if u.verified:
             row.verified = True
             row.note("verified account")
@@ -749,6 +772,54 @@ class Scraper:
             except Exception:
                 pass
             return await dom_last_post(page)
+        except Exception:
+            return ""
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+
+    async def reposts_tab_last_post(self, url: str, wanted: str, entity_id: str) -> str:
+        """Newest REPOST time off the /reposts tab. "" when there is none.
+
+        Direct navigation to `/<handle>/reposts` lands on the tab and fires
+        `UserRepostsTimeline` (confirmed live 2026-09-24). Own page, for the
+        same reason as `replies_tab_last_post`: the caller's page stays
+        parked on the profile for the evidence screenshot."""
+        page = await self.ctx.new_page()
+        found: list[str] = []
+        landed = asyncio.Event()
+
+        async def on_response(resp):
+            """Collects the reposts-timeline payload."""
+            try:
+                if REPOSTS_QUERY not in resp.url:
+                    return
+                text = await resp.text()
+            except Exception:
+                return
+            for blob in parse_lines(text):
+                if iso := latest_repost(blob, wanted, entity_id):
+                    found.append(iso)
+            landed.set()
+
+        page.on("response", lambda r: asyncio.create_task(on_response(r)))
+        try:
+            await page.goto(
+                f"{url}/reposts?lang=en",
+                wait_until="domcontentloaded",
+                timeout=self.a.timeout * 1000,
+            )
+            try:
+                await humanize_interaction(page, scroll=False, moves=1)
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(landed.wait(), timeout=self.a.settle)
+            except asyncio.TimeoutError:
+                pass
+            return max(found) if found else ""
         except Exception:
             return ""
         finally:

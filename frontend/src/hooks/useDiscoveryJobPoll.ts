@@ -89,6 +89,9 @@ export function useDiscoveryJobPoll(onFinish?: () => void, onProgress?: () => vo
     // The rev we are waiting to see change. Empty on the first request, so
     // that one is answered immediately with the state as it stands.
     let rev = "";
+    // The finished toast fires once, when the sweep ends -- not again when
+    // its picture checks finish settling behind it.
+    let announced = false;
 
     const poll = async () => {
       // A request can now be in flight for twenty seconds, so unmounting or
@@ -104,17 +107,25 @@ export function useDiscoveryJobPoll(onFinish?: () => void, onProgress?: () => vo
         if (stale()) return;
         rev = updated.rev || "";
         setJob(updated);
-        // Counts moved -> new rows are already saved and readable.
-        const counts = `${updated.found}/${updated.new}/${updated.completed}`;
+        // Counts moved -> new rows are already saved and readable. A landed
+        // picture batch counts too: it can have corrected a card's logo.
+        const counts = `${updated.found}/${updated.new}/${updated.completed}/${updated.avatar_updates ?? 0}`;
         if (counts !== lastCounts.current) {
           lastCounts.current = counts;
           progress.current?.();
         }
         if (TERMINAL.has(updated.status)) {
-          timer.current = null;
-          notifyFinished(updated);
-          finish.current?.();
-          return;
+          if (!announced) {
+            announced = true;
+            notifyFinished(updated);
+          }
+          // Picture checks still landing after the sweep ended: keep
+          // listening, so their logo corrections reach the open grid.
+          if (!updated.avatars_settling || !updated.rev) {
+            timer.current = null;
+            finish.current?.();
+            return;
+          }
         }
         if (stale()) return;
         if (!updated.rev) {

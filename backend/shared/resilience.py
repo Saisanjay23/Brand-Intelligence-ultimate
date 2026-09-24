@@ -51,7 +51,15 @@ from typing import Optional
 # to match it.
 _CHECKPOINT_TOKENS = ("checkpoint", "challenge", "verify your", "suspicious login")
 _AUTH_TOKENS = ("login", "not authenticated", "credential", "api key")
-_RATE_LIMIT_TOKENS = ("rate limit", "rate-limit", "too many requests", "floodwait", "quota")
+# "rate_limited" is the stop CODE engines report (X's sweep, and this
+# module's own `classify_failure` return value); "rate limit" alone does not
+# match it because of the underscore, so an X sweep that stopped on a rate
+# limit was never cooled down or re-queued on another session.
+_RATE_LIMIT_TOKENS = (
+    "rate limit", "rate-limit", "rate_limited", "too many requests", "floodwait", "quota",
+    # Instagram's wording for a throttle, carried in a 200's `message`
+    "please wait a few minutes",
+)
 _TRANSIENT_TOKENS = (
     "timeout", "timed out", "navigation failed", "econnreset", "econnrefused",
     "connection reset", "connection aborted", "net::err", "temporarily unavailable",
@@ -191,8 +199,12 @@ _SATISFIED_STOPS = frozenset({
 # `cancelled` sits here, not in broken: the analyst pressing Stop is a
 # budget decision like any other, and the platform-level cancel branch in
 # discovery/runner.py reports the cancel itself separately anyway.
+# `mobile-api-failed-web-recovered` is TRUNCATED, not broken: the keyword
+# really was searched and its results were saved, only through Instagram's
+# shallower web endpoint. Filing it broken left the cell owed forever and
+# the platform permanently `partial` for a search that worked.
 _TRUNCATED_STOPS = frozenset({
-    "cap:seconds", "cap:pages", "cancelled",
+    "cap:seconds", "cap:pages", "cancelled", "mobile-api-failed-web-recovered",
 })
 
 
@@ -237,6 +249,8 @@ _STOP_PHRASES = {
     # fallback that fires on every sweep means the primary path is dead,
     # which is exactly the thing worth telling somebody about.
     "mobile-api-failed-web-recovered": "fell back to the web API",
+    "empty-unconfirmed": "came back empty without the platform confirming no results",
+    "login": "hit a login wall",
 }
 
 _HTTP_RE = re.compile(r"^http-(\d{3})$")

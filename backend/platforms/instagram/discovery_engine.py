@@ -256,6 +256,10 @@ def user_to_row(u: "InstagramUser", keyword: str, *, source: str = "api") -> Row
     for f in ("followers", "friends", "bio", "location"):
         if getattr(row, f) not in (None, ""):
             row.mark(f, f"discovery-search:{source}")
+    if u.anonymous_pic is not None:
+        # Instagram's own statement -- the strongest logo evidence there is
+        # (shared/logo_verdict.py), so it is labelled as such.
+        row.mark("logo", "api-anonymous-flag")
     return row
 
 
@@ -755,6 +759,7 @@ async def web_search_users(ctx, keyword: str, timeout_s: int = 45) -> list[Insta
         if not username or username.lower() in seen:
             continue
         seen.add(username.lower())
+        anon = u.get("has_anonymous_profile_picture")
         users.append(InstagramUser(
             entity_id=str(u.get("pk") or u.get("id") or ""),
             username=username,
@@ -762,6 +767,10 @@ async def web_search_users(ctx, keyword: str, timeout_s: int = 45) -> list[Insta
             avatar=extract_instagram_hd_avatar(u),
             verified=bool(u.get("is_verified")),
             private=bool(u.get("is_private")),
+            # Instagram's own no-picture flag, which this fallback path used
+            # to drop -- leaving the verdict to asset-id markers, the tier
+            # that has already gone stale once.
+            anonymous_pic=anon if isinstance(anon, bool) else None,
         ))
     return users
 
@@ -818,7 +827,7 @@ class Discovery:
         self.a = args
         self.ctx = ctx
 
-    async def sweep(self, keyword: str, tab: str = "people") -> Sweep:
+    async def sweep(self, keyword: str, tab: str = "people", on_progress=None) -> Sweep:
         """One keyword, start to finish -- the counterpart to
         facebook/discovery_engine.py's Discovery.sweep(), but page-token
         paginated over a direct API call instead of scroll-paginated over
@@ -854,6 +863,38 @@ class Discovery:
 
         page_token = None
         rank_token = None
+        # How many users have already been handed to `on_progress` -- the
+        # same insertion-ordered slicing X's `_emit` uses, so what streams is
+        # always a prefix of what the finished sweep returns.
+        notified = 0
+
+        async def _emit() -> None:
+            """Hand the caller every user found since the last call.
+
+            Instagram's results used to land only when the WHOLE keyword
+            finished -- up to ten pages with a 2.5s pause between each -- so
+            an analyst watching the grid saw nothing for that long and then
+            everything at once. Capped exactly like the final trim, and a
+            broken callback never aborts the sweep."""
+            nonlocal notified
+            if on_progress is None:
+                return
+            users = list(by_name.values())
+            if self.a.max_results:
+                users = users[: self.a.max_results]
+            fresh = users[notified:]
+            if not fresh:
+                return
+            notified = len(users)
+            rows = [user_to_row(u, keyword, source=out.source) for u in fresh if u.url]
+            if not rows:
+                return
+            try:
+                res = on_progress(len(users), out.pages, rows)
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception:
+                pass
 
         try:
             max_pages = int(getattr(self.a, "max_pages", 0) or 0) or DEFAULT_MAX_PAGES
@@ -880,6 +921,16 @@ class Discovery:
 
                 text = await res.text()
                 data = json.loads(text)
+                # A 200 whose body says it FAILED is a soft block, not an
+                # empty search: Instagram answers a throttled or challenged
+                # session with {"status": "fail", "message": ...} and no
+                # `users`. Without this it paged to `exhausted` -- complete,
+                # satisfied, zero results -- for a keyword that was never
+                # really answered.
+                if isinstance(data, dict) and data.get("status") not in (None, "ok"):
+                    out.stopped = "http-200-status-" + str(data.get("status"))
+                    out.error = str(data.get("message") or data.get("status"))[:200]
+                    break
 
                 new_users = 0
                 for user in iter_mobile_search_users(data, probe):
@@ -889,6 +940,7 @@ class Discovery:
 
                 if new_users > 0:
                     out.pages += 1
+                    await _emit()
 
                 if self.a.max_results and len(by_name) >= self.a.max_results:
                     # Stop the instant the caller's own cap is satisfied --
@@ -965,6 +1017,10 @@ class Discovery:
                     # about it (http-403) no longer describes the sweep's
                     # outcome
                     out.stopped = "mobile-api-failed-web-recovered"
+                    # ...and neither does its error text. Left in place, a
+                    # "challenge_required" from the mobile leg would have the
+                    # runner quarantine an account whose search just worked.
+                    out.error = ""
 
             out.hits = [
                 user_to_row(u, keyword, source=out.source)

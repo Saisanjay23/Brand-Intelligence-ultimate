@@ -90,8 +90,11 @@ from typing import Optional
 # itself and cannot collide with a real photo.
 PLACEHOLDER_MARKERS: dict[str, tuple[str, ...]] = {
     "facebook": (
-        # grey silhouette
+        # grey silhouette (current)
         "453178253_471506465671661_2781666950760530985_n",
+        # the classic grey silhouette Facebook served for years before it;
+        # still on older cached URLs across the web
+        "84628273_176159830277856_972693363922829312_n",
         # illustrated default GROUP avatar
         "116687302_959241714549285_318408173653384421_n",
         "730584813_122095914603376682_2911865549814502283_n",
@@ -114,6 +117,69 @@ PLACEHOLDER_MARKERS: dict[str, tuple[str, ...]] = {
         "/sticky/default_profile",
     ),
 }
+
+# THE STOCK AVATARS THEMSELVES, by perceptual fingerprint rather than by URL.
+#
+# WHY. Every rule above is an asset-id list, and asset ids ROTATE: Instagram
+# has already swapped its anonymous avatar once, and for as long as the list
+# held only the old id every picture-less account read as a real upload. The
+# image itself does not rotate -- a re-issued silhouette under a new id, at a
+# new size, re-encoded, still hashes to the same place. So this is the check
+# that keeps working the day the next id changes, and it runs where the bytes
+# already exist (services/avatar_cache.py), never in a sweep.
+#
+# WHERE THESE CAME FROM. Measured over every avatar stored for this
+# deployment (2026-09-24: 6746 distinct Facebook, 684 Instagram and 1233 X
+# images): each entry is the fingerprint of the one image served to hundreds
+# of unrelated accounts under a known stock asset id -- the silhouette (666
+# rows), the default group picture (1007), Instagram's anonymous avatar (51),
+# X's default (801). Every copy hashed at distance 0.
+#
+# WHY THE THRESHOLD IS SAFE. Against those references the nearest REAL
+# picture sat at distance 16 on Facebook, 20 on Instagram and 22 on X; every
+# stock copy sat at 0. DEFAULT_AVATAR_MAX_DISTANCE = 6 leaves a gap of ten
+# bits on the tightest platform, and both hashes must agree.
+#
+# DELIBERATELY NOT HERE: Facebook's generated LETTER avatars. They look
+# alike to a perceptual hash (one glyph on a flat ground), but each is drawn
+# per account, so a reference would only ever match its own letter. They are
+# caught by palette + flatness in `_facebook_generated` instead. (The asset
+# id 730584813_... above turned out to be exactly one of these -- a "G" --
+# which is why it is a URL marker only and not a reference image.)
+DEFAULT_AVATAR_FINGERPRINTS: dict[str, tuple[tuple[str, str, str], ...]] = {
+    "facebook": (
+        ("a2820888a220a282", "14284d0e4d8e332b", "silhouette"),
+        ("b0ecd582bd7c42a3", "a0d40d37dbc9d81e", "default-group"),
+    ),
+    "instagram": (
+        ("e7c51a904b69d366", "324d8e964d8e172b", "anonymous"),
+    ),
+    "twitter": (
+        ("a082888228208222", "324c8e968ecc9623", "default-profile"),
+    ),
+}
+DEFAULT_AVATAR_MAX_DISTANCE = 6
+
+
+def default_avatar_match(platform: str, phash: str, dhash: str) -> str:
+    """The name of the stock avatar these fingerprints are, or "" if none.
+
+    Both hashes must sit within DEFAULT_AVATAR_MAX_DISTANCE of the same
+    reference. Pure arithmetic over stored hex strings (no decode), so it is
+    as cheap to run over a stored row as over a fresh download.
+    """
+    if not (phash and dhash):
+        return ""
+    from backend.shared.imagehashing import _hamming
+
+    for ref_p, ref_d, name in DEFAULT_AVATAR_FINGERPRINTS.get(platform, ()):
+        dp, dd = _hamming(phash, ref_p), _hamming(dhash, ref_d)
+        if dp is None or dd is None:
+            continue
+        if max(dp, dd) <= DEFAULT_AVATAR_MAX_DISTANCE:
+            return name
+    return ""
+
 
 # YouTube's generated avatars all sit under this path prefix. On its own it
 # is only 60% precise (real photographs live there too), so it is never used

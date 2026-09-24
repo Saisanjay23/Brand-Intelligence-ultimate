@@ -307,6 +307,14 @@ class TestTheClassifierFailsLoud:
         platform-level cancel branch reports the cancel itself anyway."""
         assert resilience.sweep_outcome("cancelled", False) == resilience.TRUNCATED
 
+    def test_a_web_recovered_instagram_search_was_still_searched(self):
+        """The keyword reached Instagram and its results were saved, via the
+        shallower web endpoint. Owed-forever (broken) was the wrong verdict;
+        truncated still names the fallback in the platform note."""
+        code = "mobile-api-failed-web-recovered"
+        assert resilience.sweep_outcome(code, False) == resilience.TRUNCATED
+        assert resilience.describe_stop(code) == "fell back to the web API"
+
     def test_summarise_is_deterministic_on_ties(self):
         """This string is diffed by eye across runs and asserted on above,
         so equal counts order by code rather than by dict insertion."""

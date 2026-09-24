@@ -822,10 +822,19 @@ class Scraper:
                 row.created_iso = known["created_at"]
                 row.mark("created", "discovery")
 
-        # Try the direct API call first (see fetch_via_api's docstring),
-        # independent of the page visit below, so it costs nothing extra
-        # even when it comes up empty and we fall through to interception/DOM.
-        api_user = await self.fetch_via_api(row.profile_id) if row.profile_id else None
+        # NO DIRECT API CALL ANY MORE. `fetch_via_api` asks
+        # `web_profile_info`, and re-verified live 2026-09-24 that endpoint
+        # answers HTTP 429 for every username (as discovery_engine.py already
+        # recorded on 2026-08-22), while the pk-based `users/<pk>/info/`
+        # answers 403. So every profile visit opened with a request that was
+        # certain to be refused as rate-limited -- no data, and a steady
+        # stream of 429s on the account is exactly the pattern that gets one
+        # throttled for real. The profile record arrives anyway, on the
+        # page's own `api/graphql` response (measured: every one of 10 live
+        # profiles was filled from it), so the interception below is the
+        # primary path. `fetch_via_api` is kept for the day the endpoint
+        # answers again; it is not called.
+        api_user = None
 
         # Pinned ONCE, before any listener can run. `fill()` reassigns
         # row.profile_id to the numeric pk (`u.entity_id or u.username`),

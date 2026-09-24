@@ -405,7 +405,10 @@ def iter_results(blob: Any, probe: Any = None) -> Iterator[Hit]:
             #   avatar          what Facebook actually renders, always
             #   has_custom_pic  True real upload / False stock avatar /
             #                   None never looked (see shared/models/hit.py)
-            has_custom = bool(raw_uri) and not looks_like_placeholder("facebook", raw_uri)
+            # None, not False, when the edge carried no picture at all: a
+            # "no logo" verdict needs a picture we recognised as stock, and
+            # a False here is written over whatever an earlier sweep saw.
+            has_custom = (not looks_like_placeholder("facebook", raw_uri)) if raw_uri else None
             avatar = hd_picture_url(raw_uri) if raw_uri else ""
 
             verified = bool(
@@ -459,6 +462,29 @@ async def _shows_no_results(page) -> bool:
         return bool(RE_NO_RESULTS.search(await page.inner_text("body")))
     except Exception:
         return False
+
+
+async def _session_blocked(page) -> str:
+    """"checkpoint" / "login" when the search page is a wall instead of
+    results, "" otherwise. URL first (unambiguous), then the page text
+    against the same patterns the session check and analysis use."""
+    try:
+        url = page.url or ""
+    except Exception:
+        url = ""
+    if "/checkpoint" in url:
+        return "checkpoint"
+    if "/login" in url or "/index.php?next=" in url:
+        return "login"
+    try:
+        body = await page.inner_text("body")
+    except Exception:
+        return ""
+    if RE_CHECKPOINT.search(body):
+        return "checkpoint"
+    if RE_LOGIN.search(body):
+        return "login"
+    return ""
 
 
 def page_state(blob: Any, probe: Any = None) -> Optional[PageState]:
@@ -647,6 +673,15 @@ def _tab_cap(opts) -> int:
     return int(getattr(opts, "max_results", 0) or 0)
 
 
+# The first results page is ready to read: either it has rendered real text,
+# or its server-rendered search payload is already in the document. The
+# second clause is what a SMALL result set needs -- see the wait in sweep().
+JS_FIRST_PAGE_READY = (
+    "() => document.body.innerText.length > 400 || Array.from("
+    "document.querySelectorAll('script[type=\"application/json\"]'))"
+    ".some(s => (s.textContent || '').includes('SearchProfileViewModel'))"
+)
+
 JS_EMBEDDED = (
     "() => Array.from(document.querySelectorAll("
     "'script[type=\"application/json\"]')).map(s => s.textContent)"
@@ -773,7 +808,7 @@ async def dom_search_hits(page, keyword: str, tab: str) -> list["Hit"]:
             name=(r.get("name") or "").strip(),
             url=url,
             avatar=avatar,
-            has_custom_pic=bool(avatar) and not looks_like_placeholder("facebook", avatar),
+            has_custom_pic=(not looks_like_placeholder("facebook", avatar)) if avatar else None,
             entity_type=kind,
             keyword=keyword,
             tab=tab,
@@ -1603,12 +1638,16 @@ class Discovery:
             await page.goto(
                 url, wait_until="domcontentloaded", timeout=self.a.timeout * 1000
             )
-            # the first page of results is in the document, not over XHR
+            # the first page of results is in the document, not over XHR --
+            # so the wait ends the moment that document carries results, not
+            # only once it has rendered "enough" text. A search with one or
+            # two results never renders 400 characters: measured live
+            # 2026-09-24, a Pages search for a two-result keyword sat at 219
+            # characters for 25 seconds with its results embedded from 1.2s,
+            # and this wait ran out its full `settle` ceiling (20s) on every
+            # such sweep before a single card could be shown.
             try:
-                await page.wait_for_function(
-                    "() => document.body.innerText.length > 400",
-                    timeout=self.a.settle * 1000,
-                )
+                await page.wait_for_function(JS_FIRST_PAGE_READY, timeout=self.a.settle * 1000)
             except Exception:
                 pass
 
@@ -1618,6 +1657,18 @@ class Discovery:
             # heavier payloads, the response can arrive several seconds after
             # domcontentloaded fires. Without this wait, by_id is empty when
             # run_strategies evaluates, producing a false "0 results" report.
+            # THE SERVER-RENDERED FIRST PAGE, READ BEFORE WAITING ON XHR.
+            # On the Pages and Groups tabs Facebook embeds the first page of
+            # results in the document itself and sends no search XHR until
+            # the page is scrolled (confirmed live 2026-09-24: no
+            # SearchCometResultsPaginatedResultsQuery fired at all on a
+            # two-result Pages search). Reading it here, before any wait on
+            # `arrived`, is what lets such a sweep show its cards at once.
+            # Parsing is idempotent (absorb dedups by id), so reading it
+            # again below costs nothing.
+            for blob in parse_embedded(await page.evaluate(JS_EMBEDDED), probe):
+                absorb(blob)
+
             if not by_id:
                 # DON'T WAIT FOR A RESPONSE THAT IS NEVER COMING. The wait
                 # below exists for a slow search payload, but a search that
@@ -1631,10 +1682,26 @@ class Discovery:
                 if await _shows_no_results(page):
                     out.stopped, out.complete = "no-results", True
                 else:
-                    try:
-                        await asyncio.wait_for(arrived.wait(), timeout=self.a.settle)
-                    except asyncio.TimeoutError:
-                        pass
+                    # Waited in ONE-SECOND STEPS, re-reading the document
+                    # between them, rather than once for the whole ceiling.
+                    # The server-rendered results can land a moment AFTER the
+                    # read above (measured live 2026-09-24: a Pages sweep
+                    # whose first card still took 22.3s), and a single blind
+                    # wait for an XHR that never comes sat out all of
+                    # `settle` before looking again. Ends as soon as results,
+                    # an XHR page or Facebook's own "no results" panel shows.
+                    deadline = time.time() + self.a.settle
+                    while not by_id and time.time() < deadline:
+                        try:
+                            await asyncio.wait_for(arrived.wait(), timeout=1.0)
+                            break
+                        except asyncio.TimeoutError:
+                            pass
+                        for blob in parse_embedded(await page.evaluate(JS_EMBEDDED), probe):
+                            absorb(blob)
+                        if not by_id and await _shows_no_results(page):
+                            out.stopped, out.complete = "no-results", True
+                            break
 
             for blob in parse_embedded(await page.evaluate(JS_EMBEDDED), probe):
                 absorb(blob)
@@ -1720,6 +1787,19 @@ class Discovery:
                     # too early. Still gated on having parsed nothing.
                     if not by_id and await _shows_no_results(page):
                         out.stopped, out.complete = "no-results", True
+                        break
+                    # A SESSION THAT DIED MID-SWEEP. Facebook answers a dead
+                    # or challenged session with a login wall or checkpoint
+                    # where the results should be; nothing parses, nothing
+                    # scrolls in, and this loop used to run out its patience
+                    # and report `stalled` -- a broken sweep, but not a
+                    # SESSION-shaped one, so the keyword was never handed to
+                    # another account and every keyword after it ran into the
+                    # same dead session. Named here so classify_failure
+                    # quarantines the account and the runner re-queues.
+                    if stalls >= 2 and (blocked := await _session_blocked(page)):
+                        out.stopped = blocked
+                        out.error = f"facebook search page shows a {blocked} wall"
                         break
                     if stalls >= self.a.patience:
                         out.stopped = "stalled"

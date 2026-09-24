@@ -242,6 +242,13 @@ class DiscoveryJobState(BaseModel):
     completed: int
     found: int
     new: int
+    avatar_updates: int = Field(
+        0, description="Picture batches that have landed. A batch can change "
+                       "saved cards (a corrected logo verdict), so a change here "
+                       "is a reason to re-read them.")
+    avatars_settling: bool = Field(
+        False, description="True while picture checks are still running after "
+                           "the sweep itself finished -- keep polling until false.")
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     started_at_ts: Optional[float] = None
@@ -637,7 +644,7 @@ def _sweep_fingerprint(job) -> tuple:
     """
     return (
         job.status, job.message, job.total, job.completed, job.found, job.new,
-        len(job.history),
+        len(job.history), job.avatar_updates, job.avatars_settling,
         tuple(
             (p.platform, p.status, p.keywords_total, p.keywords_done,
              p.found, p.new, p.note, p.current_keyword, p.current_tab,
@@ -677,7 +684,7 @@ async def get_job(
         )
     current = await live_poll.wait_for_change(
         lambda: _sweep_fingerprint(job), rev=rev, wait_s=wait,
-        is_final=lambda: job.status in _TERMINAL_STATUSES,
+        is_final=lambda: job.status in _TERMINAL_STATUSES and not job.avatars_settling,
     )
     d = job.to_dict()
     return DiscoveryJobState(**{
@@ -1065,6 +1072,10 @@ async def _validated_docs(
 _SEED_FIELDS = (
     "entity_id", "username", "display_name", "profile_image_url", "avatar_sha",
     "has_logo", "verified",
+    # The evidence behind `has_logo` (shared/logo_verdict.py), so analysis
+    # can weigh discovery's verdict against its own instead of either one
+    # simply overwriting the other.
+    "logo_strength", "logo_source",
     "followers", "friends", "location", "bio", "created_at", "name_score",
 )
 
@@ -1084,6 +1095,11 @@ def _seed_from_doc(doc: dict) -> dict:
     """
     seed = {f: doc.get(f) for f in _SEED_FIELDS}
     seed = {k: v for k, v in seed.items() if v not in (None, "")}
+    # A document from before `logo_source` existed still records WHO set
+    # its verdict under `sources.logo` -- "manual" for an analyst's edit,
+    # which must keep outranking everything automated.
+    if "logo_source" not in seed and (src := (doc.get("sources") or {}).get("logo")):
+        seed["logo_source"] = src
     if keywords := [k for k in (doc.get("keywords") or []) if k]:
         seed["main_keyword"] = keywords[0]
     return seed

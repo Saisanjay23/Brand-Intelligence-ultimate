@@ -145,7 +145,7 @@ const ToggleCell = ({ value, onChange, defaultWhenEmpty = "—" }: { value: stri
   );
 };
 
-const computeDynamicRisk = (row: any, formatMode: "incident" | "legacy"): number => {
+export const computeDynamicRisk = (row: any, formatMode: "incident" | "legacy"): number => {
   const nameYes = formatMode === "incident" ? row["Name (Yes/No)"] : row["Name (Yes / No)"];
   const logoYes = formatMode === "incident" ? row["Logo (Yes/No)"] : row["Logo (Yes / No)"];
   const activeYes = formatMode === "incident" ? row["Active (Yes/No)"] : row["Active (Yes / No)"];
@@ -153,7 +153,13 @@ const computeDynamicRisk = (row: any, formatMode: "incident" | "legacy"): number
   const lastPost = row["Last Post (DD-MM-YYYY) (Optional)"];
 
   const hasName = nameYes === "Yes" || nameYes === "" || nameYes === undefined;
-  const hasLogo = logoYes === "Yes" || logoYes === "" || logoYes === undefined;
+  // A blank logo cell is NOT a logo. It means the picture was never
+  // settled (the scrape failed, or no stage recognised it), and the backend
+  // exports it as "No" for exactly that reason -- counting it as a logo here
+  // put "Logo: Yes, High" on errored rows nobody had actually seen. The name
+  // default is different on purpose: every row here was already name-matched
+  // by discovery (see backend Row.name_yes).
+  const hasLogo = logoYes === "Yes";
   const isActive = activeYes === "Yes";
   const hasLocation = Boolean(location && String(location).trim() !== "");
   const hasLastPost = Boolean(lastPost && String(lastPost).trim() !== "");
@@ -1695,7 +1701,7 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
                             <td style={{ padding: "0" }}><EditableCell value={String(row["AssetName"] || "")} onChange={(v) => handleEdit(it.id, "AssetName", v)} /></td>
                             <td style={{ padding: "0", textAlign: "center" }}><ToggleCell value={String(row["Active (Yes/No)"] || "")} onChange={(v) => handleEdit(it.id, "Active (Yes/No)", v)} /></td>
                             <td style={{ padding: "0", textAlign: "center" }}><ToggleCell value={String(row["Name (Yes/No)"] || "")} defaultWhenEmpty="Yes" onChange={(v) => handleEdit(it.id, "Name (Yes/No)", v)} /></td>
-                            <td style={{ padding: "0", textAlign: "center" }}><ToggleCell value={String(row["Logo (Yes/No)"] || "")} defaultWhenEmpty="Yes" onChange={(v) => handleEdit(it.id, "Logo (Yes/No)", v)} /></td>
+                            <td style={{ padding: "0", textAlign: "center" }}><ToggleCell value={String(row["Logo (Yes/No)"] || "")} defaultWhenEmpty="No" onChange={(v) => handleEdit(it.id, "Logo (Yes/No)", v)} /></td>
                             <td style={{ padding: "0" }}><EditableCell value={String(row["Number of Followers"] ?? "")} onChange={(v) => handleEdit(it.id, "Number of Followers", v)} /></td>
                             <td style={{ padding: "0" }}><EditableCell value={String(row["Last Post (DD-MM-YYYY) (Optional)"] || "")} onChange={(v) => handleEdit(it.id, "Last Post (DD-MM-YYYY) (Optional)", v)} /></td>
                             <td style={{ padding: "0" }}><EditableCell value={String(row["Location"] || "")} onChange={(v) => handleEdit(it.id, "Location", v)} /></td>
@@ -1709,7 +1715,7 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
                             </td>
                             <td style={{ padding: "0" }}><EditableCell value={String(row["Profile name"] || "")} onChange={(v) => handleEdit(it.id, "Profile name", v)} /></td>
                             <td style={{ padding: "0" }}><EditableCell value={String(row["Created Date"] || "")} onChange={(v) => handleEdit(it.id, "Created Date", v)} /></td>
-                            <td style={{ padding: "0", textAlign: "center" }}><ToggleCell value={String(row["Logo (Yes / No)"] || "")} defaultWhenEmpty="Yes" onChange={(v) => handleEdit(it.id, "Logo (Yes / No)", v)} /></td>
+                            <td style={{ padding: "0", textAlign: "center" }}><ToggleCell value={String(row["Logo (Yes / No)"] || "")} defaultWhenEmpty="No" onChange={(v) => handleEdit(it.id, "Logo (Yes / No)", v)} /></td>
                             <td style={{ padding: "0" }}><EditableCell value={String(row["Followers"] ?? "")} onChange={(v) => handleEdit(it.id, "Followers", v)} /></td>
                             <td style={{ padding: "0", textAlign: "center" }}><ToggleCell value={String(row["Active (Yes / No)"] || "")} onChange={(v) => handleEdit(it.id, "Active (Yes / No)", v)} /></td>
                             <td style={{ padding: "0", textAlign: "center" }}><ToggleCell value={String(row["Name (Yes / No)"] || "")} defaultWhenEmpty="Yes" onChange={(v) => handleEdit(it.id, "Name (Yes / No)", v)} /></td>

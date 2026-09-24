@@ -160,6 +160,11 @@ export interface DiscoveryJobState {
   completed: number;
   found: number;
   new: number;
+  // Picture batches landed; a change means saved cards may have been
+  // corrected (e.g. a logo verdict), so the grid is re-read.
+  avatar_updates?: number;
+  // True while picture checks still run after the sweep finished.
+  avatars_settling?: boolean;
   started_at: string | null;
   finished_at: string | null;
   started_at_ts?: number | null;

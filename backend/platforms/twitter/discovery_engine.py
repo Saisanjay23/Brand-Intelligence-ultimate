@@ -151,6 +151,11 @@ USER_QUERIES = ("UserByScreenName", "UserByRestId")
 # always reachable; nothing was asking the tab that had it.
 TWEETS_QUERIES = ("UserTweets", "UserOriginalsTimeline", "UserRepliesTimeline")
 
+# The /reposts tab's own query. Kept OUT of TWEETS_QUERIES on purpose: that
+# tuple feeds `latest_post`, which counts ORIGINAL posts and replies, and a
+# repost is read by `latest_repost` instead -- see that function.
+REPOSTS_QUERY = "UserRepostsTimeline"
+
 # the default egg avatar; anything else is a real upload
 RE_DEFAULT_PIC = re.compile(
     r"default_profile(_normal)?\.png|/sticky/default_profile", re.I
@@ -179,6 +184,11 @@ class TwitterUser:
     protected: bool = False
     description: str = ""
     external_url: str = ""
+    # X's OWN statement that the account never uploaded a picture
+    # (`legacy.default_profile_image`). None when the payload did not carry
+    # the key -- a DOM-read cell, or a response shape that moved it -- never
+    # "has a picture".
+    default_pic: Optional[bool] = None
 
     @property
     def url(self) -> str:
@@ -186,10 +196,23 @@ class TwitterUser:
         return f"https://x.com/{self.handle}" if self.handle else ""
 
     @property
-    def has_custom_pic(self) -> bool:
-        """Is `avatar` a real upload, not X's own default egg avatar (see
-        RE_DEFAULT_PIC above)."""
-        return bool(self.avatar) and not looks_like_placeholder("twitter", self.avatar)
+    def has_custom_pic(self) -> Optional[bool]:
+        """Tri-state, like every other platform's: True a real upload /
+        False X's default avatar / None nothing to judge.
+
+        X's own `default_profile_image` flag leads when the payload carries
+        it; the `default_profile*.png` asset URL is the fallback (a fixed
+        asset that has never rotated, so a reliable one). An EMPTY avatar is
+        None, not False: it used to read as "no logo", which is a claim
+        about a picture nobody looked at -- and `save()` would then write
+        that False over a real verdict an earlier sweep had established."""
+        if self.default_pic is True:
+            return False
+        if not self.avatar:
+            return None
+        if looks_like_placeholder("twitter", self.avatar):
+            return False
+        return True
 
 
 def user_to_row(u: "TwitterUser", keyword: str, *, source: str = "graphql") -> Row:
@@ -224,6 +247,9 @@ def user_to_row(u: "TwitterUser", keyword: str, *, source: str = "graphql") -> R
     rich = () if source == "dom" else ("followers", "friends", "bio", "location", "created_iso")
     for f in always + rich:
         row.mark(f, f"discovery-search:{source}")
+    if u.default_pic is not None:
+        # X's own default-avatar flag (shared/logo_verdict.py: FLAG).
+        row.mark("logo", "graphql-default-flag")
     return row
 
 
@@ -411,6 +437,11 @@ def _user_from_result(res: dict, probe: Any = None) -> Optional[TwitterUser]:
         or ("blue" if res.get("is_blue_verified") else "")
     ).strip().lower()
 
+    default_pic = legacy.get("default_profile_image")
+    if not isinstance(default_pic, bool):
+        default_pic = res.get("default_profile_image")
+    default_pic = default_pic if isinstance(default_pic, bool) else None
+
     raw_entities = legacy.get("entities") or {}
     url_entities = (raw_entities.get("url") or {}).get("urls") or []
     external_url = str(url_entities[0].get("expanded_url") or url_entities[0].get("url", "") if url_entities else "").strip()
@@ -435,6 +466,7 @@ def _user_from_result(res: dict, probe: Any = None) -> Optional[TwitterUser]:
         protected=bool(legacy.get("protected") or privacy.get("protected")),
         description=description.strip(),
         external_url=external_url,
+        default_pic=default_pic,
     )
 
 
@@ -619,6 +651,52 @@ def latest_post(blob: Any, handle: str = "", entity_id: str = "") -> str:
     return best
 
 
+def latest_repost(blob: Any, handle: str = "", entity_id: str = "") -> str:
+    """Newest time this account REPOSTED something, as ISO. "" if none.
+
+    WHY THIS EXISTS. `latest_post` deliberately skips reposts, and when an
+    account has original posts that is right: their own words are the
+    better activity signal. But X now splits a profile into Posts, Replies
+    and Reposts tabs, and an account whose whole output is reposts shows an
+    EMPTY Posts tab and an empty Replies tab while its header counts every
+    repost. Confirmed live 2026-09-24: @Gautam_Adani_07 reports 13 posts,
+    both tabs are empty, and all 13 are reposts -- the engine returned no
+    date at all for an account that was active in April.
+
+    WHICH TIMESTAMP. A repost arrives as a wrapper tweet AUTHORED BY THIS
+    ACCOUNT (`legacy.retweeted_status_result` set) whose own `created_at` is
+    the moment it reposted, around the original tweet authored by somebody
+    else with its own, older date. Only the wrapper is read -- the original
+    is someone else's post, and its date says nothing about this account.
+    A wrapper naming no author at all is not counted.
+    """
+    want_h, want_id = handle.lower(), str(entity_id or "")
+    best = ""
+    for d in iter_dicts(blob):
+        legacy = d.get("legacy")
+        if not isinstance(legacy, dict) or "created_at" not in legacy:
+            continue
+        if not legacy.get("retweeted_status_result"):
+            continue
+        author = str(legacy.get("user_id_str") or "")
+        core = ((d.get("core") or {}).get("user_results") or {}).get("result") or {}
+        author_handle = (
+            (core.get("legacy") or {}).get("screen_name")
+            or (core.get("core") or {}).get("screen_name")
+            or ""
+        )
+        if not (author or author_handle):
+            continue
+        if want_id and author and author != want_id:
+            continue
+        if want_h and author_handle and author_handle.lower() != want_h:
+            continue
+        iso = parse_created(legacy["created_at"])
+        if iso > best:
+            best = iso
+    return best
+
+
 @dataclass
 class SearchState:
     """The search timeline's cursor, which is how a sweep knows to stop."""
@@ -680,6 +758,16 @@ def parse_lines(text: str) -> Iterator[Any]:
 # Crawling / pagination
 
 SEARCH_URL = "https://x.com/search?q={q}&src=typed_query&f=user"
+
+# X's own "this search matched nothing" notice ("No results for "xyz"").
+RE_X_NO_RESULTS = re.compile(r"No results for", re.I)
+
+
+async def _x_says_no_results(page) -> bool:
+    try:
+        return bool(RE_X_NO_RESULTS.search(await page.inner_text("body")))
+    except Exception:
+        return False
 
 
 @dataclass
@@ -988,6 +1076,16 @@ class Discovery:
 
                     # the same bottom cursor twice with no new users is the end
                     if cursor and cursor == last_cursor and stalls >= 2:
+                        if not by_id and not await _x_says_no_results(page):
+                            # NOTHING FOUND, AND X NEVER SAID SO. A genuinely
+                            # empty search renders "No results for ..."; a
+                            # throttled session gets an empty timeline with a
+                            # cursor and no such notice. Calling that
+                            # `exhausted` filed an unanswered keyword as a
+                            # satisfied one -- this is broken instead, which
+                            # earns it a same-run retry.
+                            out.stopped = "empty-unconfirmed"
+                            break
                         out.stopped, out.complete = "exhausted", True
                         break
                     if stalls >= self.a.patience:

@@ -62,6 +62,7 @@ from backend.sessions import manager as sessions_engine
 from backend.database.repositories import analysis_result_repository as results_db
 from backend.database.repositories import client_repository as clients_db
 from backend.shared import fast_http
+from backend.shared import logo_verdict
 from backend.shared.job_store import JobStore
 from backend.shared.logging import get_logger
 from backend.shared.models.row import Row
@@ -530,6 +531,32 @@ class _PlatformRun:
     concurrency: int
     inter_batch_delay: float
     progress: dict[str, Any]
+
+
+async def _stored_pixel_evidence(
+    platform: str, url: str, sha: str,
+) -> "logo_verdict.LogoEvidence":
+    """The pixel verdict for a picture already in the avatar store.
+
+    Never raises: a missing blob or an undecodable one is simply no pixel
+    evidence, and the other stages decide."""
+    try:
+        from backend.database.repositories import avatar_repository as avatars_db
+        from backend.shared.avatars import default_avatar_match, is_generated_avatar
+        from backend.shared.imagehashing import fingerprint
+
+        got = await avatars_db.read(sha)
+        if not got:
+            return logo_verdict.UNKNOWN
+        data = got[0]
+        fp = await asyncio.to_thread(fingerprint, data)
+        if fp and default_avatar_match(platform, fp.phash, fp.dhash):
+            return logo_verdict.LogoEvidence(False, logo_verdict.PIXELS, "default-avatar-hash")
+        if await asyncio.to_thread(is_generated_avatar, platform, url or "", data) is True:
+            return logo_verdict.LogoEvidence(False, logo_verdict.PIXELS, "generated-avatar")
+    except Exception:                                # noqa: BLE001 - never fatal
+        pass
+    return logo_verdict.UNKNOWN
 
 
 class AnalysisRunner:
@@ -1461,23 +1488,6 @@ class AnalysisRunner:
             if it.verified is None and known.get("verified") is not None:
                 it.verified = known["verified"]
 
-            # THE LOGO VERDICT IS DISCOVERY'S, NOT ANALYSIS'S -- the one
-            # field here that does not follow the "only fill a gap" rule
-            # above, and deliberately so.
-            #
-            # `known` exists only for a profile that came through
-            # POST /discovery/profiles/analyse, which is to say one an
-            # analyst looked at on a discovery card and validated by hand.
-            # The picture on that card is the thing they judged. Analysis
-            # then re-derives the same verdict from a different visit, and
-            # when the two disagree it is analysis that is wrong more often:
-            # it reads whichever fbcdn URL that page render happened to
-            # expose, including the viewer's own photo substituted into a
-            # privacy-restricted profile (see PAGE_CONTEXT_PICTURE_KEYS).
-            # Discovery's answer is the one a human has already stood
-            # behind, so it wins outright rather than only filling a blank.
-            if known.get("has_logo") is not None:
-                it.has_logo = row.has_custom_pic = known["has_logo"]
             if not it.name_score and known.get("name_score"):
                 # Restored for display only -- `Row.name_yes` no longer
                 # gates on this (see its own docstring), so `has_name_match`
@@ -1499,18 +1509,25 @@ class AnalysisRunner:
         if not it.profile_name:
             it.profile_name = it.entity_id
 
+        pixel_ev = logo_verdict.UNKNOWN
         if it.profile_image_url and not it.avatar_sha:
             try:
                 from backend.services import avatar_cache
-                # cache_one returns (sha, fingerprint) -- the fingerprint
-                # comes free with the decode discovery already pays for, and
-                # is what the logo-match comparison reads later. Analysis's
-                # own behaviour is unchanged: it still only needs the sha.
-                # (sha, fingerprint, embedding). Analysis asks for no
-                # embedding: the logo tier is a DISCOVERY ranking signal, and
-                # spending ~70ms an image here would slow analysis for a
-                # feature it does not surface.
-                sha, fp, _vec, _gen = await avatar_cache.cache_one(it.profile_image_url)
+                # (sha, fingerprint, embedding, placeholder). Analysis asks
+                # for no embedding: the logo tier is a DISCOVERY ranking
+                # signal, and spending ~70ms an image here would slow
+                # analysis for a feature it does not surface.
+                #
+                # `platform=` IS WHAT MAKES THE PIXEL CHECK RUN. It used to be
+                # omitted, so a profile pasted straight into analysis never
+                # had its picture looked at: Facebook's generated letter
+                # avatars (and any stock avatar whose asset id rotated) read
+                # "Logo: Yes" and forced High priority on their own.
+                sha, fp, _vec, placeholder = await avatar_cache.cache_one(
+                    it.profile_image_url, platform=it.platform)
+                if placeholder:
+                    pixel_ev = logo_verdict.LogoEvidence(
+                        False, logo_verdict.PIXELS, placeholder)
                 if sha:
                     it.avatar_sha = sha
                     client_id = job.org_id or (known.get("client_id") if known else "")
@@ -1526,6 +1543,39 @@ class AnalysisRunner:
                             )
             except Exception:
                 pass
+
+        elif it.avatar_sha and it.platform in ("facebook", "instagram", "twitter", "youtube"):
+            # The picture is already in our store (discovery cached it), so
+            # its pixel verdict costs one GridFS read -- and it is the verdict
+            # a legacy document, written before `logo_strength` existed, may
+            # never have had persisted.
+            pixel_ev = await _stored_pixel_evidence(
+                it.platform, it.profile_image_url, it.avatar_sha)
+
+        # THE LOGO VERDICT: the strongest evidence any stage produced, not
+        # whichever stage ran last (shared/logo_verdict.py).
+        #
+        # This used to be "discovery wins, in both directions", on the
+        # grounds that a Facebook profile visit can render the VIEWER's own
+        # photo into a privacy-restricted profile (see
+        # facebook/discovery_engine.py::PAGE_CONTEXT_PICTURE_KEYS). That
+        # protection is kept -- a picture read off a page render is only
+        # OBSERVED evidence, so it can never outrank discovery's recognised
+        # stock avatar -- but the blanket rule also threw away evidence that
+        # is strictly better than discovery's: Instagram's own
+        # `has_anonymous_profile_picture` read on the visit, X's
+        # `default_profile_image`, and the pixel check above. A URL guess
+        # from a search card no longer overrides the platform saying, in so
+        # many words, that the account has no picture.
+        final_logo = logo_verdict.resolve(
+            logo_verdict.doc_evidence(known) if known else logo_verdict.UNKNOWN,
+            logo_verdict.row_evidence(row),
+            pixel_ev,
+        )
+        if final_logo.known:
+            row.has_custom_pic = final_logo.value
+            row.mark("logo", final_logo.source or ("url" if final_logo.value is False else "observed"))
+        it.has_logo = _tri(row.logo_yes)
 
         # LAST, and deliberately after the `known` merge above. Risk and
         # priority are DERIVED from name/logo/location/activity, so reading

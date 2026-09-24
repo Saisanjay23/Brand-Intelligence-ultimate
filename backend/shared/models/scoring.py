@@ -76,7 +76,10 @@ MAX_SCORE = 9
 ACTIVE, DORMANT, UNKNOWN = "active", "dormant", "unknown"
 
 
-def resolve_match(automated: bool, analyst: Optional[bool], validated: bool) -> bool:
+def resolve_match(
+    automated: Optional[bool], analyst: Optional[bool], validated: bool,
+    *, automated_veto: bool = False,
+) -> bool:
     """Whether a logo/name match counts, from the three things that can say
     so, in strict order of authority:
 
@@ -89,11 +92,20 @@ def resolve_match(automated: bool, analyst: Optional[bool], validated: bool) -> 
        default until explicitly undone.
     3. Otherwise whatever the scraper detected -- every profile nobody has
        judged yet.
+
+    `automated_veto` (the LOGO call only) lets a CONFIRMED absence beat the
+    validated default. `has_logo is False` is never a guess any more: it is
+    written only when the picture was recognised as the platform's own stock
+    avatar (see shared/logo_verdict.py), while "never looked" stays None.
+    Validating a profile confirms the impersonation, not that a grey
+    silhouette is somebody's logo -- defaulting that to Yes put "Logo: Yes,
+    High" on profiles whose only picture is the platform's placeholder. The
+    name default is untouched (see Row.name_yes).
     """
     if analyst is not None:
         return bool(analyst)
     if validated:
-        return True
+        return not (automated_veto and automated is False)
     return bool(automated)
 
 
@@ -132,7 +144,7 @@ def _rubric(*, logo: bool, name_match: bool, location: bool, tier: str) -> int:
 
 
 def compute_score(
-    has_logo: bool, has_name_match: bool, has_location: bool,
+    has_logo: Optional[bool], has_name_match: bool, has_location: bool,
     last_post_iso: Optional[str] = "",
     *, logo_match: Optional[bool] = None, username_match: Optional[bool] = None,
     validated: bool = False,
@@ -146,7 +158,7 @@ def compute_score(
     live scrape with no analyst input yet scores exactly as it always did.
     """
     return _rubric(
-        logo=resolve_match(has_logo, logo_match, validated),
+        logo=resolve_match(has_logo, logo_match, validated, automated_veto=True),
         name_match=resolve_match(has_name_match, username_match, validated),
         location=has_location,
         tier=_activity_tier(last_post_iso),

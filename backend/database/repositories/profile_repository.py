@@ -55,6 +55,10 @@ DISCOVERY_FIELDS = (
     # a re-fetch would use while the signature is alive, and what a card
     # falls back to before the bytes have landed.
     "discovery_source", "profile_image_url", "avatar_sha", "has_logo", "verified",
+    # The EVIDENCE behind `has_logo` -- how strong it is and what produced
+    # it (shared/logo_verdict.py). `save` reads the stored pair back so a
+    # weaker reading can never overwrite a stronger one.
+    "logo_strength", "logo_source",
     # Perceptual fingerprints of the cached avatar, and how close it came to
     # one of the client's reference logos. `logo_match` is NOT here on
     # purpose -- that one is the analyst's own call (see scoring.
@@ -561,7 +565,8 @@ async def save(
     existing = await coll.find_one(
         {**match, "$or": keys},
         {"_id": 1, "url": 1, "status": 1, "entity_id": 1, "analysis_attempts": 1,
-         "profile_image_url": 1, "avatar_sha": 1}
+         "profile_image_url": 1, "avatar_sha": 1,
+         "has_logo": 1, "logo_strength": 1, "logo_source": 1, "sources": 1}
     )
 
     owned = ANALYSIS_FIELDS if phase == PHASE_ANALYSIS else DISCOVERY_FIELDS
@@ -681,6 +686,8 @@ async def save(
                     f"(old path …{old_img[-40:]}, new path …{new_img[-40:]})"
                 )
 
+        _keep_stronger_logo(existing, fields, update, phase)
+
         await coll.update_one({"_id": existing["_id"]}, update)
         return False
 
@@ -717,18 +724,61 @@ async def save(
         return False
 
 
+def _keep_stronger_logo(existing: dict, fields: dict, update: dict, phase: str) -> None:
+    """Drop this write's logo verdict when the stored one is better evidence.
+
+    THE BUG THIS CLOSES. Every discovery save used to `$set` whatever the
+    sweep's URL rule concluded. The avatar cache can do better -- it has the
+    bytes, and catches Facebook's generated letter avatars and any stock
+    image whose asset id rotated -- but its "No" only lasted until the next
+    sweep re-found the same profile and wrote the URL rule's "Yes" straight
+    back over it. `cache_for_profiles` then skipped the (already cached)
+    picture, so the correction never came back. See shared/logo_verdict.py.
+
+    A genuinely NEW picture (the asset path changed -- the avatar-change
+    branch above has already unset the stale hashes) is fresh evidence
+    about a different image, so the stored verdict no longer applies and
+    the incoming one stands whatever its strength.
+    """
+    from backend.shared import logo_verdict
+
+    sets = update.get("$set") or {}
+    if "has_logo" not in sets or phase != PHASE_DISCOVERY:
+        return
+    if "avatar_changed_at" in sets:
+        return
+    incoming = logo_verdict.LogoEvidence(
+        bool(sets["has_logo"]),
+        int(sets.get("logo_strength") or 0) or logo_verdict.evidence(
+            bool(sets["has_logo"]), str(sets.get("logo_source") or "")).strength,
+        str(sets.get("logo_source") or ""),
+    )
+    stored = logo_verdict.doc_evidence(existing)
+    if logo_verdict.stronger(stored, incoming) is stored and stored.known:
+        for k in ("has_logo", "logo_strength", "logo_source"):
+            sets.pop(k, None)
+
+
 async def set_has_logo(
     client_id: str, platform: str, value: bool, *, url: str, entity_id: str = "",
+    strength: int = 0, source: str = "",
 ) -> bool:
     """Correct one profile's logo verdict. True when a row was changed.
 
     Written by avatar_cache after it has decoded the picture, which is the
-    only point in the pipeline that can tell a platform-DRAWN avatar from a
-    real upload -- the sweep that wrote this row saw the URL and nothing
-    else. Same identity rules and the same narrow-write discipline as
-    `set_avatar_sha` above: caching a picture is not a rediscovery, so this
-    must not touch `last_seen` or re-run the status logic.
+    only point in the pipeline that can tell a platform-DRAWN avatar (or a
+    stock image whose asset id rotated) from a real upload -- the sweep that
+    wrote this row saw the URL and nothing else. Same identity rules and the
+    same narrow-write discipline as `set_avatar_sha` above: caching a
+    picture is not a rediscovery, so this must not touch `last_seen` or
+    re-run the status logic.
+
+    EVIDENCE-GATED (shared/logo_verdict.py): written only when it is at
+    least as strong as what is stored, so a pixel verdict never overrides an
+    analyst's manual call or the platform's own flag.
     """
+    from backend.shared import logo_verdict
+
     if not url:
         return False
     eid = (entity_id or "").strip()
@@ -737,9 +787,21 @@ async def set_has_logo(
         keys.append({"entity_id": eid})
     keys.append({"url": url})
     keys.append({"urls": url})
-    res = await db()[PROFILES].update_one(
-        {"client_id": client_id, "platform": platform, "$or": keys},
-        {"$set": {"has_logo": bool(value)}},
+    filt = {"client_id": client_id, "platform": platform, "$or": keys}
+    coll = db()[PROFILES]
+    incoming = (logo_verdict.LogoEvidence(bool(value), strength, source)
+                if strength else logo_verdict.evidence(bool(value), source))
+    doc = await coll.find_one(
+        filt, {"_id": 1, "has_logo": 1, "logo_strength": 1, "logo_source": 1, "sources": 1})
+    if doc is None:
+        return False
+    stored = logo_verdict.doc_evidence(doc)
+    if stored.known and logo_verdict.stronger(stored, incoming) is stored:
+        return False
+    res = await coll.update_one(
+        {"_id": doc["_id"]},
+        {"$set": {"has_logo": bool(value), "logo_strength": incoming.strength,
+                  "logo_source": incoming.source, "sources.logo": incoming.source or "avatar"}},
     )
     return res.matched_count > 0
 
@@ -866,7 +928,14 @@ async def set_avatar_fingerprint(
 async def existing_avatar_urls(client_id: str, platform: str, urls: list[str]) -> dict[str, str]:
     """Returns a mapping {url: profile_image_url} for profiles that already have
     a non-empty `avatar_sha` stored. Used by avatar_cache to check whether an
-    account's display picture has changed before deciding whether to skip re-download."""
+    account's display picture has changed before deciding whether to skip re-download.
+
+    Requires the FINGERPRINT too, not just the bytes. The media proxy
+    (`keep_avatar_for_image_url`) stores a picture's bytes when a card is
+    viewed, without fingerprinting it or running the placeholder checks --
+    and a picture that got there first used to be skipped here as "already
+    cached", so its logo verdict was never decided from the pixels at all.
+    A picture only counts as done once the path that judges it has run."""
     if not urls or not client_id or not platform:
         return {}
     cur = db()[PROFILES].find(
@@ -875,6 +944,7 @@ async def existing_avatar_urls(client_id: str, platform: str, urls: list[str]) -
             "platform": platform,
             "url": {"$in": urls},
             "avatar_sha": {"$exists": True, "$ne": ""},
+            "avatar_phash": {"$exists": True, "$ne": ""},
         },
         {"url": 1, "profile_image_url": 1},
     )
@@ -1350,7 +1420,7 @@ async def get_by_id(doc_id: str) -> Optional[dict]:
 
 
 def compute_risk_score(
-    has_logo: bool, has_name_match: bool, location, last_post_date,
+    has_logo: Optional[bool], has_name_match: bool, location, last_post_date,
     logo_match: Optional[bool] = None, username_match: Optional[bool] = None,
     validated: bool = False,
 ) -> int:
@@ -1362,14 +1432,18 @@ def compute_risk_score(
     from backend.shared.models.scoring import compute_score
 
     return compute_score(
-        has_logo=bool(has_logo), has_name_match=bool(has_name_match),
+        # Tri-state passed through, NOT bool()-ed: a confirmed stock avatar
+        # (False) vetoes the validated-profile logo default, and folding a
+        # never-looked None into False would veto on no evidence at all.
+        has_logo=has_logo if has_logo is None else bool(has_logo),
+        has_name_match=bool(has_name_match),
         has_location=bool((location or "").strip()), last_post_iso=last_post_date or "",
         logo_match=logo_match, username_match=username_match, validated=validated,
     )
 
 
 def compute_priority(
-    has_logo: bool, risk_score: int,
+    has_logo: Optional[bool], risk_score: int,
     logo_match: Optional[bool] = None, validated: bool = False,
 ) -> str:
     """High/Medium/Low off the same resolved signals the score uses, an
@@ -1397,7 +1471,7 @@ def compute_priority(
     """
     from backend.shared.models.scoring import resolve_match
 
-    if resolve_match(has_logo, logo_match, validated):
+    if resolve_match(has_logo, logo_match, validated, automated_veto=True):
         return "High"
     return "High" if risk_score >= 5 else "Low"
 
@@ -1432,12 +1506,12 @@ async def patch(doc_id: str, fields: dict) -> dict:
         merged = {**doc, **safe}
         validated = merged.get("status") == "approved"
         safe["risk_score"] = compute_risk_score(
-            merged.get("has_logo", False), merged.get("has_name_match", False),
+            merged.get("has_logo"), merged.get("has_name_match", False),
             merged.get("location"), merged.get("last_post_date"),
             merged.get("logo_match"), merged.get("username_match"), validated,
         )
         safe["priority"] = compute_priority(
-            merged.get("has_logo", False), safe["risk_score"],
+            merged.get("has_logo"), safe["risk_score"],
             merged.get("logo_match"), validated,
         )
 

@@ -40,6 +40,12 @@ class TestClassifyFailure:
         assert classify_failure("429 too many requests") == "rate_limited"
         assert classify_failure("FloodWait 300") == "rate_limited"
 
+    def test_the_rate_limited_stop_code_itself_classifies(self):
+        # REGRESSION: X's sweep stops with `stopped="rate_limited"`, and the
+        # underscore meant no token matched -- so a rate-limited account was
+        # never cooled down and the keyword was never re-queued elsewhere.
+        assert classify_failure("rate_limited") == "rate_limited"
+
     def test_non_session_failures_leave_the_pool_alone(self):
         # a parser bug or a bad URL must NOT get a healthy session cooled off
         assert classify_failure("KeyError: 'edges'") is None

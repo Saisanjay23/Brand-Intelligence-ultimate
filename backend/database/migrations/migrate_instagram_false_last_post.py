@@ -172,13 +172,13 @@ async def migrate(dry_run: bool) -> None:
             # two must not disagree about the same profile.
             validated = doc.get("status") == "approved"
             score = compute_risk_score(
-                doc.get("has_logo", False), doc.get("has_name_match", False),
+                doc.get("has_logo"), doc.get("has_name_match", False),
                 doc.get("location"), "",
                 doc.get("logo_match"), doc.get("username_match"), validated,
             )
             fields["risk_score"] = score
             fields["priority"] = compute_priority(
-                doc.get("has_logo", False), score,
+                doc.get("has_logo"), score,
                 doc.get("logo_match"), validated,
             )
             # With no date there is no evidence of a post in the window.

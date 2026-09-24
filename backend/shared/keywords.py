@@ -132,7 +132,11 @@ def _clean(value: Any) -> str:
     a client's config must never take the whole sweep down."""
     if not isinstance(value, str):
         return ""
-    return value.strip()
+    # Internal runs of whitespace collapse to one space. A permutation typed
+    # as "Yash  Mendiratta" (double space -- present in a live client's saved
+    # config) is the same search as "Yash Mendiratta" to every platform, but
+    # compared raw it deduped as a DIFFERENT term and was swept twice.
+    return " ".join(value.split())
 
 
 def _dedup(values: Iterable[str]) -> list[str]:
