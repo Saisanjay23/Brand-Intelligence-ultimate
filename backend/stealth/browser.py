@@ -367,11 +367,10 @@ class Session:
         # "en-US,en;q=0.9"). build_extra_headers still gets the PLAIN locale:
         # handing it "en-US,en" would make it emit "en-US,en,en;q=0.9".
         locale = "en-US"
-        ctx_locale = f"{locale},{locale.split('-')[0]}"
         ctx_opts = {
             "user_agent": self.identity["ua"],
             "extra_http_headers": build_extra_headers(locale=locale),
-            "locale": ctx_locale,
+            "locale": locale,
             "timezone_id": self.timezone_id,
             "viewport": self.viewport,
         }

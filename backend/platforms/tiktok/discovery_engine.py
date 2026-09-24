@@ -907,11 +907,7 @@ async def anonymous_context():
         # new_context() to pass them to.
         "user_agent": identity["ua"],
         "viewport": identity["viewport"],
-        # Chrome always carries the base language behind the region locale;
-        # "en-US" alone truncates navigator.languages to a single entry,
-        # which no ordinary browser produces. See browser.py for the
-        # measurement behind this exact spelling.
-        "locale": f"{locale},{locale.split('-')[0]}",
+        "locale": locale,
         "extra_http_headers": build_extra_headers(locale=locale),
         "timezone_id": DEFAULT_TIMEZONE_ID,
     }

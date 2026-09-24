@@ -211,7 +211,7 @@ async def _live() -> list[str]:
         # does differently from the thing it is checking is a lie it will
         # eventually tell.
         ctx = await browser.new_context(
-            viewport={"width": 1280, "height": 900}, locale="en-US,en")
+            viewport={"width": 1280, "height": 900}, locale="en-US")
 
         for pid, plat in PLATFORMS.items():
             print(f"\n{pid}")
