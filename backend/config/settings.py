@@ -344,9 +344,40 @@ class Settings(BaseSettings):
     # Let a cookie health check try one impersonated HTTPS request before
     # launching Chromium. Only a POSITIVE "still logged in" short-circuits;
     # anything else, including a positive-looking failure, still runs the
-    # browser check (see fast_http.SessionVerdict). Turn this off if session
-    # health verdicts are ever suspected of disagreeing with reality.
-    session_fast_check_enabled: bool = True
+    # browser check (see fast_http.SessionVerdict).
+    #
+    # OFF BY DEFAULT since 2026-09-24, because of WHO the request appears to
+    # come from. It carries the account's live session cookies (Facebook's
+    # `xs`, Instagram's `sessionid`) from curl_cffi impersonating Chrome 146,
+    # while every real use of the same account comes from the installed
+    # Chrome (153 at the time) on its own persistent device profile. One
+    # session token presenting from two different client fingerprints,
+    # alternating every half hour around the clock, is the pattern Meta's
+    # session-integrity checks treat as a stolen cookie. The browser check
+    # it was saving is now rare anyway (session_idle_recheck_hours), so the
+    # speed it bought is worth far less than the risk it carried. Setting it
+    # true also re-enables the canary's HTTP liveness pass.
+    session_fast_check_enabled: bool = False
+
+    # --- how often idle accounts are touched ------------------------------
+    # An idle account (no job has proved it healthy recently) gets a real
+    # logged-in check at most this often. It used to be ~90 minutes, around
+    # the clock: an account opening its own settings page 16 times a day,
+    # including every night, which no person does. Jobs still catch a dead
+    # session the moment they use it (their own login probe and
+    # classify_failure), so this only governs the early-warning check.
+    session_idle_recheck_hours: float = 8.0
+    # Local hours (default_timezone) during which the monitor touches no
+    # account at all -- no browser check, no HTTP probe. start == end
+    # disables the window. Default: midnight to 07:00.
+    session_quiet_hours_start: int = 0
+    session_quiet_hours_end: int = 7
+
+    # A scheduled run starts up to this many minutes AFTER its configured
+    # time, at random. The same accounts beginning to browse at exactly
+    # 02:00:00 every night is a pattern; a start that wanders is not.
+    # Manual runs are never delayed. 0 disables it.
+    scheduler_start_jitter_minutes: float = 15.0
     # Let an analysis batch ask the platform whether a profile URL still
     # exists before a browser worker is given it. Only a 404/410 from a
     # platform that reliably serves one settles the row; every other answer

@@ -925,7 +925,8 @@ async def anonymous_context():
             ctx = await pw.chromium.launch_persistent_context(str(profile), **launch)
             # webdriver/visibilityState masking and native-code masking on the
             # overrides -- the same script every other platform gets.
-            await ctx.add_init_script(build_init_js())
+            if init_js := build_init_js():
+                await ctx.add_init_script(init_js)
             if STEALTH_DRIVER != "patchright":
                 log.warning(
                     "tiktok: running on vanilla playwright -- the driver announces "

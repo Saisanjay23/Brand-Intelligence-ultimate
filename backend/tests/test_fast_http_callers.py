@@ -149,10 +149,22 @@ async def test_with_the_accelerator_off_avatars_take_exactly_the_old_path():
 # --------------------------------------------------------- session checking
 
 
+def test_the_http_session_check_is_off_by_default():
+    """It sends an account's live session cookies from a second client
+    fingerprint (curl_cffi) -- the stolen-cookie pattern Meta scores. Opt-in
+    only since 2026-09-24; see settings.session_fast_check_enabled."""
+    from backend.config.settings import Settings
+
+    assert Settings.model_fields["session_fast_check_enabled"].default is False
+
+
 @pytest.mark.asyncio
-async def test_a_confirmed_live_session_never_launches_a_browser():
+async def test_a_confirmed_live_session_never_launches_a_browser(monkeypatch):
+    from backend.config.settings import settings
     from backend.sessions import manager
 
+    # Opted in explicitly: this pins what the check does WHEN enabled.
+    monkeypatch.setattr(settings, "session_fast_check_enabled", True)
     with patch.object(fast_http, "check_session_alive",
                       AsyncMock(return_value=fast_http.SessionVerdict(True, "/me resolved to /zuck"))), \
          patch("backend.platforms.registry.get", side_effect=AssertionError("browser path taken")):

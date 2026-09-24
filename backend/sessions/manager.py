@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import random
 import weakref
 from datetime import datetime, timezone
-from typing import NamedTuple, Optional
+from typing import Any, NamedTuple, Optional
 
 from backend.config.settings import settings
 from backend.database.repositories import session_repository as sessions_db
@@ -1854,16 +1855,42 @@ async def _pick_batch(platform_id: str, limit: int) -> list[tuple[str, str, list
         # Recently proven by a real job, so a probe would only add another
         # authenticated hit to an account that has already demonstrated it
         # is fine. See PROVEN_FRESH_S.
-        and (now - float(s.get("last_ok") or 0.0)) >= PROVEN_FRESH_S
+        and (now - float(s.get("last_ok") or 0.0)) >= _idle_recheck_s()
     ]
     if not candidates:
         return []
     stamped = []
     for s in candidates:
         last = await sessions_db.item_last_checked(platform_id, s["id"])
+        # CHECKED RECENTLY IS AS GOOD AS USED RECENTLY. Without this an idle
+        # account whose last check succeeded was re-checked on every sweep
+        # once PROVEN_FRESH_S lapsed -- the 16-a-day settings-page visits.
+        if last is not None and _age_s(last) < _idle_recheck_s():
+            continue
         stamped.append((last or datetime.min, s))
     stamped.sort(key=lambda t: t[0])
     return [(s["id"], s["identifier"], s["cookies"]) for _, s in stamped[:limit]]
+
+
+def _idle_recheck_s() -> float:
+    """How long an account that was proved healthy (by a job or a check) is
+    left alone by the monitor. Never shorter than PROVEN_FRESH_S."""
+    hours = float(getattr(settings, "session_idle_recheck_hours", 0) or 0)
+    return max(PROVEN_FRESH_S, hours * 3600.0)
+
+
+def _age_s(when: Any) -> float:
+    """Seconds since a stored timestamp (a datetime, naive-UTC or aware, or
+    an epoch float). Unreadable -> infinitely old, so it is checked."""
+    try:
+        if isinstance(when, (int, float)):
+            return time.time() - float(when)
+        if isinstance(when, datetime):
+            aware = when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - aware).total_seconds()
+    except Exception:                                  # noqa: BLE001
+        pass
+    return float("inf")
 
 
 async def verify_session(platform_id: str) -> tuple[bool, str, Optional[tuple[str, str]], bool]:
@@ -2005,53 +2032,27 @@ async def purge_stale_dead_sessions() -> int:
     return removed
 
 
+def in_quiet_hours(now: Optional[datetime] = None) -> bool:
+    """Is it currently inside the configured quiet window (local time in
+    settings.default_timezone)? The monitor touches no account then."""
+    start = int(getattr(settings, "session_quiet_hours_start", 0)) % 24
+    end = int(getattr(settings, "session_quiet_hours_end", 0)) % 24
+    if start == end:
+        return False
+    if now is None:
+        try:
+            from zoneinfo import ZoneInfo
+            now = datetime.now(ZoneInfo(settings.default_timezone or "Asia/Kolkata"))
+        except Exception:                              # noqa: BLE001
+            now = datetime.now()
+    h = now.hour
+    return (start <= h < end) if start < end else (h >= start or h < end)
+
+
 async def _monitor_loop() -> None:
     while True:
         try:
-            await check_all_once()
-            from backend.services.session_canary_service import (
-                check_token_expiries, probe_pool_liveness,
-            )
-            await check_token_expiries()
-            # THE HALF `check_all_once` ABOVE CANNOT COVER. That sweep opens
-            # a real browser, so it is rationed: BATCH_SIZE sessions per
-            # platform per pass, skipping any proven fresh within
-            # PROVEN_FRESH_S. A pool bigger than the batch therefore cycles
-            # over several passes, and a session the platform killed early
-            # -- a password change, a checkpoint, a rotation on their side --
-            # sits in the pool looking healthy until its turn comes round.
-            #
-            # This pass costs one ordinary HTTPS request per account and so
-            # can cover EVERY session every time. It decides nothing on its
-            # own: a dead answer is handed to `check_item`, the same browser
-            # check, just started sooner than the rotation would have. Its
-            # own try/except keeps it from costing the sweep above it.
-            await probe_pool_liveness()
-            # CAN WE STILL LOG IN is only half the question; the other half
-            # is whether scraping still works once we have. A dead parser is
-            # silent where a dead session is loud, so it gets checked on the
-            # same cadence rather than waiting for somebody to notice a
-            # month of clean, empty sweeps. It has its own try/except and
-            # returns a report rather than raising, so it cannot cost the
-            # session sweep above it.
-            from backend.services import engine_health_service
-            await engine_health_service.check_once()
-            if purged := await purge_stale_dead_sessions():
-                log.info(f"session cleanup: purged {purged} stale dead session(s)")
-            # Disk housekeeping for the persistent browser profiles. One per
-            # pooled account per platform, tens to hundreds of megabytes
-            # each, on a machine nobody is watching. Synchronous file IO, so
-            # it runs in a thread rather than stalling the loop this shares
-            # with every running sweep.
-            try:
-                from backend.stealth.browser import prune_stale_profiles
-
-                pruned = await asyncio.to_thread(
-                    prune_stale_profiles, settings.browser_profile_retention_days)
-                if pruned:
-                    log.info(f"session cleanup: removed {pruned} unused browser profile(s)")
-            except Exception as e:                    # noqa: BLE001 - housekeeping
-                log.warning(f"browser profile cleanup skipped: {type(e).__name__}: {e}")
+            await _monitor_pass()
         except Exception as e:
             log.error(f"session monitor sweep failed: {type(e).__name__}: {e}")
         # Jittered so the sweep does not fire on the same wall-clock offset
@@ -2059,6 +2060,65 @@ async def _monitor_loop() -> None:
         # authenticated page load on a real account; a perfectly periodic
         # one is a pattern worth not having. See CHECK_JITTER.
         await asyncio.sleep(CHECK_INTERVAL_S * (1.0 + random.uniform(-CHECK_JITTER, CHECK_JITTER)))
+
+
+async def _monitor_pass() -> None:
+    """One monitor sweep. Account-touching work is skipped in quiet hours;
+    the bookkeeping (dead-session purge, engine health from stored
+    telemetry, profile pruning) touches no account and always runs."""
+    quiet = in_quiet_hours()
+    if quiet:
+        log.info("session monitor: quiet hours -- no account is checked now")
+    else:
+        await check_all_once()
+    from backend.services.session_canary_service import (
+        check_token_expiries, probe_pool_liveness,
+    )
+    await check_token_expiries()
+    # THE HALF `check_all_once` ABOVE CANNOT COVER. That sweep opens
+    # a real browser, so it is rationed: BATCH_SIZE sessions per
+    # platform per pass, skipping any proven fresh within
+    # PROVEN_FRESH_S. A pool bigger than the batch therefore cycles
+    # over several passes, and a session the platform killed early
+    # -- a password change, a checkpoint, a rotation on their side --
+    # sits in the pool looking healthy until its turn comes round.
+    #
+    # This pass costs one ordinary HTTPS request per account and so
+    # can cover EVERY session every time. It decides nothing on its
+    # own: a dead answer is handed to `check_item`, the same browser
+    # check, just started sooner than the rotation would have. Its
+    # own try/except keeps it from costing the sweep above it.
+    #
+    # OFF unless session_fast_check_enabled: it sends each account's live
+    # session cookies from a second client fingerprint (curl_cffi), which is
+    # the stolen-cookie pattern -- see that setting.
+    if not quiet and settings.session_fast_check_enabled:
+        await probe_pool_liveness()
+    # CAN WE STILL LOG IN is only half the question; the other half
+    # is whether scraping still works once we have. A dead parser is
+    # silent where a dead session is loud, so it gets checked on the
+    # same cadence rather than waiting for somebody to notice a
+    # month of clean, empty sweeps. It has its own try/except and
+    # returns a report rather than raising, so it cannot cost the
+    # session sweep above it.
+    from backend.services import engine_health_service
+    await engine_health_service.check_once()
+    if purged := await purge_stale_dead_sessions():
+        log.info(f"session cleanup: purged {purged} stale dead session(s)")
+    # Disk housekeeping for the persistent browser profiles. One per
+    # pooled account per platform, tens to hundreds of megabytes
+    # each, on a machine nobody is watching. Synchronous file IO, so
+    # it runs in a thread rather than stalling the loop this shares
+    # with every running sweep.
+    try:
+        from backend.stealth.browser import prune_stale_profiles
+
+        pruned = await asyncio.to_thread(
+            prune_stale_profiles, settings.browser_profile_retention_days)
+        if pruned:
+            log.info(f"session cleanup: removed {pruned} unused browser profile(s)")
+    except Exception as e:                    # noqa: BLE001 - housekeeping
+        log.warning(f"browser profile cleanup skipped: {type(e).__name__}: {e}")
 
 
 def start_monitor() -> None:

@@ -210,9 +210,78 @@ PROBE_JS = r"""
     };
   })();
 
-  return Promise.all([out.permissions_promise]).then(([perm]) => {
+  // ---- native function identity -----------------------------------------
+  // What a patched function gives away. Real Chrome renders every built-in
+  // as "function <name>() { [native code] }" -- the SAME string whether read
+  // through Function.prototype.toString or through fn.toString(). A Proxy
+  // wrapper comes back nameless ("function () {...}") through the first; a
+  // toString-intercepting mask comes back with the wrong shape through the
+  // second; a plain JS replacement comes back as its own source. All three
+  // were live in this tool's init script until 2026-09-24.
+  out.native_identity = (() => {
+    const fts = Function.prototype.toString;
+    const targets = [
+      ['Object.keys', () => Object.keys, 'keys'],
+      ['Object.getOwnPropertyNames', () => Object.getOwnPropertyNames, 'getOwnPropertyNames'],
+      ['Object.getOwnPropertyDescriptor', () => Object.getOwnPropertyDescriptor, 'getOwnPropertyDescriptor'],
+      ['permissions.query', () => navigator.permissions && navigator.permissions.query, 'query'],
+      ['canvas.toDataURL', () => HTMLCanvasElement.prototype.toDataURL, 'toDataURL'],
+      ['webgl.getParameter', () => WebGLRenderingContext.prototype.getParameter, 'getParameter'],
+      ['RTCPeerConnection', () => window.RTCPeerConnection, 'RTCPeerConnection'],
+      ['mediaDevices.enumerateDevices', () => navigator.mediaDevices && navigator.mediaDevices.enumerateDevices, 'enumerateDevices'],
+      ['speechSynthesis.getVoices', () => window.speechSynthesis && speechSynthesis.getVoices, 'getVoices'],
+    ];
+    const bad = [];
+    for (const [label, get, name] of targets) {
+      try {
+        const fn = get();
+        if (typeof fn !== 'function') continue;
+        const expected = `function ${name}() { [native code] }`;
+        const viaProto = fts.call(fn);
+        const viaSelf = String(fn.toString());
+        if (viaProto !== expected || viaSelf !== expected) {
+          bad.push(`${label}: ${JSON.stringify(viaProto).slice(0, 60)} / ${JSON.stringify(viaSelf).slice(0, 60)}`);
+        }
+      } catch (e) { bad.push(`${label}: threw ${e}`); }
+    }
+    return bad;
+  })();
+
+  // ---- own properties that real Chrome does not have ----------------------
+  out.document_own_props = Object.getOwnPropertyNames(document);
+  out.navigator_own_props = Object.getOwnPropertyNames(navigator);
+
+  // ---- canvas must not be mutated by reading it ---------------------------
+  out.canvas_read_mutates = (() => {
+    try {
+      const c = document.createElement('canvas'); c.width = 40; c.height = 20;
+      const x = c.getContext('2d'); x.fillStyle = '#123456'; x.fillRect(0, 0, 40, 20);
+      const before = Array.from(x.getImageData(0, 0, 40, 20).data).join(',');
+      c.toDataURL();
+      const after = Array.from(x.getImageData(0, 0, 40, 20).data).join(',');
+      return before !== after;
+    } catch (e) { return null; }
+  })();
+
+  // ---- WebGL main thread vs Web Worker ------------------------------------
+  // An init script cannot reach worker scope, so any GPU spoof shows up as
+  // two different GPUs in one browser.
+  out.webgl_worker_promise = new Promise((resolve) => {
+    try {
+      const src = "try{const g=new OffscreenCanvas(1,1).getContext('webgl');" +
+        "const e=g.getExtension('WEBGL_debug_renderer_info');" +
+        "postMessage(e?g.getParameter(e.UNMASKED_RENDERER_WEBGL):null)}catch(err){postMessage(null)}";
+      const w = new Worker(URL.createObjectURL(new Blob([src])));
+      w.onmessage = (m) => resolve(m.data);
+      setTimeout(() => resolve(undefined), 3000);
+    } catch (e) { resolve(undefined); }
+  });
+
+  return Promise.all([out.permissions_promise, out.webgl_worker_promise]).then(([perm, wgl]) => {
     out.permissions = perm;
+    out.webgl_worker_renderer = wgl;
     delete out.permissions_promise;
+    delete out.webgl_worker_promise;
     return out;
   });
 }
@@ -283,6 +352,12 @@ def grade(raw: dict[str, Any]) -> list[tuple[str, str, str]]:
         r.append(("PASS", "window.chrome", "present"))
     else:
         r.append(("FAIL", "window.chrome", "missing -- real desktop Chrome always defines it"))
+    if raw.get("chrome_runtime"):
+        r.append((
+            "FAIL", "chrome.runtime",
+            "present on an ordinary https page -- real Chrome only exposes it to "
+            "extension-connectable pages, so its presence reads as a stealth patch",
+        ))
 
     plugins = raw.get("plugins_length", -1)
     if plugins == 0:
@@ -408,6 +483,40 @@ def grade(raw: dict[str, Any]) -> list[tuple[str, str, str]]:
     else:
         r.append(("WARN", "permissions", "could not query"))
 
+    # --- native function identity (see PROBE_JS) ---------------------------
+    bad = raw.get("native_identity")
+    if bad:
+        r.append((
+            "FAIL", "native function identity",
+            f"{len(bad)} built-in(s) do not stringify like real Chrome: {'; '.join(bad)[:400]}",
+        ))
+    elif bad is not None:
+        r.append(("PASS", "native function identity", "every checked built-in reads as its own native function"))
+
+    extra_doc = [p for p in (raw.get("document_own_props") or []) if p != "location"]
+    if extra_doc:
+        r.append(("FAIL", "document own properties",
+                  f"{', '.join(extra_doc)} -- real Chrome's document owns only 'location'"))
+    elif raw.get("document_own_props") is not None:
+        r.append(("PASS", "document own properties", "only 'location', as in real Chrome"))
+    if raw.get("navigator_own_props"):
+        r.append(("FAIL", "navigator own properties",
+                  f"{', '.join(raw['navigator_own_props'])} -- real Chrome's navigator owns none"))
+
+    if raw.get("canvas_read_mutates") is True:
+        r.append(("FAIL", "canvas read", "toDataURL() changed the canvas pixels -- a noise patch is drawing on it"))
+
+    main_gl = ((raw.get("webgl") or {}).get("renderer") or "")
+    worker_gl = raw.get("webgl_worker_renderer")
+    if worker_gl and main_gl and worker_gl != main_gl:
+        r.append(("FAIL", "WebGL main vs worker",
+                  f"main thread {main_gl!r} but a Web Worker sees {worker_gl!r} -- one browser, two GPUs"))
+    elif worker_gl and main_gl:
+        r.append(("PASS", "WebGL main vs worker", "same GPU in both"))
+    ua = raw.get("user_agent") or ""
+    if "Windows NT" in ua and "apple" in main_gl.lower():
+        r.append(("FAIL", "WebGL vs UA", f"a Windows user-agent with an Apple GPU ({main_gl!r}) cannot exist"))
+
     # --- our own overrides -------------------------------------------------
     ts = raw.get("tostring_native") or {}
     leaky = [k for k, v in ts.items() if v == "JS-VISIBLE"]
@@ -449,7 +558,16 @@ async def probe(headful: bool = False, session_id: str = "probe") -> dict[str, A
             ),
         )
         await page.goto("https://stealth-probe.local/", wait_until="domcontentloaded")
-        return await page.evaluate(PROBE_JS)
+        # THE MAIN WORLD, where the platforms' own scripts run. patchright
+        # evaluates in an ISOLATED world by default, which sees a pristine
+        # browser no matter what the init script did -- this probe reported
+        # "0 FAIL" for months while the main world carried every patch that
+        # navigator_spoofing.py's docstring now lists. Vanilla playwright has
+        # no such parameter and always evaluates in the main world.
+        try:
+            return await page.evaluate(PROBE_JS, isolated_context=False)
+        except TypeError:
+            return await page.evaluate(PROBE_JS)
     finally:
         try:
             await page.close()

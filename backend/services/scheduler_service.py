@@ -45,6 +45,7 @@ The per-KEYWORD gap is the other half of this and lives in
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -98,6 +99,18 @@ _FLUSH_EVERY_S = 30.0
 # zero is the clean bill of health, and a failed read must never be able
 # to impersonate one.
 OWED_UNKNOWN = -1
+
+
+def _start_jitter_s(trigger: str) -> float:
+    """Random delay before a scheduled run starts; 0 for a manual one."""
+    if trigger not in ("scheduled", "catch_up"):
+        return 0.0
+    try:
+        from backend.config.settings import settings
+        minutes = float(getattr(settings, "scheduler_start_jitter_minutes", 0) or 0)
+    except Exception:                                  # noqa: BLE001
+        minutes = 0.0
+    return random.uniform(0.0, minutes * 60.0) if minutes > 0 else 0.0
 
 
 def _now() -> datetime:
@@ -426,6 +439,13 @@ class SchedulerEngine:
             log.info(f"scheduler: run {run_id} ({trigger}) starting over "
                      f"{len(entries)} client(s)")
             try:
+                # A SCHEDULED start wanders by a few minutes; a person pressing
+                # Run is never made to wait. See scheduler_start_jitter_minutes.
+                jitter_s = _start_jitter_s(trigger)
+                if jitter_s:
+                    log.info(f"scheduler: run {run_id} starts in {jitter_s / 60:.1f} min "
+                             "(randomised so scheduled runs do not begin on the same minute)")
+                    await self._sleep_interruptible(jitter_s)
                 for entry in entries:
                     if self._stopping:
                         break
@@ -436,7 +456,10 @@ class SchedulerEngine:
                     # Only between clients, never after the last one --
                     # and only after one that actually SWEPT.
                     if entry is not entries[-1] and _swept(entry):
-                        await self._sleep_interruptible(_CLIENT_GAP_S)
+                        # Varied, not a fixed minute: identical gaps between
+                        # identical bursts of activity are a rhythm.
+                        await self._sleep_interruptible(
+                            _CLIENT_GAP_S * random.uniform(0.7, 1.6))
 
                 if not self._stopping:
                     await self._close_gaps(entries)

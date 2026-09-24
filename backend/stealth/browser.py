@@ -418,11 +418,11 @@ class Session:
             # safe because stop() closes by identity, not by name.
             self.browser = self.ctx
 
-        # No hardware arguments any more: hardwareConcurrency/deviceMemory
-        # are reported honestly, because an init script cannot reach Web
-        # Worker scope and the spoof produced a main-thread-vs-worker
-        # contradiction. See navigator_spoofing.py for the measurement.
-        await self.ctx.add_init_script(build_init_js())
+        # NO INIT SCRIPT BY DEFAULT. Real Chrome under patchright is already
+        # clean in the main world, and every JavaScript override measured
+        # there only added a signal -- see navigator_spoofing.py.
+        if init_js := build_init_js():
+            await self.ctx.add_init_script(init_js)
         from backend.sessions.cookies import normalize_cookies
 
         # STORED COOKIES ARE ALWAYS INJECTED, persistent profile or not.

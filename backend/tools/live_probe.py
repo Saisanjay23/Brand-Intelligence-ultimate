@@ -264,13 +264,28 @@ async def _known_for(platform_id: str, urls: list[str]) -> dict[str, dict]:
     return out
 
 
+async def _claim(platform_id: str, identifier: str) -> dict:
+    """A pooled session: the named account when `identifier` is given (it
+    must not be in use by a job), otherwise whichever the pool hands out."""
+    if not identifier:
+        return (await sessions_engine.session_for_job(platform_id, wait_s=60))[1]
+    from backend.database.repositories import session_repository as sessions_db
+    for item in await sessions_db.list_pool(platform_id):
+        if item.get("identifier") == identifier:
+            if sessions_engine._session_in_use(platform_id, item["id"]):
+                raise RuntimeError(f"{identifier!r} is in use by a running job")
+            return {"id": item["id"], "identifier": identifier,
+                    "cookies": item.get("cookies", [])}
+    raise RuntimeError(f"no {platform_id} session named {identifier!r}")
+
+
 async def run(platform_id: str, keywords: list[str], profiles: list[str], tabs: list[str],
-              max_results: int, out_root: Path) -> list[str]:
+              max_results: int, out_root: Path, identifier: str = "") -> list[str]:
     plat = registry.get(platform_id)
     out = out_root / platform_id
     out.mkdir(parents=True, exist_ok=True)
     log: list[str] = []
-    _, session_item = await sessions_engine.session_for_job(platform_id, wait_s=60)
+    session_item = await _claim(platform_id, identifier)
     session_id = str(session_item.get("id") or "")
     log.append(f"[{platform_id}] probing with session {session_item.get('identifier')!r}")
     try:
@@ -295,11 +310,13 @@ def main() -> None:
     ap.add_argument("--tabs", default="people", help="comma-separated (facebook only)")
     ap.add_argument("--max-results", type=int, default=20)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--session", default="", help="pooled account identifier to use")
     a = ap.parse_args()
     kws = [k.strip() for k in a.keywords.split("|") if k.strip()]
     profs = [p.strip() for p in a.profiles.split("|") if p.strip()]
     tabs = [t.strip() for t in a.tabs.split(",") if t.strip()]
-    for line in asyncio.run(run(a.platform, kws, profs, tabs, a.max_results, Path(a.out))):
+    for line in asyncio.run(run(a.platform, kws, profs, tabs, a.max_results, Path(a.out),
+                                a.session)):
         print(line, flush=True)
 
 

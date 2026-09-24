@@ -728,18 +728,28 @@ DEFAULT_MAX_PAGES = 10
 WEB_SEARCH_API = "https://www.instagram.com/web/search/topsearch/?query={q}"
 
 
-async def web_search_users(ctx, keyword: str, timeout_s: int = 45) -> list[InstagramUser]:
+async def web_search_users(ctx, keyword: str, timeout_s: int = 45, *, get=None) -> list[InstagramUser]:
     """Query the web client's search endpoint. Only runs when the mobile API
-    produced nothing, see Discovery.sweep."""
-    res = await ctx.request.get(
-        WEB_SEARCH_API.format(q=quote(keyword)),
-        headers={
-            "User-Agent": MOBILE_UA,
-            "x-ig-app-id": "936619743392459",
-            "accept": "application/json",
-        },
-        timeout=timeout_s * 1000,
-    )
+    produced nothing, see Discovery.sweep.
+
+    `get` is Discovery._get: the request then goes out from the account's own
+    instagram.com tab with the BROWSER's user-agent -- this is the web
+    client's own endpoint and answers a browser normally (measured 200), so
+    there is nothing to disguise. Without it (a direct caller, a test) the
+    old context HTTP client is used."""
+    if get is not None:
+        res = await get(WEB_SEARCH_API.format(q=quote(keyword)),
+                        {"x-ig-app-id": "936619743392459", "accept": "application/json"})
+    else:
+        res = await ctx.request.get(
+            WEB_SEARCH_API.format(q=quote(keyword)),
+            headers={
+                "User-Agent": MOBILE_UA,
+                "x-ig-app-id": "936619743392459",
+                "accept": "application/json",
+            },
+            timeout=timeout_s * 1000,
+        )
     if res.status != 200:
         # surfaced by run_strategies as this strategy's failure, with this
         # line as the blame site
@@ -773,6 +783,67 @@ async def web_search_users(ctx, keyword: str, timeout_s: int = 45) -> list[Insta
             anonymous_pic=anon if isinstance(anon, bool) else None,
         ))
     return users
+
+
+# THE SEARCH GOES OUT THROUGH CHROME'S OWN NETWORK STACK.
+#
+# What Instagram saw before 2026-09-24, for every search: the account's web
+# session cookie, sent by Playwright's APIRequestContext -- a separate HTTP
+# client with its own TLS handshake, no HTTP/2 and none of the browser's
+# fetch metadata -- claiming to be an Android app. So one login was used by
+# desktop Chrome (every page view) and, in between, by a client whose
+# network fingerprint matched neither Chrome nor any Android app. That is
+# the shape of a stolen session cookie being replayed by a script.
+#
+# Now the request is a same-origin fetch() made INSIDE an instagram.com tab
+# of the account's own browser, so the TLS/HTTP-2 fingerprint, cookie jar,
+# device cookies and fetch metadata are exactly those of every other request
+# the session makes. Only the User-Agent is swapped, for this one URL, by a
+# route on that tab -- fetch() cannot set it, and the endpoint answers a
+# browser UA with 400 "useragent mismatch" (rule 1 above). Client Hints are
+# dropped from the same request, since an app does not send them.
+#
+# WHY NOT THE WEB CLIENT'S OWN SEARCH INSTEAD. Measured live 2026-09-24: the
+# search box on instagram.com (PolarisSearchBoxRefetchableQuery) and
+# /api/v1/web/search/topsearch/ both return FIVE accounts per keyword; this
+# endpoint returned 37 and 34 for the same two keywords. Switching would
+# have dropped ~85% of the candidates -- a coverage loss the pipeline does
+# not accept. Through the browser stack it returned the same 37.
+#
+# Falls back to the old APIRequestContext call if the tab path fails for a
+# reason that is not an HTTP answer (a crash, a navigation that did not
+# land), so a browser hiccup can never cost a keyword its search.
+_JS_PAGE_GET = r"""async ([url, headers]) => {
+  const r = await fetch(url, {credentials: 'include', headers});
+  return {status: r.status, text: await r.text()};
+}"""
+
+
+class _PageResponse:
+    """The two things the sweep reads off a response, from an in-page fetch."""
+
+    def __init__(self, status: int, body: str):
+        self.status = status
+        self._body = body
+
+    async def text(self) -> str:
+        return self._body
+
+
+async def _swap_to_app_ua(route) -> None:
+    """Route handler: this request, and only this one, goes out with the
+    app User-Agent and without Chrome's Client Hints. Everything else about
+    it -- TLS, HTTP/2, cookies, fetch metadata -- is the browser's own."""
+    try:
+        headers = {k: v for k, v in route.request.headers.items()
+                   if not k.lower().startswith("sec-ch-ua")}
+        headers["user-agent"] = MOBILE_UA
+        await route.continue_(headers=headers)
+    except Exception:
+        try:
+            await route.continue_()
+        except Exception:
+            pass
 
 
 @dataclass
@@ -826,6 +897,50 @@ class Discovery:
         issues raw API requests through via `ctx.request`."""
         self.a = args
         self.ctx = ctx
+        # One instagram.com tab per session, reused for every keyword --
+        # see `_search_tab` and the note above `_JS_PAGE_GET`.
+        self._tab = None
+
+    async def _search_tab(self):
+        """The instagram.com tab the searches are made from, opened on first
+        use (landing on the home feed, like a person) and reused after.
+        None when it cannot be had -- the caller falls back."""
+        if self._tab is not None:
+            try:
+                if not self._tab.is_closed():
+                    return self._tab
+            except Exception:
+                pass
+            self._tab = None
+        try:
+            tab = await self.ctx.new_page()
+            await tab.route("**/api/v1/users/search/**", _swap_to_app_ua)
+            await tab.goto("https://www.instagram.com/", wait_until="domcontentloaded",
+                           timeout=self.a.timeout * 1000)
+            self._tab = tab
+            return tab
+        except Exception:
+            return None
+
+    async def _get(self, url: str, headers: dict):
+        """GET `url` through the session's own browser (see the note above
+        `_JS_PAGE_GET`), falling back to the context's HTTP client only if
+        the browser path itself fails."""
+        tab = await self._search_tab()
+        if tab is not None:
+            same_origin = url.replace("https://i.instagram.com", "").replace(
+                "https://www.instagram.com", "")
+            browser_headers = {k: v for k, v in headers.items() if k.lower() != "user-agent"}
+            try:
+                try:
+                    res = await tab.evaluate(_JS_PAGE_GET, [same_origin, browser_headers],
+                                             isolated_context=False)
+                except TypeError:
+                    res = await tab.evaluate(_JS_PAGE_GET, [same_origin, browser_headers])
+                return _PageResponse(int(res.get("status") or 0), res.get("text") or "")
+            except Exception:
+                self._tab = None
+        return await self.ctx.request.get(url, headers=headers, timeout=self.a.timeout * 1000)
 
     async def sweep(self, keyword: str, tab: str = "people", on_progress=None) -> Sweep:
         """One keyword, start to finish -- the counterpart to
@@ -905,14 +1020,13 @@ class Discovery:
                 if rank_token:
                     url += f"&rank_token={rank_token}"
 
-                res = await self.ctx.request.get(
+                res = await self._get(
                     url,
-                    headers={
+                    {
                         "User-Agent": MOBILE_UA,
                         "x-ig-app-id": "936619743392459",
-                        "accept": "application/json"
+                        "accept": "application/json",
                     },
-                    timeout=self.a.timeout * 1000
                 )
 
                 if res.status != 200:
@@ -1007,7 +1121,8 @@ class Discovery:
                     f"instagram/search[{keyword!r}]",
                     [
                         ("api:mobile-topsearch", lambda: list(by_name.values())),
-                        ("api:web-topsearch", lambda: web_search_users(self.ctx, keyword, self.a.timeout)),
+                        ("api:web-topsearch", lambda: web_search_users(
+                            self.ctx, keyword, self.a.timeout, get=self._get)),
                     ],
                 )
                 out.users = chain.value or []
