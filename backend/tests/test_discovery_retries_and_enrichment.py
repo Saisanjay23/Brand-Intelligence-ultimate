@@ -20,7 +20,6 @@ from collections import Counter
 import pytest
 
 from backend.discovery import runner as R
-from backend.shared import resilience
 from backend.shared.models.row import Row
 from backend.tests.test_keyword_coverage import (FakeLedger, FakePool,
                                                  FakeSweep, _job, _session,

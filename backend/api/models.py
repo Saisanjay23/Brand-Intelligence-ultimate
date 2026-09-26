@@ -40,6 +40,27 @@ class JobStatus(str, Enum):
 TERMINAL_STATUSES = {JobStatus.done, JobStatus.cancelled, JobStatus.failed}
 
 
+def content_disposition(disposition: str, filename: str, fallback: str = "download") -> str:
+    """A Content-Disposition value that is always a valid header.
+
+    HTTP headers are Latin-1, so a client named in Devanagari used to turn
+    its report or export into a 500 (UnicodeEncodeError while the response
+    was being built). The plain `filename` is reduced to safe ASCII for old
+    clients; `filename*` carries the real name, UTF-8 and percent-encoded
+    (RFC 6266 / 5987), and every current browser prefers it.
+    """
+    from urllib.parse import quote
+
+    name = "".join(c for c in (filename or "") if c not in '"\\\r\n').strip()
+    ascii_name = "".join(
+        c for c in name if c.isascii() and (c.isalnum() or c in " -_.()")
+    ).strip() or fallback
+    value = f'{disposition}; filename="{ascii_name}"'
+    if name and name != ascii_name:
+        value += f"; filename*=UTF-8''{quote(name, safe='')}"
+    return value
+
+
 class Platform(str, Enum):
     facebook = "facebook"
     twitter = "twitter"

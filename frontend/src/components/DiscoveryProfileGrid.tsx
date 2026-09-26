@@ -40,7 +40,7 @@ import { useRefreshOnFocus } from "../hooks/useRefreshOnFocus";
 import { findClient } from "../services/clientDirectory";
 
 import { confirmAction } from "../utils/confirmAction";
-import { download, rowsToCsv } from "../utils/download";
+import { download, downloadBlob, rowsToCsv } from "../utils/download";
 import { AvatarImg } from "./AvatarImg";
 import { PlatformIcon } from "./PlatformIcon";
 import { CloneIcon, GlobeIcon, LayersIcon, TargetIcon, TrashIcon, VerifiedBadgeIcon, ZapIcon } from "./AppIcons";
@@ -1255,12 +1255,7 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
       const filename = `${groupId}-${tab}-${new Date().toISOString().slice(0, 10)}`;
       if (fmt === "xlsx") {
         const blob = await analysisApi.exportXlsx(filename, rows.map(exportRow));
-        const href = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = href;
-        a.download = `${filename}.xlsx`;
-        a.click();
-        URL.revokeObjectURL(href);
+        downloadBlob(`${filename}.xlsx`, blob);
       } else if (fmt === "csv") {
         download(`${filename}.csv`, rowsToCsv(rows.map(exportRow)), "text/csv");
       } else {
@@ -1329,6 +1324,13 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
         platform: mode === "all" ? (platform || undefined) : undefined,
       });
       toast.success(`Analysis started: ${res.accepted} profile(s)`);
+      // Named, never silent: over the per-call limit, not validated, or gone.
+      if (res.skipped?.length) {
+        const shown = res.skipped.slice(0, 3).map((s) => s.reason);
+        const more = res.skipped.length - shown.length;
+        toast(`Skipped:\n${shown.join("\n")}${more > 0 ? `\n...and ${more} more` : ""}`,
+          { duration: 8000 });
+      }
       onAnalyseStarted(res.job_id);
     } catch (e) {
       toast.error((e as Error).message);

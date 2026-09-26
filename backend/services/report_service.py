@@ -44,7 +44,7 @@ SAMPLE_LIMIT = 10
 async def _count(client_id: str, **extra: Any) -> int:
     _, total, _ = await profiles_db.find(
         client_id, phase=profiles_db.PHASE_DISCOVERY, include_held=True,
-        limit=1, **extra,
+        limit=1, with_counts=False, **extra,
     )
     return total
 
@@ -59,15 +59,21 @@ async def build_client_report(client_id: str) -> dict:
         # producing -- its profiles are what the analyst cares about.
         name = client_id
 
-    new_validated = await _count(client_id, status="approved", validated_age="new")
-    old_validated = await _count(client_id, status="approved", validated_age="old")
-    pending = await _count(client_id, status="pending")
-    new_pending = await _count(client_id, status="pending", age="new")
-    logo_hits = await _count(client_id, logo_matched=True)
-
-    rows, _, _ = await profiles_db.find(
-        client_id, phase=profiles_db.PHASE_DISCOVERY, include_held=True,
-        status="approved", validated_age="new", limit=SAMPLE_LIMIT,
+    # Independent reads, so they run together: a combined report builds
+    # this once per client, and six sequential round trips each is what
+    # made it slow to open.
+    (new_validated, old_validated, pending, new_pending, logo_hits,
+     (rows, _, _)) = await asyncio.gather(
+        _count(client_id, status="approved", validated_age="new"),
+        _count(client_id, status="approved", validated_age="old"),
+        _count(client_id, status="pending"),
+        _count(client_id, status="pending", age="new"),
+        _count(client_id, logo_matched=True),
+        profiles_db.find(
+            client_id, phase=profiles_db.PHASE_DISCOVERY, include_held=True,
+            status="approved", validated_age="new", limit=SAMPLE_LIMIT,
+            with_counts=False,
+        ),
     )
 
     return {

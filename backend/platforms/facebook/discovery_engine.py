@@ -52,6 +52,7 @@ from typing import Any, Iterable, Iterator, Optional
 from urllib.parse import parse_qs, quote, urlparse
 
 from backend.platforms.scan_options import cancelled
+from backend.shared.tasks import spawn
 from backend.shared.extraction import run_strategies
 from backend.shared.schema_probe import SchemaProbe, probe_or_null
 from backend.shared.avatars import looks_like_placeholder
@@ -1314,7 +1315,7 @@ class Discovery:
                             except (json.JSONDecodeError, ValueError):
                                 pass
 
-                page.on("response", lambda r: asyncio.create_task(on_response(r)))
+                page.on("response", lambda r: spawn(on_response(r)))
                 blocked = False
                 fallback_name = ""
                 # confirmed False unless the identity gate below proves
@@ -1631,7 +1632,7 @@ class Discovery:
             out.pages += 1
             arrived.set()
 
-        page.on("response", lambda r: asyncio.create_task(on_response(r)))
+        page.on("response", lambda r: spawn(on_response(r)))
 
         try:
             url = TABS[tab].format(q=quote(keyword))

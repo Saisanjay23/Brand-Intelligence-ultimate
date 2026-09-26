@@ -178,7 +178,6 @@ async def refresh_platform(
     # rather than a database round trip per hit.
     by_eid = {str(d.get("entity_id") or ""): d for d in docs if d.get("entity_id")}
     by_url = {str(d.get("url") or ""): d for d in docs if d.get("url")}
-    blank_keys = set(by_eid) | set(by_url)
 
     plat_obj, session_item = await sessions_engine.session_for_job(platform)
     session_id = str(session_item.get("id") or "")

@@ -39,7 +39,8 @@ from pydantic import BaseModel, Field
 
 from backend.analysis.runner import _TERMINAL as _TERMINAL_STATUSES
 from backend.analysis.runner import analysis_runner
-from backend.api.models import CancelResult, JobAccepted, JobStatus, SkippedInput
+from backend.api.models import (CancelResult, JobAccepted, JobStatus, SkippedInput,
+                                 content_disposition)
 from backend.database.repositories import analysis_result_repository as results_db
 from backend.shared import live_poll
 from backend.shared.errors import NotFoundError, ValidationError
@@ -450,9 +451,7 @@ async def export_xlsx(body: ExportXlsx):
                 return float(s)
             except ValueError:
                 pass
-        # a leading apostrophe stops Excel treating this as a formula
-        # without changing what a reader sees
-        return f"'{s}" if s[:1] in ("=", "+", "-", "@") else s
+        return s
 
     wb = Workbook()
     ws = wb.active
@@ -461,12 +460,23 @@ async def export_xlsx(body: ExportXlsx):
     ws.append(cols)
     for row in body.rows:
         ws.append([_safe(row.get(c)) for c in cols])
+    # FORMULA INJECTION IS STOPPED BY THE CELL TYPE, NOT BY A PREFIX.
+    # openpyxl stores any string starting with "=" as a formula, so a
+    # scraped display name like "=HYPERLINK(...)" would run when opened.
+    # The old guard put an apostrophe in front -- but in an .xlsx that
+    # apostrophe is written as a real character, so "-Official-" showed up
+    # as "'-Official-". Marking the cell as a string is what Excel itself
+    # does for typed text: it can never be evaluated, and nothing is added.
+    for cells in ws.iter_rows():
+        for cell in cells:
+            if cell.data_type == "f":
+                cell.data_type = "s"
 
     buf = BytesIO()
     wb.save(buf)
-    filename = (body.filename or "analysis.xlsx").replace('"', "")
     return Response(
         content=buf.getvalue(),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": content_disposition(
+            "attachment", body.filename or "analysis.xlsx", "analysis.xlsx")},
     )

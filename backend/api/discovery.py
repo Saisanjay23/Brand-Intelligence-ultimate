@@ -1004,7 +1004,7 @@ async def _validated_docs_one(group_id: str, platform: Optional[str], budget: in
         docs, total, _ = await profiles_db.find(
             group_id, platform=platform, status="approved",
             phase=profiles_db.PHASE_DISCOVERY, limit=MAX_LIMIT, offset=offset,
-            include_held=True,
+            include_held=True, with_counts=False,
         )
         docs_out.extend(d for d in docs if d.get("url"))
         offset += len(docs)
@@ -1123,14 +1123,28 @@ async def analyse_validated(body: AnalyseValidated) -> StartAnalysisAccepted:
     not re-scrape data this profile's sweep already read -- see
     `_seed_from_doc` and `AnalysisRunner.start`'s `seed_by_url`)."""
     if body.ids:
-        docs = await profiles_db.get_by_ids(body.group_id, body.ids)
+        # Deduplicated first: a repeated id is one profile, and counting it
+        # twice reported a phantom "not found" for every repeat.
+        ids = list(dict.fromkeys(i for i in body.ids if i))
+        docs = await profiles_db.get_by_ids(body.group_id, ids)
         ineligible = [d for d in docs if d.get("status") != "approved"]
         eligible = [d for d in docs if d.get("status") == "approved" and d.get("url")]
-        missing = len(body.ids) - len(docs)
+        missing = len(ids) - len(docs)
         skipped = [
             SkippedInput(value=str(d.get("id", "")), reason=f"status is {d.get('status')!r}, not validated")
             for d in ineligible
         ] + ([SkippedInput(value="(unresolved ids)", reason=f"{missing} id(s) not found for this group")] if missing else [])
+        # THE SAME CEILING THE "ALL VALIDATED" PATH HAS. A hand-picked list
+        # used to skip it, so ticking a few thousand cards started one job
+        # that held a live session for hours. The overflow is named, not
+        # dropped: the analyst sends it in the next call.
+        if len(eligible) > _MAX_VALIDATED_PER_ANALYSE:
+            over = eligible[_MAX_VALIDATED_PER_ANALYSE:]
+            eligible = eligible[:_MAX_VALIDATED_PER_ANALYSE]
+            skipped.append(SkippedInput(
+                value="(over limit)",
+                reason=f"{len(over)} profile(s) over the {_MAX_VALIDATED_PER_ANALYSE}-per-call "
+                       f"limit were not started -- send them in another call"))
     else:
         # `platforms` (plural) wins when sent; `platform` stays supported
         # for the single-platform callers that already speak it.

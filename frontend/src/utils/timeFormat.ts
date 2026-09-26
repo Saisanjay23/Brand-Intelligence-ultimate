@@ -39,14 +39,21 @@ export function useLiveTimer(startedAtTs?: number | null, isRunning?: boolean, s
       return;
     }
 
+    // ONE RENDER PER DISPLAYED SECOND, not five. Every consumer shows whole
+    // seconds (formatElapsed), and the 200ms interval this replaced
+    // re-rendered the whole Analysis / Live Results view five times a second
+    // for four identical frames. Waking on the next second boundary shows
+    // the same numbers -- and turns over on time instead of up to 200ms late.
+    let timer: ReturnType<typeof setTimeout>;
     const tick = () => {
-      const nowSec = Date.now() / 1000;
-      setElapsed(Math.max(0, nowSec - startedAtTs));
+      const secs = Math.max(0, Date.now() / 1000 - startedAtTs);
+      setElapsed(secs);
+      const msToNext = 1000 - ((secs * 1000) % 1000);
+      timer = setTimeout(tick, msToNext + 5);
     };
 
     tick();
-    const interval = setInterval(tick, 200);
-    return () => clearInterval(interval);
+    return () => clearTimeout(timer);
   }, [startedAtTs, isRunning, staticElapsed]);
 
   return elapsed;

@@ -156,7 +156,7 @@ def is_same_avatar_asset(old_url: str, new_url: str) -> bool:
 
 async def cache_one(
     url: str, retries: int = 1, *, want_embedding: bool = False,
-    platform: str = "",
+    platform: str = "", gone: Optional[set[str]] = None,
 ) -> tuple[Optional[str], Optional[dict], Optional[list], Optional[str]]:
     """Fetch, store and fingerprint one avatar
     -> (sha256, fingerprint, embedding, placeholder).
@@ -186,6 +186,9 @@ async def cache_one(
     not decodable as an image. The caller keeps the live URL it had.
 
     Includes a bounded retry for transient network / CDN blips (502/503/timeout).
+    A 4xx is not retried: the CDN has said the URL is dead (see
+    ImageFetchError.gone), and `url` is added to `gone` when one is passed
+    so the caller can record it.
 
     Supports `data:` URIs (Telegram's inline base64 avatars) in addition to
     regular HTTPS URLs.
@@ -241,7 +244,11 @@ async def cache_one(
                     except Exception as e:           # noqa: BLE001 - never fatal
                         log.warning(f"generated-avatar check failed: {type(e).__name__}: {e}")
             return sha, (fp.to_dict() if fp else None), vec, placeholder
-        except (ImageFetchError, asyncio.TimeoutError):
+        except (ImageFetchError, asyncio.TimeoutError) as e:
+            if isinstance(e, ImageFetchError) and e.gone:
+                if gone is not None:
+                    gone.add(url)
+                return None, None, None, None
             if attempt < retries:
                 await asyncio.sleep(1.2)
                 continue
@@ -342,6 +349,11 @@ async def cache_for_profiles(
     # Instagram profiles ended up with a stored URL, no stored bytes, and no
     # record anywhere that a fetch had ever been attempted.
     failed: dict[str, int] = {}
+    # The ones the CDN refused with a 4xx: not a blip, a verdict on the URL.
+    # Counted apart from `failed` because the fix is different -- a re-sweep
+    # for a new URL, not another try at this one.
+    gone_urls: set[str] = set()
+    gone: dict[str, int] = {}
     # What landed, keyed by profile URL, so the logo pass below runs over
     # this batch without re-reading anything from Mongo.
     landed: dict[str, tuple[str, Optional[dict], Optional[list]]] = {}
@@ -351,19 +363,32 @@ async def cache_for_profiles(
         async with sem:
             sha, fp, vec, placeholder = await cache_one(
                 image_url, want_embedding=want_embedding, platform=platform,
+                gone=gone_urls,
             )
-        if not sha:
+        if not sha and image_url not in gone_urls:
             # RETRIED ONCE, because the commonest failure here is transient
             # (a CDN hiccup, a connection reset under four-way concurrency)
             # and the URL that would let us try again later expires within
             # hours. One retry is the difference between recovering now and
-            # losing the picture for good.
+            # losing the picture for good. Not for a 4xx: that answer does
+            # not change on a second asking.
             async with sem:
                 sha, fp, vec, placeholder = await cache_one(
                     image_url, want_embedding=want_embedding, platform=platform,
+                    gone=gone_urls,
                 )
         if not sha:
-            failed[_host_of(image_url)] = failed.get(_host_of(image_url), 0) + 1
+            host = _host_of(image_url)
+            if image_url in gone_urls:
+                gone[host] = gone.get(host, 0) + 1
+                try:
+                    await profiles_db.note_avatar_gone(
+                        client_id, platform, image_url, url=url, entity_id=entity_id,
+                    )
+                except Exception as e:           # noqa: BLE001 - never fatal
+                    log.warning(f"avatar gone-mark failed: {type(e).__name__}: {e}")
+            else:
+                failed[host] = failed.get(host, 0) + 1
             return
         try:
             ok = await profiles_db.set_avatar_sha(
@@ -431,6 +456,12 @@ async def cache_for_profiles(
             f"avatar cache: {sum(failed.values())} picture(s) could not be fetched "
             f"({detail}) -- stored URL kept, but it expires, so these need the "
             f"backfill rather than another sweep")
+    if gone:
+        detail = ", ".join(f"{n} from {host}" for host, n in sorted(gone.items()))
+        log.warning(
+            f"avatar cache: {sum(gone.values())} picture(s) are gone at the source "
+            f"({detail}) -- the CDN refused the stored URL (usually the account "
+            f"changed its picture); a re-sweep of this client picks up the new one")
 
     # Compare what just landed against the client's reference logos. Pure
     # arithmetic over stored hashes (~4us a comparison), and a no-op for a

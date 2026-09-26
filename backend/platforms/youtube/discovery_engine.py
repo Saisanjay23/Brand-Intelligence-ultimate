@@ -47,7 +47,7 @@ import json
 import os
 import re
 import time
-from backend.shared.schema_probe import SchemaProbe, probe_or_null
+from backend.shared.schema_probe import SchemaProbe
 import urllib.error
 import urllib.parse
 import urllib.request

@@ -23,6 +23,7 @@ from typing import Optional
 from fastapi import APIRouter, Body, Path, Response
 from pydantic import BaseModel, Field
 
+from backend.api.models import content_disposition
 from backend.services import report_service
 from backend.shared.errors import UpstreamPlatformError
 
@@ -126,8 +127,8 @@ async def client_report_html(client_id: str = Path(...)) -> Response:
     return Response(
         content=report_service.render_client_html(rep),
         media_type="text/html; charset=utf-8",
-        headers={"Content-Disposition":
-                 f'attachment; filename="report-{name}-{rep["generated_at"][:10]}.html"'},
+        headers={"Content-Disposition": content_disposition(
+            "attachment", f'report-{name}-{rep["generated_at"][:10]}.html', "report.html")},
     )
 
 
@@ -138,8 +139,8 @@ async def combined_report_html() -> Response:
     return Response(
         content=report_service.render_combined_html(rep),
         media_type="text/html; charset=utf-8",
-        headers={"Content-Disposition":
-                 f'attachment; filename="report-all-clients-{rep["generated_at"][:10]}.html"'},
+        headers={"Content-Disposition": content_disposition(
+            "attachment", f'report-all-clients-{rep["generated_at"][:10]}.html', "report.html")},
     )
 
 

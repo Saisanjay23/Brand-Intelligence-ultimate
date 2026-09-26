@@ -29,7 +29,7 @@ import { useEffect, useMemo, useState } from "react";
 import { toast } from "react-hot-toast";
 
 import type { Schedule, ScheduleMode, SchedulerRun } from "../api/schedulerApi";
-import { browserTimezone, schedulerApi } from "../api/schedulerApi";
+import { schedulerApi } from "../api/schedulerApi";
 import { saveSchedule } from "../services/scheduleRunner";
 import { AlertTriangleIcon } from "./AppIcons";
 

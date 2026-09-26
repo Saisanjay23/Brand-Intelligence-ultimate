@@ -57,10 +57,10 @@ import re
 
 from fastapi import APIRouter, Path, Query, Response
 
-import asyncio
 
 from backend.database.repositories import avatar_repository as avatars_db
 from backend.database.repositories import profile_repository as profiles_db
+from backend.shared.tasks import spawn
 from backend.shared.imagefetch import ImageFetchError, allowed as _allowed
 from backend.shared.imagefetch import close as _close_fetcher
 from backend.shared.imagefetch import fetch_image
@@ -89,6 +89,16 @@ _CACHE_CONTROL = "public, max-age=21600"
 _STORED_CACHE_CONTROL = "public, max-age=31536000, immutable"
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+# THE BYTES ARE A THIRD PARTY'S, SERVED FROM OUR ORIGIN. An allowlisted CDN
+# can still answer with an SVG, and an SVG opened directly in a tab runs its
+# own scripts with this API's origin. `nosniff` stops a browser guessing a
+# different type, and a sandboxing CSP makes any document these bytes turn
+# out to be inert. Neither changes how an <img> renders them.
+_IMAGE_SAFETY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+}
 
 
 async def close() -> None:
@@ -143,7 +153,7 @@ async def avatar(
     # this image; keeping a copy must not add a database round trip to the
     # time it takes to appear. A failure here costs the copy and never the
     # picture on screen.
-    asyncio.create_task(_keep(url, img.data, img.content_type))
+    spawn(_keep(url, img.data, img.content_type))
 
     return Response(
         content=img.data,
@@ -154,6 +164,7 @@ async def avatar(
             # to the default, because the UI is not always same-origin with
             # this API -- see VITE_API_BASE_URL in frontend/src/api/httpClient.ts.
             "Cross-Origin-Resource-Policy": "cross-origin",
+            **_IMAGE_SAFETY_HEADERS,
         },
     )
 
@@ -206,5 +217,6 @@ async def stored_avatar(
         headers={
             "Cache-Control": _STORED_CACHE_CONTROL,
             "Cross-Origin-Resource-Policy": "cross-origin",
+            **_IMAGE_SAFETY_HEADERS,
         },
     )

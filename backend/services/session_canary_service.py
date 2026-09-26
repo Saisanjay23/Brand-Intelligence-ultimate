@@ -14,6 +14,7 @@ from backend.database.repositories import alert_settings_repository as alert_set
 from backend.database.repositories import incident_repository as incidents_db
 from backend.database.repositories import session_repository as sessions_db
 from backend.services import email_service
+from backend.shared.tasks import spawn
 from backend.shared.logging import get_logger
 
 log = get_logger("services.session_canary")
@@ -107,7 +108,7 @@ async def check_token_expiries() -> list[dict[str, Any]]:
                             "ts": datetime.now(timezone.utc),
                         })
                         # Dispatch email alert asynchronously
-                        asyncio.create_task(
+                        spawn(
                             email_service.send_session_expiring_alert(
                                 platform=platform_id,
                                 identifier=identifier,

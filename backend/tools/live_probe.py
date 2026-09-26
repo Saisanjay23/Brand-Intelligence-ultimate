@@ -40,7 +40,7 @@ import argparse
 import asyncio
 import json
 import time
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 

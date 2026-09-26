@@ -126,7 +126,6 @@ class TestARefreshNeverInventsProfiles:
     """
 
     def test_only_known_profiles_are_kept(self):
-        from backend.services import profile_refresh as pr
 
         held = {"111": {"client_id": "c1"}, "222": {"client_id": "c1"}}
         by_url = {"https://fb.com/known": {"client_id": "c1"}}
@@ -150,7 +149,6 @@ class TestARefreshNeverInventsProfiles:
         """Two clients can hold the same profile. A refresh running for one
         must not write the other's row -- that would move a profile between
         investigations."""
-        from backend.services import profile_refresh as pr
 
         held = {"111": {"client_id": "other-client"}}
         cid = "c1"
@@ -196,7 +194,6 @@ class TestLookingAtACardKeepsItsPicture:
     def test_an_uncached_picture_is_routed_through_the_proxy(self):
         """Direct-to-CDN is faster and loses the picture: the browser gets
         the bytes, we never do, and there is nothing to store."""
-        import re
         from pathlib import Path
 
         src = Path("frontend/src/utils/avatar.ts").read_text(encoding="utf-8")
@@ -210,8 +207,10 @@ class TestLookingAtACardKeepsItsPicture:
 
         src = Path("backend/api/media.py").read_text(encoding="utf-8")
         assert "_keep(url, img.data, img.content_type)" in src
-        # Off the response path -- the analyst is waiting for this image.
-        assert "asyncio.create_task(_keep(" in src
+        # Off the response path -- the analyst is waiting for this image --
+        # and HELD until it finishes (shared/tasks.py), so it cannot be
+        # garbage-collected half way through the write.
+        assert "spawn(_keep(" in src
         # And the old contract is gone.
         assert "LIVE, NOT STORED" not in src
 

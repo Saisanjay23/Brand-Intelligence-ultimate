@@ -47,12 +47,12 @@ A detector that has never seen a platform work must not vouch for it.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any
 
 from backend.database.repositories import incident_repository as incidents_db
 from backend.database.repositories import telemetry_repository as telemetry_db
+from backend.shared.tasks import spawn
 from backend.shared.logging import get_logger
 
 log = get_logger("services.engine_health")
@@ -458,6 +458,6 @@ async def _raise(p: dict[str, Any]) -> None:
         # `alert_on_critical_incident` and renders exactly this dict --
         # a bespoke template here would be a second thing to keep in step
         # with the incident shape for no gain.
-        asyncio.create_task(email_service.send_critical_incident_alert(incident))
+        spawn(email_service.send_critical_incident_alert(incident))
     except Exception as e:                       # noqa: BLE001 - never fatal
         log.warning(f"engine health alert email skipped: {type(e).__name__}: {e}")

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import smtplib
+from html import escape as _esc
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timezone
@@ -28,7 +29,17 @@ def _format_html_template(
     recommendation: str,
     footer_note: str = "Brand Intelligence Automated Security System",
 ) -> str:
-    """Renders a sleek, responsive HTML email matching enterprise security alerts."""
+    """Renders a sleek, responsive HTML email matching enterprise security alerts.
+
+    Every value is ESCAPED except `recommendation`, which carries this
+    module's own <strong> markup -- callers escape what they put inside it.
+    Account names, exception text and incident messages come from outside
+    this process, and one stray `<` or `&` used to break the whole layout.
+    """
+    esc = _esc
+    title, badge_text, badge_color, headline, footer_note = (
+        esc(title), esc(badge_text), esc(badge_color), esc(headline), esc(footer_note))
+    details_table = [(esc(str(label)), esc(str(val))) for label, val in details_table]
     rows_html = "".join(
         f"""<tr>
             <td style="padding: 10px 14px; border-bottom: 1px solid #242B35; color: #8A99AD; font-size: 13px; font-weight: 500; width: 30%;">{label}</td>
@@ -127,7 +138,20 @@ def _send_smtp_sync(
                         server.starttls()
                         server.ehlo()
                     except Exception as tls_err:
-                        log.debug(f"STARTTLS negotiation skipped/failed: {tls_err}")
+                        # NEVER FALL THROUGH TO A PLAINTEXT LOGIN. This used
+                        # to log at debug and carry on, which sent the SMTP
+                        # password unencrypted -- and after a failed
+                        # handshake the connection is usually dead anyway,
+                        # so the real error surfaced later as a confusing
+                        # "connection unexpectedly closed".
+                        if user and password:
+                            err = (f"secure connection (STARTTLS) to {host}:{port} failed "
+                                   f"({type(tls_err).__name__}: {tls_err}) -- not sending "
+                                   f"the password unencrypted")
+                            log.error(f"SMTP delivery failed to {recipients}: {err}")
+                            return False, err
+                        log.warning(f"STARTTLS to {host}:{port} failed, sending "
+                                    f"unauthenticated: {tls_err}")
                 if user and password:
                     server.login(user, password)
                 server.sendmail(sender, recipients, msg.as_string())
@@ -222,7 +246,7 @@ async def send_session_failure_alert(
             ("Detail", detail or "The platform rejected authentication or enforced a checkpoint."),
             ("Operational Impact", "Scheduled discovery & analysis sweeps on this platform will fail or pause."),
         ],
-        recommendation=f"Navigate to <strong>Admin → Sessions</strong> in the application, locate the <strong>{plat_display}</strong> session pool, and paste freshly exported cookies to restore automated scraping.",
+        recommendation=f"Navigate to <strong>Admin → Sessions</strong> in the application, locate the <strong>{_esc(plat_display)}</strong> session pool, and paste freshly exported cookies to restore automated scraping.",
     )
     text = f"CRITICAL: {plat_display} session {identifier} is {reason}. Detail: {detail}. Please re-authenticate under Sessions."
     ok, _ = await send_email(subject, html, text)
@@ -251,7 +275,7 @@ async def send_session_expiring_alert(
             ("Status", "Approaching cookie expiration deadline"),
             ("Detail", detail or "Auth token (xs, sessionid, auth_token) expiry timestamp is within warning threshold."),
         ],
-        recommendation=f"Re-export fresh cookies from your browser for <strong>{plat_display} ({identifier})</strong> and paste them in <strong>Admin → Sessions</strong> before automated jobs encounter a login wall.",
+        recommendation=f"Re-export fresh cookies from your browser for <strong>{_esc(f'{plat_display} ({identifier})')}</strong> and paste them in <strong>Admin → Sessions</strong> before automated jobs encounter a login wall.",
     )
     text = f"WARNING: {plat_display} session {identifier} expires in ~{hours_remaining:.1f} hours. Please refresh cookies before sweeps fail."
     ok, _ = await send_email(subject, html, text)
@@ -281,7 +305,7 @@ async def send_critical_incident_alert(incident: dict) -> bool:
             ("Message", incident.get("message") or ""),
             ("Cause", incident.get("cause") or ""),
         ],
-        recommendation=incident.get("fix") or "Review the Live Incidents dashboard in the Brand Intelligence UI.",
+        recommendation=_esc(str(incident.get("fix") or "Review the Live Incidents dashboard in the Brand Intelligence UI.")),
     )
     ok, _ = await send_email(subject, html)
     return ok

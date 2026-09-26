@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterator, Optional
 from urllib.parse import quote
 
+from backend.shared.tasks import spawn
 from backend.shared.extraction import run_strategies
 from backend.shared.schema_probe import SchemaProbe, probe_or_null
 from backend.shared.avatars import hd_picture_url, looks_like_placeholder
@@ -954,7 +955,7 @@ class Discovery:
             out.pages += 1
             arrived.set()
 
-        page.on("response", lambda r: asyncio.create_task(on_response(r)))
+        page.on("response", lambda r: spawn(on_response(r)))
 
         try:
             await page.goto(

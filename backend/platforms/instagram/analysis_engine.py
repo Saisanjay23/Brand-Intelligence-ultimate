@@ -111,6 +111,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import quote, urlparse
 
+from backend.shared.tasks import spawn
 from backend.shared.models.row import Row
 from backend.platforms.scan_options import captures_screenshot
 from backend.stealth.mouse_movement import humanize_interaction
@@ -690,7 +691,7 @@ class Scraper:
             except Exception:
                 pass
 
-        page.on("response", lambda r: asyncio.create_task(on_response(r)))
+        page.on("response", lambda r: spawn(on_response(r)))
         try:
             await page.goto(
                 f"https://www.instagram.com/{quote(username)}/",
@@ -881,7 +882,7 @@ class Scraper:
                     post_dates.append(iso)
                     timeline_got.set()
 
-        page.on("response", lambda r: asyncio.create_task(on_response(r)))
+        page.on("response", lambda r: spawn(on_response(r)))
 
         try:
             try:

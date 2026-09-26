@@ -28,7 +28,7 @@ same platform sessions.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Optional
 
 from fastapi import APIRouter, Query, status
 from pydantic import BaseModel, Field
@@ -385,15 +385,20 @@ async def set_queue(body: QueueBody) -> dict:
         raise ConflictError(
             "a run is in progress -- stop it before changing the queue")
 
+    # One place per client, first position wins. A client listed twice would
+    # be swept twice in one run -- double the session time on the same
+    # accounts for results the first pass already saved.
+    client_ids = list(dict.fromkeys(c.strip() for c in body.client_ids if c and c.strip()))
+
     # Names are snapshotted so a queued client that is later deleted still
     # has something to show besides a bare id.
     names: dict[str, str] = {}
-    for cid in body.client_ids:
+    for cid in client_ids:
         doc = await clients_db.try_get(cid)
         if doc:
             names[cid] = doc.get("name") or cid
 
-    await schedule_db.set_queue(body.client_ids, names)
+    await schedule_db.set_queue(client_ids, names)
     snap = await scheduler_engine.snapshot()
     return _state_out(snap, Schedule.from_dict(snap["schedule"]))
 

@@ -363,9 +363,32 @@ app.include_router(media_router)
 # where the UI was never built) starts fine and simply has no `/`. See
 # run.py, which builds `frontend/dist` on first run.
 _DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+
+
+class _UIFiles(StaticFiles):
+    """The built UI, with cache headers that match how Vite names files.
+
+    Everything under /assets/ carries a content hash in its name, so a given
+    URL can never change: `immutable` lets a reload skip re-downloading and
+    re-parsing the ~475KB bundle entirely. index.html is the opposite -- it
+    is what points at the current hashes -- so it must always be revalidated.
+    With no Cache-Control at all it used to be cached heuristically off its
+    Last-Modified date, and a browser kept running the PREVIOUS UI after an
+    update until that guess expired.
+    """
+
+    def file_response(self, full_path, stat_result, scope, status_code=200):
+        resp = super().file_response(full_path, stat_result, scope, status_code)
+        if scope.get("path", "").startswith("/assets/"):
+            resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        else:
+            resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+
 if (_DIST / "index.html").is_file():
     # html=True serves index.html for "/" itself.
-    app.mount("/", StaticFiles(directory=str(_DIST), html=True), name="ui")
+    app.mount("/", _UIFiles(directory=str(_DIST), html=True), name="ui")
     log.info(f"serving the UI from {_DIST}")
 else:
     log.warning(

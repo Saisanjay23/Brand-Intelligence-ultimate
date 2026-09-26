@@ -1,12 +1,10 @@
-import React, { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import toast from "react-hot-toast";
 import {
   analysisApi,
-  type AnalysisItemData,
   type AnalysisJobResponse,
 } from "../api/analysisApi";
 import {
-  ActivityWaveIcon,
   DownloadIcon,
   AnalysisNavIcon,
   SearchIcon,
@@ -20,7 +18,6 @@ import {
   clearSession,
   startAnalysis,
   useAnalysisField,
-  loadSaved,
   setOrg,
   mergedItems,
   getSnapshot,
@@ -31,7 +28,7 @@ import {
 } from "../services/analysisSession";
 import { confirmAction } from "../utils/confirmAction";
 import { download, downloadBlob, rowsToCsv, rowsToTsv } from "../utils/download";
-import { formatElapsed, formatSeconds, useLiveTimer } from "../utils/timeFormat";
+import { formatElapsed, useLiveTimer } from "../utils/timeFormat";
 
 const SAMPLE_URLS = [
   "https://www.facebook.com/zuck",
@@ -446,7 +443,6 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
   const [urlInput, setUrlInput] = useAnalysisField("urlInput");
 
   // Job & Results state (in RAM only, lost on refresh -- not on unmount)
-  const [jobId] = useAnalysisField("jobId");
   const [jobData] = useAnalysisField("jobData");
   const [loading] = useAnalysisField("loading");
   const [cancelling] = useAnalysisField("cancelling");

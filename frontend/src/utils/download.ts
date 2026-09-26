@@ -13,7 +13,10 @@ export function downloadBlob(filename: string, blob: Blob) {
   a.href = href;
   a.download = filename;
   a.click();
-  URL.revokeObjectURL(href);
+  // Released on the next turn, not straight after click(): Firefox and
+  // Safari start reading the blob asynchronously, and revoking it in the
+  // same tick can cancel the download before it begins.
+  setTimeout(() => URL.revokeObjectURL(href), 1000);
 }
 
 // Flat records -> CSV text. Column order is the first row's own key order,

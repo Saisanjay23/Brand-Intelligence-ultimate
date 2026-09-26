@@ -65,6 +65,7 @@ from typing import Any, Iterator, Optional
 from urllib.parse import quote
 
 from backend.config.settings import settings
+from backend.shared.tasks import spawn
 from backend.shared.extraction import run_strategies
 from backend.shared.schema_probe import SchemaProbe, probe_or_null
 from backend.shared.logging import get_logger
@@ -699,7 +700,7 @@ async def newest_post_via_search(ctx, username: str, timeout_s: float = 20.0) ->
         except Exception:
             pass
 
-    page.on("response", lambda r: asyncio.create_task(on_response(r)))
+    page.on("response", lambda r: spawn(on_response(r)))
     try:
         await page.goto(
             SEARCH_URL.format(q=quote(username)), wait_until="domcontentloaded",
@@ -1114,7 +1115,7 @@ async def _users_for(
         if text:
             bodies.append(text)
 
-    page.on("response", lambda r: asyncio.create_task(on_response(r)))
+    page.on("response", lambda r: spawn(on_response(r)))
     try:
         await page.goto(USER_SEARCH_URL.format(q=quote(keyword)),
                         wait_until="domcontentloaded", timeout=int(timeout_s * 1000))
@@ -1313,7 +1314,7 @@ class Discovery:
             out.pages += 1
             arrived.set()
 
-        page.on("response", lambda r: asyncio.create_task(on_response(r)))
+        page.on("response", lambda r: spawn(on_response(r)))
 
         try:
             await page.goto(

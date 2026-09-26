@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import type { Client } from "../api/types";
-import { GlobeIcon, TagIcon, SearchIcon } from "./AppIcons";
+import { GlobeIcon, TagIcon } from "./AppIcons";
 
 // Full-text client finder: name, id, domain, or any configured keyword --
 // broader than CustomClientSelect's own name/id-only filter, since this is

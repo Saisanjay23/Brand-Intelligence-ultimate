@@ -13,11 +13,31 @@ export const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/+$/
 
 export const url = (path: string) => `${API_BASE}${path}`;
 
-export async function json<T>(res: Response): Promise<T> {
-  if (!res.ok) {
-    const d = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(d.detail ?? `request failed (${res.status})`);
+// The error text for a failed response. FastAPI's 422 carries `detail` as a
+// LIST of {loc, msg} objects, not a string, and `new Error(list)` rendered
+// as "[object Object]" -- so a rejected form told the analyst nothing.
+export function errorDetail(d: unknown, status: number): string {
+  const detail = (d as { detail?: unknown } | null)?.detail;
+  if (typeof detail === "string" && detail) return detail;
+  if (Array.isArray(detail) && detail.length) {
+    return detail
+      .map((e) => {
+        const { loc, msg } = (e ?? {}) as { loc?: unknown[]; msg?: string };
+        const field = Array.isArray(loc) ? loc.filter((p) => p !== "body").join(".") : "";
+        return field ? `${field}: ${msg ?? "invalid"}` : (msg ?? String(e));
+      })
+      .join("; ");
   }
+  return `request failed (${status})`;
+}
+
+async function failure(res: Response): Promise<never> {
+  const d = await res.json().catch(() => ({ detail: res.statusText }));
+  throw new Error(errorDetail(d, res.status));
+}
+
+export async function json<T>(res: Response): Promise<T> {
+  if (!res.ok) await failure(res);
   return res.json() as Promise<T>;
 }
 
@@ -31,9 +51,6 @@ export const post = (path: string, body: unknown) =>
 // Same error-shape handling as `json<T>`, but for an endpoint whose success
 // body is a binary file (e.g. a generated .xlsx) rather than JSON.
 export async function blob(res: Response): Promise<Blob> {
-  if (!res.ok) {
-    const d = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(d.detail ?? `request failed (${res.status})`);
-  }
+  if (!res.ok) await failure(res);
   return res.blob();
 }

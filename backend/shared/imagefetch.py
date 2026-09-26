@@ -65,12 +65,29 @@ _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 class ImageFetchError(Exception):
     """A fetch that did not produce usable image bytes. `status` is the
-    status the API layer should answer with, not the upstream's own."""
+    status the API layer should answer with, not the upstream's own --
+    that one, when the CDN gave one, is `upstream`."""
 
-    def __init__(self, detail: str, status: int = 502) -> None:
+    def __init__(self, detail: str, status: int = 502,
+                 upstream: Optional[int] = None) -> None:
         super().__init__(detail)
         self.detail = detail
         self.status = status
+        self.upstream = upstream
+
+    @property
+    def gone(self) -> bool:
+        """Did the CDN say THIS URL will never serve an image?
+
+        A 4xx is a verdict about the URL -- 404 because the account changed
+        its picture, 403 because the signature no longer matches -- and
+        asking again gets the same answer. Without this, the same 18 dead
+        YouTube, Twitter and Facebook pictures were fetched four times an
+        hour for days. 408 and 429 are the exceptions: they are about the
+        moment, not the URL.
+        """
+        return (self.upstream is not None and 400 <= self.upstream < 500
+                and self.upstream not in (408, 429))
 
 
 @dataclass(frozen=True)
@@ -318,7 +335,7 @@ async def fetch_image(raw: str) -> FetchedImage:
 
         if hop.status != 200:
             log.warning(f"avatar upstream {hop.status} from {host}")
-            raise ImageFetchError("upstream image fetch failed")
+            raise ImageFetchError("upstream image fetch failed", upstream=hop.status)
 
         if not hop.content_type.startswith("image/"):
             raise ImageFetchError("upstream did not return an image")

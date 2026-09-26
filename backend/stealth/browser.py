@@ -24,6 +24,7 @@ WHAT ACTUALLY HELPS & HAS BEEN HARDENED
 from __future__ import annotations
 
 import asyncio
+import base64
 import random
 import shutil
 import sys
@@ -66,6 +67,7 @@ except ImportError:
 from typing import Optional
 
 from backend.shared.logging import get_logger
+from backend.shared.tasks import spawn
 from backend.platforms.scan_options import cancelled
 from backend.stealth.human import BASE, Human
 from backend.stealth.fingerprint import (
@@ -317,6 +319,10 @@ class Session:
         # the fallback and what every run did before profiles existed.
         self._profile: Optional[Path] = None
         self._persistent = False
+        # The browser-level CDP session carrying the native request filter,
+        # when that wiring is in use (see _install_filter). Held so it is
+        # not collected while Chrome still has requests paused on it.
+        self._cdp = None
         # An explicit platform id wins; otherwise it is read off the
         # subclass's module (backend.platforms.<id>.discovery_engine), which
         # is what lets every engine keep its current constructor untouched.
@@ -441,9 +447,102 @@ class Session:
         # byte-for-byte what it was before profiles existed.
         safe_cookies = normalize_cookies(self.cookies)
         await self.ctx.add_cookies(safe_cookies)
-        await self.ctx.route("**/*", self._filter)
+        await self._install_filter()
         await self._warmup()
         return self.ctx
+
+    # ------------------------------------------------------ request filter
+    #
+    # ONE DECISION, TWO WAYS TO APPLY IT. `_verdict` is the whole policy --
+    # which requests get a stub instead of the network -- and both wirings
+    # below call it, so they cannot drift apart.
+    #
+    # WHY THE NATIVE WIRING EXISTS. `ctx.route("**/*")` made Playwright
+    # pause EVERY request (about 250 per Facebook page) for a round trip
+    # through its driver and this Python process, and Playwright disables
+    # the HTTP cache whenever any route is installed -- so the 80MB profile
+    # cache in PERSISTENT_ARGS was written and never read, and every page
+    # re-downloaded and re-compiled the platform's JS bundles. Measured on a
+    # local test site with this exact Chrome and LAUNCH_ARGS (six pages,
+    # CPU summed over Python, the driver and every Chrome process):
+    #     images loaded   53.3s -> 31.7s CPU, 17.5s -> 11.2s wall
+    #     images stubbed  44.7s -> 36.4s CPU, 16.6s -> 13.4s wall
+    # with the same requests blocked, the same stubs served, and the same
+    # behaviour inside cross-origin iframes.
+    #
+    # The native filter is a BROWSER-LEVEL Fetch session: Chrome pauses only
+    # requests matching the patterns (the trackers, media, and images when
+    # stubbing), and it covers every target -- pages, popups and
+    # cross-origin iframes -- which a per-page session does not. Each
+    # Session owns its own Chrome, so browser-wide is exactly this session.
+
+    def _verdict(self, url: str, rtype: str) -> Optional[tuple[bytes, str]]:
+        """(body, content type) to answer this request with, or None to let
+        it through. `rtype` in either spelling ("image" / "Image")."""
+        url, rtype = url.lower(), rtype.lower()
+        # 1. Known third-party telemetry, ad beacons, and analytics
+        if any(tracker in url for tracker in BLOCKED_TRACKERS):
+            return b"", "application/javascript"
+        # 2. Video/audio streaming chunks (prevents background buffering)
+        if rtype == "media":
+            return b"", "video/mp4"
+        # 3. Images only when evidence/image loading is disabled
+        if not self.load_images and rtype == "image":
+            return TRANSPARENT_GIF, "image/gif"
+        return None
+
+    def _fetch_patterns(self) -> list[dict]:
+        """What Chrome should pause: a superset of what `_verdict` acts on
+        (the handler re-checks), and nothing else."""
+        stage = "Request"
+        patterns = [{"urlPattern": f"*{t}*", "requestStage": stage} for t in BLOCKED_TRACKERS]
+        patterns.append({"urlPattern": "*", "resourceType": "Media", "requestStage": stage})
+        if not self.load_images:
+            patterns.append({"urlPattern": "*", "resourceType": "Image", "requestStage": stage})
+        return patterns
+
+    async def _install_filter(self) -> None:
+        from backend.config.settings import settings
+
+        browser = getattr(self.ctx, "browser", None)
+        if settings.browser_native_request_filter and browser is not None:
+            try:
+                cdp = await browser.new_browser_cdp_session()
+                cdp.on("Fetch.requestPaused",
+                       lambda ev: spawn(self._on_paused(cdp, ev)))
+                await cdp.send("Fetch.enable", {"patterns": self._fetch_patterns()})
+                self._cdp = cdp
+                return
+            except Exception as e:                      # noqa: BLE001
+                log.warning(
+                    f"native request filter unavailable ({type(e).__name__}: {e}) "
+                    f"-- using the Playwright route instead")
+        await self.ctx.route("**/*", self._filter)
+
+    async def _on_paused(self, cdp, ev: dict) -> None:
+        """Answer one paused request. MUST always answer: a paused request
+        nobody continues hangs its page for good."""
+        rid = ev.get("requestId")
+        try:
+            verdict = self._verdict(ev.get("request", {}).get("url", ""),
+                                    ev.get("resourceType", ""))
+            if verdict is None:
+                await cdp.send("Fetch.continueRequest", {"requestId": rid})
+                return
+            body, ctype = verdict
+            await cdp.send("Fetch.fulfillRequest", {
+                "requestId": rid, "responseCode": 200,
+                "responseHeaders": [{"name": "Content-Type", "value": ctype}],
+                "body": base64.b64encode(body).decode("ascii"),
+            })
+        except Exception:                               # noqa: BLE001
+            # The page navigated away or closed mid-request (the request is
+            # already gone), or the fulfil failed -- in which case letting
+            # it through is the answer that never hangs a page.
+            try:
+                await cdp.send("Fetch.continueRequest", {"requestId": rid})
+            except Exception:                           # noqa: BLE001
+                pass
 
     def _wanted_profile(self) -> Optional[Path]:
         """The directory this session should reuse, or None to run
@@ -521,27 +620,14 @@ class Session:
                     pass
 
     async def _filter(self, route, request):
-        url = request.url.lower()
-        rtype = request.resource_type
-
-        # 1. Block known third-party telemetry, ad beacons, and analytics
-        if any(tracker in url for tracker in BLOCKED_TRACKERS):
-            await route.fulfill(status=200, content_type="application/javascript", body=b"")
+        """The Playwright-route wiring of `_verdict` -- the fallback, and
+        what `browser_native_request_filter = False` selects."""
+        verdict = self._verdict(request.url, request.resource_type)
+        if verdict is None:
+            await route.continue_()
             return
-
-        # 2. Block video/audio media streaming chunks cleanly (prevents background buffering)
-        if rtype == "media":
-            await route.fulfill(status=200, content_type="video/mp4", body=b"")
-            return
-
-        # 3. Block images only when evidence/image loading is disabled
-        if not self.load_images and rtype == "image":
-            await route.fulfill(
-                status=200, content_type="image/gif", body=TRANSPARENT_GIF
-            )
-            return
-
-        await route.continue_()
+        body, ctype = verdict
+        await route.fulfill(status=200, content_type=ctype, body=body)
 
     async def sync_cookies(self) -> None:
         """Persists the live context cookie jar mid-session.

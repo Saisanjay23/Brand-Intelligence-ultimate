@@ -30,6 +30,7 @@ import re
 from typing import Optional
 from urllib.parse import urlparse
 
+from backend.shared.tasks import spawn
 from backend.shared.models.row import Row
 from backend.shared.avatars import hd_picture_url
 from backend.platforms.scan_options import captures_screenshot
@@ -374,7 +375,7 @@ class Scraper:
                     ):
                         posts.append(iso)
 
-        page.on("response", lambda r: asyncio.create_task(on_response(r)))
+        page.on("response", lambda r: spawn(on_response(r)))
 
         try:
             try:
@@ -671,7 +672,7 @@ class Scraper:
                     found.append(about)
                     landed.set()
 
-        page.on("response", lambda r: asyncio.create_task(on_response(r)))
+        page.on("response", lambda r: spawn(on_response(r)))
         try:
             await page.goto(
                 f"{url}/about", wait_until="domcontentloaded",
@@ -744,7 +745,7 @@ class Scraper:
                     found.append(iso)
                     landed.set()
 
-        page.on("response", lambda r: asyncio.create_task(on_response(r)))
+        page.on("response", lambda r: spawn(on_response(r)))
         try:
             await page.goto(
                 f"{url}/with_replies?lang=en",
@@ -804,7 +805,7 @@ class Scraper:
                     found.append(iso)
             landed.set()
 
-        page.on("response", lambda r: asyncio.create_task(on_response(r)))
+        page.on("response", lambda r: spawn(on_response(r)))
         try:
             await page.goto(
                 f"{url}/reposts?lang=en",

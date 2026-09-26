@@ -317,6 +317,14 @@ class Settings(BaseSettings):
     # Failure is always non-fatal -- warming is a courtesy, not a step.
     browser_warmup_enabled: bool = True
     browser_warmup_min_gap_minutes: float = 15.0
+    # WHERE THE TRACKER / MEDIA / IMAGE-STUB FILTER RUNS. On (default): inside
+    # Chrome, pausing ONLY the requests the filter acts on. Off: the older
+    # Playwright `route("**/*")`, which pauses EVERY request for a round trip
+    # through Python and -- as a side effect of Playwright's routing -- turns
+    # the browser's HTTP cache off, so every page re-downloads and
+    # re-compiles the site's JS. Same blocking either way; measured locally
+    # the native filter costs 19-41% less CPU. See Session._install_filter.
+    browser_native_request_filter: bool = True
     # RE-LOG IN BY ITSELF when a pooled account with stored credentials is
     # found expired or checkpointed. Off leaves the existing quarantine and
     # alert path exactly as it is.

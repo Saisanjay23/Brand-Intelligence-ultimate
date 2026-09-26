@@ -567,13 +567,58 @@ a:hover {
   margin-bottom: 28px;
 }
 
+/* THE SAME GLOW, WITHOUT REPAINTING THE CARD 60 TIMES A SECOND.
+   heroPulse animated `box-shadow` on the card itself, and box-shadow is a
+   paint property: every frame, for as long as the Analysis view was open,
+   Chrome re-painted the card -- including the whole results table inside
+   it. Measured idle on that view: ~4.6% of a core, doing nothing.
+
+   Now the two ends of the pulse are two fixed shadows on two layers behind
+   the card, cross-faded by OPACITY, which the compositor animates without
+   touching the card's paint. `isolation` keeps the z-index:-1 layers above
+   the page background and below the card's content. The animation still
+   overrides the inline boxShadow the JSX sets, exactly as heroPulse did. */
 .home-card {
   background: var(--bg-card);
   border: 1px solid var(--border-subtle);
   border-radius: 20px;
   padding: 28px;
   text-align: left;
-  animation: heroPulse 6s infinite ease-in-out;
+  position: relative;
+  isolation: isolate;
+  box-shadow: none !important;
+}
+
+.home-card::before,
+.home-card::after {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  pointer-events: none;
+  z-index: -1;
+  animation: 6s infinite ease-in-out;
+  will-change: opacity;
+}
+
+.home-card::before {
+  box-shadow: 0 0 20px rgba(136, 56, 221, 0.15);
+  animation-name: heroPulseLow;
+}
+
+.home-card::after {
+  box-shadow: 0 0 35px rgba(119, 39, 205, 0.3);
+  animation-name: heroPulseHigh;
+}
+
+@keyframes heroPulseLow {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+@keyframes heroPulseHigh {
+  0%, 100% { opacity: 0; }
+  50% { opacity: 1; }
 }
 
 .field-label {

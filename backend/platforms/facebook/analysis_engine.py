@@ -17,11 +17,11 @@ from datetime import datetime, timezone
 from typing import Any, Iterator, Optional
 
 from backend.config.settings import settings
+from backend.shared.tasks import spawn
 from backend.shared.avatars import looks_like_placeholder
 from backend.shared.models.row import Row
 from backend.platforms.scan_options import captures_screenshot
-from backend.shared.text import (MONTHS, epoch_to_dt, find_ints,
-                               is_place, iter_dicts, iter_kv, name_score,
+from backend.shared.text import (MONTHS, epoch_to_dt, is_place, iter_dicts, iter_kv, name_score,
                                parse_count)
 from backend.platforms.facebook.discovery_engine import (RE_CHECKPOINT,
                                                           RE_DEFAULT_PIC,
@@ -1511,7 +1511,7 @@ class Scraper:
             except Exception:
                 pass
 
-        page.on("response", lambda r: asyncio.create_task(on_response(r)))
+        page.on("response", lambda r: spawn(on_response(r)))
 
         try:
             needle = row.profile_id if row.profile_id.isdigit() else ""

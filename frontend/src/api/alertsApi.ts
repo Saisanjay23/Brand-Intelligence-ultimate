@@ -2,21 +2,10 @@
  * REST API client for Alerts, Live Incidents, Email notifications, and Session Canary.
  */
 
-const API_BASE = "";
-
-async function json<T>(res: Response): Promise<T> {
-  if (!res.ok) {
-    let err = "Request failed";
-    try {
-      const data = await res.json();
-      err = data.detail || err;
-    } catch {
-      err = `${res.status} ${res.statusText}`;
-    }
-    throw new Error(err);
-  }
-  return res.json() as Promise<T>;
-}
+// The shared base and error handling, not local copies: a hard-coded ""
+// here sent every Alerts call to the UI's own origin when VITE_API_BASE_URL
+// pointed the rest of the app at a backend elsewhere.
+import { API_BASE, json } from "./httpClient";
 
 export interface AlertSettings {
   alert_emails: string[];

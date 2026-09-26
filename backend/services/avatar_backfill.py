@@ -47,7 +47,6 @@ import time
 from typing import Any, Callable, Optional
 
 from backend.database.connection import db
-from backend.database.repositories import profile_repository as profiles_db
 from backend.services import avatar_cache
 from backend.shared.imagefetch import url_is_live
 from backend.shared.logging import get_logger
@@ -90,6 +89,21 @@ _PAGE = 200
 # so it takes the default.
 _REVISIT_PAGE = {"facebook": 80}
 
+# HOW MANY SEPARATE 4xx ANSWERS WRITE A URL OFF. An unsigned YouTube or
+# Twitter URL has no expiry stamp, so `url_is_live` can never rule it out --
+# and when the account changes its picture the old URL answers 404 for ever.
+# With nothing to stop it, the hourly retry fetched the same 18 dead
+# pictures four times an hour for days. Three strikes across three hourly
+# passes is long enough that a brief CDN block cannot write off a good
+# picture, and short enough that the waste ends the same afternoon.
+GONE_AFTER_STRIKES = 3
+
+
+def _is_gone(doc: dict, url: str) -> bool:
+    """Has the CDN refused THIS exact URL often enough to stop asking?"""
+    return (bool(url) and doc.get("avatar_gone_url") == url
+            and int(doc.get("avatar_gone_strikes") or 0) >= GONE_AFTER_STRIKES)
+
 
 def _blank_query(client_id: Optional[str], platform: Optional[str] = None,
                  with_url: bool = True) -> dict:
@@ -122,21 +136,27 @@ async def count_blank(client_id: Optional[str] = None) -> dict[str, dict[str, in
     nothing but an HTTP GET. `expired` is the number whose URL has provably
     passed its `oe=` stamp -- nobody can fetch those from that URL again, so
     they need re-discovering rather than retrying, and reporting them as
-    merely "failed" would send someone to retry them for ever.
+    merely "failed" would send someone to retry them for ever. `gone` is
+    the same fact learned the other way: the CDN itself refused the URL
+    GONE_AFTER_STRIKES times.
     """
     out: dict[str, dict[str, int]] = {}
     cursor = db()[PROFILES].find(
         _blank_query(client_id, with_url=False),
-        {"platform": 1, "profile_image_url": 1},
+        {"platform": 1, "profile_image_url": 1,
+         "avatar_gone_url": 1, "avatar_gone_strikes": 1},
     )
     now = time.time()
     async for doc in cursor:
         pid = doc.get("platform", "") or "unknown"
-        row = out.setdefault(pid, {"live": 0, "expired": 0, "no_url": 0, "total": 0})
+        row = out.setdefault(pid, {"live": 0, "expired": 0, "gone": 0,
+                                   "no_url": 0, "total": 0})
         row["total"] += 1
         url = (doc.get("profile_image_url") or "").strip()
         if not url:
             row["no_url"] += 1
+        elif _is_gone(doc, url):
+            row["gone"] += 1
         elif url_is_live(url, now):
             row["live"] += 1
         else:
@@ -166,7 +186,7 @@ async def from_stored_urls(
     started = time.time()
     result: dict[str, Any] = {
         "tier": "stored-url", "platforms": {},
-        "recovered": 0, "failed": 0, "skipped_expired": 0,
+        "recovered": 0, "failed": 0, "skipped_expired": 0, "skipped_gone": 0,
     }
 
     # WALKED BY `_id`, NOT RE-QUERIED FROM THE TOP.
@@ -190,7 +210,8 @@ async def from_stored_urls(
         cursor = db()[PROFILES].find(
             query,
             {"url": 1, "entity_id": 1, "profile_image_url": 1,
-             "client_id": 1, "platform": 1},
+             "client_id": 1, "platform": 1,
+             "avatar_gone_url": 1, "avatar_gone_strikes": 1},
         ).sort("_id", 1).limit(_PAGE)
         batch = [d async for d in cursor]
         if not batch:
@@ -201,7 +222,7 @@ async def from_stored_urls(
         # (client, platform) -> items, because `cache_for_profiles` is scoped
         # to one of each and a backfill spans every client.
         buckets: dict[tuple[str, str], list[dict]] = {}
-        skipped = 0
+        skipped = skipped_gone = 0
         for doc in batch:
             url = (doc.get("profile_image_url") or "").strip()
             cid = doc.get("client_id") or ""
@@ -211,12 +232,16 @@ async def from_stored_urls(
             if not url_is_live(url, now):
                 skipped += 1
                 continue
+            if _is_gone(doc, url):
+                skipped_gone += 1
+                continue
             buckets.setdefault((cid, pid), []).append({
                 "url": doc.get("url", ""),
                 "entity_id": doc.get("entity_id", ""),
                 "profile_image_url": url,
             })
         result["skipped_expired"] += skipped
+        result["skipped_gone"] += skipped_gone
 
         attempted = 0
         for (cid, pid), items in buckets.items():
@@ -248,6 +273,7 @@ async def from_stored_urls(
             f"avatar backfill: recovered {result['recovered']}, "
             f"failed {result['failed']}, "
             f"skipped {result['skipped_expired']} expired "
+            f"and {result['skipped_gone']} gone "
             f"in {result['seconds']}s")
     return result
 
@@ -280,6 +306,12 @@ async def _retry_loop() -> None:
                     f"picture retry: {res['skipped_expired']} profile(s) have a picture "
                     f"URL that has expired -- re-sweep their client to pick the picture "
                     f"up again; retrying cannot recover them")
+            if res["skipped_gone"]:
+                log.warning(
+                    f"picture retry: {res['skipped_gone']} profile(s) have a picture "
+                    f"URL the CDN has refused {GONE_AFTER_STRIKES} times (usually the "
+                    f"account changed its picture) -- no longer retried; re-sweep "
+                    f"their client to pick the new one up")
         except Exception as e:                       # noqa: BLE001 - never fatal
             log.error(f"picture retry sweep failed: {type(e).__name__}: {e}")
         await asyncio.sleep(PICTURE_RETRY_INTERVAL_S)

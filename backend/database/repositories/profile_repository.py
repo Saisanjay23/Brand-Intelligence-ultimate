@@ -13,6 +13,7 @@ run unattended.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -869,6 +870,46 @@ async def set_avatar_sha(
     return res.matched_count > 0
 
 
+async def note_avatar_gone(
+    client_id: str, platform: str, image_url: str, *, url: str, entity_id: str = "",
+) -> bool:
+    """Count one more 4xx from the CDN for this profile's stored picture URL.
+
+    STRIKES, KEYED TO THE URL. The count only grows while the failing URL
+    stays the same; a sweep that stores a new picture URL starts it again
+    at one, so a mark can never outlive the link it was about. The picture
+    retry (avatar_backfill) stops asking once the count reaches
+    GONE_AFTER_STRIKES -- one refusal alone could be a brief block, three
+    separate hourly refusals are the URL.
+
+    Same narrow-write reasoning as `set_avatar_sha`.
+    """
+    if not image_url or not url:
+        return False
+    eid = (entity_id or "").strip()
+    keys: list[dict] = []
+    if eid:
+        keys.append({"entity_id": eid})
+    keys.append({"url": url})
+    keys.append({"urls": url})
+    # A pipeline update so the read of the old URL and the write of the new
+    # count are one atomic step -- inside one $set stage, `$avatar_gone_url`
+    # is still the value from before this update.
+    res = await db()[PROFILES].update_one(
+        {"client_id": client_id, "platform": platform, "$or": keys},
+        [{"$set": {
+            "avatar_gone_strikes": {"$cond": [
+                {"$eq": ["$avatar_gone_url", {"$literal": image_url}]},
+                {"$add": [{"$ifNull": ["$avatar_gone_strikes", 0]}, 1]},
+                1,
+            ]},
+            "avatar_gone_url": {"$literal": image_url},
+            "avatar_gone_at": "$$NOW",
+        }}],
+    )
+    return res.matched_count > 0
+
+
 async def set_logo_match(
     client_id: str, platform: str, fields: dict, *, url: str, entity_id: str = "",
 ) -> bool:
@@ -1214,6 +1255,7 @@ async def find(
     age: Optional[str] = None, validated_age: Optional[str] = None,
     logo_matched: bool = False, is_original: Optional[bool] = None,
     first_seen_from: Optional[datetime] = None, first_seen_to: Optional[datetime] = None,
+    with_counts: bool = True,
 ) -> tuple[list[dict], int, dict]:
     """`include_held=False` (the default, used by any caller that doesn't
     explicitly ask otherwise, i.e. the SaaS backend's normal poll) hides a
@@ -1228,6 +1270,11 @@ async def find(
     filtering "High priority" across 500 rows showed only the High rows
     within page 1 and still claimed 500 results. A filter that doesn't
     survive pagination isn't a filter.
+
+    `with_counts=False` skips the five facet aggregates and returns `{}` for
+    them -- for callers that page through rows or only need `total` (the
+    analyse-validated fetch, reports), which used to pay for every badge
+    count on every page and then discard them.
     """
     q = _build_query(
         client_id, platform=platform, status=status, phase=phase, include_held=include_held,
@@ -1240,7 +1287,6 @@ async def find(
     )
 
     coll = db()[PROFILES]
-    total = await coll.count_documents(q)
     if phase == PHASE_DISCOVERY and status == "rejected":
         # Rejected is the one status view that reads newest-decision-first
         # on purpose, an analyst reviewing what they've dismissed wants
@@ -1300,42 +1346,46 @@ async def find(
     # Spilling to disk removes the ceiling outright. The compound index added
     # in ensure_indexes() is what keeps it from being needed in the common
     # case; this is the guarantee that the page still renders when it is.
-    rows = []
-    async for doc in coll.find(q).sort(sort_spec).allow_disk_use(True).skip(offset).limit(limit):
-        doc["id"] = str(doc.pop("_id"))
-        rows.append(_stamp_utc_for_api(doc))
+    async def _rows() -> list[dict]:
+        out = []
+        async for doc in coll.find(q).sort(sort_spec).allow_disk_use(True).skip(offset).limit(limit):
+            doc["id"] = str(doc.pop("_id"))
+            out.append(_stamp_utc_for_api(doc))
+        return out
 
-    plat_match = _without(q, "platform")
-    plat_counts = {}
-    async for doc in coll.aggregate([{"$match": plat_match}, {"$group": {"_id": "$platform", "count": {"$sum": 1}}}]):
-        if doc.get("_id"):
-            plat_counts[str(doc["_id"])] = doc["count"]
+    # EVERY QUERY BELOW IS INDEPENDENT, SO THEY RUN TOGETHER. This used to be
+    # seven round trips one after another -- the total, the page, then five
+    # facet aggregates -- so a grid refresh cost their SUM. The grid re-reads
+    # on every count change while a sweep is running, which made that sum the
+    # latency an analyst watched. Run concurrently it costs the slowest one.
+    async def _group(match: dict, pipeline: list[dict]) -> dict[str, int]:
+        out: dict[str, int] = {}
+        async for doc in coll.aggregate([{"$match": match}, *pipeline]):
+            if doc.get("_id"):
+                out[str(doc["_id"])] = doc["count"]
+        return out
 
-    status_match = _without(q, "status")
-    status_counts = {}
-    async for doc in coll.aggregate([{"$match": status_match}, {"$group": {"_id": "$status", "count": {"$sum": 1}}}]):
-        if doc.get("_id"):
-            status_counts[str(doc["_id"])] = doc["count"]
+    if not with_counts:
+        total, rows = await asyncio.gather(coll.count_documents(q), _rows())
+        return rows, total, {}
 
-    keyword_match = _without(q, "keywords")
-    keyword_counts: dict[str, int] = {}
-    async for doc in coll.aggregate([
-        {"$match": keyword_match}, {"$unwind": "$keywords"},
-        {"$group": {"_id": "$keywords", "count": {"$sum": 1}}},
-    ]):
-        if doc.get("_id"):
-            keyword_counts[str(doc["_id"])] = doc["count"]
+    def _by(field: str) -> list[dict]:
+        return [{"$group": {"_id": f"${field}", "count": {"$sum": 1}}}]
+
+    plat_task = _group(_without(q, "platform"), _by("platform"))
+    status_task = _group(_without(q, "status"), _by("status"))
+    keyword_task = _group(_without(q, "keywords"),
+                          [{"$unwind": "$keywords"}, *_by("keywords")])
 
     # New/Old totals for the grid's tab badges. Counted over the query with
     # its OWN age filter dropped, so each badge shows the real size of its
     # tab rather than the size of whichever tab is open.
-    age_counts = {"new": 0, "old": 0}
     cutoff = _new_cutoff()
-    async for doc in coll.aggregate([
+    age_task = _group(
         # The same query with NO age filter -- rebuilt rather than stripped,
         # because the "old" clause is an `$or` and removing every `$or`
         # would take the phase, publish-hold and search clauses with it.
-        {"$match": _build_query(
+        _build_query(
             client_id, platform=platform, status=status, phase=phase,
             include_held=include_held, keyword=keyword, entity_type=entity_type,
             priority=priority, match_level=match_level,
@@ -1349,8 +1399,8 @@ async def find(
             # a tab that renders 12.
             first_seen_from=first_seen_from, first_seen_to=first_seen_to,
             logo_matched=logo_matched, is_original=is_original,
-        )},
-        {"$group": {
+        ),
+        [{"$group": {
             # A profile is "new" if first_seen OR avatar_changed_at is within
             # the window -- matching _age_clause exactly.
             "_id": {"$cond": [
@@ -1361,19 +1411,16 @@ async def find(
                 "new", "old",
             ]},
             "count": {"$sum": 1},
-        }},
-    ]):
-        if doc.get("_id") in age_counts:
-            age_counts[str(doc["_id"])] = doc["count"]
+        }}],
+    )
 
     # Recently-validated vs older-validated totals, for the Validated tab's
     # own two badges. Counted with the validated_age filter dropped (and the
     # age filter left alone), so each badge states the real size of its tab
     # rather than the size of whichever one is open -- exactly what the
     # age_counts block above does for New/Old.
-    validated_age_counts = {"new": 0, "old": 0}
-    async for doc in coll.aggregate([
-        {"$match": _build_query(
+    validated_age_task = _group(
+        _build_query(
             client_id, platform=platform, status=status, phase=phase,
             include_held=include_held, keyword=keyword, entity_type=entity_type,
             priority=priority, match_level=match_level,
@@ -1382,18 +1429,27 @@ async def find(
             data_quality=data_quality, age=age,
             first_seen_from=first_seen_from, first_seen_to=first_seen_to,
             logo_matched=logo_matched, is_original=is_original,
-        )},
-        {"$group": {
+        ),
+        [{"$group": {
             # `$gte` against a missing field is false in Mongo, so a profile
             # validated before `validated_at` existed lands in "old" -- the
             # same answer _validated_age_clause gives, which is what keeps
             # the badge and the list agreeing.
             "_id": {"$cond": [{"$gte": ["$validated_at", cutoff]}, "new", "old"]},
             "count": {"$sum": 1},
-        }},
-    ]):
-        if doc.get("_id") in validated_age_counts:
-            validated_age_counts[str(doc["_id"])] = doc["count"]
+        }}],
+    )
+
+    (total, rows, plat_counts, status_counts, keyword_counts,
+     ages, validated_ages) = await asyncio.gather(
+        coll.count_documents(q), _rows(), plat_task, status_task, keyword_task,
+        age_task, validated_age_task,
+    )
+    # Both always carry both keys, so an empty tab reads 0 rather than
+    # missing -- exactly as before.
+    age_counts = {"new": ages.get("new", 0), "old": ages.get("old", 0)}
+    validated_age_counts = {"new": validated_ages.get("new", 0),
+                            "old": validated_ages.get("old", 0)}
 
     counts = {"platforms": plat_counts, "statuses": status_counts,
               "keywords": keyword_counts, "ages": age_counts,

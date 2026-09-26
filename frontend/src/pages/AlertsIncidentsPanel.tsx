@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback } from "react";
 import toast from "react-hot-toast";
 import {
   alertsApi,
@@ -11,8 +11,6 @@ import {
   AlertBellIcon,
   RefreshIcon,
   ShieldIcon,
-  ZapIcon,
-  AlertTriangleIcon,
 } from "../components/AppIcons";
 
 type SubTab = "incidents" | "canary" | "settings";
@@ -212,7 +210,6 @@ export function AlertsIncidentsPanel() {
   };
 
   const criticalCount = counts.critical || 0;
-  const warningCount = counts.warning || 0;
   const totalIncidents = incidents.length;
 
   return (
