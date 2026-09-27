@@ -1,0 +1,415 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Brand Intelligence — System Map",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/Saisanjay23/Brand-Intelligence-ultimate",
+      "provider": "github",
+      "link_mode": "web",
+      "revision": "2ec60bd9ee5614044dda9047a566045f7931272a"
+    },
+    "views": [
+      {
+        "id": "discovery-path",
+        "label": "Discovery sweep",
+        "focus": [
+          "ui",
+          "api",
+          "discovery",
+          "engines",
+          "stealth",
+          "platforms"
+        ],
+        "note": "Keywords go out to each platform's own search; candidate profiles come back and are stored one per URL."
+      },
+      {
+        "id": "analysis-path",
+        "label": "Analysis and scoring",
+        "focus": [
+          "api",
+          "analysis",
+          "engines",
+          "stealth",
+          "platforms"
+        ],
+        "note": "Validated profiles are visited one by one, scraped, screenshotted and scored 2 to 9."
+      },
+      {
+        "id": "stealth-layer",
+        "label": "Sessions and stealth",
+        "focus": [
+          "engines",
+          "sessions",
+          "stealth",
+          "platforms"
+        ],
+        "note": "Pooled logged-in accounts, human pacing, read-only, and a hard stop on the first challenge."
+      },
+      {
+        "id": "scheduled-runs",
+        "label": "Scheduled sweeps",
+        "focus": [
+          "scheduler",
+          "discovery",
+          "api",
+          "mongo"
+        ],
+        "note": "The scheduler fires timed sweeps one client at a time, using the same path as the Run queue button."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "ui",
+      "type": "frontend",
+      "label": "React UI",
+      "sublabel": "analyst's triage grid",
+      "brand": "react",
+      "pos": [
+        40,
+        280
+      ],
+      "size": [
+        140,
+        64
+      ],
+      "sources": [
+        {
+          "path": "frontend/src/components/DiscoveryProfileGrid.tsx",
+          "label": "triage grid"
+        },
+        {
+          "path": "frontend/src/App.tsx"
+        }
+      ]
+    },
+    {
+      "id": "api",
+      "type": "backend",
+      "label": "FastAPI",
+      "sublabel": "one process :8000",
+      "brand": "fastapi",
+      "pos": [
+        230,
+        280
+      ],
+      "size": [
+        140,
+        64
+      ],
+      "sources": [
+        {
+          "path": "backend/main.py",
+          "line": 281,
+          "label": "app + routers"
+        },
+        {
+          "path": "backend/api/discovery.py"
+        },
+        {
+          "path": "backend/api/analysis.py"
+        }
+      ]
+    },
+    {
+      "id": "scheduler",
+      "type": "backend",
+      "label": "Scheduler",
+      "sublabel": "timed, one client at a time",
+      "pos": [
+        420,
+        100
+      ],
+      "size": [
+        140,
+        64
+      ],
+      "sources": [
+        {
+          "path": "backend/services/scheduler_service.py",
+          "line": 185,
+          "label": "SchedulerEngine"
+        }
+      ]
+    },
+    {
+      "id": "discovery",
+      "type": "backend",
+      "label": "Discovery runner",
+      "sublabel": "keywords → profiles",
+      "pos": [
+        420,
+        280
+      ],
+      "size": [
+        140,
+        64
+      ],
+      "sources": [
+        {
+          "path": "backend/discovery/runner.py",
+          "line": 891,
+          "label": "DiscoveryRunner"
+        },
+        {
+          "path": "backend/shared/keywords.py",
+          "label": "keyword permutations"
+        }
+      ]
+    },
+    {
+      "id": "analysis",
+      "type": "backend",
+      "label": "Analysis runner",
+      "sublabel": "scrape + score 2–9",
+      "pos": [
+        420,
+        460
+      ],
+      "size": [
+        140,
+        64
+      ],
+      "sources": [
+        {
+          "path": "backend/analysis/runner.py",
+          "line": 562,
+          "label": "AnalysisRunner"
+        },
+        {
+          "path": "backend/shared/models/scoring.py",
+          "line": 146,
+          "label": "risk rubric"
+        }
+      ]
+    },
+    {
+      "id": "engines",
+      "type": "backend",
+      "label": "Platform engines",
+      "sublabel": "6 adapters",
+      "pos": [
+        610,
+        280
+      ],
+      "size": [
+        140,
+        64
+      ],
+      "sources": [
+        {
+          "path": "backend/platforms/registry.py",
+          "line": 101,
+          "label": "PLATFORMS"
+        },
+        {
+          "path": "backend/platforms/facebook/discovery_engine.py"
+        },
+        {
+          "path": "backend/shared/extraction.py",
+          "label": "GraphQL-first extraction"
+        }
+      ]
+    },
+    {
+      "id": "sessions",
+      "type": "security",
+      "label": "Session pool",
+      "sublabel": "leases · backoff",
+      "pos": [
+        800,
+        100
+      ],
+      "size": [
+        140,
+        64
+      ],
+      "sources": [
+        {
+          "path": "backend/sessions/manager.py",
+          "line": 638,
+          "label": "get_healthy_session"
+        }
+      ]
+    },
+    {
+      "id": "stealth",
+      "type": "security",
+      "label": "Stealth browser",
+      "sublabel": "patchright · human pacing",
+      "pos": [
+        800,
+        280
+      ],
+      "size": [
+        140,
+        64
+      ],
+      "sources": [
+        {
+          "path": "backend/stealth/browser.py"
+        },
+        {
+          "path": "backend/stealth/human.py",
+          "label": "jitter + fatigue"
+        }
+      ]
+    },
+    {
+      "id": "platforms",
+      "type": "external",
+      "label": "Social platforms",
+      "sublabel": "FB · IG · X · YT · TikTok · TG",
+      "pos": [
+        990,
+        280
+      ],
+      "size": [
+        150,
+        64
+      ]
+    },
+    {
+      "id": "mongo",
+      "type": "database",
+      "label": "MongoDB",
+      "sublabel": "profiles · clients · results",
+      "brand": "mongodb",
+      "pos": [
+        40,
+        460
+      ],
+      "size": [
+        140,
+        64
+      ],
+      "sources": [
+        {
+          "path": "backend/database/connection.py",
+          "line": 31,
+          "label": "one Motor client"
+        },
+        {
+          "path": "backend/database/repositories/profile_repository.py"
+        }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Python backend · one process",
+      "wraps": [
+        "api",
+        "scheduler",
+        "discovery",
+        "analysis",
+        "engines",
+        "sessions",
+        "stealth"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "ui-api",
+      "from": "ui",
+      "to": "api",
+      "label": "REST"
+    },
+    {
+      "id": "api-discovery",
+      "from": "api",
+      "to": "discovery",
+      "label": "start job",
+      "variant": "emphasis"
+    },
+    {
+      "id": "discovery-engines",
+      "from": "discovery",
+      "to": "engines",
+      "label": "search",
+      "variant": "emphasis"
+    },
+    {
+      "id": "engines-stealth",
+      "from": "engines",
+      "to": "stealth",
+      "variant": "emphasis"
+    },
+    {
+      "id": "stealth-platforms",
+      "from": "stealth",
+      "to": "platforms",
+      "label": "read-only",
+      "variant": "emphasis"
+    },
+    {
+      "id": "scheduler-discovery",
+      "from": "scheduler",
+      "to": "discovery",
+      "label": "timed sweep",
+      "variant": "dashed",
+      "labelDy": 24
+    },
+    {
+      "id": "sessions-stealth",
+      "from": "sessions",
+      "to": "stealth",
+      "label": "cookies",
+      "variant": "security",
+      "labelDy": 24
+    },
+    {
+      "id": "api-analysis",
+      "from": "api",
+      "to": "analysis",
+      "label": "validated URLs"
+    },
+    {
+      "id": "analysis-engines",
+      "from": "analysis",
+      "to": "engines",
+      "label": "profile visit"
+    },
+    {
+      "id": "api-mongo",
+      "from": "api",
+      "to": "mongo",
+      "label": "Motor"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Workflow",
+      "items": [
+        "Discover: search each platform for client keywords",
+        "Triage: analyst marks validated or rejected",
+        "Analyse: scrape + score validated profiles",
+        "Export: Excel report, optional email"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Risk score (2–9)",
+      "items": [
+        "Copied logo + name match scores 6 to 9",
+        "Name match only scores 3 to 5",
+        "Location and recent posts add weight",
+        "Blank fields never lower a score"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Stealth posture",
+      "items": [
+        "Read-only: no likes, posts or messages",
+        "Stable identity, human-like pacing",
+        "First challenge stops the run"
+      ]
+    }
+  ]
+}
