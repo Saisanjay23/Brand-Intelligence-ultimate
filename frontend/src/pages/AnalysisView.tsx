@@ -683,8 +683,23 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey || previewScreenshot) return;
+      // STEP ASIDE ONLY WHERE THE KEY ALREADY MEANS SOMETHING. This used to
+      // skip every INPUT and BUTTON -- so after ticking a row's checkbox,
+      // pressing Platform Format, or clicking the search box (the ordinary
+      // things to do here) the arrows silently stopped scrolling.
+      //   textarea / select / editable text: arrows move the caret or choice
+      //   number, date, range, radio inputs: arrows change the value
+      //   text-like inputs (the search box): Up/Down scroll the table, but
+      //     Home/End/PageUp/PageDown stay with the caret
+      //   checkboxes, buttons, links, cells: every key scrolls the table
       const t = e.target as HTMLElement | null;
-      if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test(t.tagName))) return;
+      if (t && (t.isContentEditable || t.tagName === "TEXTAREA" || t.tagName === "SELECT")) return;
+      if (t && t.tagName === "INPUT") {
+        const type = ((t as HTMLInputElement).type || "text").toLowerCase();
+        if (/^(radio|range|number|date|time|datetime-local|month|week|color)$/.test(type)) return;
+        const textLike = !/^(checkbox|button|submit|reset|image|file)$/.test(type);
+        if (textLike && e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+      }
       const box = tableScrollRef.current;
       if (!box) return;
       const r = box.getBoundingClientRect();
@@ -692,8 +707,11 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
       const header = box.querySelector("thead")?.getBoundingClientRect().height ?? 0;
       const row = box.querySelector("tbody tr")?.getBoundingClientRect().height || 60;
       const page = Math.max(row, box.clientHeight - header - row);
+      // A single press moves exactly one row, for precision; a HELD key
+      // (auto-repeat) moves two per repeat, so holding it covers ground.
+      const rowStep = e.repeat ? row * 2 : row;
       const step: Record<string, number> = {
-        ArrowDown: row, ArrowUp: -row, PageDown: page, PageUp: -page,
+        ArrowDown: rowStep, ArrowUp: -rowStep, PageDown: page, PageUp: -page,
         End: box.scrollHeight, Home: -box.scrollHeight,
       };
       if (!(e.key in step)) return;
@@ -703,6 +721,60 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [previewScreenshot]);
+
+  // A FASTER MOUSE WHEEL INSIDE THE RESULTS TABLE. A notch scrolls ~100px
+  // and a row is ~111px (the screenshot cell), so the wheel crawled at less
+  // than a row per notch. Inside the table a notch now goes WHEEL_BOOST
+  // times as far, eased over a few frames so it glides rather than jumps.
+  //   - mouse-wheel notches only: a touchpad sends many small pixel deltas
+  //     and is left entirely to the browser, or it would become twitchy;
+  //   - at the table's top or bottom the wheel is left alone, so the page
+  //     itself scrolls on as before;
+  //   - Ctrl+wheel (zoom) and sideways scrolling are untouched.
+  const hasTable = allItems.length > 0;
+  useEffect(() => {
+    const box = tableScrollRef.current;
+    if (!box) return;
+    const WHEEL_BOOST = 2.5;
+    let target: number | null = null;
+    let raf = 0;
+    const glide = () => {
+      if (target === null) { raf = 0; return; }
+      const d = target - box.scrollTop;
+      if (Math.abs(d) < 1) { box.scrollTop = target; target = null; raf = 0; return; }
+      box.scrollTop += d * 0.35;
+      raf = requestAnimationFrame(glide);
+    };
+    const onWheel = (e: WheelEvent) => {
+      if (e.ctrlKey || e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
+      // What the browser itself would scroll for this event. Chrome reports
+      // a pixel-mode notch in DEVICE-independent units divided by the
+      // display scale (66.7 at 150%) yet scrolls the full 100px, so the
+      // reported delta is scaled back up -- otherwise the boost comes out
+      // smaller on exactly the high-DPI laptops this is used on.
+      const px = e.deltaMode === 1 ? e.deltaY * 40
+        : e.deltaMode === 2 ? e.deltaY * box.clientHeight
+        : e.deltaY * (window.devicePixelRatio || 1);
+      const isNotch = e.deltaMode !== 0 || Math.abs(px) >= 50;
+      if (!isNotch) return;
+      const max = box.scrollHeight - box.clientHeight;
+      const from = target ?? box.scrollTop;
+      if ((px < 0 && from <= 0) || (px > 0 && from >= max - 1)) return;
+      e.preventDefault();
+      target = Math.max(0, Math.min(max, from + px * WHEEL_BOOST));
+      if (!raf) raf = requestAnimationFrame(glide);
+    };
+    // Grabbing the scrollbar or clicking into the table ends any glide, so
+    // the analyst's own drag is never fought.
+    const stopGlide = () => { target = null; };
+    box.addEventListener("wheel", onWheel, { passive: false });
+    box.addEventListener("pointerdown", stopGlide);
+    return () => {
+      box.removeEventListener("wheel", onWheel);
+      box.removeEventListener("pointerdown", stopGlide);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [hasTable]);
 
   // Scoped to what the current filters actually show -- see the Select-all
   // checkbox's own note on why that matters.

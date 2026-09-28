@@ -1,5 +1,6 @@
-// The discovery triage grid -- three tabs: New Profiles (scraped within the
-// last 24h), Old Profiles (still pending, aged past 24h -- moves here
+// The discovery triage grid -- three tabs: New Profiles (found by this
+// client's latest run -- they stay New until the next run finds something),
+// Old Profiles (still pending, from earlier runs -- moves here
 // automatically, no action needed), and Validated Profiles (an analyst
 // explicitly validated it, from either New or Old). There is no reject
 // action in this UI -- validate is the only triage decision it exposes.
@@ -228,6 +229,20 @@ const PAGE_SIZE_OPTIONS = [25, 50, 100, 200] as const;
 // instead. Medium still does.
 const MATCH_MEDIUM_THRESHOLD = 50;
 const NEW_WINDOW_MS = 24 * 60 * 60 * 1000;
+// WHERE "NEW" BEGINS, as the server last said (`new_since` on every profile
+// page): the start of this client's latest run. The per-card new/old badge
+// and the export's Status column read it, so they always agree with the tab
+// a profile is listed under. The 24h window is only the fallback for a
+// response that does not carry it. Module-level because the grid is the
+// only thing that renders these badges and it refreshes it on every fetch.
+let newSinceMs: number | null = null;
+function newBoundaryMs(): number {
+  return newSinceMs ?? Date.now() - NEW_WINDOW_MS;
+}
+function rememberNewSince(v: string | null | undefined): void {
+  const t = v ? new Date(v).getTime() : NaN;
+  newSinceMs = Number.isNaN(t) ? null : t;
+}
 // Ceiling for the one remaining bulk read (Copy All Validated), matching
 // the backend's own hard limit per request (backend/shared/pagination.py's
 // MAX_LIMIT). Every LISTING is server-paged and no longer goes through this:
@@ -334,22 +349,22 @@ const DATE_WINDOWS: { days: number; label: string }[] = [
 function isProfileNew(p: DiscoveredProfile): boolean {
   const tSeen = p.first_seen ? new Date(p.first_seen).getTime() : NaN;
   const tAvatar = p.avatar_changed_at ? new Date(p.avatar_changed_at).getTime() : NaN;
-  const seenNew = !isNaN(tSeen) && Date.now() - tSeen < NEW_WINDOW_MS;
-  const avatarNew = !isNaN(tAvatar) && Date.now() - tAvatar < NEW_WINDOW_MS;
+  const since = newBoundaryMs();
+  const seenNew = !isNaN(tSeen) && tSeen >= since;
+  const avatarNew = !isNaN(tAvatar) && tAvatar >= since;
   return seenNew || avatarNew;
 }
 
-// True when the profile's display picture was changed recently enough to
-// warrant a visual indicator — the same 24h window the New/Old split uses.
+// True when the profile's display picture changed since the latest run
+// began -- the same line the New/Old split uses.
 function isAvatarChangedRecent(p: DiscoveredProfile): boolean {
   if (!p.avatar_changed_at) return false;
   const t = new Date(p.avatar_changed_at).getTime();
-  return !isNaN(t) && Date.now() - t < NEW_WINDOW_MS;
+  return !isNaN(t) && t >= newBoundaryMs();
 }
 
 // Table-row equivalent of the card's badge stack: a validated profile
-// that's still inside its 24h window reads "validated + new", not just
-// "validated".
+// found by the latest run reads "validated + new", not just "validated".
 function statusLabel(p: DiscoveredProfile): string {
   const dpTag = isAvatarChangedRecent(p) ? " (DP changed)" : "";
   if (p.status === "validated") return isProfileNew(p) ? `validated + new${dpTag}` : "validated";
@@ -907,6 +922,7 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
         offset: tab === "validated" ? 0 : offset,
       });
       if (ticket !== pendingSeq.current) return;   // superseded -- drop it
+      rememberNewSince(res.new_since);
       setPendingItems(tab === "validated" ? [] : res.items);
       setAgeCounts({ new: res.counts?.ages?.new ?? 0, old: res.counts?.ages?.old ?? 0 });
       setKeywordCounts(res.counts?.keywords ?? {});
@@ -947,6 +963,7 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
         limit: effectivePageSize, offset,
       });
       if (ticket !== validatedSeq.current) return;   // superseded -- drop it
+      rememberNewSince(res.new_since);
       setValidatedPage(res);
       setValidatedAgeCounts({
         new: res.counts?.validated_ages?.new ?? 0,
@@ -1771,13 +1788,13 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
               can be empty for a reason that is not about the data, and
               without saying so an empty list reads as "the sweep found
               nothing". The Old tab is the sharp case: it means "first seen
-              more than 24h ago", which a one-day window cannot contain by
-              definition. */}
+              before the latest run", which a one-day window will not contain
+              when that run was today. */}
           {activeWindow && (
             <div style={{ marginTop: "8px", fontSize: "12px" }}>
               Showing {activeWindow.label.toLowerCase()} only
               {tab === "old" && windowDays <= 1
-                && " — and the Old tab means first seen more than 24 hours ago, which a one-day window cannot contain"}
+                && " — and the Old tab means found before the latest run, which a one-day window may not contain"}
               .
             </div>
           )}

@@ -37,7 +37,7 @@ class ValidatedCounts(BaseModel):
 
 
 class PendingCounts(BaseModel):
-    new: int = Field(..., description="First discovered in the last 24 hours.")
+    new: int = Field(..., description="Found since this client's latest discovery run began.")
     total: int
 
 

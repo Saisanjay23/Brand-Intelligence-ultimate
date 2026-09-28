@@ -246,6 +246,10 @@ export interface DiscoveredProfilePage {
   total: number;
   limit: number;
   offset: number;
+  // Where this client's New tab begins: the start of its latest run that
+  // found anything. A profile first seen (or whose picture changed) at or
+  // after this is New. Absent from an older backend.
+  new_since?: string | null;
   // Totals for the WHOLE filtered set, not this page -- so the New/Old tab
   // badges can state the true size of a tab that isn't open. Counted with
   // the `age` filter itself dropped, so both numbers are always the real

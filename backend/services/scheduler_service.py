@@ -427,9 +427,11 @@ class SchedulerEngine:
             self._current_job_id = ""
             self._cancel_sent_for = ""
             self._last_flush = 0.0
-            self._run = {"_id": run_id, "entries": entries, "current_id": "",
-                         "stopping": False, "trigger": trigger}
             started = time.time()
+            # `started_ts` is where every client's New tab begins for this
+            # run -- first pass and gap-closing pass alike.
+            self._run = {"_id": run_id, "entries": entries, "current_id": "",
+                         "stopping": False, "trigger": trigger, "started_ts": started}
             # Seeded so that every exit below -- including one this code
             # never anticipated -- closes the run out as SOMETHING. A run
             # left at `running` with no process behind it is the one state
@@ -602,6 +604,7 @@ class SchedulerEngine:
                 facebook_tabs=fb_tabs or None,
                 max_seconds=budget_minutes * 60 if budget_minutes > 0 else None,
                 only_owed=only_owed,
+                new_window_since=(self._run or {}).get("started_ts"),
             )
         except Exception as e:                              # noqa: BLE001
             await self._settle(entry, "failed", f"could not start: {type(e).__name__}: {e}")

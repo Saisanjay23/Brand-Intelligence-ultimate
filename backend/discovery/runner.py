@@ -37,6 +37,7 @@ from typing import Any, Optional
 
 from backend.config.settings import settings
 from backend.database.repositories import coverage_repository as coverage_db
+from backend.database.repositories import new_window_repository as new_window_db
 from backend.database.repositories import profile_repository as profiles_db
 from backend.database.repositories import telemetry_repository as telemetry_db
 from backend.platforms import registry
@@ -774,6 +775,27 @@ class PlatformSweep:
         }
 
 
+async def _mark_new_window(job: "DiscoveryJob", new: int) -> None:
+    """Start this client's New tab at this run, the first time the run saves
+    a NEW profile (see new_window_repository for why "first new profile" and
+    not "run started"). Once per job; never fatal -- the finds are saved
+    whether or not the tab boundary moves."""
+    # A SCHEDULED run's own start, when this job is one pass of one (the
+    # scheduler sweeps each client, then goes round again to close gaps --
+    # both passes are the same weekly run, and the second must not push the
+    # first one's finds into Old). Otherwise this job's start.
+    start_ts = job.new_window_ts or job.started_at_ts
+    if not new or job.new_window_marked or not start_ts:
+        return
+    job.new_window_marked = True
+    try:
+        await new_window_db.advance(
+            job.group_id, datetime.fromtimestamp(start_ts, tz=timezone.utc))
+    except Exception as e:                               # noqa: BLE001
+        log.warning(f"could not move the New tab to this run for {job.group_id!r}: "
+                    f"{type(e).__name__}: {e}")
+
+
 @dataclass
 class DiscoveryJob:
     id: str
@@ -791,6 +813,11 @@ class DiscoveryJob:
     # rather than re-read per platform so the progress totals and the sweep
     # itself can never disagree about how much work there is.
     tabs: dict[str, list[str]] = field(default_factory=dict)
+    # Set once this run has moved the client's New tab to itself.
+    new_window_marked: bool = False
+    # When this job is part of a scheduled run: that run's start, which is
+    # where the client's New tab begins (see _mark_new_window).
+    new_window_ts: Optional[float] = None
     # GAP-CLOSING MODE. When set, each platform sweeps only the cells its
     # coverage ledger still lists as owed (never attempted, missed, or
     # broken) instead of the whole plan -- see
@@ -1004,6 +1031,7 @@ class DiscoveryRunner:
         platform_tab_limits: Optional[dict[str, dict[str, dict[str, int]]]] = None,
         facebook_tabs: Optional[list[str]] = None,
         only_owed: bool = False,
+        new_window_since: Optional[float] = None,
     ) -> tuple[DiscoveryJob, dict[str, str]]:
         # Deduped WITHIN each type, independently -- these are two
         # separately-curated lists (executive/person names vs brand/domain
@@ -1024,6 +1052,7 @@ class DiscoveryRunner:
             id=uuid.uuid4().hex[:12], group_id=group_id, keyword_plan=plan,
             tabs={pid: tabs_for(pid, facebook_tabs) for pid in ready},
             only_owed=only_owed,
+            new_window_ts=new_window_since,
         )
         for pid in ready:
             tabs = job.tabs[pid]
@@ -1825,6 +1854,7 @@ class DiscoveryRunner:
                                 job.group_id, platform_id, profiles_db.PHASE_DISCOVERY,
                                 field_rows,
                             )
+                            await _mark_new_window(job, new)
                             delivered.update(r.url for r in fresh)
                             for r in fresh:
                                 streamed_as[r.url] = _enrichable(r)
@@ -1955,6 +1985,7 @@ class DiscoveryRunner:
                                 job.group_id, platform_id, profiles_db.PHASE_DISCOVERY,
                                 rows,
                             )
+                            await _mark_new_window(job, new)
                             # `+=`, not `=`: `saved_count` is seeded with
                             # what streaming already banked, and assigning
                             # here threw that away -- then the line further

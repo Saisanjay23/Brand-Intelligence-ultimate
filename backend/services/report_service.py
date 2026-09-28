@@ -198,7 +198,7 @@ def render_client_html(rep: dict) -> str:
         + _cards(v["new"], v["delta"], v["total"])
         + f'<div style="color:#8A99AD;font-size:13px;margin:16px 0 6px;">'
           f'Awaiting triage: <strong style="color:#F0F4F8;">{rep["pending"]["total"]}</strong> '
-          f'({rep["pending"]["new"]} found in the last 24h) &nbsp;&middot;&nbsp; '
+          f'({rep["pending"]["new"]} found in the latest run) &nbsp;&middot;&nbsp; '
           f'Logo matches: <strong style="color:#FDB71B;">{rep["logo_matches"]}</strong></div>'
         + '<div style="color:#8A99AD;font-size:12px;text-transform:uppercase;'
           'letter-spacing:1px;margin:18px 0 4px;">Newly validated</div>'

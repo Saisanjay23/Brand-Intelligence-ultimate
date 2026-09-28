@@ -338,7 +338,17 @@ def _new_cutoff() -> datetime:
     return datetime.now(timezone.utc) - timedelta(hours=NEW_WINDOW_HOURS)
 
 
-def _age_clause(age: str) -> dict:
+async def discovery_new_cutoff(client_id: str) -> datetime:
+    """Where this client's New tab begins: the start of its latest run that
+    found anything (new_window_repository), so New holds that run's finds
+    until the next run replaces them. A client that has never had such a
+    run keeps the 24h rule."""
+    from backend.database.repositories import new_window_repository as new_window
+
+    return await new_window.since(client_id) or _new_cutoff()
+
+
+def _age_clause(age: str, cutoff: Optional[datetime] = None) -> dict:
     """A profile is "new" when it was first seen within the window OR its
     avatar changed within the window (a repeat sweep detected a genuine DP
     swap -- see `is_same_avatar_asset`).  "old" is the exact complement.
@@ -346,8 +356,11 @@ def _age_clause(age: str) -> dict:
     The avatar_changed_at leg exists to catch the "sleeper impersonation"
     pivot: an account discovered months ago that changes its picture to the
     client's brand logo today must surface in the New tab immediately, not
-    stay buried in Old where no analyst would see it."""
-    cutoff = _new_cutoff()
+    stay buried in Old where no analyst would see it.
+
+    `cutoff` is where New begins -- `discovery_new_cutoff()` for a client,
+    which is the start of its latest run; the 24h window when omitted."""
+    cutoff = cutoff or _new_cutoff()
     if age == "new":
         return {"$or": [
             {"first_seen": {"$gte": cutoff}},
@@ -1049,6 +1062,7 @@ def _build_query(
     age: Optional[str] = None, validated_age: Optional[str] = None,
     logo_matched: bool = False, is_original: Optional[bool] = None,
     first_seen_from: Optional[datetime] = None, first_seen_to: Optional[datetime] = None,
+    new_cutoff: Optional[datetime] = None,
 ) -> dict[str, Any]:
     """The filter `find()` queries with, factored out so `delete_matching()`
     (the "Delete Platform Data" button) can delete EXACTLY the set of
@@ -1148,7 +1162,7 @@ def _build_query(
         incomplete = _incomplete_clause()
         clauses.append(incomplete if data_quality == "incomplete" else {"$nor": [incomplete]})
     if age in ("new", "old"):
-        clauses.append(_age_clause(age))
+        clauses.append(_age_clause(age, new_cutoff))
     if validated_age in ("new", "old"):
         clauses.append(_validated_age_clause(validated_age))
     if first_seen_from or first_seen_to:
@@ -1276,6 +1290,10 @@ async def find(
     analyse-validated fetch, reports), which used to pay for every badge
     count on every page and then discard them.
     """
+    # Where New begins for THIS client (its latest run), read once and used
+    # by both the filter and the New/Old badge counts so they cannot disagree.
+    new_cut = (await discovery_new_cutoff(client_id)
+               if (age in ("new", "old") or with_counts) else None)
     q = _build_query(
         client_id, platform=platform, status=status, phase=phase, include_held=include_held,
         keyword=keyword, entity_type=entity_type, priority=priority, match_level=match_level,
@@ -1284,6 +1302,7 @@ async def find(
         validated_age=validated_age, logo_matched=logo_matched,
         is_original=is_original,
         first_seen_from=first_seen_from, first_seen_to=first_seen_to,
+        new_cutoff=new_cut,
     )
 
     coll = db()[PROFILES]
@@ -1380,7 +1399,9 @@ async def find(
     # New/Old totals for the grid's tab badges. Counted over the query with
     # its OWN age filter dropped, so each badge shows the real size of its
     # tab rather than the size of whichever tab is open.
-    cutoff = _new_cutoff()
+    # Two clocks: discovery New/Old starts at the latest run; the Validated
+    # tab's New/Old stays "validated within 24h".
+    validated_cut = _new_cutoff()
     age_task = _group(
         # The same query with NO age filter -- rebuilt rather than stripped,
         # because the "old" clause is an `$or` and removing every `$or`
@@ -1405,8 +1426,8 @@ async def find(
             # the window -- matching _age_clause exactly.
             "_id": {"$cond": [
                 {"$or": [
-                    {"$gte": ["$first_seen", cutoff]},
-                    {"$gte": ["$avatar_changed_at", cutoff]},
+                    {"$gte": ["$first_seen", new_cut]},
+                    {"$gte": ["$avatar_changed_at", new_cut]},
                 ]},
                 "new", "old",
             ]},
@@ -1429,13 +1450,14 @@ async def find(
             data_quality=data_quality, age=age,
             first_seen_from=first_seen_from, first_seen_to=first_seen_to,
             logo_matched=logo_matched, is_original=is_original,
+            new_cutoff=new_cut,
         ),
         [{"$group": {
             # `$gte` against a missing field is false in Mongo, so a profile
             # validated before `validated_at` existed lands in "old" -- the
             # same answer _validated_age_clause gives, which is what keeps
             # the badge and the list agreeing.
-            "_id": {"$cond": [{"$gte": ["$validated_at", cutoff]}, "new", "old"]},
+            "_id": {"$cond": [{"$gte": ["$validated_at", validated_cut]}, "new", "old"]},
             "count": {"$sum": 1},
         }}],
     )
@@ -1453,7 +1475,10 @@ async def find(
 
     counts = {"platforms": plat_counts, "statuses": status_counts,
               "keywords": keyword_counts, "ages": age_counts,
-              "validated_ages": validated_age_counts}
+              "validated_ages": validated_age_counts,
+              # Where New began for this answer, so the UI's per-card
+              # new/old badge uses the SAME line as the tabs and counts.
+              "new_since": new_cut}
     return rows, total, counts
 
 

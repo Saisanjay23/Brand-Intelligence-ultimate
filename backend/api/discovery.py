@@ -422,9 +422,9 @@ class ProfileCounts(BaseModel):
 
     ages: dict[str, int] = Field(
         default_factory=dict,
-        description="Pending rows by age bucket: `new` (first seen within the "
-                    "last 24h) and `old`. Counted with the `age` filter itself "
-                    "dropped, so both are the true totals.",
+        description="Pending rows by age bucket: `new` (found since this client's "
+                    "latest run began -- see `new_since`) and `old`. Counted with the "
+                    "`age` filter itself dropped, so both are the true totals.",
     )
     validated_ages: dict[str, int] = Field(
         default_factory=dict,
@@ -449,6 +449,12 @@ class DiscoveredProfilePage(BaseModel):
     limit: int
     offset: int
     counts: ProfileCounts = Field(default_factory=ProfileCounts)
+    new_since: Optional[str] = Field(
+        None, description="Where the New tab begins for this client: the start of its "
+                          "latest discovery run that found anything (so New holds that "
+                          "run's finds until the next run replaces them), or 24h ago for "
+                          "a client that has never had one. A profile is New when it was "
+                          "first seen -- or changed its picture -- at or after this.")
 
 
 def _to_profile(doc: dict) -> DiscoveredProfile:
@@ -740,10 +746,12 @@ async def list_profiles(
     ),
     age: Optional[Literal["new", "old"]] = Query(
         None,
-        description="Split by how recently the profile was first discovered: "
-                    "`new` = first seen within the last 24h, `old` = everything "
-                    "else (a profile with no first_seen counts as old). Applied "
-                    "server-side so the split survives pagination.",
+        description="Split by discovery run: `new` = first seen (or picture "
+                    "changed) since this client's latest run began -- it stays New "
+                    "until the next run finds something -- `old` = everything else "
+                    "(a profile with no first_seen counts as old). See `new_since` "
+                    "in the response. Applied server-side so the split survives "
+                    "pagination.",
     ),
     validated_age: Optional[Literal["new", "old"]] = Query(
         None,
@@ -823,8 +831,10 @@ async def list_profiles(
         match_level=match_level, entity_type=entity_type,
         keyword_match_type=keyword_match_type, client_keywords=client_keywords,
     )
+    since = counts.get("new_since")
     return DiscoveredProfilePage(
         items=[_to_profile(d) for d in docs], total=total, limit=limit, offset=offset,
+        new_since=since.isoformat() if hasattr(since, "isoformat") else None,
         counts=ProfileCounts(
             ages=counts.get("ages") or {},
             validated_ages=counts.get("validated_ages") or {},
