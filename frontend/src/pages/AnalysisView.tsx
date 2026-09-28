@@ -670,6 +670,40 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
     return () => io.disconnect();
   }, [hasMoreRows, shownRows]);
 
+  // FAST KEYBOARD SCROLLING FOR THE RESULTS TABLE. A row here is ~110px
+  // tall (the screenshot cell), and the browser's own arrow-key step is
+  // ~40px -- about three presses per row, and only after clicking into the
+  // box. So while the table is on screen:
+  //   Up / Down            one whole row per press (holding repeats fast)
+  //   PageUp / PageDown    one box-height
+  //   Home / End           top / bottom (End also pulls in the next rows)
+  // Instant, not smooth: a smooth scroll restarts on every key repeat and
+  // lags behind a held key, which is the slowness this removes. Typing in a
+  // field, a dropdown, or with the screenshot preview open is left alone.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey || previewScreenshot) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test(t.tagName))) return;
+      const box = tableScrollRef.current;
+      if (!box) return;
+      const r = box.getBoundingClientRect();
+      if (r.bottom <= 0 || r.top >= window.innerHeight) return;   // table not on screen
+      const header = box.querySelector("thead")?.getBoundingClientRect().height ?? 0;
+      const row = box.querySelector("tbody tr")?.getBoundingClientRect().height || 60;
+      const page = Math.max(row, box.clientHeight - header - row);
+      const step: Record<string, number> = {
+        ArrowDown: row, ArrowUp: -row, PageDown: page, PageUp: -page,
+        End: box.scrollHeight, Home: -box.scrollHeight,
+      };
+      if (!(e.key in step)) return;
+      e.preventDefault();
+      box.scrollBy({ top: step[e.key], behavior: "auto" });
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [previewScreenshot]);
+
   // Scoped to what the current filters actually show -- see the Select-all
   // checkbox's own note on why that matters.
   const selectableIds = useMemo(
