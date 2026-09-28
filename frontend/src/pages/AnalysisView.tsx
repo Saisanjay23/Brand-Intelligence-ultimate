@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import toast from "react-hot-toast";
 import {
   analysisApi,
@@ -600,6 +600,20 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
     if (deleted) toast.success(`Deleted ${deleted} result${deleted === 1 ? "" : "s"}`);
   };
 
+  // ENDLESS SCROLL. The table draws ROWS_PER_STEP rows, and another step
+  // each time the analyst scrolls near the bottom of it -- so a few hundred
+  // saved results open instantly instead of mounting every row (and every
+  // screenshot thumbnail) up front. Filters start it again from the top; a
+  // live job adding rows does not, so the view never jumps mid-read.
+  const ROWS_PER_STEP = 50;
+  const [shownRows, setShownRows] = useState(ROWS_PER_STEP);
+  const tableScrollRef = useRef<HTMLDivElement | null>(null);
+  const loadMoreRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    setShownRows(ROWS_PER_STEP);
+    tableScrollRef.current?.scrollTo({ top: 0 });
+  }, [searchQuery, platformFilter, riskFilter]);
+
   // Filtered rows for the table -- grouped one platform after another (in
   // the same order the Platform Status Chips above the table show them),
   // rather than interleaved in whatever order each platform's scrape
@@ -634,6 +648,27 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
     });
     return filtered.sort((a, b) => orderIndex(a.platform) - orderIndex(b.platform));
   }, [allItems, jobData?.platform_progress, platformFilter, riskFilter, searchQuery]);
+
+  // Draw the next step once the "scroll for more" marker comes within 600px
+  // of the table's visible area. Re-armed whenever a step lands, so a tall
+  // screen that shows the marker straight away keeps filling until it is
+  // full or everything is drawn.
+  const hasMoreRows = filteredItems.length > shownRows;
+  useEffect(() => {
+    const root = tableScrollRef.current;
+    const target = loadMoreRef.current;
+    if (!hasMoreRows || !root || !target || typeof IntersectionObserver === "undefined") return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          setShownRows((n) => n + ROWS_PER_STEP);
+        }
+      },
+      { root, rootMargin: "0px 0px 600px 0px" },
+    );
+    io.observe(target);
+    return () => io.disconnect();
+  }, [hasMoreRows, shownRows]);
 
   // Scoped to what the current filters actually show -- see the Select-all
   // checkbox's own note on why that matters.
@@ -1504,7 +1539,7 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
           </div>
 
           {/* ─── Interactive Table View ─── */}
-          <div className="analysis-table-container">
+          <div className="analysis-table-container" ref={tableScrollRef}>
             {/* NOT width:"100%" -- an 11-column table pinned to 100% of the
                 scroll wrapper's width has nowhere to grow, so the browser
                 squeezes every column down to fit instead, cutting long
@@ -1561,7 +1596,7 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
                     </td>
                   </tr>
                 ) : (
-                  filteredItems.map((it) => {
+                  filteredItems.slice(0, shownRows).map((it) => {
                     const originalRow = formatMode === "incident" ? it.incident_row : it.legacy_row;
                     const row = { ...originalRow, ...(edits[it.id] || {}) };
                     // Addressed by result_id wherever there is one, so the
@@ -1644,6 +1679,7 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
                                 <AvatarImg
                                   src={it.profile_image_url}
                                   sha={it.avatar_sha}
+                                  sizes="26px"
                                   style={{ width: "26px", height: "26px", borderRadius: "50%", objectFit: "cover", flexShrink: 0 }}
                                   fallback={
                                     <div
@@ -1731,6 +1767,16 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
                 )}
               </tbody>
             </table>
+            {/* The trigger for the next step: when it scrolls into view
+                (or close to it), more rows are drawn. */}
+            {filteredItems.length > shownRows && (
+              <div
+                ref={loadMoreRef}
+                style={{ padding: "14px", textAlign: "center", fontSize: "12px", color: "var(--text-muted)", position: "sticky", left: 0 }}
+              >
+                Showing {shownRows} of {filteredItems.length} -- scroll for more
+              </div>
+            )}
           </div>
         </div>
       )}

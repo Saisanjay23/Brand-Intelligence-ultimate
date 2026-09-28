@@ -161,10 +161,23 @@ export const analysisApi = {
   // listed every client's analysis results under whichever client was open.
   // Passing "" now means the no-client bucket, which is the right answer for
   // a scratch run and never another client's work.
+  //
+  // EVERY PAGE, not just the first. One request stops at the server's
+  // 1000-row ceiling, and the rows past it simply never appeared while the
+  // counter still read "Showing N of N" -- a silent cut. Pages are walked
+  // until `total` is reached (or a page comes back empty), so the table's
+  // endless scroll really does reach the last saved result.
   listResults: async (orgId: string): Promise<SavedResultPage> => {
-    const res = await fetch(
-      url(`/analysis/results?limit=1000&org_id=${encodeURIComponent(orgId || "")}`));
-    return json<SavedResultPage>(res);
+    const PAGE = 1000;
+    const org = encodeURIComponent(orgId || "");
+    let items: AnalysisItemData[] = [];
+    let page: SavedResultPage;
+    do {
+      const res = await fetch(url(`/analysis/results?limit=${PAGE}&offset=${items.length}&org_id=${org}`));
+      page = await json<SavedResultPage>(res);
+      items = items.concat(page.items);
+    } while (page.items.length > 0 && items.length < page.total);
+    return { ...page, items };
   },
 
   // Addressed by result_id and served from storage, so it still resolves

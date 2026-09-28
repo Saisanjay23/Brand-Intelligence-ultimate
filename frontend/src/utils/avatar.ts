@@ -152,3 +152,20 @@ export function avatarSources(
   }
   return [...stored, raw];
 }
+
+// DISPLAY-SIZE COPIES OF THE STORED PICTURE, for `srcset`.
+//
+// A quarter of stored avatars are 1024-2048px originals painted into a card
+// a few hundred pixels wide or a 26px table cell. The backend can hand back
+// a resized copy (`?w=`, backend/shared/imagethumb.py) without touching the
+// original, and `srcset` lets the BROWSER choose: it takes the smallest
+// candidate with at least as many pixels as it will actually paint --
+// display width x devicePixelRatio -- so a picture is never shown at lower
+// resolution than before. The plain URL stays last (and stays `src`), which
+// is exactly what every browser loaded before this existed.
+const STORED_WIDTHS = [128, 256, 512, 1024];
+
+export function storedSrcSet(sha: string): string {
+  const base = url(`/media/avatar/${sha}`);
+  return [...STORED_WIDTHS.map((w) => `${base}?w=${w} ${w}w`), `${base} 2048w`].join(", ");
+}

@@ -52,8 +52,10 @@ security controls, not tidiness.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+from typing import Optional
 
 from fastapi import APIRouter, Path, Query, Response
 
@@ -64,6 +66,7 @@ from backend.shared.tasks import spawn
 from backend.shared.imagefetch import ImageFetchError, allowed as _allowed
 from backend.shared.imagefetch import close as _close_fetcher
 from backend.shared.imagefetch import fetch_image
+from backend.shared.imagethumb import ThumbCache, thumbnail
 from backend.shared.fast_http import close as _close_fast_http
 from backend.shared.logging import get_logger
 
@@ -89,6 +92,9 @@ _CACHE_CONTROL = "public, max-age=21600"
 _STORED_CACHE_CONTROL = "public, max-age=31536000, immutable"
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+# Display-size copies already produced, by (sha, width). See shared/imagethumb.py.
+_thumbs = ThumbCache()
 
 # THE BYTES ARE A THIRD PARTY'S, SERVED FROM OUR ORIGIN. An allowlisted CDN
 # can still answer with an SVG, and an SVG opened directly in a tab runs its
@@ -193,6 +199,12 @@ async def _keep(url: str, data: bytes, content_type: str) -> None:
             summary="Serve a profile picture from our own store")
 async def stored_avatar(
     sha: str = Path(..., description="sha256 of the image bytes, from a profile's `avatar_sha`."),
+    w: Optional[int] = Query(
+        None, ge=16, le=2048,
+        description="Display width in pixels. Omit for the stored original, byte for "
+                    "byte. With it, a picture larger than `w` is served as a resized "
+                    "copy for display; one that already fits is served unchanged. The "
+                    "stored original is never modified."),
 ) -> Response:
     """The cached copy: bytes we pulled from the CDN once and kept.
 
@@ -211,6 +223,16 @@ async def stored_avatar(
     if not found:
         return _err(404, "no stored image for that digest")
     data, ctype = found
+    if w:
+        key = (sha, w)
+        small = _thumbs.get(key)
+        if small is KeyError:
+            # Off the event loop: decoding is CPU-bound, and this loop is
+            # shared with any sweep that is running.
+            small = await asyncio.to_thread(thumbnail, data, w)
+            _thumbs.put(key, small)
+        if small:
+            data, ctype = small
     return Response(
         content=data,
         media_type=ctype,

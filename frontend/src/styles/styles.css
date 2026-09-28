@@ -3967,7 +3967,13 @@ tr:hover .row-quick-actions {
   max-width: 100%;
   overflow-x: auto;
   overflow-y: auto;
-  max-height: calc(100vh - 270px);
+  /* A FULL-SCREEN SCROLL AREA, not a box that shrinks to its rows. It used
+     to be max-height only, so one result made a one-row sliver. Now it is
+     always most of the viewport tall (never under 480px), rows scroll
+     inside it under a sticky header, and more load as you reach the end
+     (AnalysisView's endless scroll). */
+  height: calc(100vh - 160px);
+  min-height: 480px;
   position: relative;
   border: 1px solid var(--border-color);
   border-radius: 12px;

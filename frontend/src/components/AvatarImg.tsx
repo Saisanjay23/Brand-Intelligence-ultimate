@@ -8,7 +8,7 @@
 // change at the call sites. See utils/avatar.ts for why the list is ordered
 // the way it is.
 import { useEffect, useMemo, useState } from "react";
-import { avatarSources } from "../utils/avatar";
+import { avatarSources, storedSrcSet } from "../utils/avatar";
 
 interface Props {
   src: string | null | undefined;
@@ -19,9 +19,16 @@ interface Props {
   style?: React.CSSProperties;
   /** Drawn when there is no picture, or when every candidate URL has failed. */
   fallback?: React.ReactNode;
+  /**
+   * How wide this picture is PAINTED, as an <img sizes> value (e.g. "26px").
+   * With it, the stored copy is offered at several resolutions and the
+   * browser downloads the smallest one that still covers the painted size
+   * at the screen's pixel ratio. Without it, the original, as before.
+   */
+  sizes?: string;
 }
 
-export function AvatarImg({ src, sha, alt = "", className, style, fallback = null }: Props) {
+export function AvatarImg({ src, sha, alt = "", className, style, fallback = null, sizes }: Props) {
   const sources = useMemo(() => avatarSources(src, sha), [src, sha]);
   const [attempt, setAttempt] = useState(0);
 
@@ -32,13 +39,21 @@ export function AvatarImg({ src, sha, alt = "", className, style, fallback = nul
 
   if (attempt >= sources.length) return <>{fallback}</>;
 
+  // Only the stored copy has sizes to choose from; the proxy and the CDN
+  // are single URLs. `src` stays the original, so the fallback chain and
+  // any browser without srcset behave exactly as before.
+  const current = sources[attempt];
+  const responsive = sizes && sha && current === sources[0] && current.includes(`/media/avatar/${sha}`);
+
   return (
     <img
       // Keyed on the URL so swapping to the next candidate remounts the
       // element -- React reuses a plain <img> on a src change, and a browser
       // that has already errored on it will not always re-fire onError.
       key={sources[attempt]}
-      src={sources[attempt]}
+      src={current}
+      srcSet={responsive ? storedSrcSet(sha) : undefined}
+      sizes={responsive ? sizes : undefined}
       alt={alt}
       className={className}
       style={style}

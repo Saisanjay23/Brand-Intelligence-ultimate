@@ -156,6 +156,32 @@ def _release_profile(path: Path) -> None:
     _profile_leases.discard(str(path).lower())
 
 
+# How long an abandoned close is given to finish on its own before the
+# driver is stopped underneath it. Every abandoned Chrome observed in the
+# logs had exited well inside this; stopping the driver sooner would kill a
+# browser that is still writing its profile.
+_ABANDONED_CLOSE_GRACE_S = 30.0
+
+
+async def _stop_driver(pw) -> None:
+    if pw is None:
+        return
+    try:
+        await asyncio.wait_for(pw.stop(), timeout=15.0)
+    except Exception:                                   # noqa: BLE001
+        pass
+
+
+async def _finish_abandoned_close(pw, profile: Optional[Path]) -> None:
+    """The half of Session.stop() a cut-off close never reached."""
+    try:
+        await asyncio.sleep(_ABANDONED_CLOSE_GRACE_S)
+        await _stop_driver(pw)
+    finally:
+        if profile is not None:
+            _release_profile(profile)
+
+
 def profiles_root() -> Path:
     from backend.config.settings import settings
 
@@ -676,22 +702,38 @@ class Session:
         closers = [(self.ctx, "close")]
         if self.browser is not None and self.browser is not self.ctx:
             closers.append((self.browser, "close"))
-        closers.append((self._pw, "stop"))
-        for obj, meth in closers:
-            if obj:
-                try:
-                    await getattr(obj, meth)()
-                except Exception:
-                    pass
-
-        # THE LEASE GOES BACK EVEN IF EVERY CLOSE ABOVE FAILED. A directory
-        # left leased is a session that can never use its own profile again
-        # for the life of the process, which degrades silently -- exactly
-        # the kind of failure that gets noticed months later, if ever.
-        if self._profile is not None:
-            _release_profile(self._profile)
-            self._profile = None
-        self._persistent = False
+        closed = False
+        try:
+            for obj, meth in closers:
+                if obj:
+                    try:
+                        await getattr(obj, meth)()
+                    except Exception:
+                        pass
+            closed = True
+        finally:
+            # THE DRIVER STOPS AND THE LEASE GOES BACK EVEN WHEN THE CLOSE
+            # WAS CUT OFF. The runners give a teardown 10s and then cancel
+            # it (discovery/runner.py::_close_quietly), and that cancel lands
+            # HERE, mid-close. `except Exception` does not catch it, so this
+            # used to skip the rest of stop(): Playwright's node driver was
+            # left running for the life of the process (four of them after
+            # one six-platform sweep), and the profile stayed leased -- that
+            # account then ran every later sweep on a throwaway profile, a
+            # silent loss of the device continuity profiles exist for.
+            pw, self._pw = self._pw, None
+            profile, self._profile = self._profile, None
+            self._persistent = False
+            if closed:
+                await _stop_driver(pw)
+                if profile is not None:
+                    _release_profile(profile)
+            else:
+                # Chrome is still finishing its close (flushing the profile
+                # to disk). Stopping the driver now would kill it mid-write,
+                # so the rest happens in the background after a grace
+                # period, without holding up the caller that gave up.
+                spawn(_finish_abandoned_close(pw, profile))
 
     async def pause(self, mult: float = 1.0):
         """Between-profile pacing, jittered and fatigued.

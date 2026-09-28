@@ -448,12 +448,15 @@ function OriginalBadge({ p }: { p: DiscoveredProfile }) {
   );
 }
 
-function Avatar({ p }: { p: DiscoveredProfile }) {
+function Avatar({ p, sizes }: { p: DiscoveredProfile; sizes: string }) {
   const label = p.display_name || p.username || "?";
   return (
     <AvatarImg
       src={p.profile_image_url}
       sha={p.avatar_sha}
+      // The card's MEASURED width, so the browser picks the smallest stored
+      // copy that still covers it at this screen's pixel ratio.
+      sizes={sizes}
       style={{ width: "100%", height: "100%", objectFit: "cover" }}
       fallback={
         <span className="profile-avatar-circle" style={{ width: 64, height: 64, fontSize: 26, borderRadius: "50%" }}>
@@ -466,8 +469,10 @@ function Avatar({ p }: { p: DiscoveredProfile }) {
 
 function ProfileCard({
   p, selected, onToggleSelected, onValidate, onUnvalidate, onToggleOriginal, busy,
+  avatarSizes = "536px",
 }: {
   p: DiscoveredProfile;
+  avatarSizes?: string;
   selected: boolean;
   onToggleSelected: (id: string) => void;
   onValidate?: (id: string) => void;
@@ -487,7 +492,7 @@ function ProfileCard({
     >
       <div className="profile-card-header">
         <a href={p.url} target="_blank" rel="noreferrer" onClick={stop} style={{ display: "block", width: "100%", height: "100%" }}>
-          <Avatar p={p} />
+          <Avatar p={p} sizes={avatarSizes} />
         </a>
         <div style={{ position: "absolute", top: 9, left: 9, display: "flex", alignItems: "center", gap: 5, zIndex: 2 }}>
           <span
@@ -749,6 +754,11 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
   // appears -- leaving the column count stuck at 1 and the rounding inert.
   // A callback ref fires exactly when the node attaches and detaches.
   const [columns, setColumns] = useState(1);
+  // One card's laid-out width, rounded UP to 16px so a pixel of drift does
+  // not re-render the grid. It is the `sizes` hint for the card pictures;
+  // 536px (the widest a minmax(260px, 1fr) column gets before another one
+  // fits) until the first measurement lands.
+  const [cardWidth, setCardWidth] = useState(536);
   const observer = useRef<ResizeObserver | null>(null);
   const measureRef = useRef<(() => void) | null>(null);
   const gridNode = useRef<HTMLDivElement | null>(null);
@@ -761,9 +771,15 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
     const measure = () => {
       // The RESOLVED track list -- one entry per real column, which is what
       // auto-fill actually produced at this width and zoom.
-      const cols = window.getComputedStyle(el)
-        .gridTemplateColumns.split(" ").filter(Boolean).length;
+      const tracks = window.getComputedStyle(el)
+        .gridTemplateColumns.split(" ").filter(Boolean);
+      const cols = tracks.length;
       setColumns((prev) => (prev === cols ? prev : Math.max(1, cols)));
+      const w = parseFloat(tracks[0] ?? "");
+      if (Number.isFinite(w) && w > 0) {
+        const rounded = Math.ceil(w / 16) * 16;
+        setCardWidth((prev) => (prev === rounded ? prev : rounded));
+      }
     };
     measureRef.current = measure;
     measure();
@@ -1771,7 +1787,7 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
       {viewMode === "cards" ? (
         <div ref={gridRef} className="profile-grid-container" style={{ marginTop: "16px" }}>
           {displayed.map((p) => (
-            <ProfileCard key={p.id} p={p} selected={selected.has(p.id)} onToggleSelected={toggle} onValidate={onValidateHandler} onUnvalidate={onUnvalidateHandler} onToggleOriginal={tab === "validated" ? onToggleOriginal : undefined} busy={busyId === p.id} />
+            <ProfileCard key={p.id} p={p} selected={selected.has(p.id)} onToggleSelected={toggle} onValidate={onValidateHandler} onUnvalidate={onUnvalidateHandler} onToggleOriginal={tab === "validated" ? onToggleOriginal : undefined} busy={busyId === p.id} avatarSizes={`${cardWidth}px`} />
           ))}
         </div>
       ) : (

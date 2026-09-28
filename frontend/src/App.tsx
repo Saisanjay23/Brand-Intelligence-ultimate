@@ -1,11 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+import { Suspense, lazy, startTransition, useCallback, useEffect, useState } from "react";
 import toast, { Toaster } from "react-hot-toast";
 import type { Client } from "./api/types";
 import type { ViewPage } from "./components/Header";
 import { AppLayout } from "./layouts/AppLayout";
-import { AdminPanel } from "./pages/AdminPanel";
 import { HomeView } from "./pages/HomeView";
-import { LiveResultsView } from "./pages/LiveResultsView";
 import { GlobalSearchModal } from "./components/GlobalSearchModal";
 import { useDiscoveryJobPoll } from "./hooks/useDiscoveryJobPoll";
 import { usePlatformState } from "./hooks/usePlatformState";
@@ -17,8 +15,32 @@ import {
   useClientDirectory,
 } from "./services/clientDirectory";
 
+// LOADED ON DEMAND, NOT UP FRONT. Live Results (the profile grid and the
+// Analysis page) and Admin (sessions, alerts, scheduler, reports) are most
+// of the UI's code, and the app opens on Home. Split out, the first load
+// parses only what Home needs; both are then fetched in the background
+// straight after startup (see the prefetch effect below), so by the time an
+// analyst clicks a tab its code is already here.
+const loadLiveResults = () => import("./pages/LiveResultsView");
+const loadAdmin = () => import("./pages/AdminPanel");
+const LiveResultsView = lazy(() => loadLiveResults().then((m) => ({ default: m.LiveResultsView })));
+const AdminPanel = lazy(() => loadAdmin().then((m) => ({ default: m.AdminPanel })));
+
 export default function App() {
-  const [page, setPage] = useState<ViewPage>("home");
+  const [page, setPageNow] = useState<ViewPage>("home");
+  // A page change is a TRANSITION: if the next page's code is still on its
+  // way, React keeps the current page on screen until it arrives instead of
+  // flashing an empty one -- so switching tabs looks exactly as it did when
+  // everything was in one bundle.
+  const setPage = useCallback((p: ViewPage) => startTransition(() => setPageNow(p)), []);
+
+  useEffect(() => {
+    const t = window.setTimeout(() => {
+      void loadLiveResults();
+      void loadAdmin();
+    }, 300);
+    return () => window.clearTimeout(t);
+  }, []);
   const [theme, setTheme] = useState<"light" | "dark">(
     () => (localStorage.getItem("theme") as "light" | "dark") || "dark"
   );
@@ -208,6 +230,7 @@ export default function App() {
         />
       )}
 
+      <Suspense fallback={null}>
       {page === "results" && (
         <LiveResultsView
           clientId={clientId}
@@ -228,6 +251,7 @@ export default function App() {
       )}
 
       {page === "admin" && <AdminPanel sessions={sessions} platforms={platforms} onChanged={refreshPlatformState} />}
+      </Suspense>
       {globalSearchOpen && (
         <GlobalSearchModal
           clients={allClients}
