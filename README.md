@@ -18,42 +18,50 @@ Built to solve real-world intelligence challenges: platform anti-bot behavioral 
 
 ```mermaid
 flowchart TD
-    classDef input fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#ffffff;
-    classDef discovery fill:#1e3a8a,stroke:#60a5fa,stroke-width:2px,color:#ffffff;
-    classDef platform fill:#0f172a,stroke:#818cf8,stroke-width:1.5px,color:#f8fafc;
-    classDef storage fill:#064e3b,stroke:#34d399,stroke-width:2px,color:#ffffff;
-    classDef triage fill:#581c87,stroke:#c084fc,stroke-width:2px,color:#ffffff;
-    classDef analysis fill:#78350f,stroke:#fbbf24,stroke-width:2px,color:#ffffff;
-    classDef forensic fill:#1e1b4b,stroke:#a78bfa,stroke-width:1.5px,color:#ffffff;
-    classDef score fill:#831843,stroke:#f472b6,stroke-width:2px,color:#ffffff;
-    classDef output fill:#065f46,stroke:#10b981,stroke-width:2px,color:#ffffff;
+    classDef input fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#ffffff
+    classDef discovery fill:#1e3a8a,stroke:#60a5fa,stroke-width:2px,color:#ffffff
+    classDef platform fill:#0f172a,stroke:#818cf8,stroke-width:1.5px,color:#f8fafc
+    classDef storage fill:#064e3b,stroke:#34d399,stroke-width:2px,color:#ffffff
+    classDef triage fill:#581c87,stroke:#c084fc,stroke-width:2px,color:#ffffff
+    classDef forensic fill:#1e1b4b,stroke:#a78bfa,stroke-width:1.5px,color:#ffffff
+    classDef score fill:#831843,stroke:#f472b6,stroke-width:2px,color:#ffffff
+    classDef output fill:#065f46,stroke:#10b981,stroke-width:2px,color:#ffffff
 
-    A[Input: Brand Targets & Permutations]:::input --> B[Phase 1: Concurrent Discovery Engine]:::discovery
+    A["Input: Brand Targets & Permutations"]:::input --> B["Phase 1: Concurrent Discovery Engine"]:::discovery
     
-    B --> B1[Session Mesh Lease & Health Probe]:::discovery
-    B1 --> B2[Multi-Platform Parallel Sweeper]:::discovery
+    B --> B1["Session Mesh Lease & Health Probe"]:::discovery
+    B1 --> B2["Multi-Platform Parallel Sweeper"]:::discovery
     
-    B2 --> C1[Meta / Facebook: Comet GraphQL Interception]:::platform
-    B2 --> C2[X / Twitter: SearchTimeline GraphQL Interception]:::platform
-    B2 --> C3[Instagram: Web Profile API Hydration]:::platform
-    B2 --> C4[TikTok: UserSearch API & Hydration State]:::platform
-    B2 --> C5[YouTube: Data API v3 & DOM Verification]:::platform
-    B2 --> C6[Telegram: Async MTProto Binary RPC]:::platform
+    B2 --> C1["Meta / Facebook: Comet GraphQL Interception"]:::platform
+    B2 --> C2["X / Twitter: SearchTimeline GraphQL Interception"]:::platform
+    B2 --> C3["Instagram: Web Profile API Hydration"]:::platform
+    B2 --> C4["TikTok: UserSearch API & Hydration State"]:::platform
+    B2 --> C5["YouTube: Data API v3 & DOM Verification"]:::platform
+    B2 --> C6["Telegram: Async MTProto Binary RPC"]:::platform
     
-    C1 & C2 & C3 & C4 & C5 & C6 --> D[Deduplication & Pre-Cache Engine]:::storage
-    D --> D1[MongoDB profiles: Deduped by client_id + platform + url]:::storage
-    D1 --> D2[GridFS Mirror: Cached Avatar Snapshots]:::storage
+    C1 --> D["Deduplication & Pre-Cache Engine"]:::storage
+    C2 --> D
+    C3 --> D
+    C4 --> D
+    C5 --> D
+    C6 --> D
     
-    D2 --> E[Phase 2: Analyst Triage Workbench]:::triage
-    E -->|Reject / Noise| E1[Immutable Audit Trail]:::triage
-    E -->|Validate Impersonator| F[Phase 3: Deep Forensic Analysis]:::analysis
+    D --> D1["MongoDB: Deduped by client_id + platform + url"]:::storage
+    D1 --> D2["GridFS Mirror: Cached Avatar Snapshots"]:::storage
     
-    F --> G1[Deep Entity Harvest: Bio, Links, Verification, Age]:::forensic
-    F --> G2[Visual AI Engine: CLIP ViT-B/32 Cosine Similarity]:::forensic
-    F --> G3[Fuzzy Text Match: Levenshtein Distance & Token Ratios]:::forensic
+    D2 --> E["Phase 2: Analyst Triage Workbench"]:::triage
+    E -->|"Reject / Noise"| E1["Immutable Audit Trail"]:::triage
+    E -->|"Validate Impersonator"| F["Phase 3: Deep Forensic Analysis"]:::forensic
     
-    G1 & G2 & G3 --> H[Multi-Variable Threat Rubric: 0-100 Score]:::score
-    H --> Z[Forensic XLSX Export / Webhook & Email Alerts]:::output
+    F --> G1["Deep Entity Harvest: Bio, Links, Verification, Age"]:::forensic
+    F --> G2["Visual AI Engine: CLIP ViT-B/32 Cosine Similarity"]:::forensic
+    F --> G3["Fuzzy Text Match: Levenshtein Distance & Token Ratios"]:::forensic
+    
+    G1 --> H["Multi-Variable Threat Rubric: 0-100 Score"]:::score
+    G2 --> H
+    G3 --> H
+    
+    H --> Z["Forensic XLSX Export / Webhook & Email Alerts"]:::output
 ```
 
 ---
