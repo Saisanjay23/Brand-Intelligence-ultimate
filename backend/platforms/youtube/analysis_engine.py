@@ -19,6 +19,7 @@ import urllib.request
 from typing import Optional
 from urllib.parse import unquote, urlparse
 
+from backend.shared import diagnostics
 from backend.shared.avatars import (YOUTUBE_GENERATED_PREFIX,
                                     hd_picture_url,
                                     is_generated_avatar)
@@ -190,12 +191,7 @@ class Scraper:
         # `known` -- see api/discovery.py::_SEED_FIELDS), and nothing,
         # which leaves this blank and the id URL standing. It never
         # invents one.
-        if kind == "handle" and ref.startswith("@"):
-            row.username = ref[1:]
-        elif seed_handle := str((known or {}).get("username") or "").strip():
-            row.username = seed_handle.lstrip("@")
-        if row.username:
-            row.canonical_url = channel_url("", row.username)
+        self._seed_readable_url(row, kind, ref, known)
 
         if not ref:
             row.status = "ERROR"
@@ -248,6 +244,18 @@ class Scraper:
 
         row.status = "OK" if row.profile_name else "PARTIAL"
         return row
+
+    @staticmethod
+    def _seed_readable_url(row: Row, kind: str, ref: str, known: Optional[dict]) -> None:
+        """The readable @handle URL, from the URL itself or discovery's
+        record, set before any lookup can fail -- see process() for why.
+        Shared by process() and run() so the batch path gets it too."""
+        if kind == "handle" and ref.startswith("@"):
+            row.username = ref[1:]
+        elif seed_handle := str((known or {}).get("username") or "").strip():
+            row.username = seed_handle.lstrip("@")
+        if row.username:
+            row.canonical_url = channel_url("", row.username)
 
     @staticmethod
     def fill(row: Row, ch: dict) -> None:
@@ -404,6 +412,7 @@ class Scraper:
             row = Row(url=normalize_url(u), target=tgt, original_feed=feed)
             row.status = "ERROR"
             row.note(f"{type(e).__name__}: {e}")
+            row.where = diagnostics.where(e)
             return row
 
     @staticmethod
@@ -419,7 +428,10 @@ class Scraper:
             f"active={row.active_yes or '-'} risk={row.risk} {row.priority}"
         )
 
-    async def run(self, jobs: list[tuple[str, str, str]]) -> list[Row]:
+    async def run(
+        self, jobs: list[tuple[str, str, str]],
+        known_by_url: Optional[dict[str, dict]] = None,
+    ) -> list[Row]:
         """WHAT: drives a whole batch of (url, target, feed) jobs. HOW:
         resolves every job's channel reference up front, then fetches every
         id-shaped channel through ONE (or few, chunked-50 -- see
@@ -443,10 +455,27 @@ class Scraper:
         from backend.shared.logging import get_logger as _gl
         log = _gl("platforms.youtube.analysis")
 
-        resolved = [(normalize_url(u), tgt, feed, *channel_ref(normalize_url(u))) for u, tgt, feed in jobs]
+        # `known_by_url` is discovery's record per job URL (the runner's
+        # `seed_by_url`). THE STORED CHANNEL ID IS THE POINT OF IT: the
+        # runner analyses YouTube through this batch method, not process(),
+        # so without it a channel that renamed its @handle after discovery
+        # found it resolved to nothing and was reported GONE -- "may already
+        # be taken down" -- about a channel still up and still impersonating.
+        # process() had that fallback; this path, the one production uses,
+        # did not.
+        known_by_url = known_by_url or {}
+        resolved = [(normalize_url(u), tgt, feed, *channel_ref(normalize_url(u)))
+                    for u, tgt, feed in jobs]
+        knowns = [known_by_url.get(u) or {} for u, _, _ in jobs]
+        seed_ids = [str(k.get("entity_id") or "").strip() for k in knowns]
 
-        id_refs = list(dict.fromkeys(ref for _, _, _, kind, ref in resolved if kind == "id" and ref))
+        # Seed ids ride in the SAME batched channels.list call: one quota
+        # unit per 50 ids either way.
+        id_refs = list(dict.fromkeys(
+            [ref for _, _, _, kind, ref in resolved if kind == "id" and ref]
+            + [sid for sid in seed_ids if sid.startswith("UC")]))
         by_id: dict[str, dict] = {}
+        batch_failed = False
         if id_refs:
             try:
                 by_id = {c.get("id"): c for c in await self.api.channels(id_refs) if c.get("id")}
@@ -457,10 +486,32 @@ class Scraper:
                         status="CHECKPOINT", notes=str(e))
                     for url, tgt, feed, _, _ in resolved
                 ]
+            except Exception as e:
+                # Anything else (a network blip, a 5xx) costs the batch
+                # shortcut, not the batch: each channel below is then looked
+                # up on its own and fails, if it fails, as its own row.
+                log.warning(
+                    f"batch channel lookup failed ({type(e).__name__}: {e}) -- "
+                    f"resolving {len(id_refs)} channel(s) one at a time")
+                by_id = {}
+                batch_failed = True
+
+        async def by_channel_id(cid: str) -> Optional[dict]:
+            """From the batch, or -- only when the batch call failed -- on
+            its own. Never a silent None for a channel nobody asked about:
+            that is what would turn a network blip into a GONE row."""
+            if cid in by_id or not batch_failed:
+                return by_id.get(cid)
+            found = await self.api.channels([cid])
+            if found:
+                by_id[cid] = found[0]
+            return found[0] if found else None
 
         rows: list[Row] = []
         for i, (url, tgt, feed, kind, ref) in enumerate(resolved, 1):
             row = Row(url=url, target=tgt, original_feed=feed, entity_type="channel")
+            self._seed_readable_url(row, kind, ref, knowns[i - 1])
+            seed_id = seed_ids[i - 1]
             if not ref:
                 row.status = "ERROR"
                 row.note("could not read a channel reference from the URL")
@@ -468,7 +519,9 @@ class Scraper:
                 self.report(i, len(resolved), url, row)
                 continue
             try:
-                ch = by_id.get(ref) if kind == "id" else None
+                ch = await by_channel_id(ref) if kind == "id" else None
+                if ch is None and seed_id.startswith("UC") and seed_id != ref:
+                    ch = await by_channel_id(seed_id)
                 if ch is None:
                     ch = await self.api.channel_by_handle(ref)
                 if ch is None:
@@ -496,6 +549,7 @@ class Scraper:
             except Exception as e:
                 row.status = "ERROR"
                 row.note(f"{type(e).__name__}: {e}")
+                row.where = diagnostics.where(e)
             rows.append(row)
             self.report(i, len(resolved), url, row)
         return rows

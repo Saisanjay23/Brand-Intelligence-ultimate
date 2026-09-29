@@ -27,8 +27,10 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterator, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
+from backend.platforms.scan_options import cancelled
+from backend.shared import diagnostics
 from backend.shared.tasks import spawn
 from backend.shared.extraction import run_strategies
 from backend.shared.schema_probe import SchemaProbe, probe_or_null
@@ -771,6 +773,39 @@ async def _x_says_no_results(page) -> bool:
         return False
 
 
+async def _x_session_blocked(page, *, have_results: bool) -> str:
+    """"checkpoint" / "login" when the search page is a wall instead of
+    results, "" otherwise -- the X counterpart of facebook/
+    discovery_engine.py::_session_blocked.
+
+    Without it a logged-out session scrolled an empty page to `stalled`
+    on every keyword: broken, but not SESSION-shaped, so classify_failure
+    never quarantined the account and nothing was handed to another one.
+    The stop codes returned here are the ones classify_failure already
+    reads ("login" -> expired, "checkpoint" -> checkpointed).
+
+    The login text is only trusted on a page with no results: it is the
+    logged-out sidebar's wording, and a bio in a real result could quote
+    it. The URL is unambiguous either way."""
+    try:
+        path = urlparse(page.url or "").path
+    except Exception:
+        path = ""
+    if "/account/access" in path:
+        return "checkpoint"
+    if "/login" in path or path.startswith("/i/flow/"):
+        return "login"
+    try:
+        body = await page.inner_text("body")
+    except Exception:
+        return ""
+    if RE_CHECKPOINT.search(body):
+        return "checkpoint"
+    if not have_results and RE_LOGIN.search(body):
+        return "login"
+    return ""
+
+
 @dataclass
 class Sweep:
     """One keyword's search sweep, and how it ended. LINKED TO: built and
@@ -788,6 +823,9 @@ class Sweep:
     complete: bool = False
     seconds: float = 0.0
     error: str = ""
+    # Where in OUR code the sweep failed, when it raised -- see
+    # shared/diagnostics.py::where. Blank for a sweep that ended itself.
+    where: str = ""
     # which extraction method actually produced `users`, "graphql" normally,
     # "dom" when the network payload yielded nothing and the rendered feed
     # had to stand in. Carried onto each Row so a card can say where it came
@@ -994,8 +1032,29 @@ class Discovery:
             # whole sweep.
             await _emit()
 
+            # NOTHING ARRIVED: SAY WHY BEFORE SCROLLING. An empty search whose
+            # timeline carried no cursor never reached the cursor-repeat
+            # check below, so X's own "No results for" went unread and the
+            # keyword scrolled to `stalled` -- broken, retried, broken again,
+            # for a search that had simply matched nobody. A logged-out or
+            # checkpointed session is named here too, so the runner hands
+            # the keyword to another account instead of running every later
+            # keyword into the same wall.
+            if not by_id and not rate_limited:
+                if blocked := await _x_session_blocked(page, have_results=False):
+                    out.stopped = blocked
+                    out.error = f"x search page shows a {blocked} wall"
+                elif await _x_says_no_results(page):
+                    out.stopped, out.complete = "no-results", True
+
             stalls, last_cursor = 0, ""
-            while True:
+            while not out.stopped:
+                # Every scroll, so Stop lands within one page rather than
+                # after this sweep runs out its whole max_seconds budget;
+                # what was already found is still returned below.
+                if cancelled(self.a):
+                    out.stopped = "cancelled"
+                    break
                 if rate_limited:
                     out.stopped = "rate_limited"
                     break
@@ -1064,12 +1123,19 @@ class Discovery:
                     stalls += 1
                     # Check page body for soft-block or rate-limit notice on repeated stall
                     if stalls >= 2:
+                        if blocked := await _x_session_blocked(page, have_results=bool(by_id)):
+                            out.stopped = blocked
+                            out.error = f"x search page shows a {blocked} wall"
+                            break
+                        # The empty-results panel can render after the
+                        # pre-loop check above ran; still gated on having
+                        # found nobody, so it can never end a real sweep.
+                        if not by_id and await _x_says_no_results(page):
+                            out.stopped, out.complete = "no-results", True
+                            break
                         try:
-                            body_text = await page.inner_text("body")
-                            if RE_CHECKPOINT.search(body_text):
-                                out.stopped = "checkpoint"
-                                break
-                            if "rate limit" in body_text.lower() or "something went wrong" in body_text.lower():
+                            body_text = (await page.inner_text("body")).lower()
+                            if "rate limit" in body_text or "something went wrong" in body_text:
                                 out.stopped = "rate_limited"
                                 break
                         except Exception:
@@ -1129,6 +1195,7 @@ class Discovery:
                 out.hits = out.hits[: self.a.max_results]
         except Exception as e:
             out.stopped, out.error = "error", f"{type(e).__name__}: {e}"
+            out.where = diagnostics.where(e)
         finally:
             try:
                 await page.close()

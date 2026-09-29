@@ -35,6 +35,9 @@ class AlertSettingsIn(BaseModel):
     alert_on_session_dead: bool = True
     alert_on_session_expiring: bool = True
     alert_on_critical_incident: bool = True
+    alert_on_discovery_failure: bool = True
+    alert_on_analysis_failure: bool = True
+    alert_on_scheduler_issue: bool = True
     session_expiry_warning_hours: int = 24
     report_on_sweep_complete: bool = False
     report_emails: list[str] = Field(default_factory=list)

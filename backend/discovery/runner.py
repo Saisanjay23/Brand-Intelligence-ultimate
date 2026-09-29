@@ -44,6 +44,7 @@ from backend.platforms import registry
 from backend.services import avatar_cache
 from backend.platforms.scan_options import DiscoveryOptions
 from backend.sessions import manager as sessions_engine
+from backend.shared import diagnostics
 from backend.shared import keywords as kw_groups
 from backend.shared import logo_verdict
 from backend.shared import resilience
@@ -51,6 +52,7 @@ from backend.shared.job_store import JobStore
 from backend.shared.logging import get_logger
 from backend.shared.models.row import Row
 from backend.shared.resilience import classify_failure
+from backend.shared.tasks import spawn
 from backend.shared.text import (contiguous_letters_match, handle_from_url,
                                  name_score)
 
@@ -413,6 +415,29 @@ class _PlatformSweepRun:
                 self.sweep_errors.append(detail)
         return outcome
 
+    def unrecord_stop(self, stopped: str, complete: bool, error: str = "") -> None:
+        """Roll back one recorded stop when its sweep is re-queued for a retry.
+
+        Without this, a tab that failed once and then succeeded on its retry still
+        leaves its failure in broken, stop_counts, and sweep_errors -- so the platform
+        note continues to report the retried error even though the retry succeeded.
+        """
+        outcome = resilience.sweep_outcome(stopped, complete)
+        if outcome == resilience.SATISFIED:
+            return
+        if outcome == resilience.TRUNCATED:
+            self.truncated = max(0, self.truncated - 1)
+        else:
+            self.broken = max(0, self.broken - 1)
+        key = (stopped or "").strip().lower()
+        if self.stop_counts[key] > 0:
+            self.stop_counts[key] -= 1
+            if self.stop_counts[key] == 0:
+                del self.stop_counts[key]
+        if detail := " ".join(str(error or "").split())[:160]:
+            if detail in self.sweep_errors:
+                self.sweep_errors.remove(detail)
+
     def note(self) -> str:
         """The line an analyst reads under a `partial` platform.
 
@@ -646,6 +671,12 @@ class CompletedSweep:
     # part of a sweep and the most detectable, so it is the number to watch.
     resolved_visits: int = 0
     resolve_seconds: float = 0.0
+    # WHAT WENT WRONG AND WHERE, for a sweep that did not go cleanly: the
+    # engine's own error text, and the file:line in our code it raised at
+    # (shared/diagnostics.py::where). Read by the failure alert, which is
+    # otherwise left to guess from a stop code.
+    error: str = ""
+    where: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -664,6 +695,8 @@ class CompletedSweep:
             "schema": self.schema,
             "resolved_visits": self.resolved_visits,
             "resolve_seconds": self.resolve_seconds,
+            "error": self.error,
+            "where": self.where,
         }
 
 
@@ -826,6 +859,10 @@ class DiscoveryJob:
     # cost, which is the difference between gap-closing being something an
     # analyst does and something they mean to do.
     only_owed: bool = False
+    # Email a failure report when this job ends with broken sweeps. Off for
+    # the Scheduler's jobs, which are reported together in ONE email per
+    # run (services/failure_alerts.py) rather than one per client.
+    notify_failures: bool = True
     created_at: float = field(default_factory=time.time)
     status: str = QUEUED
     message: str = ""
@@ -1032,6 +1069,7 @@ class DiscoveryRunner:
         facebook_tabs: Optional[list[str]] = None,
         only_owed: bool = False,
         new_window_since: Optional[float] = None,
+        notify_failures: bool = True,
     ) -> tuple[DiscoveryJob, dict[str, str]]:
         # Deduped WITHIN each type, independently -- these are two
         # separately-curated lists (executive/person names vs brand/domain
@@ -1053,6 +1091,7 @@ class DiscoveryRunner:
             tabs={pid: tabs_for(pid, facebook_tabs) for pid in ready},
             only_owed=only_owed,
             new_window_ts=new_window_since,
+            notify_failures=notify_failures,
         )
         for pid in ready:
             tabs = job.tabs[pid]
@@ -1082,6 +1121,9 @@ class DiscoveryRunner:
         elif not ready:
             job.status = DONE
             job.message = "no platform has a usable session to sweep"
+            # The worst failure of all -- nothing searched anywhere -- ends
+            # here without ever reaching `_run`, so its alert is sent here.
+            self._alert_failures(job)
         else:
             job.task = asyncio.create_task(
                 self._run(
@@ -1202,6 +1244,25 @@ class DiscoveryRunner:
                 # and it is the slowest thing in this block -- which is the
                 # last place to spend time when the whole point was to stop.
                 await self._maybe_report(job)
+                # WHAT BROKE, WHERE, AND HOW TO FIX IT -- mailed when this
+                # job had failures. Spawned: an SMTP server that hangs must
+                # not hold the job open. Never on a cancelled job (the
+                # analyst chose the stop) and never for the Scheduler's jobs,
+                # which it reports together once per run.
+                self._alert_failures(job)
+
+    @staticmethod
+    def _alert_failures(job: DiscoveryJob) -> None:
+        """Spawn this job's failure report (services/failure_alerts.py),
+        unless the Scheduler owns the reporting for it."""
+        if not job.notify_failures:
+            return
+        try:
+            from backend.services import failure_alerts
+            spawn(failure_alerts.notify_discovery(job))
+        except Exception as e:                                  # noqa: BLE001
+            log.error(f"discovery job {job.id}: failure alert not sent -- "
+                      f"{type(e).__name__}: {e}")
 
     async def _maybe_report(self, job: DiscoveryJob) -> None:
         """Email this client's sweep report, if an operator asked for it.
@@ -1894,6 +1955,8 @@ class DiscoveryRunner:
                                 complete=False,
                                 stopped="error",
                                 outcome=resilience.BROKEN,
+                                error=f"{type(e).__name__}: {e}",
+                                where=diagnostics.where(e),
                             ))
                             if session is not None and hasattr(session, "sync_cookies"):
                                 await session.sync_cookies()
@@ -2062,6 +2125,8 @@ class DiscoveryRunner:
                             schema=dict(getattr(sweep, "schema", None) or {}),
                             resolved_visits=int(getattr(sweep, "resolved_visits", 0) or 0),
                             resolve_seconds=float(getattr(sweep, "resolve_seconds", 0.0) or 0.0),
+                            error=str(getattr(sweep, "error", "") or ""),
+                            where=str(getattr(sweep, "where", "") or ""),
                         ))
                         if session is not None and hasattr(session, "sync_cookies"):
                             await session.sync_cookies()
@@ -2119,6 +2184,9 @@ class DiscoveryRunner:
                                 # a day. It gets one more attempt in this run;
                                 # see the retry after the tab loop.
                                 stats.setdefault("retry_tabs", []).append(tab)
+                                stats.setdefault("retry_stops", []).append(
+                                    (tab, sweep_stopped, sweep_complete, str(getattr(sweep, "error", "") or ""))
+                                )
                         return stop_reason
 
                     while run.queue and not job.cancel.is_set() and not run.hard_stop:
@@ -2137,6 +2205,12 @@ class DiscoveryRunner:
                         # that makes an unaccounted-for tab impossible
                         # rather than merely unlikely.
                         resolved: set[str] = set()
+                        # Tabs whose sweep RAISED out of `_sweep_tab` itself
+                        # (the engine's own errors are caught inside it, so
+                        # this is our side: a save or ledger write failing),
+                        # with the error text. See the retry below.
+                        crashed: dict[str, str] = {}
+                        crashed_where: dict[str, str] = {}
 
                         # CONCURRENT ONLY WHEN IT IS SAFE AND WORTH IT: more than
                         # one tab, a factory to give each its own cap, and the
@@ -2173,8 +2247,13 @@ class DiscoveryRunner:
                                 *(_slot(i, t) for i, t in enumerate(item_tabs)),
                                 return_exceptions=True,
                             )
-                            for r in reasons:
+                            for t, r in zip(item_tabs, reasons):
                                 if isinstance(r, BaseException):
+                                    if isinstance(r, Exception):
+                                        # Not a cancellation: that is the
+                                        # stop path's business, not an error.
+                                        crashed[t] = f"{type(r).__name__}: {r}"
+                                        crashed_where[t] = diagnostics.where(r)
                                     # NOT THE END OF IT. A tab that crashed
                                     # here produced no sweep record and no
                                     # ledger write, so it used to vanish
@@ -2191,18 +2270,40 @@ class DiscoveryRunner:
                             for tab in item_tabs:
                                 if job.cancel.is_set() or run.hard_stop:
                                     break
-                                reason = await _sweep_tab(
-                                    item.keyword, item.kw_type, item.parent,
-                                    item.targets, tab,
-                                    stats, fatal_kind, resolved)
+                                # CAUGHT PER TAB, like the concurrent path's
+                                # `return_exceptions=True`. Uncaught, an error
+                                # here (a database write failing after the
+                                # search itself worked) left this worker --
+                                # and with it this keyword, already popped
+                                # off the queue -- so the keyword was neither
+                                # retried nor recorded as missed.
+                                try:
+                                    reason = await _sweep_tab(
+                                        item.keyword, item.kw_type, item.parent,
+                                        item.targets, tab,
+                                        stats, fatal_kind, resolved)
+                                except Exception as e:
+                                    crashed[tab] = f"{type(e).__name__}: {e}"
+                                    crashed_where[tab] = diagnostics.where(e)
+                                    log.error(
+                                        f"[{platform_id}] {item.keyword!r}/{tab}: tab sweep "
+                                        f"crashed: {crashed[tab]}")
+                                    continue
                                 if reason or fatal_kind[0]:
                                     break
 
                         retry_tabs = [t for t in (stats.get("retry_tabs") or [])
                                       if t in resolved]
-                        if (retry_tabs and not fatal_kind[0]
+                        crashed_tabs = [t for t in crashed if t not in resolved]
+                        if ((retry_tabs or crashed_tabs) and not fatal_kind[0]
                                 and item.attempts < _MAX_KEYWORD_ATTEMPTS
                                 and not job.cancel.is_set() and not run.hard_stop):
+                            # Roll back the recorded failures for tabs that are being retried,
+                            # so a successful retry won't leave the platform marked with
+                            # stale errors from the first attempt.
+                            for r_tab, r_stopped, r_complete, r_err in (stats.get("retry_stops") or []):
+                                if r_tab in retry_tabs:
+                                    run.unrecord_stop(r_stopped, r_complete, r_err)
                             # ONE SAME-RUN RETRY for a tab that broke with
                             # zero results (see `_sweep_tab`). Its progress
                             # unit is handed back so the retry's own unit does
@@ -2211,6 +2312,17 @@ class DiscoveryRunner:
                             # is also the backoff. On a queue with nothing
                             # else in it, a short explicit pause stands in.
                             prog.keywords_done = max(0, prog.keywords_done - len(retry_tabs))
+                            # A crashed tab may have streamed and counted
+                            # rows before it fell over; the retry will count
+                            # them again, so this attempt's share goes back.
+                            by_tab = stats.get("by_tab") or {}
+                            for t in crashed_tabs:
+                                per = by_tab.pop(t, None) or {}
+                                prog.keywords_done = max(0, prog.keywords_done - per.get("units", 0))
+                                prog.found = max(0, prog.found - per.get("found", 0))
+                                job.found = max(0, job.found - per.get("found", 0))
+                                prog.new = max(0, prog.new - per.get("new", 0))
+                                job.new = max(0, job.new - per.get("new", 0))
                             # Any tab that never reached a verdict at all (a
                             # crash in the gather) rides along rather than
                             # being written off as missed.
@@ -2219,7 +2331,8 @@ class DiscoveryRunner:
                             run.queue.append(item)
                             log.info(
                                 f"[{platform_id}] {item.keyword!r} broke with no results on "
-                                f"{', '.join(retry_tabs)} -- retrying once later in this run")
+                                f"{', '.join(retry_tabs + crashed_tabs)} -- retrying once "
+                                f"later in this run")
                             if len(run.queue) == 1:
                                 try:
                                     await asyncio.wait_for(job.cancel.wait(), timeout=_RETRY_BACKOFF_S)
@@ -2249,6 +2362,24 @@ class DiscoveryRunner:
                         # about to end the platform. Whatever never reached
                         # a verdict is recorded as owed, by name, and
                         # outlives the job that failed to do it.
+                        # A crash is BROKEN, and says so. It used to leave
+                        # no stop behind, so a platform whose tab crashed
+                        # could still finish `done`.
+                        for t in crashed_tabs:
+                            run.record_stop("error", False, crashed[t])
+                            job.history.append(CompletedSweep(
+                                platform=platform_id, display_name=prog.display_name,
+                                keyword=item.keyword, tab=t, duration_seconds=0.0,
+                                hits_found=0, hits_new=0,
+                                timestamp=datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                                complete=False, stopped="error",
+                                outcome=resilience.BROKEN,
+                                error=crashed[t], where=crashed_where.get(t, ""),
+                            ))
+                            await coverage_db.miss(
+                                job.group_id, job.id, platform_id, [t], [item],
+                                f"sweep crashed: {crashed[t]}")
+                            resolved.add(t)
                         if unresolved := [t for t in item_tabs if t not in resolved]:
                             await coverage_db.miss(
                                 job.group_id, job.id, platform_id, unresolved,

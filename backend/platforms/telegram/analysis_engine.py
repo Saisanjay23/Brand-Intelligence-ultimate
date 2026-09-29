@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 
 from typing import Optional
 
+from backend.shared import diagnostics
 from backend.shared.avatars import hd_picture_url
 from backend.shared.models.row import Row
 from backend.shared.text import (name_score, normalized_host,
@@ -237,6 +238,7 @@ class Scraper:
             row.profile_id = username_of(row.url)
             row.status = "ERROR"
             row.note(f"{type(e).__name__}: {e}")
+            row.where = diagnostics.where(e)
             return row
 
     @staticmethod

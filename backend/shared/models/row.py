@@ -76,6 +76,10 @@ class Row:
     verified: Optional[bool] = None
     screenshot: str = ""
     screenshot_bytes: Optional[bytes] = None
+    # Where in OUR code this row's visit failed, when it raised (see
+    # shared/diagnostics.py::where). Diagnostic only -- never stored as a field
+    # of the profile, read by the failure alert.
+    where: str = ""
     notes: str = ""
     name_score: int = 0
     src: dict[str, str] = field(default_factory=dict)  # field -> where it came from

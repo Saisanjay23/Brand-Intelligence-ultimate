@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 from typing import Any, Iterator, Optional
 from urllib.parse import quote
 
+from backend.platforms.scan_options import cancelled
+from backend.shared import diagnostics
 from backend.shared.avatars import extract_instagram_hd_avatar, looks_like_placeholder
 from backend.shared.extraction import run_strategies
 from backend.shared.schema_probe import SchemaProbe, probe_or_null
@@ -865,6 +867,9 @@ class Sweep:
     complete: bool = False
     seconds: float = 0.0
     error: str = ""
+    # Where in OUR code the sweep failed, when it raised -- see
+    # shared/diagnostics.py::where. Blank for a sweep that ended itself.
+    where: str = ""
     # "api" normally; "web-api" when the private mobile endpoint refused us
     # or stopped being parseable and the web client's endpoint stood in
     source: str = "api"
@@ -1014,6 +1019,9 @@ class Discovery:
         try:
             max_pages = int(getattr(self.a, "max_pages", 0) or 0) or DEFAULT_MAX_PAGES
             for _ in range(max_pages):
+                if cancelled(self.a):
+                    out.stopped = "cancelled"
+                    break
                 url = MOBILE_SEARCH_API.format(q=quote(keyword), count=100)
                 if page_token:
                     url += f"&page_token={page_token}"
@@ -1146,6 +1154,7 @@ class Discovery:
                 out.hits = out.hits[: self.a.max_results]
         except Exception as e:
             out.stopped, out.error = "error", f"{type(e).__name__}: {e}"
+            out.where = diagnostics.where(e)
         finally:
             out.seconds = time.time() - started
             # In `finally` so a sweep that raised mid-parse still reports

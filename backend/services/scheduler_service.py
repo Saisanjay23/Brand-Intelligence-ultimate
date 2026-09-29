@@ -57,6 +57,7 @@ from backend.discovery.runner import discovery_runner
 from backend.services import schedule_math
 from backend.services.schedule_math import Schedule
 from backend.shared.logging import get_logger
+from backend.shared.tasks import spawn
 
 log = get_logger("services.scheduler")
 
@@ -215,6 +216,10 @@ class SchedulerEngine:
         #
         # Set and read with no await in between, so there is no window.
         self._claimed = False
+        # Each client's discovery failures in the run in flight, keyed by
+        # client id -- mailed together once the run ends (see
+        # services/failure_alerts.py::notify_scheduler_run).
+        self._findings: dict[str, list[dict]] = {}
 
     # ------------------------------------------------------------ lifecycle
 
@@ -324,6 +329,22 @@ class SchedulerEngine:
             log.warning(f"scheduler: missed run -- {reason}")
             await schedule_db.record_missed(
                 due_at=due_at, late_seconds=lateness.total_seconds(), reason=reason)
+            self._alert_missed(due_at, reason)
+            return
+
+        if self.busy:
+            # DUE WHILE A RUN IS ALREADY GOING (a manual press that is still
+            # sweeping). `fire` would decline it -- correctly, the run in
+            # progress is sweeping this same queue -- but that decline used
+            # to be one INFO line, so the scheduled run simply did not exist
+            # anywhere an analyst could see. Recorded like any other run that
+            # did not happen, with the reason.
+            reason = ("a run was already in progress when this one fell due, so it "
+                      "was not started a second time -- the run in progress is "
+                      "sweeping the same queue")
+            log.warning(f"scheduler: scheduled run not started -- {reason}")
+            await schedule_db.record_missed(
+                due_at=due_at, late_seconds=lateness.total_seconds(), reason=reason)
             return
 
         trigger = "catch_up" if lateness > timedelta(seconds=90) else "scheduled"
@@ -340,6 +361,14 @@ class SchedulerEngine:
         down. Same rules as a tick -- this exists only so the decision is
         made immediately at startup rather than up to `_TICK_S` later."""
         await self._tick()
+
+    @staticmethod
+    def _alert_missed(due_at: Optional[datetime], reason: str) -> None:
+        try:
+            from backend.services import failure_alerts
+            spawn(failure_alerts.notify_scheduler_missed(due_at=due_at, reason=reason))
+        except Exception as e:                              # noqa: BLE001
+            log.error(f"scheduler: missed-run alert not sent: {type(e).__name__}: {e}")
 
     # --------------------------------------------------------------- firing
 
@@ -432,6 +461,7 @@ class SchedulerEngine:
             # run -- first pass and gap-closing pass alike.
             self._run = {"_id": run_id, "entries": entries, "current_id": "",
                          "stopping": False, "trigger": trigger, "started_ts": started}
+            self._findings = {}
             # Seeded so that every exit below -- including one this code
             # never anticipated -- closes the run out as SOMETHING. A run
             # left at `running` with no process behind it is the one state
@@ -489,6 +519,17 @@ class SchedulerEngine:
                 except Exception as e:                      # noqa: BLE001
                     log.error(f"scheduler: could not close out run {run_id}: "
                               f"{type(e).__name__}: {e}")
+                # ONE EMAIL FOR THE WHOLE RUN, when anything in it needs a
+                # human (failure_alerts decides). Spawned: an SMTP server that
+                # hangs must not keep the Scheduler claimed.
+                try:
+                    from backend.services import failure_alerts
+                    spawn(failure_alerts.notify_scheduler_run(
+                        run_id=run_id, trigger=trigger, status=status, message=message,
+                        entries=[dict(e) for e in entries],
+                        findings_by_client=dict(self._findings)))
+                except Exception as e:                      # noqa: BLE001
+                    log.error(f"scheduler: run alert not sent: {type(e).__name__}: {e}")
                 self._run = None
                 self._stopping = False
                 self._current_job_id = ""
@@ -605,6 +646,9 @@ class SchedulerEngine:
                 max_seconds=budget_minutes * 60 if budget_minutes > 0 else None,
                 only_owed=only_owed,
                 new_window_since=(self._run or {}).get("started_ts"),
+                # Reported ONCE for the whole run, not per client -- see
+                # `_run_queue`'s close-out.
+                notify_failures=False,
             )
         except Exception as e:                              # noqa: BLE001
             await self._settle(entry, "failed", f"could not start: {type(e).__name__}: {e}")
@@ -669,11 +713,9 @@ class SchedulerEngine:
                     status = "stopped" if self._stopping else "cancelled"
                 else:
                     status = "failed"
-                entry["found"] = job.found
-                entry["new_profiles"] = job.new
-                entry["platforms"] = self._platform_outcomes(job)
-                entry["platform_details"] = self._platform_details(job)
+                self._mirror(entry, job)
                 entry["owed"] = owed
+                self._collect_findings(entry, job)
                 await self._settle(entry, status, job.message or job.status)
                 return
 
@@ -681,9 +723,9 @@ class SchedulerEngine:
                 # See `_CLIENT_CEILING_S`. Cut it loose so the rest of the
                 # queue still gets swept tonight, and say exactly why.
                 await self._cancel_now(job.id)
-                entry["platforms"] = self._platform_outcomes(job)
-                entry["platform_details"] = self._platform_details(job)
+                self._mirror(entry, job)
                 entry["owed"] = await self._owed_for(entry["client_id"])
+                self._collect_findings(entry, job)
                 await self._settle(
                     entry, "failed",
                     f"gave up after {_CLIENT_CEILING_S / 3600:.0f}h -- this sweep was "
@@ -691,10 +733,7 @@ class SchedulerEngine:
                     f"Anything it found before now was saved.")
                 return
 
-            entry["found"] = job.found
-            entry["new_profiles"] = job.new
-            entry["platforms"] = self._platform_outcomes(job)
-            entry["platform_details"] = self._platform_details(job)
+            self._mirror(entry, job)
             entry["message"] = job.message or f"{job.completed}/{job.total} sweeps"
             await self._flush()
 
@@ -732,16 +771,86 @@ class SchedulerEngine:
         for entry in owing:
             if self._stopping:
                 break
+            # THE FIRST PASS IS KEPT, NOT REPLACED. The lap only re-searches
+            # the few owed cells, so its job's counts and per-platform
+            # results describe those few searches -- written over the entry,
+            # a client that found 150 profiles showed 2, and one whose lap
+            # found no free session showed "skipped" about a client that had
+            # in fact been swept. `lap_base` is what `_mirror` adds the lap
+            # to; `_finish_lap` settles the status.
+            before = {k: entry.get(k) for k in (
+                "status", "message", "found", "new_profiles", "platforms",
+                "platform_details", "swept", "job_id")}
+            entry["lap_base"] = {k: before[k] for k in (
+                "found", "new_profiles", "platforms", "platform_details")}
+            entry["swept"] = False
             entry["status"] = "pending"
             entry["job_id"] = ""
-            entry["message"] = f"closing {entry['owed']} missed search(es)…"
+            entry["message"] = f"closing {entry['owed']} missed search(es)..."
             await self._flush()
-            await self._run_entry(entry, only_owed=True)
+            try:
+                await self._run_entry(entry, only_owed=True)
+            finally:
+                lap_swept = self._finish_lap(entry, before)
             await self._set_current("")
             if self._stopping:
                 break
-            if entry is not owing[-1] and _swept(entry):
+            if entry is not owing[-1] and lap_swept:
                 await self._sleep_interruptible(_CLIENT_GAP_S)
+
+    @staticmethod
+    def _finish_lap(entry: dict, before: dict) -> bool:
+        """Fold a gap-closing lap's outcome into the first pass's entry.
+        -> whether the lap itself swept anything."""
+        entry.pop("lap_base", None)
+        lap_swept = bool(entry.get("swept"))
+        entry["swept"] = bool(before.get("swept")) or lap_swept
+        lap_msg = entry.get("message") or entry.get("status") or ""
+        if not lap_swept:
+            # The lap never reached a platform (no free session, could not
+            # start): nothing it says changes what the first pass did.
+            for k in ("status", "found", "new_profiles", "platforms",
+                      "platform_details", "job_id"):
+                entry[k] = before.get(k)
+        first = before.get("message") or ""
+        entry["message"] = f"{first} -- gap-closing lap: {lap_msg}" if first else f"gap-closing lap: {lap_msg}"
+        return lap_swept
+
+    def _mirror(self, entry: dict, job: Any) -> None:
+        """Copy a job's counts and per-platform results onto its entry --
+        ADDED to the first pass when this is a gap-closing lap (see
+        `_close_gaps`)."""
+        base = entry.get("lap_base") or {}
+        entry["found"] = int(base.get("found") or 0) + job.found
+        entry["new_profiles"] = int(base.get("new_profiles") or 0) + job.new
+        platforms = dict(base.get("platforms") or {})
+        details = {k: dict(v) for k, v in (base.get("platform_details") or {}).items()}
+        outcomes = self._platform_outcomes(job)
+        for pid, st in outcomes.items():
+            if st != "skipped" or pid not in platforms:
+                platforms[pid] = st
+        for pid, d in self._platform_details(job).items():
+            prev = details.get(pid) or {}
+            ran = outcomes.get(pid) != "skipped"
+            details[pid] = {
+                "found": int(prev.get("found") or 0) + d["found"],
+                "new": int(prev.get("new") or 0) + d["new"],
+                "note": d["note"] if ran else (prev.get("note") or d["note"]),
+            }
+        entry["platforms"] = platforms
+        entry["platform_details"] = details
+
+    def _collect_findings(self, entry: dict, job: Any) -> None:
+        """This client's discovery failures, for the run's one email. A gap
+        lap REPLACES the first pass's findings: whatever it closed is no
+        longer a problem, and whatever it could not close it reports
+        itself."""
+        try:
+            from backend.services import failure_alerts
+            self._findings[entry["client_id"]] = failure_alerts.discovery_findings(job)
+        except Exception as e:                              # noqa: BLE001
+            log.warning(f"scheduler: could not collect findings for "
+                        f"{entry.get('client_id')}: {type(e).__name__}: {e}")
 
     # ------------------------------------------------------------- plumbing
 

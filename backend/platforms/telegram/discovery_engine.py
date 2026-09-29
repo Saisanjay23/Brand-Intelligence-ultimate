@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from backend.shared import diagnostics
 from backend.shared.avatars import hd_picture_url
 from backend.shared.logging import get_logger
 from backend.shared.models.row import Row
@@ -274,6 +275,9 @@ class Telegram:
 
         self.session_file = str(settings.session_blob_path / "telegram")
         self.client: Any = None
+        # Profile-photo downloads are skipped until this time.time(): set
+        # when Telegram answers one with a FloodWait. See search().
+        self._photos_paused_until = 0.0
 
     async def start(self) -> None:
         """WHAT: connects the MTProto client against the saved session
@@ -353,35 +357,52 @@ class Telegram:
             raise FloodWait(int(getattr(e, "seconds", 0))) from e
 
     async def search(self, keyword: str, limit: int = 50,
-                     probe: Any = None) -> list[TelegramEntity]:
+                     probe: Any = None, max_results: int = 0) -> list[TelegramEntity]:
         """Global search. Telegram returns one capped page, there is no cursor.
 
         `probe` tallies which identity attributes Telethon's result objects
         still carry -- owned by the sweep above, so one sweep is one tally.
+
+        `max_results` (0 = all) trims to the entities the sweep will
+        actually return BEFORE any photo is downloaded. Every result used
+        to have its photo fetched first and the cap applied after, so a
+        sweep capped at 5 could still make ~100 download calls -- slow, and
+        the likeliest thing in this file to trigger a FloodWait.
+
+        A FloodWait ON A PHOTO no longer throws the search away. The search
+        itself was answered; raising here discarded its results and stopped
+        the whole platform over a cosmetic field. Instead photos are paused
+        for exactly as long as Telegram asked -- so later keywords do not
+        dig the account deeper into the limit (the reason this used to
+        raise) -- and the results are returned without pictures.
         """
         res = await self._call(SearchRequest(q=keyword, limit=limit))
-        out: list[TelegramEntity] = []
+        found: list[tuple[Any, TelegramEntity]] = []
         for obj in list(getattr(res, "users", [])) + list(getattr(res, "chats", [])):
             if ent := entity_from(obj, probe):
-                if ent.has_photo:
-                    try:
-                        photo_bytes = await self.client.download_profile_photo(obj, file=bytes)
-                        if photo_bytes:
-                            ent.avatar = f"data:image/jpeg;base64,{base64.b64encode(photo_bytes).decode('utf-8')}"
-                    except FloodWaitError as e:
-                        # NOT the generic except below -- every other RPC in
-                        # this file converts this to the module's own
-                        # FloodWait and lets it propagate so the run stops;
-                        # swallowing it here at debug level let a flood
-                        # triggered by a photo download go completely
-                        # unnoticed, and every remaining photo download in
-                        # this same search() call (and every resolve() call
-                        # after it) would re-hit the same limit with no
-                        # backoff, silently.
-                        raise FloodWait(int(getattr(e, "seconds", 0))) from e
-                    except Exception as e:
-                        log.debug(f"could not download photo for {ent.username or ent.entity_id}: {e}")
-                out.append(ent)
+                found.append((obj, ent))
+        if max_results:
+            # The sweep keeps only entities with a URL, so that is what the
+            # cap counts.
+            found = [(o, e) for o, e in found if e.url][:max_results]
+
+        out: list[TelegramEntity] = []
+        for obj, ent in found:
+            if ent.has_photo and time.time() >= self._photos_paused_until:
+                try:
+                    photo_bytes = await self.client.download_profile_photo(obj, file=bytes)
+                    if photo_bytes:
+                        ent.avatar = f"data:image/jpeg;base64,{base64.b64encode(photo_bytes).decode('utf-8')}"
+                except FloodWaitError as e:
+                    wait_s = int(getattr(e, "seconds", 0) or 0)
+                    self._photos_paused_until = time.time() + max(wait_s, 1)
+                    log.warning(
+                        f"telegram: photo downloads flood-waited for {wait_s}s -- "
+                        f"results for {keyword!r} kept without pictures, and no "
+                        f"photo is fetched again until the wait is over")
+                except Exception as e:
+                    log.debug(f"could not download photo for {ent.username or ent.entity_id}: {e}")
+            out.append(ent)
         return out
 
     async def resolve(self, username: str) -> Optional[TelegramEntity]:
@@ -479,6 +500,9 @@ class Sweep:
     complete: bool = False
     seconds: float = 0.0
     error: str = ""
+    # Where in OUR code the sweep failed, when it raised -- see
+    # shared/diagnostics.py::where. Blank for a sweep that ended itself.
+    where: str = ""
     # WHICH TARGETED ATTRIBUTES ARE STILL PRESENT: {key: [hits, misses]},
     # from shared/schema_probe.py -- folded into the rolling telemetry by
     # the runner so an alert can name the exact attribute that moved.
@@ -587,7 +611,9 @@ class Discovery:
         probe = SchemaProbe()
         try:
             await self._ensure_connected()
-            found = await self.tg.search(keyword, SEARCH_LIMIT, probe=probe)
+            found = await self.tg.search(
+                keyword, SEARCH_LIMIT, probe=probe,
+                max_results=int(self.a.max_results or 0))
             out.pages = 1
             out.hits = [entity_to_row(e, keyword) for e in found if e.url]
             if self.a.max_results:
@@ -597,6 +623,7 @@ class Discovery:
             out.stopped, out.error = "flood-wait", str(e)
         except Exception as e:
             out.stopped, out.error = "error", f"{type(e).__name__}: {e}"
+            out.where = diagnostics.where(e)
             log.error(f"[telegram] {keyword!r} sweep failed: {out.error}")
         finally:
             out.seconds = time.time() - started

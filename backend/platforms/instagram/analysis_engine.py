@@ -111,6 +111,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import quote, urlparse
 
+from backend.shared import diagnostics
 from backend.shared.tasks import spawn
 from backend.shared.models.row import Row
 from backend.platforms.scan_options import captures_screenshot
@@ -889,9 +890,13 @@ class Scraper:
                 await page.goto(
                     url, wait_until="domcontentloaded", timeout=self.a.timeout * 1000
                 )
-            except Exception:
+            except Exception as e:
+                # The error itself, first line only (Playwright appends a
+                # call log): without it the runner could not tell a dead
+                # browser or a blocked account from a slow page.
+                first = (str(e).splitlines() or [""])[0][:200]
                 row.status = "ERROR"
-                row.note("navigation failed")
+                row.note(f"navigation failed: {type(e).__name__}: {first}")
                 return row
 
             # No need to wait for passive interception if the direct API
@@ -1224,6 +1229,7 @@ class Scraper:
             row.profile_id = username_of(row.url)
             row.status = "ERROR"
             row.note(f"{type(e).__name__}: {e}")
+            row.where = diagnostics.where(e)
             return row
 
     @staticmethod

@@ -15,6 +15,34 @@ import {
 
 type SubTab = "incidents" | "canary" | "settings";
 
+// Failure reports (backend/services/failure_alerts.py): each names the
+// platform, the file and line, and the fix. Rendered from one list so the
+// three stay identical in behaviour.
+const FAILURE_ALERT_TOGGLES: {
+  key: "alert_on_discovery_failure" | "alert_on_analysis_failure" | "alert_on_scheduler_issue";
+  title: string;
+  detail: string;
+}[] = [
+  {
+    key: "alert_on_discovery_failure",
+    title: "Discovery Scrape Failures",
+    detail:
+      "Emails when a discovery job ends with broken searches: which platform and keywords, the file and line, and how to fix it.",
+  },
+  {
+    key: "alert_on_analysis_failure",
+    title: "Analysis Failures & Missing Data",
+    detail:
+      "Emails when analysed URLs fail or come back missing a field (name, followers, last post, screenshot), with where and why.",
+  },
+  {
+    key: "alert_on_scheduler_issue",
+    title: "Scheduled Run Problems",
+    detail:
+      "One email per scheduled run that failed, was missed, or left clients failed, skipped or with searches still owed.",
+  },
+];
+
 const SMTP_PRESETS: {
   name: string;
   host: string;
@@ -969,6 +997,26 @@ export function AlertsIncidentsPanel() {
                   </div>
                 </div>
               </label>
+
+              {FAILURE_ALERT_TOGGLES.map(({ key, title, detail }) => (
+                <label
+                  key={key}
+                  style={{ display: "flex", alignItems: "flex-start", gap: "10px", fontSize: "13px", cursor: "pointer" }}
+                >
+                  <input
+                    type="checkbox"
+                    style={{ marginTop: "3px" }}
+                    checked={settings?.[key] ?? true}
+                    onChange={(e) =>
+                      setSettings((prev) => (prev ? { ...prev, [key]: e.target.checked } : prev))
+                    }
+                  />
+                  <div>
+                    <div style={{ fontWeight: 600, color: "var(--text-main)" }}>{title}</div>
+                    <div style={{ fontSize: "12px", color: "var(--text-muted)" }}>{detail}</div>
+                  </div>
+                </label>
+              ))}
             </div>
 
             <div style={{ display: "flex", justifyContent: "flex-end", marginTop: "auto" }}>

@@ -42,6 +42,7 @@ import re
 from typing import Optional
 from urllib.parse import urlparse
 
+from backend.shared import diagnostics
 from backend.shared.models.row import Row
 from backend.platforms.scan_options import captures_screenshot
 from backend.shared.text import name_score, normalized_host, parse_count, parse_normalized_url
@@ -654,6 +655,7 @@ class Scraper:
             row.profile_id = username_of(row.url)
             row.status = "ERROR"
             row.note(f"{type(e).__name__}: {e}")
+            row.where = diagnostics.where(e)
             return row
 
     @staticmethod

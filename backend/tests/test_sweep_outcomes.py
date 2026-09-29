@@ -370,3 +370,25 @@ class TestTheCountersStayInStepWithTheNote:
         run = self._run()
         run.record_stop("error", False, "boom " * 200)
         assert len(run.sweep_errors[0]) <= 160
+
+    def test_unrecord_stop_clears_failure_on_retry(self):
+        """When a sweep fails on attempt 1, it is recorded into broken and sweep_errors.
+        When re-queued for retry, unrecord_stop clears that failure so a successful retry
+        doesn't leave the platform marked partial/errored."""
+        run = self._run()
+        run.record_stop("error", False, "TimeoutError: Page.goto: Timeout 45000ms exceeded")
+        assert run.broken == 1
+        assert run.incomplete == 1
+        assert "TimeoutError" in run.note()
+
+        # Re-queued for retry:
+        run.unrecord_stop("error", False, "TimeoutError: Page.goto: Timeout 45000ms exceeded")
+        assert run.broken == 0
+        assert run.incomplete == 0
+        assert run.note() == ""
+        assert run.sweep_errors == []
+
+        # Retry succeeds:
+        assert run.record_stop("cap:results", False) == resilience.SATISFIED
+        assert run.incomplete == 0
+        assert run.note() == ""

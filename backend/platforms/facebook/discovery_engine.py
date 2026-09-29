@@ -42,6 +42,7 @@ SPEED
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import random
 import re
@@ -52,6 +53,7 @@ from typing import Any, Iterable, Iterator, Optional
 from urllib.parse import parse_qs, quote, urlparse
 
 from backend.platforms.scan_options import cancelled
+from backend.shared import diagnostics
 from backend.shared.tasks import spawn
 from backend.shared.extraction import run_strategies
 from backend.shared.schema_probe import SchemaProbe, probe_or_null
@@ -699,7 +701,7 @@ async def _notify(on_progress, found_count: int, page_num: int, new_hits: list) 
     contract to code against rather than one per platform -- see
     twitter/discovery_engine.py::_emit, which does the same conversion.
     """
-    if asyncio.iscoroutinefunction(on_progress):
+    if inspect.iscoroutinefunction(on_progress):
         await on_progress(found_count, page_num, new_hits)
     else:
         on_progress(found_count, page_num, new_hits)
@@ -834,6 +836,9 @@ class Sweep:
     unshown: int = 0
     seconds: float = 0.0
     error: str = ""
+    # Where in OUR code the sweep failed, when it raised -- see
+    # shared/diagnostics.py::where. Blank for a sweep that ended itself.
+    where: str = ""
     # "graphql" normally; "dom" when the search payload yielded nothing and
     # the rendered results page had to stand in
     source: str = "graphql"
@@ -1636,39 +1641,89 @@ class Discovery:
 
         try:
             url = TABS[tab].format(q=quote(keyword))
-            await page.goto(
-                url, wait_until="domcontentloaded", timeout=self.a.timeout * 1000
-            )
-            # the first page of results is in the document, not over XHR --
-            # so the wait ends the moment that document carries results, not
-            # only once it has rendered "enough" text. A search with one or
-            # two results never renders 400 characters: measured live
-            # 2026-09-24, a Pages search for a two-result keyword sat at 219
-            # characters for 25 seconds with its results embedded from 1.2s,
-            # and this wait ran out its full `settle` ceiling (20s) on every
-            # such sweep before a single card could be shown.
+            nav_error = None
             try:
-                await page.wait_for_function(JS_FIRST_PAGE_READY, timeout=self.a.settle * 1000)
-            except Exception:
-                pass
+                await page.goto(
+                    url, wait_until="domcontentloaded", timeout=self.a.timeout * 1000
+                )
+            except Exception as e:
+                nav_error = e
 
-            # Wait for the first GraphQL search response to arrive before
-            # reading embedded data. Facebook's search results come via XHR
-            # (not embedded in the initial HTML), and on slower connections or
-            # heavier payloads, the response can arrive several seconds after
-            # domcontentloaded fires. Without this wait, by_id is empty when
-            # run_strategies evaluates, producing a false "0 results" report.
-            # THE SERVER-RENDERED FIRST PAGE, READ BEFORE WAITING ON XHR.
-            # On the Pages and Groups tabs Facebook embeds the first page of
-            # results in the document itself and sends no search XHR until
-            # the page is scrolled (confirmed live 2026-09-24: no
-            # SearchCometResultsPaginatedResultsQuery fired at all on a
-            # two-result Pages search). Reading it here, before any wait on
-            # `arrived`, is what lets such a sweep show its cards at once.
-            # Parsing is idempotent (absorb dedups by id), so reading it
-            # again below costs nothing.
-            for blob in parse_embedded(await page.evaluate(JS_EMBEDDED), probe):
-                absorb(blob)
+            # If domcontentloaded timed out or raised:
+            if nav_error is not None:
+                # 1. Did Facebook redirect to a login wall or checkpoint during navigation?
+                if blocked := await _session_blocked(page):
+                    out.stopped = blocked
+                    out.error = f"facebook search page shows a {blocked} wall"
+                    return out
+
+                # 2. Did the document actually commit and carry embedded results despite the timeout?
+                # On heavy SPAs, background telemetry or streaming chunks can hold domcontentloaded
+                # open long past the moment results are embedded and parseable.
+                try:
+                    for blob in parse_embedded(await page.evaluate(JS_EMBEDDED), probe):
+                        absorb(blob)
+                except Exception:
+                    pass
+
+                # 3. If still empty and not blocked, retry once with wait_until="commit"
+                # so we don't stall waiting for a lagging background stream/script
+                if not by_id:
+                    from backend.shared.logging import get_logger as _gl
+                    _gl("facebook").warning(
+                        f"facebook: {keyword!r}/{tab} goto domcontentloaded failed ({nav_error}) "
+                        f"-- retrying with wait_until='commit'"
+                    )
+                    try:
+                        await page.goto(
+                            url, wait_until="commit", timeout=min(25000, self.a.timeout * 1000)
+                        )
+                        try:
+                            await page.wait_for_function(JS_FIRST_PAGE_READY, timeout=self.a.settle * 1000)
+                        except Exception:
+                            pass
+                        for blob in parse_embedded(await page.evaluate(JS_EMBEDDED), probe):
+                            absorb(blob)
+                    except Exception as retry_err:
+                        if blocked := await _session_blocked(page):
+                            out.stopped = blocked
+                            out.error = f"facebook search page shows a {blocked} wall"
+                            return out
+                        if not by_id:
+                            # Chained, so the retry's own reason survives
+                            # in the traceback instead of being dropped.
+                            raise nav_error from retry_err
+            else:
+                # the first page of results is in the document, not over XHR --
+                # so the wait ends the moment that document carries results, not
+                # only once it has rendered "enough" text. A search with one or
+                # two results never renders 400 characters: measured live
+                # 2026-09-24, a Pages search for a two-result keyword sat at 219
+                # characters for 25 seconds with its results embedded from 1.2s,
+                # and this wait ran out its full `settle` ceiling (20s) on every
+                # such sweep before a single card could be shown.
+                try:
+                    await page.wait_for_function(JS_FIRST_PAGE_READY, timeout=self.a.settle * 1000)
+                except Exception:
+                    pass
+
+                # Wait for the first GraphQL search response to arrive before
+                # reading embedded data. Facebook's search results come via XHR
+                # (not embedded in the initial HTML), and on slower connections or
+                # heavier payloads, the response can arrive several seconds after
+                # domcontentloaded fires. Without this wait, by_id is empty when
+                # run_strategies evaluates, producing a false "0 results" report.
+                # THE SERVER-RENDERED FIRST PAGE, READ BEFORE WAITING ON XHR.
+                # On the Pages and Groups tabs Facebook embeds the first page of
+                # results in the document itself and sends no search XHR until
+                # the page is scrolled (confirmed live 2026-09-24: no
+                # SearchCometResultsPaginatedResultsQuery fired at all on a
+                # two-result Pages search). Reading it here, before any wait on
+                # `arrived`, is what lets such a sweep show its cards at once.
+                # Parsing is idempotent (absorb dedups by id), so reading it
+                # again below costs nothing.
+                for blob in parse_embedded(await page.evaluate(JS_EMBEDDED), probe):
+                    absorb(blob)
 
             if not by_id:
                 # DON'T WAIT FOR A RESPONSE THAT IS NEVER COMING. The wait
@@ -2056,6 +2111,7 @@ class Discovery:
             out.reported_total = state.total_results if state else None
         except Exception as e:
             out.stopped, out.error = "error", f"{type(e).__name__}: {e}"
+            out.where = diagnostics.where(e)
         finally:
             try:
                 await page.close()

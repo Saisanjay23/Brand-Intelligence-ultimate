@@ -423,7 +423,9 @@ class TestWhenNothingCanBeClaimed:
         await _scrape(job, items)
 
         assert [i.status for i in items] == ["error"] * 4
-        assert all("failed or checkpointed" in i.error for i in items[1:])
+        # Named: which account stopped, and why -- not a generic "failed".
+        assert all("no healthy session left" in i.error and "acct-a" in i.error
+                   for i in items[1:])
         assert job.completed == job.total == 4
         assert job.platform_progress[PLATFORM]["status"] == "failed"
 
@@ -566,3 +568,128 @@ class TestParallelismIsPurelyBySessionCount:
         await _scrape(job, items)
         assert len(scraper_cls.instances) == 1
         assert scraper_cls.instances[0].seen == [i.url for i in items]
+
+
+class TestABlockedRowIsASessionFailure:
+    """Engines RETURN a CHECKPOINT / LOGIN_REQUIRED row for a challenge or a
+    login wall rather than raising. The runner only classified exceptions, so
+    such a session kept reading every remaining URL, was never quarantined,
+    and none of its URLs went to a healthy account."""
+
+    @staticmethod
+    def _blocked_on(scraper_cls, blocked: dict[str, tuple[str, str]]):
+        async def one(self, url, target, feed, known=None):
+            self.seen.append(url)
+            await asyncio.sleep(0)
+            if self.session_id in blocked:
+                status, note = blocked[self.session_id]
+                row = Row(url=url, target=target, status=status)
+                row.note(note)
+                return row
+            return Row(url=url, target=target, status="OK", profile_name="Someone")
+        scraper_cls.one = one
+
+    @pytest.mark.asyncio
+    async def test_a_checkpointed_account_hands_its_urls_to_a_healthy_one(self, monkeypatch):
+        pool, scraper_cls, _ = _wire(monkeypatch, [_session("a"), _session("b")])
+        self._blocked_on(scraper_cls, {"a": ("CHECKPOINT", "session checkpointed")})
+        job, items = _job([f"https://x.com/u{n}" for n in range(4)])
+
+        await _scrape(job, items)
+
+        assert ("a", "checkpointed") in pool.marked_failed
+        # `a` stopped at its first blocked row instead of burning through the rest
+        a = next(s for s in scraper_cls.instances if s.session_id == "a")
+        assert len(a.seen) == 1
+        assert [i.status for i in items] == ["done"] * 4
+        assert job.completed == job.total == 4
+
+    @pytest.mark.asyncio
+    async def test_a_login_wall_marks_the_account_expired(self, monkeypatch):
+        pool, scraper_cls, _ = _wire(monkeypatch, [_session("a"), _session("b")])
+        self._blocked_on(scraper_cls, {"a": ("LOGIN_REQUIRED", "cookies rejected/expired")})
+        job, items = _job([f"https://x.com/u{n}" for n in range(2)])
+
+        await _scrape(job, items)
+
+        assert ("a", "expired") in pool.marked_failed
+        assert [i.status for i in items] == ["done"] * 2
+
+    @pytest.mark.asyncio
+    async def test_with_no_other_account_it_stops_and_says_why(self, monkeypatch):
+        pool, scraper_cls, _ = _wire(monkeypatch, [_session("a")])
+        self._blocked_on(scraper_cls, {"a": ("CHECKPOINT", "rate limited by X -- cooling down")})
+        job, items = _job([f"https://x.com/u{n}" for n in range(4)])
+
+        await _scrape(job, items)
+
+        assert ("a", "rate_limited") in pool.marked_failed
+        assert len(scraper_cls.instances[0].seen) == 1
+        assert [i.status for i in items] == ["error"] * 4
+        assert all("rate limited" in i.error for i in items[1:])
+        assert job.completed == job.total == 4
+        assert job.platform_progress[PLATFORM]["status"] == "failed"
+
+    def test_a_telegram_flood_wait_is_a_rate_limit(self):
+        row = Row(url="https://t.me/x", target="", status="CHECKPOINT")
+        row.note("telegram asked for a 60s pause")
+        assert R._blocked_reason("telegram", row) == "rate_limited"
+
+
+class TestAnErrorRowIsReadLikeAnException:
+    """Every engine's one() returns its own exceptions as an ERROR row, so
+    the runner has to classify the row -- otherwise a rate limit or a dead
+    browser reads as "this one profile failed"."""
+
+    @staticmethod
+    def _error_once(scraper_cls, note: str):
+        state = {"n": 0}
+
+        async def one(self, url, target, feed, known=None):
+            self.seen.append(url)
+            await asyncio.sleep(0)
+            if state["n"] == 0:
+                state["n"] += 1
+                row = Row(url=url, target=target, status="ERROR")
+                row.note(note)
+                return row
+            return Row(url=url, target=target, status="OK", profile_name="Someone")
+        scraper_cls.one = one
+
+    @pytest.mark.asyncio
+    async def test_a_rate_limit_error_row_quarantines_the_account(self, monkeypatch):
+        pool, scraper_cls, _ = _wire(monkeypatch, [_session("a"), _session("b")])
+        self._error_once(scraper_cls, "RuntimeError: HTTP 429 Too Many Requests")
+        job, items = _job([f"https://x.com/u{n}" for n in range(3)])
+
+        await _scrape(job, items)
+
+        assert ("a", "rate_limited") in pool.marked_failed
+        assert [i.status for i in items] == ["done"] * 3
+
+    @pytest.mark.asyncio
+    async def test_a_dead_browser_restarts_without_blaming_the_account(self, monkeypatch):
+        pool, scraper_cls, _ = _wire(monkeypatch, [_session("a")])
+        self._error_once(
+            scraper_cls,
+            "TargetClosedError: Target page, context or browser has been closed")
+        job, items = _job([f"https://x.com/u{n}" for n in range(3)])
+
+        await _scrape(job, items)
+
+        assert pool.marked_failed == []
+        assert len(scraper_cls.instances) == 2          # a fresh browser
+        assert [i.status for i in items] == ["done"] * 3
+        assert job.completed == job.total == 3
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_profile_error_changes_nothing(self, monkeypatch):
+        pool, scraper_cls, _ = _wire(monkeypatch, [_session("a")])
+        self._error_once(scraper_cls, "ValueError: could not parse follower count")
+        job, items = _job([f"https://x.com/u{n}" for n in range(3)])
+
+        await _scrape(job, items)
+
+        assert pool.marked_failed == []
+        assert len(scraper_cls.instances) == 1
+        assert [i.status for i in items] == ["error", "done", "done"]

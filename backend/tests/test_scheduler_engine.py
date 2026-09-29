@@ -914,3 +914,80 @@ class TestTimezoneDetection:
         assert res["timezone"] == settings.default_timezone
         assert res["source"] == "default_fallback"
 
+
+
+# ------------------------------------- the gap-closing lap keeps the first pass
+
+class TestTheGapLapAddsToTheFirstPass:
+    async def test_counts_are_added_not_replaced(self, rig):
+        """The lap re-searches only the owed cells; its job's counts used to
+        overwrite the whole client's, so 150 found read as 2."""
+        rig.store.state["queue"] = ["c1"]
+        rig.clients.docs = {"c1": client("c1")}
+        rig.owed["value"] = 4
+        await rig.engine.fire(trigger="manual")
+        await rig.drive()
+        e = entries_of(rig)[0]
+        assert len(rig.runner.calls) == 2
+        assert e["found"] == 6 and e["new_profiles"] == 2      # 3+3, 1+1
+        assert e["platform_details"]["facebook"]["found"] == 6
+        assert "gap-closing lap" in e["message"]
+        assert "lap_base" not in e
+
+    async def test_a_lap_with_no_session_does_not_unsweep_the_client(self, rig):
+        rig.store.state["queue"] = ["c1"]
+        rig.clients.docs = {"c1": client("c1")}
+        rig.owed["value"] = 4
+        real_start = rig.runner.start
+
+        async def start(*, group_id, **kw):
+            if kw.get("only_owed"):
+                rig.runner.skipped_for[group_id] = {"facebook": "session expired"}
+            return await real_start(group_id=group_id, **kw)
+
+        rig.runner.start = start
+        await rig.engine.fire(trigger="manual")
+        await rig.drive()
+        e = entries_of(rig)[0]
+        assert e["status"] == "done"            # not "skipped"
+        assert e["found"] == 3
+        assert e["platforms"] == {"facebook": "done"}
+        assert "session expired" in e["message"]
+
+
+class TestDueDuringARun:
+    async def test_it_is_recorded_not_silently_dropped(self, rig):
+        rig.store.state["schedule"] = {"enabled": True, "mode": "daily",
+                                       "at": "02:00", "on_date": "",
+                                       "weekdays": [], "tz": "UTC"}
+        rig.store.state["next_run_at"] = datetime.now(UTC) - timedelta(seconds=5)
+        rig.engine._claimed = True              # a manual run is going
+        try:
+            await rig.engine._tick()
+        finally:
+            rig.engine._claimed = False
+        assert rig.runner.calls == []
+        [missed] = [r for r in rig.store.runs.values() if r["status"] == "missed"]
+        assert "already in progress" in missed["message"]
+        assert rig.store.state["next_run_at"] > datetime.now(UTC)
+
+
+class TestTheRunIsReportedOnce:
+    async def test_one_alert_per_run_with_every_client(self, rig, monkeypatch):
+        from backend.services import failure_alerts
+        calls = []
+
+        async def record(**kw):
+            calls.append(kw)
+            return True
+
+        monkeypatch.setattr(failure_alerts, "notify_scheduler_run", record)
+        rig.store.state["queue"] = ["c1", "c2"]
+        rig.clients.docs = {"c1": client("c1"), "c2": client("c2")}
+        await rig.engine.fire(trigger="scheduled")
+        await rig.drive()
+        await asyncio.sleep(0.01)
+        assert len(calls) == 1
+        assert [e["client_id"] for e in calls[0]["entries"]] == ["c1", "c2"]
+        # and the runner was told not to mail each client separately
+        assert all(kw["notify_failures"] is False for _g, kw in rig.runner.calls)

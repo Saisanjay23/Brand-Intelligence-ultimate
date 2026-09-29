@@ -33,6 +33,12 @@ def _default_settings() -> dict[str, Any]:
         "alert_on_session_dead": True,
         "alert_on_session_expiring": True,
         "alert_on_critical_incident": True,
+        # Failure reports (services/failure_alerts.py): what broke, where in
+        # the code and how to fix it. ON by default -- each fires only when
+        # something actually went wrong, at most once per job or run.
+        "alert_on_discovery_failure": True,
+        "alert_on_analysis_failure": True,
+        "alert_on_scheduler_issue": True,
         # OFF by default, deliberately. A sweep finishing is a routine event
         # that happens many times a day; turning this on without the operator
         # asking would turn a feature into a mail flood on the first sweep
@@ -52,7 +58,15 @@ async def get_settings() -> dict[str, Any]:
         doc = await db()[SETTINGS_COLLECTION].find_one({"_id": SETTINGS_DOC_ID})
         if doc:
             doc.pop("_id", None)
-            return doc
+            # LAYERED OVER THE DEFAULTS. A document saved before a setting
+            # existed does not carry it, and returning the stored document
+            # alone left every later-added setting simply absent -- the UI
+            # showed its toggle blank and each caller had to remember its
+            # own fallback.
+            merged = _default_settings()
+            merged.pop("_id", None)
+            merged.update(doc)
+            return merged
     except Exception as e:
         log.warning(f"failed to read alert settings from DB, falling back to env: {e}")
 
@@ -76,6 +90,9 @@ async def save_settings(fields: dict[str, Any]) -> dict[str, Any]:
         "alert_on_session_dead",
         "alert_on_session_expiring",
         "alert_on_critical_incident",
+        "alert_on_discovery_failure",
+        "alert_on_analysis_failure",
+        "alert_on_scheduler_issue",
         "session_expiry_warning_hours",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}

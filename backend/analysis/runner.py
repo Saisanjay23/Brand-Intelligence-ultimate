@@ -61,6 +61,8 @@ from backend.platforms.scan_options import ScanOptions
 from backend.sessions import manager as sessions_engine
 from backend.database.repositories import analysis_result_repository as results_db
 from backend.database.repositories import client_repository as clients_db
+from backend.shared import completeness
+from backend.shared import diagnostics
 from backend.shared import fast_http
 from backend.shared import logo_verdict
 from backend.shared.job_store import JobStore
@@ -68,6 +70,7 @@ from backend.shared.logging import get_logger
 from backend.shared.models.row import Row
 from backend.shared.models.scoring import compute_incident_risk_score
 from backend.shared.resilience import classify_failure
+from backend.shared.tasks import spawn
 
 log = get_logger("analysis.runner")
 
@@ -416,6 +419,14 @@ class AnalysisItem:
     legacy_row: dict[str, Any] = field(default_factory=dict)
     duration_seconds: Optional[float] = None
     started_at_ts: Optional[float] = None
+    # DIAGNOSTICS for the failure alert (services/failure_alerts.py), not
+    # part of to_dict()'s frontend contract: the engine's own row status
+    # (CHECKPOINT and PARTIAL both map onto `status` coarsely), the fields
+    # this visit should have read and did not (shared/completeness.py), and
+    # where in our code the visit raised, when it did.
+    row_status: str = ""
+    missed: list[str] = field(default_factory=list)
+    where: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -531,6 +542,47 @@ class _PlatformRun:
     concurrency: int
     inter_batch_delay: float
     progress: dict[str, Any]
+    # Why the most recent session on this platform was taken out of the
+    # batch, e.g. "acct-a: session checkpointed". Named on any URL left
+    # stranded afterwards, instead of a generic "every session failed".
+    last_session_failure: str = ""
+
+
+# ROW STATUSES THAT ARE ABOUT THE ACCOUNT, NOT THE PROFILE. Every engine
+# returns these (rather than raising) when the page it landed on is a
+# challenge, a login wall, a rate-limit notice or -- Telegram -- a
+# FloodWait. They say nothing about the URL being read and everything
+# about the session reading it.
+_SESSION_BLOCKED_STATUSES = frozenset({"CHECKPOINT", "LOGIN_REQUIRED"})
+
+
+def _blocked_reason(platform_id: str, row: Row) -> str:
+    """The `mark_session_failed` reason for a session-blocked row."""
+    if platform_id == "telegram":
+        # Its only CHECKPOINT is a FloodWait, whose text ("telegram asked
+        # for a 60s pause") carries none of the rate-limit words.
+        return "rate_limited"
+    if row.status == "LOGIN_REQUIRED":
+        return "expired"
+    return classify_failure(row.notes or "") or "checkpointed"
+
+
+# THE BROWSER DIED, NOT THE ACCOUNT. Playwright's wording when the context
+# or its driver is gone. Every URL after it fails instantly on the same dead
+# browser, so the worker stops and its URLs go back on the queue -- a later
+# claim round starts a fresh browser -- but the account is NOT marked failed:
+# nothing about it was wrong.
+_BROWSER_GONE_TOKENS = (
+    "targetclosederror",
+    "target page, context or browser has been closed",
+    "browser has been closed",
+    "connection closed while reading from the driver",
+)
+
+
+def _browser_gone(text: str) -> bool:
+    t = (text or "").lower()
+    return any(tok in t for tok in _BROWSER_GONE_TOKENS)
 
 
 async def _stored_pixel_evidence(
@@ -793,6 +845,16 @@ class AnalysisRunner:
             log.error(f"analysis job {job.id} failed: {job.message}")
         finally:
             job.finished_at_ts = time.time()
+            # URLs THAT FAILED OR CAME BACK INCOMPLETE, mailed with where and
+            # why. Not for a cancelled job (the analyst chose the stop);
+            # spawned so a slow SMTP server never holds the job open.
+            if job.status != CANCELLED:
+                try:
+                    from backend.services import failure_alerts
+                    spawn(failure_alerts.notify_analysis(job))
+                except Exception as e:                          # noqa: BLE001
+                    log.error(f"analysis job {job.id}: failure alert not sent -- "
+                              f"{type(e).__name__}: {e}")
 
     async def _preflight(
         self, job: AnalysisJob, by_platform: dict[str, list[AnalysisItem]],
@@ -897,6 +959,9 @@ class AnalysisRunner:
                 if job.cancel.is_set() or res is None or not res.is_dead:
                     live.append(it)
                     continue
+                # A finding about the profile, not a failure of ours: the
+                # failure alert skips GONE rows.
+                it.row_status = "GONE"
                 await self._fail_item(job, it, (
                     f"{registry.display_name(pid)} answered HTTP {res.status_code} "
                     f"for this URL -- the profile is gone. Checked by pre-flight; "
@@ -1039,6 +1104,9 @@ class AnalysisRunner:
             progress["status"] = "done"
         elif stranded:
             detail = setup_error or worker_error or (
+                f"no healthy session left to continue with -- last one stopped "
+                f"({run.last_session_failure})"
+                if run.last_session_failure else
                 "every available session for this platform failed or checkpointed -- "
                 "see the earlier failed item(s) on this platform for why")
             for it in stranded:
@@ -1228,6 +1296,9 @@ class AnalysisRunner:
                             # the same event as the platform stopping.
                             for it, is_fatal in zip(chunk, fatal):
                                 if is_fatal:
+                                    # Read before _requeue clears it.
+                                    run.last_session_failure = (
+                                        f"{label}: {it.comments or it.error}")
                                     self._requeue(job, run, it, label)
                             return True
                         if run.queue and run.inter_batch_delay > 0:
@@ -1316,7 +1387,10 @@ class AnalysisRunner:
         jobs = [(it.url, job.target_name, job.official_feed) for it in items]
         t0 = time.time()
         try:
-            rows = await scraper.run(jobs)
+            # Discovery's record per URL goes with the batch, so a channel
+            # whose @handle changed since discovery still resolves by its
+            # stored id instead of being reported GONE.
+            rows = await scraper.run(jobs, known_by_url=job.seed_by_url)
         except Exception as e:
             dur = time.time() - t0
             detail = f"{type(e).__name__}: {e}"
@@ -1382,8 +1456,36 @@ class AnalysisRunner:
             # job's own lifecycle is what owns durability, so the write
             # belongs at this level.
             await self._settle(job, it, screenshot=row.screenshot_bytes)
+            # A BLOCKED SESSION RETURNS, IT DOES NOT RAISE. Only exceptions
+            # were classified here, so a row the engine had already marked
+            # CHECKPOINT/LOGIN_REQUIRED left this worker visiting every
+            # remaining URL under the same challenged account -- each one
+            # another failure, none handed to a healthy session, and the
+            # account never quarantined, so the next job got it too. The
+            # engines' own run() loops stop on exactly this; the runner
+            # calls one() and so has to do it itself.
+            #
+            # AND AN ERROR ROW IS CLASSIFIED LIKE AN EXCEPTION. Every engine's
+            # one() catches its own exceptions and returns them as an ERROR
+            # row, so the `except` below almost never ran for a real engine:
+            # a rate limit or an auth failure that surfaced as an exception
+            # read as "this profile failed" and the same account carried on.
+            if not job.cancel.is_set():
+                reason = None
+                if row.status in _SESSION_BLOCKED_STATUSES:
+                    reason = _blocked_reason(platform_id, row)
+                elif row.status == "ERROR":
+                    reason = classify_failure(row.notes or "")
+                if reason:
+                    await sessions_engine.mark_session_failed(
+                        platform_id, session_item.get("id", ""), reason,
+                        detail=row.notes or row.status)
+                    fatal = True
+                elif row.status == "ERROR" and _browser_gone(row.notes or ""):
+                    fatal = True
         except Exception as e:
             it.duration_seconds = round(time.time() - t0, 2)
+            it.where = diagnostics.where(e)
             await self._fail_item(job, it, f"{type(e).__name__}: {e}")
             # A STOP IS NOT A BAD ACCOUNT. Tearing a browser down under an
             # in-flight page produces platform-shaped error text: a Playwright
@@ -1399,6 +1501,8 @@ class AnalysisRunner:
             if (reason := classify_failure(e)) and not job.cancel.is_set():
                 await sessions_engine.mark_session_failed(
                     platform_id, session_item.get("id", ""), reason, detail=str(e))
+                fatal = True
+            elif _browser_gone(f"{type(e).__name__}: {e}") and not job.cancel.is_set():
                 fatal = True
         finally:
             job.completed += 1
@@ -1494,6 +1598,26 @@ class AnalysisRunner:
                 # needs no re-derivation here: `_populate` already set it
                 # True, unconditionally, before this merge ran.
                 it.name_score = row.name_score = known["name_score"]
+
+        # WHAT THIS VISIT SHOULD HAVE READ AND DID NOT, judged after the
+        # `known` merge -- a field discovery already supplied is not missing
+        # from the result -- and before the handle stands in for a name
+        # below. The screenshot is checked against the in-memory capture,
+        # which is where this runner keeps it (`ephemeral_screenshot`).
+        it.row_status = row.status
+        it.where = row.where
+        if it.status == "done":
+            missed = []
+            for f in completeness.missing_fields(it.platform, row, want_screenshot=False):
+                if ((f == "display name" and it.profile_name)
+                        or (f == "followers" and it.followers is not None)
+                        or (f == "last post date" and it.last_post_date)):
+                    continue
+                missed.append(f)
+            if (it.platform in completeness.PLATFORMS_WITH_SCREENSHOT
+                    and not (row.screenshot or row.screenshot_bytes)):
+                missed.append("screenshot")
+            it.missed = missed
 
         # THE HANDLE, ONLY ONCE NOTHING ELSE CAN NAME THIS ACCOUNT. Placed
         # here, after the `known` merge, so the display name discovery

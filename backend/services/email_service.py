@@ -198,9 +198,165 @@ async def send_email(
         msg.attach(MIMEText(text_content, "plain", "utf-8"))
     msg.attach(MIMEText(html_content, "html", "utf-8"))
 
-    return await asyncio.to_thread(
+    ok, detail = await asyncio.to_thread(
         _send_smtp_sync, host, port, user, password, sender, recipients, msg, use_ssl
     )
+    if not ok and _transient_smtp(detail):
+        # ONE RETRY FOR A MOMENTARY FAILURE. A mail server that drops the
+        # connection or times out once (seen live: "SMTPServerDisconnected:
+        # Connection unexpectedly closed: The read operation timed out")
+        # otherwise lost the alert for good -- and an alert is only ever
+        # sent because something already went wrong. A wrong password or a
+        # rejected recipient is not retried: that fails identically again.
+        log.warning(f"SMTP send failed transiently ({detail}) -- retrying once")
+        await asyncio.sleep(_SMTP_RETRY_DELAY_S)
+        ok, detail = await asyncio.to_thread(
+            _send_smtp_sync, host, port, user, password, sender, recipients, msg, use_ssl
+        )
+    return ok, detail
+
+
+_SMTP_RETRY_DELAY_S = 5.0
+_TRANSIENT_SMTP_TOKENS = (
+    "smtpserverdisconnected", "timed out", "timeout", "connection reset",
+    "connection refused", "smtpconnecterror", "temporarily", "try again",
+    "connection unexpectedly closed",
+)
+
+
+def _transient_smtp(detail: str) -> bool:
+    d = (detail or "").lower()
+    return any(tok in d for tok in _TRANSIENT_SMTP_TOKENS)
+
+
+# ------------------------------------------------------------ failure reports
+
+_SEVERITY_COLOR = {"critical": "#FF3B30", "warning": "#FF9500"}
+_MONO = "font-family:Consolas,Menlo,monospace;"
+
+
+def _subject_list(subjects: list[str], cap: int) -> tuple[list[str], int]:
+    shown = list(subjects[:cap])
+    return shown, max(0, len(subjects) - len(shown))
+
+
+def _card_row(label: str, value: str, mono: bool = False) -> str:
+    if not value:
+        return ""
+    font = _MONO if mono else ""
+    return (f'<tr><td style="padding:6px 12px;color:#8A99AD;font-size:12px;width:26%;'
+            f'vertical-align:top;">{_esc(label)}</td><td style="padding:6px 12px;'
+            f'color:#E6ECF2;font-size:12px;{font}word-break:break-word;">{_esc(value)}</td></tr>')
+
+
+def _finding_card(n: int, f: dict, subject_cap: int) -> str:
+    color = _SEVERITY_COLOR.get(f.get("severity"), "#FF9500")
+    shown, more = _subject_list(list(f.get("subjects") or []), subject_cap)
+    items = "".join(f'<li style="margin:2px 0;word-break:break-all;">{_esc(x)}</li>' for x in shown)
+    if more:
+        items += f'<li style="margin:2px 0;color:#8A99AD;">... and {more} more</li>'
+    scope = f" -- {_esc(f['scope'])}" if f.get("scope") else ""
+    rows = (_card_row("Error", f.get("error", ""), mono=True)
+            + _card_row("Where (file:line)", f.get("where", ""), mono=True)
+            + _card_row("Likely cause", f.get("cause", ""))
+            + _card_row("How to fix", f.get("fix", "")))
+    return (
+        f'<div style="border:1px solid #202732;border-left:4px solid {color};border-radius:8px;'
+        f'background:#0E1218;margin:0 0 16px 0;">'
+        f'<div style="padding:12px 14px 6px 14px;">'
+        f'<span style="font-size:10px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;'
+        f'color:{color};">{_esc(str(f.get("severity", "")))} &middot; '
+        f'{_esc(str(f.get("platform_name", "")))}{scope}</span>'
+        f'<div style="font-size:15px;font-weight:700;color:#FFFFFF;margin-top:4px;">'
+        f'{n}. {_esc(str(f.get("title", "")))}</div></div>'
+        f'<table role="presentation" width="100%" cellspacing="0" cellpadding="0" '
+        f'style="border-collapse:collapse;">{rows}</table>'
+        f'<div style="padding:6px 12px 12px 12px;">'
+        f'<div style="font-size:12px;color:#8A99AD;margin-bottom:4px;">'
+        f'{_esc(str(f.get("subject_label", "Affected")))} ({int(f.get("count", 0))}):</div>'
+        f'<ul style="margin:0;padding-left:18px;color:#D0D8E2;font-size:12px;{_MONO}">{items}</ul>'
+        f'</div></div>')
+
+
+def render_failure_report(
+    *, title: str, badge_text: str, headline: str, intro: str,
+    summary: list[tuple[str, str]], findings: list[dict], hidden_findings: int = 0,
+    subject_cap: int = 15,
+) -> str:
+    """The failure-report email: a summary table, then one card per
+    finding -- what happened, the error, WHERE in the code (file:line), the
+    likely cause and the fix. Built for the engineer who has to act on it.
+
+    Every value is escaped: keywords, URLs and exception text all come from
+    outside this process."""
+    summary_rows = "".join(
+        f'<tr><td style="padding:8px 14px;border-bottom:1px solid #242B35;color:#8A99AD;'
+        f'font-size:13px;width:32%;vertical-align:top;">{_esc(str(k))}</td>'
+        f'<td style="padding:8px 14px;border-bottom:1px solid #242B35;color:#F0F4F8;'
+        f'font-size:13px;">{_esc(str(v))}</td></tr>'
+        for k, v in summary)
+    cards = "".join(_finding_card(n, f, subject_cap) for n, f in enumerate(findings, 1))
+    if hidden_findings:
+        cards += (f'<p style="color:#8A99AD;font-size:12px;">... and {hidden_findings} more '
+                  f'finding(s) not shown. See the job in the application.</p>')
+    if not cards:
+        cards = '<p style="color:#8A99AD;font-size:13px;">No individual findings.</p>'
+    generated = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+    return (
+        '<!DOCTYPE html><html><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1.0">'
+        f'<title>{_esc(title)}</title></head>'
+        '<body style="margin:0;padding:24px;background-color:#0A0D12;font-family:-apple-system,'
+        "BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#F0F4F8;\">"
+        '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" '
+        'style="max-width:720px;margin:0 auto;background-color:#12171F;border:1px solid #202732;'
+        'border-radius:12px;">'
+        '<tr><td style="padding:24px 28px;border-bottom:1px solid #202732;">'
+        '<span style="display:inline-block;font-size:11px;font-weight:700;text-transform:uppercase;'
+        'letter-spacing:.8px;padding:4px 10px;border-radius:20px;background-color:#FF3B3022;'
+        f'color:#FF3B30;border:1px solid #FF3B3066;">{_esc(badge_text)}</span>'
+        '<h1 style="margin:12px 0 6px 0;font-size:20px;font-weight:700;color:#FFFFFF;">'
+        f'{_esc(headline)}</h1>'
+        f'<p style="margin:0;font-size:13px;line-height:1.5;color:#B8C4D2;">{_esc(intro)}</p>'
+        '</td></tr>'
+        '<tr><td style="padding:20px 28px 4px 28px;"><table width="100%" cellspacing="0" '
+        'cellpadding="0" style="border-collapse:collapse;background-color:#0E1218;'
+        f'border:1px solid #202732;border-radius:8px;">{summary_rows}</table></td></tr>'
+        '<tr><td style="padding:20px 28px;"><div style="font-size:11px;font-weight:700;'
+        'text-transform:uppercase;color:#9A50E9;letter-spacing:.5px;margin-bottom:10px;">'
+        f'Findings -- most severe first</div>{cards}</td></tr>'
+        '<tr><td style="padding:16px 28px;background-color:#0A0D12;border-top:1px solid #1E2530;'
+        'text-align:center;"><p style="margin:0;font-size:12px;color:#586576;">'
+        f'Brand Intelligence Automated Monitoring &bull; Generated at {generated}</p></td></tr>'
+        '</table></body></html>')
+
+
+def render_failure_report_text(
+    *, headline: str, intro: str, summary: list[tuple[str, str]],
+    findings: list[dict], hidden_findings: int = 0, subject_cap: int = 15,
+) -> str:
+    """The same report as plain text, for mail clients that do not render
+    HTML."""
+    lines = [headline, "=" * len(headline), intro, ""]
+    lines += [f"{k}: {v}" for k, v in summary]
+    lines.append("")
+    for n, f in enumerate(findings, 1):
+        scope = f" -- {f['scope']}" if f.get("scope") else ""
+        lines.append(f"{n}. [{str(f.get('severity', '')).upper()}] "
+                     f"{f.get('platform_name', '')}{scope}: {f.get('title', '')}")
+        for label, key in (("Error", "error"), ("Where", "where"),
+                           ("Likely cause", "cause"), ("How to fix", "fix")):
+            if f.get(key):
+                lines.append(f"   {label}: {f[key]}")
+        shown, more = _subject_list(list(f.get("subjects") or []), subject_cap)
+        lines.append(f"   {f.get('subject_label', 'Affected')} ({f.get('count', 0)}):")
+        lines += [f"     - {x}" for x in shown]
+        if more:
+            lines.append(f"     ... and {more} more")
+        lines.append("")
+    if hidden_findings:
+        lines.append(f"... and {hidden_findings} more finding(s) not shown.")
+    return "\n".join(lines)
 
 
 async def send_test_email(to_email: Optional[str] = None) -> tuple[bool, str]:

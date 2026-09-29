@@ -65,6 +65,8 @@ from typing import Any, Iterator, Optional
 from urllib.parse import quote
 
 from backend.config.settings import settings
+from backend.platforms.scan_options import cancelled
+from backend.shared import diagnostics
 from backend.shared.tasks import spawn
 from backend.shared.extraction import run_strategies
 from backend.shared.schema_probe import SchemaProbe, probe_or_null
@@ -1220,6 +1222,9 @@ class Sweep:
     complete: bool = False
     seconds: float = 0.0
     error: str = ""
+    # Where in OUR code the sweep failed, when it raised -- see
+    # shared/diagnostics.py::where. Blank for a sweep that ended itself.
+    where: str = ""
     # "hydration+network" normally; "dom" when both came up empty and the
     # rendered results page had to stand in
     source: str = "hydration+network"
@@ -1385,9 +1390,18 @@ class Discovery:
                 except asyncio.TimeoutError:
                     pass
 
+            def _found() -> int:
+                # The logged-in account is dropped from the results below
+                # (see viewer_username), so it must not count towards the
+                # cap either -- counting it stopped a sweep one short.
+                return len(by_username) - (1 if self._viewer and self._viewer in by_username else 0)
+
             stalls = 0
             while True:
-                if self.a.max_results and len(by_username) >= self.a.max_results:
+                if cancelled(self.a):
+                    out.stopped = "cancelled"
+                    break
+                if self.a.max_results and _found() >= self.a.max_results:
                     out.stopped = "cap:results"
                     break
                 if self.a.max_pages and out.pages >= self.a.max_pages:
@@ -1399,7 +1413,16 @@ class Discovery:
 
                 before = len(by_username)
                 arrived.clear()
-                await page.evaluate(JS_SCROLL_RESULTS)
+                try:
+                    await page.evaluate(JS_SCROLL_RESULTS)
+                except Exception as e:
+                    # Ends the scrolling, not the sweep: raised out of here
+                    # it reached the outer `except` and every account
+                    # already collected was discarded with it.
+                    out.stopped = "error"
+                    out.error = f"scroll failed: {type(e).__name__}: {e}"
+                    out.where = diagnostics.where(e)
+                    break
                 try:
                     await asyncio.wait_for(arrived.wait(), timeout=self.a.page_wait)
                 except asyncio.TimeoutError:
@@ -1490,6 +1513,7 @@ class Discovery:
                 out.hits = out.hits[: self.a.max_results]
         except Exception as e:
             out.stopped, out.error = "error", f"{type(e).__name__}: {e}"
+            out.where = diagnostics.where(e)
         finally:
             try:
                 await page.close()

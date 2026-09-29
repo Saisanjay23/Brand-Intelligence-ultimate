@@ -18,6 +18,9 @@ export interface AlertSettings {
   alert_on_session_dead: boolean;
   alert_on_session_expiring: boolean;
   alert_on_critical_incident: boolean;
+  alert_on_discovery_failure?: boolean;
+  alert_on_analysis_failure?: boolean;
+  alert_on_scheduler_issue?: boolean;
   session_expiry_warning_hours: number;
   report_on_sweep_complete?: boolean;
   report_emails?: string[];

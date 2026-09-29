@@ -54,6 +54,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from backend.platforms.scan_options import cancelled
+from backend.shared import diagnostics
 from backend.shared.avatars import hd_picture_url
 from backend.shared.logging import get_logger
 from backend.shared.models.hit import Hit, hit_to_row
@@ -263,7 +265,11 @@ class YouTubeAPI:
                 custom = str(((ch.get("snippet") or {}).get("customUrl")) or "").strip()
                 if cid and custom:
                     out[cid] = custom
-        except (QuotaExceeded, RuntimeError) as e:
+        except Exception as e:                        # noqa: BLE001 - see NEVER RAISES
+            # Every exception, not just the API's own RuntimeError: a
+            # network timeout or dropped connection surfaces from urllib as
+            # URLError/TimeoutError, and letting one out here ended the sweep
+            # as `error` and discarded the page of results already fetched.
             # Named, not swallowed: a sweep quietly reverting to id-shaped
             # URLs looks like a product decision rather than a failure.
             log.warning(
@@ -401,6 +407,9 @@ class Sweep:
     complete: bool = False
     seconds: float = 0.0
     error: str = ""
+    # Where in OUR code the sweep failed, when it raised -- see
+    # shared/diagnostics.py::where. Blank for a sweep that ended itself.
+    where: str = ""
     # WHICH TARGETED ATTRIBUTES THE PLATFORM STILL SERVES: {key: [hits,
     # misses]}, from shared/schema_probe.py. Carried on the Sweep so the
     # runner can fold it into the rolling telemetry, which is what lets an
@@ -465,6 +474,9 @@ class Discovery:
         token = ""
         try:
             while True:
+                if cancelled(self.a):
+                    out.stopped = "cancelled"
+                    break
                 if self.a.max_results and len(by_id) >= self.a.max_results:
                     out.stopped = "cap:results"
                     break
@@ -523,7 +535,9 @@ class Discovery:
                         entity_type="channel",
                         keyword=keyword,
                         tab=tab,
-                        rank=len(by_id) + i,
+                        # 1-based position across the whole sweep; the
+                        # old `len(by_id) + i` counted every step twice.
+                        rank=len(by_id) + 1,
                         source="api",
                     )
                     by_id[cid] = hit
@@ -558,6 +572,7 @@ class Discovery:
             out.stopped, out.error = "quota", str(e)
         except Exception as e:
             out.stopped, out.error = "error", f"{type(e).__name__}: {e}"
+            out.where = diagnostics.where(e)
         finally:
             # search.list's snippet has no statistics/contentDetails part at
             # all (that's channels.list, a different API resource analysis

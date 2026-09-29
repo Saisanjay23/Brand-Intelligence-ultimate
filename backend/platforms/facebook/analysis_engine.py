@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterator, Optional
 
 from backend.config.settings import settings
+from backend.shared import diagnostics
 from backend.shared.tasks import spawn
 from backend.shared.avatars import looks_like_placeholder
 from backend.shared.models.row import Row
@@ -145,6 +146,10 @@ class Harvest:
         self.text: dict[str, str] = {}
         self.ents: list[dict] = []  # dicts that ARE this profile (id == pid)
         self.dom: dict[str, Any] = {}  # header fields read straight off the page
+        # Why a tab's navigation failed, first line of the error, by tag --
+        # see visit(). Kept here rather than on the Scraper because several
+        # profiles are visited at once through one Scraper.
+        self.nav_errors: dict[str, str] = {}
         self._scopes: dict[str, "Harvest"] = {}
         self.pid: str = ""  # set on a scoped view, see scoped()
         self._parent: Optional["Harvest"] = None
@@ -1213,7 +1218,9 @@ class Scraper:
             await page.goto(
                 url, wait_until="domcontentloaded", timeout=self.a.timeout * 1000
             )
-        except Exception:
+        except Exception as e:
+            first = (str(e).splitlines() or [""])[0][:200]
+            h.nav_errors[tag] = f"{type(e).__name__}: {first}"
             return False
         try:
             if needle is not None:
@@ -1519,7 +1526,10 @@ class Scraper:
                 page, url, h, "main", scrolls=self.a.scrolls, needle=needle
             ):
                 row.status = "ERROR"
-                row.note("main nav failed")
+                # With the reason: the runner reads it to tell a dead
+                # browser or a blocked account from a slow page.
+                why = h.nav_errors.get("main", "")
+                row.note(f"main nav failed: {why}" if why else "main nav failed")
                 return row
 
             txt = h.text.get("main", "")
@@ -1660,6 +1670,7 @@ class Scraper:
             row.profile_id = profile_id(row.url)
             row.status = "ERROR"
             row.note(f"{type(e).__name__}: {e}")
+            row.where = diagnostics.where(e)
             return row
 
     @staticmethod

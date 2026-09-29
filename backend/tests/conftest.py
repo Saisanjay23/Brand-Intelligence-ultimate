@@ -51,3 +51,53 @@ def _isolate_audit_log(tmp_path_factory):
         yield
     finally:
         settings.log_path = original
+
+
+# Every SMTP send the suite attempted, for tests that want to assert on it.
+SENT_EMAILS: list[dict] = []
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _no_real_email():
+    """NO TEST MAY EVER SEND A REAL EMAIL.
+
+    Jobs and Scheduler runs now mail failure reports on their own
+    (services/failure_alerts.py), and the SMTP settings live in MongoDB --
+    so a test run on a machine whose database is up would mail the
+    operator a report about fixture keywords. Patched at the lowest level,
+    the SMTP connection itself, so everything above it (settings,
+    rendering, STARTTLS handling, the retry) still runs exactly as it does
+    for real -- and a test that patches smtplib itself still wins.
+    """
+    from backend.services import email_service
+
+    class _NoNetworkSMTP:
+        def __init__(self, host="", port=0, *a, **kw):
+            self.host = host
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def ehlo(self, *a, **kw):
+            return (250, b"ok")
+
+        def has_extn(self, name):
+            return False
+
+        def starttls(self, *a, **kw):
+            return (220, b"ok")
+
+        def login(self, *a, **kw):
+            return (235, b"ok")
+
+        def sendmail(self, sender, recipients, text):
+            SENT_EMAILS.append({"to": list(recipients), "text": text})
+            return {}
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(email_service.smtplib, "SMTP", _NoNetworkSMTP)
+        mp.setattr(email_service.smtplib, "SMTP_SSL", _NoNetworkSMTP)
+        yield

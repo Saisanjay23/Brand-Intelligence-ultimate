@@ -34,6 +34,10 @@ def _session(ctx_close, tmp_path: Path):
     return s
 
 
+async def _hung_cookie_save():
+    await asyncio.sleep(10)                     # driver no longer answering
+
+
 def _leased(p: Path) -> bool:
     return str(p).lower() in SB._profile_leases
 
@@ -72,6 +76,36 @@ async def test_a_cut_off_close_finishes_in_the_background(tmp_path, monkeypatch)
     assert _leased(profile)
 
     await asyncio.sleep(0.3)
+    pw.stop.assert_awaited_once()
+    assert not _leased(profile)
+
+
+@pytest.mark.asyncio
+async def test_a_cut_off_cookie_save_still_cleans_up(tmp_path, monkeypatch):
+    # The cookie save used to sit BEFORE the try/finally, so a cancel that
+    # landed while it hung skipped the cleanup entirely.
+    monkeypatch.setattr(SB, "_ABANDONED_CLOSE_GRACE_S", 0.05)
+    s = _session(AsyncMock(), tmp_path)
+    s.sync_cookies = _hung_cookie_save
+    pw, profile = s._pw, s._profile
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(s.stop(), timeout=0.05)
+    await asyncio.sleep(0.3)
+    pw.stop.assert_awaited_once()
+    assert not _leased(profile)
+
+
+@pytest.mark.asyncio
+async def test_a_hung_cookie_save_does_not_block_the_close(tmp_path, monkeypatch):
+    monkeypatch.setattr(SB, "_COOKIE_SYNC_TIMEOUT_S", 0.05)
+    close = AsyncMock()
+    s = _session(close, tmp_path)
+    s.sync_cookies = _hung_cookie_save
+    pw, profile = s._pw, s._profile
+
+    await asyncio.wait_for(s.stop(), timeout=2)
+    close.assert_awaited_once()
     pw.stop.assert_awaited_once()
     assert not _leased(profile)
 

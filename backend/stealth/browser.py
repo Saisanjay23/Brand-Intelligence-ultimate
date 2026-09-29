@@ -162,6 +162,11 @@ def _release_profile(path: Path) -> None:
 # browser that is still writing its profile.
 _ABANDONED_CLOSE_GRACE_S = 30.0
 
+# Ceiling on the cookie save at the start of Session.stop(). Well under the
+# runners' 10s teardown budget, so a hung driver cannot spend all of it
+# before the close is even attempted.
+_COOKIE_SYNC_TIMEOUT_S = 4.0
+
 
 async def _stop_driver(pw) -> None:
     if pw is None:
@@ -693,8 +698,6 @@ class Session:
         Best-effort throughout -- a failed save must never stop a browser
         from closing, or the next run inherits a leaked process.
         """
-        await self.sync_cookies()
-
         # CLOSED BY IDENTITY, NOT BY NAME. On a persistent context
         # `self.browser IS self.ctx`, so walking the pair blindly would
         # close the same object twice -- harmless today only because the
@@ -704,6 +707,19 @@ class Session:
             closers.append((self.browser, "close"))
         closed = False
         try:
+            # THE COOKIE SAVE IS INSIDE THE `try`, AND BOUNDED. It talks to
+            # the same driver the close does, so on a dying browser it hangs
+            # the same way ("BrowserContext.cookies: Connection closed while
+            # reading from the driver"). Outside the `try`, the runner's
+            # teardown cancel landed here and skipped the `finally` below --
+            # the driver leak and stuck profile lease it exists to prevent.
+            # Its own ceiling also leaves the close itself time to happen.
+            try:
+                await asyncio.wait_for(self.sync_cookies(),
+                                       timeout=_COOKIE_SYNC_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                log.warning(f"{self.platform}: cookie save did not finish within "
+                            f"{_COOKIE_SYNC_TIMEOUT_S:.0f}s -- closing without it")
             for obj, meth in closers:
                 if obj:
                     try:

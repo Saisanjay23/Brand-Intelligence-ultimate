@@ -62,10 +62,20 @@ from pathlib import Path
 # --reload the app is imported by a CHILD process that never executes
 # run.py, so a policy set there would not apply to the process that actually
 # launches browsers.
+#
+# The policy API is deprecated from Python 3.14 and goes in 3.16. Proactor is
+# already Windows' default, so where the API no longer exists there is
+# nothing to undo; until then the deprecation notice is silenced rather than
+# printed on every start.
 if sys.platform == "win32":
-    _policy = asyncio.get_event_loop_policy()
-    if not isinstance(_policy, asyncio.WindowsProactorEventLoopPolicy):
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        _proactor = getattr(asyncio, "WindowsProactorEventLoopPolicy", None)
+        if _proactor is not None and not isinstance(
+                asyncio.get_event_loop_policy(), _proactor):
+            asyncio.set_event_loop_policy(_proactor())
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware

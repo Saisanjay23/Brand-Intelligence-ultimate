@@ -15,10 +15,12 @@ import react from "@vitejs/plugin-react";
 // back ("Unexpected token '<'... is not valid JSON") -- a clear error
 // toast, not a crash.
 //
-// /scheduler is gone from this list entirely: nothing calls it any more. The
-// Scheduler tab sequences its own queue over POST /discovery/jobs (see
-// services/scheduleRunner.ts), and Live Activity's Client Coverage tab reads
-// that same store instead of the /scheduler/status that never existed here.
+// /scheduler IS proxied: the Scheduler page is a client of the server-side
+// run loop (backend/api/scheduler.py, services/scheduler_service.py) and
+// every one of its requests goes to /scheduler/*. It was once left out here
+// on the belief that nothing called it, which under `npm run dev` handed
+// the page index.html for every Scheduler request -- nothing loaded, and a
+// schedule could not be saved.
 //
 // Overridable so a second backend (a branch, a test instance on another
 // port) can be pointed at without editing this file and forgetting to put
@@ -27,7 +29,7 @@ const BACKEND = process.env.BACKEND_ORIGIN || "http://127.0.0.1:8000";
 const proxy = Object.fromEntries(
   [
     "/discovery", "/analysis", "/sessions", "/health", "/media",
-    "/clients", "/jobs", "/reports", "/alerts",
+    "/clients", "/jobs", "/reports", "/alerts", "/scheduler",
     "/docs", "/redoc", "/openapi.json",
   ].map((path) => [path, { target: BACKEND, changeOrigin: true }]),
 );
