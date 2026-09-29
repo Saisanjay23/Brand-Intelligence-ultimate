@@ -3966,19 +3966,41 @@ tr:hover .row-quick-actions {
   width: 100%;
   max-width: 100%;
   overflow-x: auto;
-  overflow-y: auto;
-  /* A FULL-SCREEN SCROLL AREA, not a box that shrinks to its rows. It used
-     to be max-height only, so one result made a one-row sliver. Now it is
-     always most of the viewport tall (never under 480px), rows scroll
-     inside it under a sticky header, and more load as you reach the end
-     (AnalysisView's endless scroll). */
-  height: calc(100vh - 160px);
-  min-height: 480px;
+  overflow-y: hidden;
+  /* AS TALL AS ITS ROWS. A fixed-height box with its own scrollbar hid
+     most results behind a second scroll inside the page; now the box
+     grows with every row and the PAGE scrolls, with more rows loading as
+     its end comes into view (AnalysisView's endless scroll). The table is
+     wider than the screen, so its own sideways scrollbar -- which would
+     now sit below the last row -- is hidden in favour of the one pinned
+     to the bottom of the window (.analysis-table-hscroll). */
+  scrollbar-width: none;
   position: relative;
   border: 1px solid var(--border-color);
   border-radius: 12px;
   background: var(--bg-card);
   box-sizing: border-box;
+}
+
+.analysis-table-container::-webkit-scrollbar {
+  display: none;
+}
+
+/* The results table's sideways scrollbar, stuck to the bottom of the
+   window while the table is on screen, and kept in step with the table. */
+.analysis-table-hscroll {
+  position: sticky;
+  bottom: 0;
+  z-index: 30;
+  overflow-x: auto;
+  overflow-y: hidden;
+  height: 14px;
+  background: var(--bg-card);
+  border-radius: 0 0 12px 12px;
+}
+
+.analysis-table-hscroll > div {
+  height: 1px;
 }
 
 .analysis-table-container thead th {

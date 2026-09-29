@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import toast from "react-hot-toast";
 import {
   analysisApi,
+  type AnalysisItemData,
   type AnalysisJobResponse,
 } from "../api/analysisApi";
 import {
@@ -29,6 +30,14 @@ import {
 import { confirmAction } from "../utils/confirmAction";
 import { download, downloadBlob, rowsToCsv, rowsToTsv } from "../utils/download";
 import { formatElapsed, useLiveTimer } from "../utils/timeFormat";
+
+// What actually scrolls when the analyst scrolls this page: the app shell's
+// `.page-content` (html/body/#root are fixed-height), else the document.
+function pageScroller(el: HTMLElement): HTMLElement {
+  return (el.closest(".page-content") as HTMLElement | null)
+    ?? (document.scrollingElement as HTMLElement | null)
+    ?? document.documentElement;
+}
 
 const SAMPLE_URLS = [
   "https://www.facebook.com/zuck",
@@ -181,6 +190,142 @@ const getPriorityFromRisk = (score: number) => {
   if (score >= 5) return "High";
   return "Low";
 };
+
+const ITEM_STATUS_LABEL: Record<AnalysisItemData["status"], string> = {
+  pending: "waiting",
+  running: "⏳ live",
+  done: "done",
+  error: "failed",
+};
+
+const ITEM_STATUS_COLOR: Record<AnalysisItemData["status"], string> = {
+  pending: "var(--text-muted)",
+  running: "var(--purple, #9A50E9)",
+  done: "var(--success, #12B76A)",
+  error: "var(--danger, #E95053)",
+};
+
+// EVERY URL IN THE JOB, GROUPED BY PLATFORM. This used to be one mixed list
+// in a 200px box with its own scrollbar, so on an "Analyse all" of a few
+// hundred discovery profiles nearly every URL was hidden, and a failed one
+// said only "error". Now each platform gets its own section -- counts in
+// its header, every URL listed in full, and a failed URL's reason under it
+// -- and a section can be folded away once it is finished with.
+function UrlStatusByPlatform({ jobData }: { jobData: AnalysisJobResponse }) {
+  const [folded, setFolded] = useState<Record<string, boolean>>({});
+
+  const groups = useMemo(() => {
+    const byPlatform = new Map<string, AnalysisItemData[]>();
+    // The platform chips' order first, then anything they do not list, so
+    // no URL can be left out of every section.
+    for (const pid of Object.keys(jobData.platform_progress || {})) byPlatform.set(pid, []);
+    for (const it of jobData.items) {
+      if (!byPlatform.has(it.platform)) byPlatform.set(it.platform, []);
+      byPlatform.get(it.platform)!.push(it);
+    }
+    return [...byPlatform.entries()].filter(([, items]) => items.length);
+  }, [jobData.items, jobData.platform_progress]);
+
+  if (!groups.length) return null;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+      {groups.map(([pid, items]) => {
+        const count = (s: AnalysisItemData["status"]) => items.filter((it) => it.status === s).length;
+        const done = count("done"), failed = count("error"), live = count("running"), waiting = count("pending");
+        const name = jobData.platform_progress?.[pid]?.display_name || items[0]?.platform_name || pid;
+        const isFolded = !!folded[pid];
+        return (
+          <div
+            key={pid}
+            style={{
+              border: "1px solid var(--border-color, #344054)",
+              borderRadius: "8px",
+              background: "rgba(0, 0, 0, 0.12)",
+            }}
+          >
+            <button
+              type="button"
+              onClick={() => setFolded((f) => ({ ...f, [pid]: !f[pid] }))}
+              aria-expanded={!isFolded}
+              style={{
+                display: "flex", alignItems: "center", gap: "10px", width: "100%",
+                padding: "8px 12px", background: "transparent", border: "none",
+                color: "var(--text-main, #fff)", cursor: "pointer", fontSize: "12.5px",
+                flexWrap: "wrap", textAlign: "left",
+              }}
+            >
+              <span style={{ fontSize: "10px", color: "var(--text-muted)", width: "10px" }}>
+                {isFolded ? "▸" : "▾"}
+              </span>
+              <PlatformIcon platform={pid} size={15} />
+              <span style={{ fontWeight: 700 }}>{name}</span>
+              <span style={{ color: "var(--text-dim, #98a2b3)" }}>
+                {done + failed}/{items.length} finished
+              </span>
+              <span style={{ display: "inline-flex", gap: "10px", fontSize: "11px", fontWeight: 600, marginLeft: "auto" }}>
+                <span style={{ color: ITEM_STATUS_COLOR.done }}>{done} done</span>
+                <span style={{ color: failed ? ITEM_STATUS_COLOR.error : "var(--text-muted)" }}>{failed} failed</span>
+                {live > 0 && <span style={{ color: ITEM_STATUS_COLOR.running }}>{live} live</span>}
+                {waiting > 0 && <span style={{ color: ITEM_STATUS_COLOR.pending }}>{waiting} waiting</span>}
+              </span>
+            </button>
+
+            {!isFolded && (
+              <div style={{ display: "flex", flexDirection: "column", gap: "4px", padding: "0 10px 10px 10px" }}>
+                {items.map((it) => {
+                  const reason = it.status === "error" ? (it.error || it.comments || "") : "";
+                  return (
+                    <div
+                      key={it.id}
+                      style={{
+                        fontSize: "12px",
+                        padding: "5px 10px",
+                        borderRadius: "6px",
+                        background: it.status === "running" ? "rgba(154, 80, 233, 0.1)" : "rgba(0, 0, 0, 0.15)",
+                        border: it.status === "running" ? "1px solid rgba(154, 80, 233, 0.35)" : "1px solid transparent",
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                        <span
+                          style={{
+                            fontSize: "10px", fontWeight: 700, textTransform: "uppercase",
+                            width: "56px", flexShrink: 0, color: ITEM_STATUS_COLOR[it.status],
+                          }}
+                        >
+                          {ITEM_STATUS_LABEL[it.status]}
+                        </span>
+                        <a
+                          href={it.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          title={it.url}
+                          style={{ color: "var(--text-dim, #98a2b3)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, textDecoration: "none" }}
+                        >
+                          {it.url}
+                        </a>
+                        {it.duration_seconds !== undefined && it.duration_seconds !== null && it.status !== "pending" && (
+                          <span style={{ fontFamily: "var(--font-mono)", fontSize: "11px", color: "var(--purple, #a78bfa)", fontWeight: 700, flexShrink: 0 }}>
+                            ⏱️ {it.duration_seconds.toFixed(1)}s
+                          </span>
+                        )}
+                      </div>
+                      {reason && (
+                        <div style={{ marginTop: "3px", paddingLeft: "64px", fontSize: "11px", color: "var(--danger, #E95053)", wordBreak: "break-word" }}>
+                          {reason}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
 
 function AnalysisProgressBanner({
   jobData,
@@ -367,53 +512,8 @@ function AnalysisProgressBanner({
         ))}
       </div>
 
-      {/* Live per-URL status & timings */}
-      <div style={{ display: "flex", flexDirection: "column", gap: "5px", maxHeight: "200px", overflowY: "auto" }}>
-        {jobData.items.map((it) => (
-          <div
-            key={it.id}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: "8px",
-              fontSize: "12px",
-              padding: "5px 10px",
-              borderRadius: "6px",
-              background: it.status === "running" ? "rgba(154, 80, 233, 0.1)" : "rgba(0, 0, 0, 0.15)",
-              border: it.status === "running" ? "1px solid rgba(154, 80, 233, 0.35)" : "1px solid transparent",
-            }}
-          >
-            <PlatformIcon platform={it.platform} size={13} />
-            <span
-              style={{
-                fontSize: "10px",
-                fontWeight: 700,
-                textTransform: "uppercase",
-                width: "56px",
-                flexShrink: 0,
-                color:
-                  it.status === "done"
-                    ? "var(--success, #12B76A)"
-                    : it.status === "running"
-                    ? "var(--purple, #9A50E9)"
-                    : it.status === "error"
-                    ? "var(--danger, #E95053)"
-                    : "var(--text-muted)",
-              }}
-            >
-              {it.status === "running" ? "⏳ live" : it.status}
-            </span>
-            <span style={{ color: "var(--text-dim, #98a2b3)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }} title={it.url}>
-              {it.url}
-            </span>
-            {it.duration_seconds !== undefined && it.duration_seconds !== null && it.status !== "pending" && (
-              <span style={{ fontFamily: "var(--font-mono)", fontSize: "11px", color: "var(--purple, #a78bfa)", fontWeight: 700, flexShrink: 0 }}>
-                ⏱️ {it.duration_seconds.toFixed(1)}s
-              </span>
-            )}
-          </div>
-        ))}
-      </div>
+      {/* Every URL's status, one section per platform -- see UrlStatusByPlatform. */}
+      <UrlStatusByPlatform jobData={jobData} />
     </div>
   );
 }
@@ -609,9 +709,14 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
   const [shownRows, setShownRows] = useState(ROWS_PER_STEP);
   const tableScrollRef = useRef<HTMLDivElement | null>(null);
   const loadMoreRef = useRef<HTMLDivElement | null>(null);
+  const hScrollRef = useRef<HTMLDivElement | null>(null);
+  const [tableWidth, setTableWidth] = useState(0);
   useEffect(() => {
     setShownRows(ROWS_PER_STEP);
-    tableScrollRef.current?.scrollTo({ top: 0 });
+    // Back to the table's first row -- only when it has been scrolled past,
+    // so a filter changed while the table's top is on screen never jumps.
+    const box = tableScrollRef.current;
+    if (box && box.getBoundingClientRect().top < 0) box.scrollIntoView({ block: "start" });
   }, [searchQuery, platformFilter, riskFilter]);
 
   // Filtered rows for the table -- grouped one platform after another (in
@@ -650,21 +755,22 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
   }, [allItems, jobData?.platform_progress, platformFilter, riskFilter, searchQuery]);
 
   // Draw the next step once the "scroll for more" marker comes within 600px
-  // of the table's visible area. Re-armed whenever a step lands, so a tall
+  // of the bottom of the window. Re-armed whenever a step lands, so a tall
   // screen that shows the marker straight away keeps filling until it is
   // full or everything is drawn.
   const hasMoreRows = filteredItems.length > shownRows;
   useEffect(() => {
-    const root = tableScrollRef.current;
     const target = loadMoreRef.current;
-    if (!hasMoreRows || !root || !target || typeof IntersectionObserver === "undefined") return;
+    if (!hasMoreRows || !target || typeof IntersectionObserver === "undefined") return;
     const io = new IntersectionObserver(
       (entries) => {
         if (entries.some((e) => e.isIntersecting)) {
           setShownRows((n) => n + ROWS_PER_STEP);
         }
       },
-      { root, rootMargin: "0px 0px 600px 0px" },
+      // The table no longer scrolls itself -- the page does -- so this
+      // watches the window, not the table box.
+      { root: null, rootMargin: "0px 0px 600px 0px" },
     );
     io.observe(target);
     return () => io.disconnect();
@@ -704,19 +810,23 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
       if (!box) return;
       const r = box.getBoundingClientRect();
       if (r.bottom <= 0 || r.top >= window.innerHeight) return;   // table not on screen
-      const header = box.querySelector("thead")?.getBoundingClientRect().height ?? 0;
+      // THE PAGE SCROLLS, not the table (it grows to fit its rows).
+      const scroller = pageScroller(box);
+      const view = scroller.getBoundingClientRect();
       const row = box.querySelector("tbody tr")?.getBoundingClientRect().height || 60;
-      const page = Math.max(row, box.clientHeight - header - row);
+      const page = Math.max(row, scroller.clientHeight - row);
       // A single press moves exactly one row, for precision; a HELD key
       // (auto-repeat) moves two per repeat, so holding it covers ground.
       const rowStep = e.repeat ? row * 2 : row;
       const step: Record<string, number> = {
         ArrowDown: rowStep, ArrowUp: -rowStep, PageDown: page, PageUp: -page,
-        End: box.scrollHeight, Home: -box.scrollHeight,
+        // The table's first row / last row, not the top or end of the page.
+        End: r.bottom - Math.min(view.bottom, window.innerHeight),
+        Home: r.top - Math.max(view.top, 0),
       };
       if (!(e.key in step)) return;
       e.preventDefault();
-      box.scrollBy({ top: step[e.key], behavior: "auto" });
+      scroller.scrollBy({ top: step[e.key], behavior: "auto" });
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -728,21 +838,22 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
   // times as far, eased over a few frames so it glides rather than jumps.
   //   - mouse-wheel notches only: a touchpad sends many small pixel deltas
   //     and is left entirely to the browser, or it would become twitchy;
-  //   - at the table's top or bottom the wheel is left alone, so the page
-  //     itself scrolls on as before;
+  //   - it moves the PAGE (the table grows to fit its rows), and only while
+  //     the pointer is over the table;
   //   - Ctrl+wheel (zoom) and sideways scrolling are untouched.
   const hasTable = allItems.length > 0;
   useEffect(() => {
     const box = tableScrollRef.current;
     if (!box) return;
+    const scroller = pageScroller(box);
     const WHEEL_BOOST = 2.5;
     let target: number | null = null;
     let raf = 0;
     const glide = () => {
       if (target === null) { raf = 0; return; }
-      const d = target - box.scrollTop;
-      if (Math.abs(d) < 1) { box.scrollTop = target; target = null; raf = 0; return; }
-      box.scrollTop += d * 0.35;
+      const d = target - scroller.scrollTop;
+      if (Math.abs(d) < 1) { scroller.scrollTop = target; target = null; raf = 0; return; }
+      scroller.scrollTop += d * 0.35;
       raf = requestAnimationFrame(glide);
     };
     const onWheel = (e: WheelEvent) => {
@@ -753,12 +864,12 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
       // reported delta is scaled back up -- otherwise the boost comes out
       // smaller on exactly the high-DPI laptops this is used on.
       const px = e.deltaMode === 1 ? e.deltaY * 40
-        : e.deltaMode === 2 ? e.deltaY * box.clientHeight
+        : e.deltaMode === 2 ? e.deltaY * scroller.clientHeight
         : e.deltaY * (window.devicePixelRatio || 1);
       const isNotch = e.deltaMode !== 0 || Math.abs(px) >= 50;
       if (!isNotch) return;
-      const max = box.scrollHeight - box.clientHeight;
-      const from = target ?? box.scrollTop;
+      const max = scroller.scrollHeight - scroller.clientHeight;
+      const from = target ?? scroller.scrollTop;
       if ((px < 0 && from <= 0) || (px > 0 && from >= max - 1)) return;
       e.preventDefault();
       target = Math.max(0, Math.min(max, from + px * WHEEL_BOOST));
@@ -769,10 +880,40 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
     const stopGlide = () => { target = null; };
     box.addEventListener("wheel", onWheel, { passive: false });
     box.addEventListener("pointerdown", stopGlide);
+    scroller.addEventListener("pointerdown", stopGlide);
     return () => {
       box.removeEventListener("wheel", onWheel);
       box.removeEventListener("pointerdown", stopGlide);
+      scroller.removeEventListener("pointerdown", stopGlide);
       if (raf) cancelAnimationFrame(raf);
+    };
+  }, [hasTable]);
+
+  // THE SIDEWAYS SCROLLBAR, PINNED TO THE BOTTOM OF THE WINDOW. The table is
+  // wider than the screen and now as tall as all its rows, so its own
+  // scrollbar would sit below the last row -- out of reach until the end.
+  // This one sticks to the window's bottom edge while the table is on
+  // screen, and the two are kept at the same sideways position.
+  useEffect(() => {
+    const box = tableScrollRef.current;
+    const bar = hScrollRef.current;
+    const table = box?.querySelector("table");
+    if (!box || !bar || !table) return;
+    const measure = () =>
+      setTableWidth(box.scrollWidth > box.clientWidth + 1 ? box.scrollWidth : 0);
+    measure();
+    const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(measure) : null;
+    ro?.observe(table);
+    ro?.observe(box);
+    // Setting the same value fires no further scroll, so the pair settles.
+    const fromBar = () => { if (box.scrollLeft !== bar.scrollLeft) box.scrollLeft = bar.scrollLeft; };
+    const fromBox = () => { if (bar.scrollLeft !== box.scrollLeft) bar.scrollLeft = box.scrollLeft; };
+    bar.addEventListener("scroll", fromBar, { passive: true });
+    box.addEventListener("scroll", fromBox, { passive: true });
+    return () => {
+      ro?.disconnect();
+      bar.removeEventListener("scroll", fromBar);
+      box.removeEventListener("scroll", fromBox);
     };
   }, [hasTable]);
 
@@ -1883,6 +2024,14 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
                 Showing {shownRows} of {filteredItems.length} -- scroll for more
               </div>
             )}
+          </div>
+          <div
+            ref={hScrollRef}
+            className="analysis-table-hscroll"
+            style={{ display: tableWidth ? "block" : "none" }}
+            aria-hidden="true"
+          >
+            <div style={{ width: `${tableWidth}px` }} />
           </div>
         </div>
       )}
