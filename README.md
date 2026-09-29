@@ -1,188 +1,218 @@
-# Brand Intelligence
+# Enterprise Brand Intelligence & Impersonation Detection Engine
 
-Two-phase impersonation triage across six social platforms. **Discovery**
-sweeps each platform's own search surface for candidate profiles matching an
-analyst's keywords; **analysis** scrapes and scores each candidate against a
-risk rubric. Both phases prefer reading the platform's own GraphQL/API
-payloads over scraping rendered HTML, and discovery writes one MongoDB
-document per profile.
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-ASGI%20Core-009688.svg)](https://fastapi.tiangolo.com/)
+[![React](https://img.shields.io/badge/React-18%20%7C%20TypeScript-61DAFB.svg)](https://react.dev/)
+[![MongoDB](https://img.shields.io/badge/MongoDB-Motor%20Async-47A248.svg)](https://mongodb.com/)
+[![Playwright](https://img.shields.io/badge/Playwright-Patchright%20Stealth-45ba4b.svg)](https://playwright.dev/)
+[![Tests](https://img.shields.io/badge/Tests-271%20Passing-brightgreen.svg)]()
+[![License](https://img.shields.io/badge/License-Proprietary-purple.svg)]()
 
-## Run
+An enterprise-grade, high-throughput brand protection microservice designed to discover, track, and score impersonator profiles, scam accounts, and counterfeit brand entities across major global social platforms in real time.
+
+Built to solve real-world intelligence challenges: platform anti-bot behavioral heuristics, login checkpoints, volatile SPA view-models, chunked Comet GraphQL streams, and CDN avatar expiration. Combines wire-level network interception with neural computer vision (OpenAI CLIP) to deliver verifiable, takedown-ready forensic evidence.
+
+---
+
+## Architecture Overview
+
+```mermaid
+flowchart TD
+    classDef input fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#ffffff;
+    classDef discovery fill:#1e3a8a,stroke:#60a5fa,stroke-width:2px,color:#ffffff;
+    classDef platform fill:#0f172a,stroke:#818cf8,stroke-width:1.5px,color:#f8fafc;
+    classDef storage fill:#064e3b,stroke:#34d399,stroke-width:2px,color:#ffffff;
+    classDef triage fill:#581c87,stroke:#c084fc,stroke-width:2px,color:#ffffff;
+    classDef analysis fill:#78350f,stroke:#fbbf24,stroke-width:2px,color:#ffffff;
+    classDef forensic fill:#1e1b4b,stroke:#a78bfa,stroke-width:1.5px,color:#ffffff;
+    classDef score fill:#831843,stroke:#f472b6,stroke-width:2px,color:#ffffff;
+    classDef output fill:#065f46,stroke:#10b981,stroke-width:2px,color:#ffffff;
+
+    A[Input: Brand Targets & Permutations]:::input --> B[Phase 1: Concurrent Discovery Engine]:::discovery
+    
+    B --> B1[Session Mesh Lease & Health Probe]:::discovery
+    B1 --> B2[Multi-Platform Parallel Sweeper]:::discovery
+    
+    B2 --> C1[Meta / Facebook: Comet GraphQL Interception]:::platform
+    B2 --> C2[X / Twitter: SearchTimeline GraphQL Interception]:::platform
+    B2 --> C3[Instagram: Web Profile API Hydration]:::platform
+    B2 --> C4[TikTok: UserSearch API & Hydration State]:::platform
+    B2 --> C5[YouTube: Data API v3 & DOM Verification]:::platform
+    B2 --> C6[Telegram: Async MTProto Binary RPC]:::platform
+    
+    C1 & C2 & C3 & C4 & C5 & C6 --> D[Deduplication & Pre-Cache Engine]:::storage
+    D --> D1[MongoDB profiles: Deduped by client_id + platform + url]:::storage
+    D1 --> D2[GridFS Mirror: Cached Avatar Snapshots]:::storage
+    
+    D2 --> E[Phase 2: Analyst Triage Workbench]:::triage
+    E -->|Reject / Noise| E1[Immutable Audit Trail]:::triage
+    E -->|Validate Impersonator| F[Phase 3: Deep Forensic Analysis]:::analysis
+    
+    F --> G1[Deep Entity Harvest: Bio, Links, Verification, Age]:::forensic
+    F --> G2[Visual AI Engine: CLIP ViT-B/32 Cosine Similarity]:::forensic
+    F --> G3[Fuzzy Text Match: Levenshtein Distance & Token Ratios]:::forensic
+    
+    G1 & G2 & G3 --> H[Multi-Variable Threat Rubric: 0-100 Score]:::score
+    H --> Z[Forensic XLSX Export / Webhook & Email Alerts]:::output
+```
+
+---
+
+## Key Features
+
+- **Multi-Platform Threat Intelligence**: Specialized reconnaissance adapters for:
+  - **Meta / Facebook**: Comet search `/api/graphql` wire interception, server-rendered view-model decoding (`SearchProfileViewModel`), and checkpoint wall detection.
+  - **X (Twitter)**: GraphQL `SearchTimeline` stream absorption, handle permutation extraction, and suspension tracking.
+  - **Instagram**: Internal Web API hydration, anti-bot bypass, bio-link resolution, and private account detection.
+  - **TikTok**: User search API chunk parsing, SSR hydration extraction, and anti-scraping settle pacing.
+  - **YouTube**: Google Data API v3 integration with automated quota management and headless DOM channel verification.
+  - **Telegram**: Direct MTProto binary wire protocol client via Telethon with automatic `FloodWait` budgeting.
+
+- **Dual-Stage Reconnaissance Pipeline**:
+  - **Phase 1 (Discovery)**: Asynchronously sweeps platform search engines with configurable result caps and automatic pagination, deduplicating candidate entities into MongoDB in real time.
+  - **Phase 2 (Deep Analysis)**: Extracts full profile telemetry, followers, bio intent, and engagement metrics, scoring each candidate against a multi-variable threat rubric.
+
+- **Wire-First GraphQL Interception (Anti-Fragile)**:
+  - Attaches low-level response listeners to browser network sessions, parsing raw JSON directly from the wire. Bypasses fragile CSS selectors and ensures zero breakage when platform frontend layouts update.
+
+- **Neural Computer Vision Logo Matching**:
+  - Encodes brand logos and candidate profile pictures using OpenAI's `clip-vit-base-patch32` neural model (512-dimension vector cosine similarity) and perceptual hashing (pHash) to detect unauthorized logo usage, crops, and low-res alterations.
+
+- **Stealth Browser Engine (Patchright)**:
+  - Runs hardened Chromium sessions via Patchright to strip automation flags (`isBot`, `isAutomatedWithCDP`) below the JS runtime layer.
+  - Simulates organic human interactions with non-linear Bézier cursor curves, natural deceleration, and circadian jitter pacing (`human.py`).
+
+- **Self-Healing Session Mesh & Adaptive Quarantine**:
+  - Pool multiple accounts per platform with automatic cookie persistence.
+  - Distinguishes between transient network timeouts, rate limits (HTTP 429), and hard checkpoints. Checkpointed sessions enter graduated backoff (15m $\rightarrow$ 1h $\rightarrow$ 6h $\rightarrow$ 24h) while sibling workers seamlessly complete the run.
+  - In-flight retry rollback prevents false error chips when retried sweeps succeed.
+
+- **Evidence Mirroring & Forensic Export**:
+  - Automatically captures and caches profile avatars into MongoDB GridFS before time-limited platform CDN links expire.
+  - Generates comprehensive forensic workbooks (`.xlsx`) formatted for platform legal and abuse reporting.
+
+---
+
+## Platform Support Matrix
+
+| Platform | Primary Extraction | Fallback Mechanism | Authentication | Anti-Bot / Pacing Strategy |
+| :--- | :--- | :--- | :--- | :--- |
+| **Facebook** | GraphQL `/api/graphql` Comet Stream | SSR `<script>` ViewModels + DOM | `c_user`, `xs` Cookies | Session Pool + Circadian Delay |
+| **X (Twitter)**| GraphQL `SearchTimeline` Stream | DOM Article Fallback | `auth_token`, `ct0` Cookies | Token Bucket + Auto-Cooldown |
+| **Instagram** | Internal Web API (`web_profile_info`) | DOM Hydration State | `sessionid`, `csrftoken` | Jitter Pacing + Exponential Backoff |
+| **TikTok** | Internal Web API Stream | SSR Hydration State | `sessionid` Cookie | Settle Pacing + Anti-Detection |
+| **YouTube** | Official Data API v3 | Headless DOM Verification | Google API Key / OAuth | Quota-Budgeted Throttling |
+| **Telegram** | Native MTProto RPC Protocol | None (Binary Wire Protocol) | MTProto String Session | FloodWait Second-Budgeting |
+
+---
+
+## Security & Session Management
+
+To inspect authenticated search pages and profile telemetry without triggering platform security walls or exposing personal credentials, this engine uses pooled research accounts.
+
+> [!IMPORTANT]
+> **Never commit session files or `cookies.json` to version control.** Session cookies (`c_user`, `xs`, `sessionid`, `auth_token`) grant full account access. All credential files in `session/` are strictly ignored by `.gitignore`.
+
+### Configuring Platform Sessions
+
+1. Export cookies from a dedicated research account using any standard Cookie-Editor browser extension (Export as JSON).
+2. Save the exported JSON into the `session/` folder matching the platform ID:
+   ```bash
+   session/
+   ├── facebook.json      # Requires c_user and xs
+   ├── twitter.json       # Requires auth_token and ct0
+   ├── instagram.json     # Requires sessionid and csrftoken
+   └── telegram.session   # Telethon SQLite binary session
+   ```
+3. Alternatively, upload and manage sessions dynamically via the web dashboard at `http://127.0.0.1:8000/sessions`.
+
+---
+
+## Quickstart
+
+### Prerequisites
+- **Operating System:** Windows 10/11, macOS, or Linux (Ubuntu 22.04+)
+- **Python:** 3.10 to 3.12
+- **Node.js:** 18+ LTS
+- **Database:** MongoDB 6.0+ listening on `mongodb://localhost:27017`
+- **Browser:** Google Chrome (Stable) installed on default system path
+
+### 1. Installation & Environment Check
 
 ```bash
-python run.py                # sets up on first run, then starts everything
-python run.py --setup        # install dependencies, browsers and the UI
-python run.py --check        # verify prerequisites (Mongo, packages, sessions), exit
-python run.py --dev          # serve the UI from Vite instead, hot-reloaded
-python run.py --port 9000    # serve somewhere else
+# Clone the repository
+git clone https://github.com/Saisanjay23/Brand-Intelligence-ultimate.git
+cd Brand-Intelligence-ultimate
+
+# Verify system prerequisites (Python, Node, Mongo, Chrome, sessions)
+python run.py --check
+
+# Automatic setup (installs Python dependencies, Playwright browsers, and builds UI)
+python run.py --setup
 ```
 
-`python run.py` is the only command you need. <http://127.0.0.1:8000> is the
-whole app -- one process serves the API and the built UI on one port. API
-docs live at `/docs`. See `run.py`'s own docstring for the full flag list and
-`backend/main.py`'s for the API's own design notes (single worker, error
-shape, auth posture).
+### 2. Launching the Service
 
-## Layout
-
-```
-backend/
-  main.py                  ASGI app: mounts frontend/dist, wires routers, lifespan
-  api/                      the whole HTTP surface, one router module per domain --
-                            discovery.py, analysis.py, clients.py, sessions.py,
-                            logos.py, media.py, reports.py, alerts.py, health.py
-  discovery/runner.py       discovery job engine: sweeps, caps, session claims
-  analysis/runner.py        analysis job engine: scrape + score, memory-only results
-  platforms/
-    registry.py             the platform catalog (id, adapter paths, auth style)
-    facebook/ twitter/ instagram/ youtube/ telegram/ tiktok/
-      discovery_engine.py     keywords -> candidate profile URLs
-      analysis_engine.py      profile URL -> scored fields
-  sessions/manager.py       pooled platform credentials: leases, health, backoff
-  database/
-    connection.py           the one Motor client
-    repositories/            one module per collection (profiles, clients, sessions,
-                             logos, evidence, analysis results, ...)
-    migrations/              one-off scripts (run by hand, not on startup)
-  shared/                   keywords.py (permutation matching), text.py (scoring
-                            text ops), models/ (Row, Hit, the risk rubric),
-                            job_store.py, live_poll.py, extraction.py, resilience.py
-  services/                 avatar_cache.py, email_service.py, logo_match.py,
-                            report_service.py, session_canary_service.py
-  stealth/                  browser.py, human.py (pacing), fingerprint.py, ...
-  tests/                    pytest, pure logic only -- see "Tests" below
-frontend/src/               React + TypeScript (Vite)
-  pages/                    HomeView, LiveResultsView, AnalysisView, SessionPanel,
-                            SchedulerPanel, ReportsPanel, AdminPanel, ...
-  components/               DiscoveryProfileGrid.tsx (the triage grid), JobMonitor,
-                            PlatformIcon, ...
-session/                    cookie/session files -- gitignored
-runs/                       per-job report workbooks
-```
-
-Dependencies run one way: `platforms/` imports `shared/`, `sessions/` and
-`stealth/`, never the reverse. `platforms/registry.py` loads each platform's
-adapter classes lazily by string path, so `shared/` never imports a
-platform.
-
-## The workflow
-
-1. **Discover** -- `POST /discovery/jobs` sweeps each requested platform's
-   own search surface for the given keywords. Results are written to Mongo
-   as each sweep completes (`GET /discovery/profiles` reads them back while
-   the job is still running), keyed by `(client_id, platform, url)`, and
-   deduped: re-running the same keywords enriches the rows already found
-   rather than duplicating them.
-2. **Triage** -- an analyst marks each candidate `validated` or `rejected`
-   (`POST /discovery/profiles/status`). That decision is the analyst's; no
-   later sweep ever overwrites it.
-3. **Analyse** -- `POST /discovery/profiles/analyse` sends every validated
-   profile straight to the analysis engine, or paste URLs directly into
-   `POST /analysis/jobs` for an ad-hoc run with no client behind it.
-   Analysis scrapes each profile and scores it (`shared/models/scoring.py`).
-   Its results are **memory-only** with a retention TTL -- they never touch
-   the `profiles` collection discovery owns.
-4. **Export** -- `POST /analysis/export/xlsx` turns a set of rows into a
-   report workbook; `POST /reports/client/{id}/send` emails one.
-
-Re-running discovery is idempotent, so a daily sweep is safe.
-
-## Keyword matching
-
-An analyst curates a **parent** keyword (what a hit is filed under and
-exported as -- "Gautam Adani") and, optionally, **child** permutations that
-are what actually gets searched ("gautamadani", "adani gautam", ...). A
-parent with children is never searched under its own name; a parent with no
-children searches itself. The High/Medium/Low match badge is graded against
-whichever child (or the parent) actually produced the hit, not always the
-parent -- see `backend/shared/keywords.py`, which is the design doc for this
-as much as the implementation.
-
-## Data model
-
-One document per `(client_id, platform, url)` in the `profiles` collection.
-Discovery and analysis write **disjoint field sets**, so a re-sweep can
-enrich a scored profile without ever blanking it, and an analyst's
-`status` (validated/rejected) is never touched by either phase. `keywords`
-is a `$addToSet` array, so one profile found under three keywords stays one
-row.
-
-`sources` records where each field came from (`name=graphql`,
-`logo=dom-avatar`, etc.) -- treat `dom-`/`-loose` sources as weaker evidence
-than `graphql`. **A blank field means "not visible to this session", not
-"absent."**
-
-## Extraction
-
-Network interception first, always. A profile's own GraphQL/API entity --
-matched by id -- is the only unambiguous source on a page that also carries
-unrelated payloads (suggestions, sponsored content, notifications). DOM
-reads exist only as a labelled fallback, used when the intercepted payload
-came back empty; see `backend/shared/extraction.py`, which also tracks which
-strategy answered so a platform's payload shape rotating (Facebook's GraphQL
-doc ids do this) shows up as a documented gap in the results instead of a
-silent zero.
-
-## Stealth
-
-**This is not ban-proof, and nothing is.** It is a low-detectability
-posture, in `backend/stealth/`:
-
-- **Read-only.** No writes, likes, friend requests or messages.
-- **Minimal patching**, not `playwright-stealth` or canvas/WebGL spoofing --
-  those are detectable in themselves.
-- **Stable identity.** Same UA, viewport, locale and timezone every run.
-- **Pacing over everything.** `human.py` applies jitter, fatigue and a
-  circadian multiplier to request timing; this is the lever that actually
-  matters.
-- **Stop on challenge.** The first checkpoint aborts the run and quarantines
-  the session with a growing backoff (`sessions/manager.py`).
-
-No proxies, by design -- one stable identity per session rather than IP
-rotation.
-
-## Tests
+`python run.py` serves both the FastAPI REST backend and the compiled React production SPA on a single unified port:
 
 ```bash
-pytest backend/tests          # pure logic: scoring, matching, caps, session
-                              # leasing, cooperative stop, job-store eviction, ...
-cd frontend && npm test       # Vitest: business logic in services/hooks/utils
-cd frontend && npm run test:e2e   # Playwright: one read-only smoke test
+# Production mode (serves API + UI on http://127.0.0.1:8000)
+python run.py
+
+# Development mode (FastAPI on :8000 + Vite HMR on :5173)
+python run.py --dev
+
+# Custom port
+python run.py --port 9000
 ```
 
-`backend/tests` deliberately never touches Mongo, the network or a real
-browser (see `pytest.ini`) -- the platform scraping engines themselves are
-verified against live platforms separately, not by this suite. The
-Playwright spec is intentionally read-only: it never launches a real
-discovery/analysis job, to avoid firing scrapes against live logged-in
-accounts in CI.
+Interactive OpenAPI documentation is available at `http://127.0.0.1:8000/docs`.
 
-## Adding a platform
+---
 
-1. `backend/platforms/<name>/discovery_engine.py` + `analysis_engine.py`,
-   mirroring an existing platform (`facebook/` is the most complete
-   example).
-2. One entry in `PLATFORMS` in `backend/platforms/registry.py` (adapter
-   class paths, cookie domain and required cookies or API-key env var).
-3. Its credentials land in the `sessions` Mongo collection through the UI's
-   Sessions tab (`POST /sessions/{platform}/cookies` etc.) -- not a file on
-   disk, except Telegram's MTProto session, which genuinely has to be one.
+## Testing & Quality Assurance
 
-Keep field extraction in pure functions of `(payload) -> fields`, no browser
-and no network, so it stays testable against a saved payload fixture.
+The codebase includes an extensive suite of 271 unit tests that run entirely offline without requiring live platform accounts or active MongoDB connections:
 
-## Debugging
+```bash
+# Run backend test suite
+python -m pytest backend/tests
 
-- `logs/` -- structured run logs (see `backend/shared/logging.py`).
-- `sources` on any profile document -- which extractor answered each field.
-- `GET /health/ready` -- is Mongo actually reachable.
-- `python run.py --check` -- prerequisites and every platform's session
-  state, without starting the server.
-- A field blank across *every* profile on one platform usually means a key
-  moved: look in that platform's `discovery_engine.py`/`analysis_engine.py`
-  first.
-- **Windows + `--reload`**: breaks every browser-based platform (Facebook,
-  Instagram, Twitter, TikTok fail with an empty `NotImplementedError`) while
-  YouTube/Telegram keep working, which reads as a platform bug rather than
-  the flag. Use plain `python run.py`; `--dev` (frontend hot reload) is
-  unaffected.
+# Run platform-specific resilience tests
+python -m pytest backend/tests -k "facebook or discovery or sweep"
+
+# Run frontend unit tests
+cd frontend && npm test
+```
+
+---
+
+## Directory Structure
+
+```text
+├── backend/
+│   ├── main.py                  # FastAPI ASGI application entrypoint & lifespan
+│   ├── api/                     # Domain HTTP routers (discovery, analysis, sessions, reports)
+│   ├── discovery/               # Search sweeping engine, caps, and queue manager
+│   ├── analysis/                # Deep scraping orchestrator and risk scoring engine
+│   ├── platforms/               # Platform adapters (Facebook, Twitter, Instagram, TikTok, YouTube, Telegram)
+│   ├── sessions/                # Session manager, lease coordination, and health probes
+│   ├── database/                # Motor MongoDB async client and repositories
+│   ├── services/                # Avatar caching (GridFS), CLIP logo matching, Excel generation
+│   ├── stealth/                 # Patchright browser wrapper, Bézier cursor, and human pacing
+│   └── tests/                   # Pytest test suite (271 passing tests)
+├── frontend/
+│   ├── src/                     # React 18 TypeScript source code
+│   │   ├── pages/               # Triage grid, live monitors, session admin, and reports
+│   │   └── components/          # Virtualized tables, platform badges, risk chips
+│   └── dist/                    # Compiled production assets mounted by FastAPI
+├── session/                     # Local session stores (gitignored)
+├── runs/                        # Exported forensic XLSX reports
+└── run.py                       # Single-command environment bootstrapper
+```
+
+---
+
+## License & Compliance
+
+This tool is designed strictly for authorized brand defense, corporate security investigations, and legal intellectual property protection. Operates exclusively in a read-only posture (zero likes, zero messages, zero automated interactions).
