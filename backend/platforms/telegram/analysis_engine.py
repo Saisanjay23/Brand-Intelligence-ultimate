@@ -71,6 +71,15 @@ def username_of(url: str) -> str:
     return name
 
 
+def numeric_id_of(url: str) -> Optional[int]:
+    """The id in a `t.me/c/<id>` link, else None. Discovery writes that
+    form for an account with no @username (TelegramEntity.url)."""
+    seg = [s for s in urlparse(normalize_url(url)).path.split("/") if s]
+    if len(seg) >= 2 and seg[0].lower() == "c" and seg[1].isdigit():
+        return int(seg[1])
+    return None
+
+
 class Scraper:
     """Same surface as the browser scanners; MTProto behind it.
 
@@ -147,13 +156,21 @@ class Scraper:
         row = Row(url=url, target=target, original_feed=feed)
         username = username_of(url)
         row.profile_id = username
+        # NOT EVERY LINK WITHOUT A USERNAME IS PRIVATE. Discovery writes
+        # `t.me/c/<id>` for every account that has no @username -- most
+        # people found by a name search -- so refusing these failed the
+        # majority of Telegram results with no reading at all.
+        ref: str | int = username
+        if not username and (num := numeric_id_of(url)) is not None:
+            ref = num
+            row.profile_id = str(num)
 
-        if not username:
+        if not ref:
             row.status = "ERROR"
             row.note("no @username in the URL -- private links cannot be resolved")
             return row
 
-        ent = await self.tg.resolve(username)
+        ent = await self.tg.resolve(ref)
         if ent is None:
             row.status = "GONE"
             row.note("no such user or channel -- may already be taken down")

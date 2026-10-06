@@ -111,8 +111,36 @@ except ImportError:  # pragma: no cover
 # Connection / auth state
 
 
+# HOW MANY `Telegram` CLIENTS IN THIS PROCESS HAVE THE SESSION FILE OPEN.
+#
+# Every pooled Telegram account shares ONE file, session/telegram.session,
+# and Telethon holds it open from the moment a client is constructed until
+# disconnect(). A second client on it raises `OperationalError: database is
+# locked`. The session monitor's in-use guard is keyed by session id, so it
+# could not see that a job on account A had the file open while it checked
+# account B -- or that the analyst's "Check" button was mid-check while the
+# monitor started its own. That collision is in the log (2026-10-05).
+#
+# A counter, not a lock: jobs must never queue behind each other here (a
+# lock held for a whole sweep would hang every other Telegram caller
+# silently). Only health checks read it, and they step aside when it is
+# non-zero -- see sessions/manager.py::_verify_credential_item.
+_open_clients = 0
+
+
+def session_file_in_use() -> bool:
+    """True while any `Telegram` client in this process has the shared
+    session file open."""
+    return _open_clients > 0
+
+
 class NotAuthorised(RuntimeError):
     """The saved session is not logged in. Only an interactive login fixes it."""
+
+
+class NotCached(LookupError):
+    """A numeric id this session has never seen. Not evidence the account
+    is gone -- only that there is no access hash to reach it with."""
 
 
 class FloodWait(RuntimeError):
@@ -275,6 +303,9 @@ class Telegram:
 
         self.session_file = str(settings.session_blob_path / "telegram")
         self.client: Any = None
+        # Whether this instance is counted in `_open_clients`; makes stop()
+        # safe to call twice, or without a start().
+        self._counted = False
         # Profile-photo downloads are skipped until this time.time(): set
         # when Telegram answers one with a FloodWait. See search().
         self._photos_paused_until = 0.0
@@ -289,10 +320,27 @@ class Telegram:
         docstring on why login is never attempted here."""
         if not (self.api_id and self.api_hash):
             raise NotAuthorised("TELEGRAM_API_ID / TELEGRAM_API_HASH not set -- not authenticated")
-        self.client = TelegramClient(self.session_file, self.api_id, self.api_hash)
-        # connect(), never start(): start() prompts for a phone code on stdin
-        await self.client.connect()
-        if not await self.client.is_user_authorized():
+        global _open_clients
+        # Counted BEFORE the constructor, with no await in between, so a
+        # health check that tests session_file_in_use() and then starts its
+        # own client cannot interleave with this one.
+        _open_clients += 1
+        self._counted = True
+        try:
+            # The constructor opens the SQLite file, not connect().
+            self.client = TelegramClient(self.session_file, self.api_id, self.api_hash)
+            # connect(), never start(): start() prompts for a phone code on stdin
+            await self.client.connect()
+            authorised = await self.client.is_user_authorized()
+        except BaseException:
+            # CLOSE ON A FAILED START. Callers only call stop() after a
+            # start() that returned, so a connect that raised (no network,
+            # a timeout) used to leave the file open for the life of the
+            # process -- and every later Telegram run failed with
+            # "database is locked".
+            await self.stop()
+            raise
+        if not authorised:
             await self.stop()
             # "not authenticated" is deliberate phrasing, not just English.
             # It is one of shared/resilience.py::classify_failure's matched
@@ -308,12 +356,16 @@ class Telegram:
         """Disconnects and releases the MTProto client, freeing the local
         session file's lock (see Discovery.stop() below for the real
         "database is locked" incident this matters for)."""
+        global _open_clients
         if self.client is not None:
             try:
                 await self.client.disconnect()
             except Exception:
                 pass
             self.client = None
+        if self._counted:
+            self._counted = False
+            _open_clients -= 1
 
     async def check_session(self) -> bool:
         """False means CONCLUSIVELY dead. Telegram itself says this
@@ -405,15 +457,28 @@ class Telegram:
             out.append(ent)
         return out
 
-    async def resolve(self, username: str) -> Optional[TelegramEntity]:
+    async def resolve(self, username: str | int) -> Optional[TelegramEntity]:
         """@name -> entity, with the detail that needs a second call filled
         in. Used only by the analysis pass, which is independent of
         discovery by design: everything here is re-read over MTProto for
         this run, including the profile photo, rather than reusing
-        anything a discovery sweep may already have fetched."""
+        anything a discovery sweep may already have fetched.
+
+        AN INT IS A NUMERIC ID, from a `t.me/c/<id>` link -- what discovery
+        writes for an account with no @username. Telethon can only reach
+        one through the access hash it cached when it last saw it (the
+        search that found it saves it into the shared session file). A
+        miss there raises NotCached rather than returning None: None means
+        GONE, and an id we merely never cached is not a takedown."""
         try:
             obj = await self.client.get_entity(username)
-        except (UsernameInvalidError, UsernameNotOccupiedError, ValueError):
+        except ValueError as e:
+            if isinstance(username, int):
+                raise NotCached(
+                    f"id {username} is not in this Telegram session's cache -- re-run "
+                    "discovery for this client, then analyse it again") from e
+            return None
+        except (UsernameInvalidError, UsernameNotOccupiedError):
             return None
         except FloodWaitError as e:
             raise FloodWait(int(getattr(e, "seconds", 0))) from e

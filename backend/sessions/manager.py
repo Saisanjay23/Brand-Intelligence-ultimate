@@ -1466,6 +1466,15 @@ async def _verify_credential_item(platform_id: str, item: dict) -> tuple[bool, s
     elif plat.env_keys:
         if not (item.get("api_id") and item.get("api_hash")):
             return False, "pooled item is missing api_id/api_hash", False
+        # ONE FILE FOR EVERY TELEGRAM ACCOUNT. The per-session in-use guard
+        # cannot see a job (or another check) on a DIFFERENT account that
+        # already has session/telegram.session open; a second client on it
+        # fails with "database is locked". Step aside, inconclusive, so the
+        # account's status is left exactly as it was.
+        from backend.platforms.telegram.discovery_engine import session_file_in_use
+        if session_file_in_use():
+            return (False, "telegram session file is in use by a running job or "
+                    "another check -- skipped, it will be checked next pass", False)
         os.environ["TELEGRAM_API_ID"] = str(item["api_id"])
         os.environ["TELEGRAM_API_HASH"] = str(item["api_hash"])
         if item.get("phone"):
