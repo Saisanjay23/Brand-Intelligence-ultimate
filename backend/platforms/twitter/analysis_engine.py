@@ -26,11 +26,10 @@ from __future__ import annotations
 
 import asyncio
 import random
-import re
 from typing import Optional
 from urllib.parse import urlparse
 
-from backend.shared import diagnostics
+from backend.shared import diagnostics, evidence
 from backend.shared.tasks import spawn
 from backend.shared.models.row import Row
 from backend.shared.avatars import hd_picture_url
@@ -450,7 +449,15 @@ class Scraper:
                 # See instagram/analysis_engine.py: a row we could not
                 # read is the one most worth having a picture of, and
                 # returning before screenshot() threw that away.
-                await self.screenshot(page, row)
+                #
+                # BUT ONLY OF THE PROFILE. A CHECKPOINT or LOGIN_REQUIRED
+                # row is on X's wall, not the account, and a picture of
+                # that stored as this profile's evidence is worse than
+                # none -- it reads as what the profile looked like.
+                # Instagram and TikTok already return before capturing in
+                # both cases.
+                if row.status in ("GONE", "PARTIAL"):
+                    await self.screenshot(page, row)
                 return row
 
             # the timeline query lands just after the profile one
@@ -840,38 +847,19 @@ class Scraper:
         paint before shooting, not just the profile header -- see
         stealth/browser.py::Session.wait_for_visible_content. LINKED TO:
         called from process(), the final step once every field tier has
-        run."""
-        if not self.evidence and not getattr(self.a, 'ephemeral_screenshot', False):
-            return
-        # DETERMINISTIC key, no timestamp: re-analysing a profile must
-        # overwrite its own previous capture, not add another one. With a
-        # timestamp, a daily re-sweep left one PNG per profile per run in
-        # the store forever, and the profile document only ever pointed at
-        # the newest, every earlier one was unreachable garbage.
-        stem = re.sub(r"[^A-Za-z0-9._-]", "_", row.profile_id or "entity")[:60]
-        key = f"{self.evidence}/{stem}.png" if self.evidence else ""
-        try:
-            # See Session.wait_for_visible_content: field extraction here
-            # comes from intercepted API responses, which can land well
-            # before the page has visually painted anything, a screenshot
-            # taken right after would capture the loading state, not the
-            # profile.
-            # A rendered tweet cell is X's "the timeline has painted"
-            # signal. Without it the capture is a correct header above a
-            # spinner where the posts belong.
-            await self.session.wait_for_visible_content(
-                page, content_selector='[data-testid="tweet"]')
-            data = await page.screenshot(full_page=False)
-            
-            if self.evidence:
-                from backend.database.repositories import evidence_repository
-                await evidence_repository.save(key, data)
-                row.screenshot = key
-                
-            if getattr(self.a, 'ephemeral_screenshot', False):
-                row.screenshot_bytes = data
-        except Exception:
-            pass
+        run. The shared mechanics live in shared/evidence.py."""
+        # See Session.wait_for_visible_content: field extraction here
+        # comes from intercepted API responses, which can land well
+        # before the page has visually painted anything, a screenshot
+        # taken right after would capture the loading state, not the
+        # profile.
+        # A rendered tweet cell is X's "the timeline has painted"
+        # signal. Without it the capture is a correct header above a
+        # spinner where the posts belong.
+        await evidence.capture(
+            self.session, page, row, evidence=self.evidence,
+            ephemeral=getattr(self.a, 'ephemeral_screenshot', False),
+            content_selector='[data-testid="tweet"]', platform="twitter")
 
     # ─────────────────────────── orchestration ────────────────────────── #
 

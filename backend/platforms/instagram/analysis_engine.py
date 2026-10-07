@@ -111,7 +111,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import quote, urlparse
 
-from backend.shared import diagnostics
+from backend.shared import diagnostics, evidence
 from backend.shared.tasks import spawn
 from backend.shared.models.row import Row
 from backend.platforms.scan_options import captures_screenshot
@@ -1184,37 +1184,19 @@ class Scraper:
         capture proves the account is in use, not just that it exists --
         see stealth/browser.py::Session.wait_for_visible_content. LINKED
         TO: called from process() after fields are filled but before the
-        last-post fallback tiers (which can navigate this page away)."""
-        if not self.evidence and not getattr(self.a, 'ephemeral_screenshot', False):
-            return
-        # DETERMINISTIC key, no timestamp: re-analysing a profile must
-        # overwrite its own previous capture, not add another one. With a
-        # timestamp, a daily re-sweep left one PNG per profile per run in
-        # the store forever, and the profile document only ever pointed at
-        # the newest, every earlier one was unreachable garbage.
-        stem = re.sub(r"[^A-Za-z0-9._-]", "_", row.profile_id or "entity")[:60]
-        key = f"{self.evidence}/{stem}.png" if self.evidence else ""
-        try:
-            # See Session.wait_for_visible_content: field extraction here
-            # comes from intercepted API responses, which can land well
-            # before the page has visually painted anything, a screenshot
-            # taken right after would capture the loading state, not the
-            # profile.
-            # A grid tile is Instagram's "the posts have painted" signal.
-            # Without it the capture is a correct header above a spinner.
-            await self.session.wait_for_visible_content(
-                page, content_selector='a[href*="/p/"], a[href*="/reel/"]')
-            data = await page.screenshot(full_page=False)
-            
-            if self.evidence:
-                from backend.database.repositories import evidence_repository
-                await evidence_repository.save(key, data)
-                row.screenshot = key
-                
-            if getattr(self.a, 'ephemeral_screenshot', False):
-                row.screenshot_bytes = data
-        except Exception:
-            pass
+        last-post fallback tiers (which can navigate this page away). The
+        shared mechanics live in shared/evidence.py."""
+        # See Session.wait_for_visible_content: field extraction here
+        # comes from intercepted API responses, which can land well
+        # before the page has visually painted anything, a screenshot
+        # taken right after would capture the loading state, not the
+        # profile.
+        # A grid tile is Instagram's "the posts have painted" signal.
+        # Without it the capture is a correct header above a spinner.
+        await evidence.capture(
+            self.session, page, row, evidence=self.evidence,
+            ephemeral=getattr(self.a, 'ephemeral_screenshot', False),
+            content_selector='a[href*="/p/"], a[href*="/reel/"]', platform="instagram")
 
     # ─────────────────────────── orchestration ────────────────────────── #
 

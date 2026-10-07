@@ -38,11 +38,10 @@ payload, so that column stays blank rather than guessed.
 
 from __future__ import annotations
 
-import re
 from typing import Optional
 from urllib.parse import urlparse
 
-from backend.shared import diagnostics
+from backend.shared import diagnostics, evidence
 from backend.shared.models.row import Row
 from backend.platforms.scan_options import captures_screenshot
 from backend.shared.text import name_score, normalized_host, parse_count, parse_normalized_url
@@ -386,6 +385,11 @@ class Scraper:
                 else:
                     row.status = "PARTIAL"
                     row.note("profile payload not seen")
+                    # Capture anyway, as Instagram and X do: the row whose
+                    # fields could not be read is the one an analyst most
+                    # needs a picture of. Login walls and not-found pages
+                    # have already returned above, so this is the profile.
+                    await self.screenshot(page, row)
                     return row
 
             if not row.last_post_iso:
@@ -618,27 +622,16 @@ class Scraper:
         failed screenshot must never fail the profile visit, since the
         scraped fields are the actual finding. LINKED TO:
         database/repositories/evidence_repository.py owns the store;
-        row.screenshot holds the key, not a filesystem path."""
-        if not self.evidence and not getattr(self.a, 'ephemeral_screenshot', False):
-            return
-        # DETERMINISTIC key, no timestamp, re-analysing a profile must
-        # overwrite its own previous capture, not add another one.
-        stem = re.sub(r"[^A-Za-z0-9._-]", "_", row.profile_id or "entity")[:60]
-        key = f"{self.evidence}/{stem}.png" if self.evidence else ""
-        try:
-            if self.session is not None:
-                await self.session.wait_for_visible_content(page)
-            data = await page.screenshot(full_page=False)
-            
-            if self.evidence:
-                from backend.database.repositories import evidence_repository
-                await evidence_repository.save(key, data)
-                row.screenshot = key
-                
-            if getattr(self.a, 'ephemeral_screenshot', False):
-                row.screenshot_bytes = data
-        except Exception:
-            pass
+        row.screenshot holds the key, not a filesystem path. The shared
+        mechanics live in shared/evidence.py."""
+        # A video tile is TikTok's "the grid has painted" signal, the same
+        # role the post/tweet selectors play on the other three. This was
+        # the one platform shooting with no content wait at all, so its
+        # captures could show the header above an empty, loading grid.
+        await evidence.capture(
+            self.session, page, row, evidence=self.evidence,
+            ephemeral=getattr(self.a, 'ephemeral_screenshot', False),
+            content_selector='a[href*="/video/"], a[href*="/photo/"]', platform="tiktok")
 
     # ─────────────────────────── orchestration ────────────────────────── #
 

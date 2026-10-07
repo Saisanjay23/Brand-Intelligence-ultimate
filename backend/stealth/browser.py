@@ -187,6 +187,24 @@ async def _finish_abandoned_close(pw, profile: Optional[Path]) -> None:
             _release_profile(profile)
 
 
+async def scroll_to_top(page, attempts: int = 3) -> int:
+    """Scroll to the top and confirm it STAYED there; returns the final
+    scrollY. A single scrollTo is not enough on Facebook: the page moved
+    itself back down afterwards (see Session.capture_evidence), so each
+    attempt re-checks after a short repaint wait."""
+    y = 0
+    for _ in range(attempts):
+        try:
+            await page.evaluate("window.scrollTo(0, 0)")
+            await page.wait_for_timeout(250)
+            y = int(await page.evaluate("window.scrollY") or 0)
+        except Exception:
+            return y
+        if y == 0:
+            break
+    return y
+
+
 def profiles_root() -> Path:
     from backend.config.settings import settings
 
@@ -860,25 +878,62 @@ class Session:
             except Exception:
                 pass  # genuinely empty timeline, or slower than the budget
 
-        # Give the images that are actually ON SCREEN a moment to decode.
-        # A tile that exists in the DOM but has not painted screenshots as a
-        # blank rectangle, which is indistinguishable in the evidence from a
-        # profile that posts blank images.
-        if settle_images_ms > 0:
-            try:
-                await page.wait_for_function(
-                    """() => {
-                        const vis = Array.from(document.images).filter(i => {
-                          const r = i.getBoundingClientRect();
-                          return r.width > 0 && r.top < innerHeight && r.bottom > 0;
-                        });
-                        return vis.length === 0
-                            || vis.every(i => i.complete && i.naturalWidth > 0);
-                    }""",
-                    timeout=settle_images_ms,
-                )
-            except Exception:
-                pass
+        await self._settle_images(page, settle_images_ms)
+
+    @staticmethod
+    async def _settle_images(page, timeout_ms: int) -> None:
+        """Give the images that are actually ON SCREEN a moment to decode.
+        A tile that exists in the DOM but has not painted screenshots as a
+        blank rectangle, which is indistinguishable in the evidence from a
+        profile that posts blank images."""
+        if timeout_ms <= 0:
+            return
+        try:
+            await page.wait_for_function(
+                """() => {
+                    const vis = Array.from(document.images).filter(i => {
+                      const r = i.getBoundingClientRect();
+                      return r.width > 0 && r.top < innerHeight && r.bottom > 0;
+                    });
+                    return vis.length === 0
+                        || vis.every(i => i.complete && i.naturalWidth > 0);
+                }""",
+                timeout=timeout_ms,
+            )
+        except Exception:
+            pass
+
+    async def capture_evidence(self, page, *, content_selector: str = "") -> bytes:
+        """The evidence PNG: the profile as a person opening it would first
+        see it -- painted, from the top, with its on-screen images loaded.
+
+        FROM THE TOP. Measured live (2026-10-07): every Facebook capture
+        was taken 425px down the page, which cut the cover photo to a strip
+        -- and a copied cover photo is often the strongest evidence an
+        impersonation has. Something after read_dom's own scrollTo(0, 0)
+        moves it again, so this does not trust any earlier scroll: it
+        scrolls immediately before the shot and checks it held. Images that
+        were off screen until now get their own settle afterwards.
+
+        AND PUTS THE PAGE BACK. Engines keep reading this page after the
+        shot (Facebook's last-post fallback reads post links that it only
+        fills in while they are on screen), so the capture must leave the
+        scroll exactly where it found it."""
+        await self.wait_for_visible_content(page, content_selector=content_selector)
+        try:
+            before = int(await page.evaluate("window.scrollY") or 0)
+        except Exception:
+            before = 0
+        try:
+            await scroll_to_top(page)
+            await self._settle_images(page, 1500)
+            return await page.screenshot(full_page=False)
+        finally:
+            if before:
+                try:
+                    await page.evaluate(f"window.scrollTo(0, {before})")
+                except Exception:
+                    pass
 
     async def check_session(
         self, probe_url: str, login_re, checkpoint_re, *, expect_path: str = "",
