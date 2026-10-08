@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import time
+import unicodedata
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from typing import Any, Iterator, Optional
@@ -246,8 +247,17 @@ def _letters_only(s: str) -> str:
     "gautam.adani", "GAUTAM_ADANI", and "GautamAdani" all normalize to the
     identical `gautamadani` -- whatever separator (or none) an impersonator
     happened to put between the words disappears before the comparison
-    ever runs."""
-    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+    ever runs.
+
+    Unicode-aware, so it works for every script (Telugu, Hindi, Arabic,
+    Chinese, Cyrillic...). Letters (L*), digits (N*) and combining marks
+    (M*) are kept -- the marks matter: Indic vowel signs and viramas are
+    marks, and dropping them would mangle the word. Everything else
+    (spaces, punctuation, symbols, zero-width joiners) is removed. NFKC
+    folds look-alike forms (full-width letters, ligatures) first, and
+    casefold() lowercases properly for non-Latin scripts."""
+    folded = unicodedata.normalize("NFKC", s or "").casefold()
+    return "".join(c for c in folded if unicodedata.category(c)[0] in "LNM")
 
 
 def contiguous_letters_match(candidate: str, keyword: str) -> bool:
