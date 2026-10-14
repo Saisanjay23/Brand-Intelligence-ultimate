@@ -286,11 +286,19 @@ JS_DOM_USERS = """
     seen.add(handle.toLowerCase());
 
     const img = cell.querySelector('img[src*="profile_images"]');
-    // the display name is the first text span that is not the @handle
+    // THE DISPLAY NAME IS THE TEXT OF THE CARD'S OWN PROFILE LINK. A result
+    // card holds three links to /handle: the avatar (no text), the display
+    // name, and the @handle. Reading it from the name link is what makes an
+    // account whose display name IS its handle (NASA) come out as "NASA".
+    // The old rule -- first span that is not the handle -- skipped exactly
+    // those accounts and landed on the next text in the card, the "Follow"
+    // button, which was then stored as the account's name.
     let name = '';
-    for (const sp of cell.querySelectorAll('span')) {
-      const t = (sp.textContent || '').trim();
-      if (t && !t.startsWith('@') && t.toLowerCase() !== handle.toLowerCase()) { name = t; break; }
+    for (const a of cell.querySelectorAll('a[role="link"][href^="/"]')) {
+      const h = (a.getAttribute('href') || '').split('?')[0].replace(/^\\//, '');
+      if (h.toLowerCase() !== handle.toLowerCase()) continue;
+      const t = (a.innerText || '').split(/\\r?\\n/)[0].trim();
+      if (t && !t.startsWith('@')) { name = t; break; }
     }
     out.push({
       handle,

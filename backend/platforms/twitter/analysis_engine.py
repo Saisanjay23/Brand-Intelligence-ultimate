@@ -184,14 +184,14 @@ JS_DISPLAY_NAME = r"""
       // Verified badges and similar render as their own text nodes; a
       // name is never a lone punctuation mark.
       if (!/[\p{L}\p{N}]/u.test(t)) continue;
-      return t;
+      return {name: t, own: true};
     }
   }
   // "Display Name (@handle) / X" -- the parenthesised handle is the anchor,
   // so this does not depend on the suffix X is using today.
   const m = clean(document.title).match(/^(.*?)\s*\(@([^)]+)\)/);
   return m && (!handle || m[2].toLowerCase() === handle.toLowerCase())
-    ? clean(m[1]) : '';
+    ? {name: clean(m[1]), own: true} : {name: '', own: false};
 }
 """
 
@@ -220,13 +220,24 @@ async def dom_display_name(page, handle: str = "") -> str:
         pass
     try:
         h = json.dumps((handle or "").strip().lstrip("@"))
-        name = (await page.evaluate(f"({JS_DISPLAY_NAME})({h})") or "").strip()
+        got = await page.evaluate(f"({JS_DISPLAY_NAME})({h})")
     except Exception:
         return ""
+    # `own` = read from THIS account's own header block (the one carrying its
+    # @handle), not a sidebar card. A bare string is the older shape and has
+    # no such guarantee.
+    own = isinstance(got, dict) and bool(got.get("own"))
+    name = ((got.get("name") if isinstance(got, dict) else got) or "").strip()
     if not name:
         return ""
+    # A name that is just the @handle carries no more information than the
+    # URL -- UNLESS it was read from the account's own header, in which case
+    # it IS the display name and merely happens to match (NASA, CYFIRMA).
+    # Rejecting those left the row nameless and the handle showing as its
+    # "profile name".
     bare = name.lstrip("@").strip()
-    if handle and bare.lower() == handle.strip().lstrip("@").lower():
+    if (not own and handle
+            and bare.lower() == handle.strip().lstrip("@").lower()):
         return ""
     return name
 

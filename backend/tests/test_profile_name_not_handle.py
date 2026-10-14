@@ -153,3 +153,31 @@ class TestTheNamingCascade:
     def test_no_known_record_at_all_still_reaches_the_handle(self):
         """A pasted URL has no discovery record behind it."""
         assert _name_after_populate("", "", self.HANDLE) == self.HANDLE
+
+
+class TestANameReadFromTheAccountsOwnHeaderIsKept:
+    """A brand whose display name IS its handle (NASA, CYFIRMA) used to come
+    back nameless, so the handle showed in the Profile name column. When the
+    name is read from the account's OWN header block it is the display name
+    and is kept; the same string from an unanchored read is still refused."""
+
+    @pytest.mark.asyncio
+    async def test_own_block_name_equal_to_handle_is_kept(self):
+        page = _Page({"name": "NASA", "own": True})
+        assert await dom_display_name(page, "NASA") == "NASA"
+
+    @pytest.mark.asyncio
+    async def test_unanchored_name_equal_to_handle_is_still_refused(self):
+        page = _Page({"name": "NASA", "own": False})
+        assert await dom_display_name(page, "NASA") == ""
+
+    @pytest.mark.asyncio
+    async def test_empty_name_stays_empty(self):
+        assert await dom_display_name(_Page({"name": "", "own": False}), "NASA") == ""
+
+
+def test_discovery_takes_the_name_from_the_profile_link_not_the_follow_button():
+    from backend.platforms.twitter.discovery_engine import JS_DOM_USERS
+    assert "a[role=\"link\"]" in JS_DOM_USERS and "innerText" in JS_DOM_USERS
+    # the old rule that picked the first stray span (the "Follow" button)
+    assert "querySelectorAll('span')" not in JS_DOM_USERS
