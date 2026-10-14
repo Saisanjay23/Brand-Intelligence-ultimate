@@ -45,10 +45,10 @@ async def capture(session: Any, page: Any, row: Any, *, evidence: str, ephemeral
         if session is not None:
             data = await session.capture_evidence(page, content_selector=content_selector)
         else:
-            from backend.stealth.browser import scroll_to_top
+            from backend.stealth.browser import scroll_to_top, shoot
 
             await scroll_to_top(page)
-            data = await page.screenshot(full_page=False)
+            data = await shoot(page)
         if evidence:
             from backend.database.repositories import evidence_repository
 

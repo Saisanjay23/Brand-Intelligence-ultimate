@@ -205,6 +205,70 @@ async def scroll_to_top(page, attempts: int = 3) -> int:
     return y
 
 
+# Ceiling on ONE screenshot attempt. Playwright's own default is 30s, and a
+# page.screenshot() that hits it is almost never "slow": on a laptop with a
+# slow disk, an antivirus scanning Chrome, or a window that is not in front,
+# Playwright waits for web fonts / a paint that is not coming. Shorter
+# attempts with a different method behind them beat one long wait.
+_SHOT_TIMEOUT_MS = 20000
+
+
+async def shoot(page) -> bytes:
+    """One viewport PNG of `page`, however this laptop makes that hard.
+
+    The same code produced screenshots on one machine and none on another,
+    and the difference was never the page -- it was how the machine
+    rendered it. So this tries the ordinary way first and falls back
+    rather than failing:
+
+      1. bring the tab to the front. In a headed run, opening a second tab
+         (the About / replies tabs do) leaves the first one in the
+         background, and Chrome stops painting a background tab, so its
+         screenshot hangs or comes back blank.
+      2. Playwright's own screenshot, with a bounded wait.
+      3. The same, with animations frozen and the caret hidden -- a
+         still-running animation or blinking caret is what keeps Playwright
+         waiting for a "stable" frame on a slow GPU.
+      4. Chrome's DevTools capture directly. It does not wait for fonts or
+         for a stable frame, so it works when 2 and 3 timed out.
+
+    Raises the LAST error only when every route failed, so the caller's
+    "screenshot failed -- <why>" note names a real cause. Never returns an
+    empty image: that would be stored as evidence and shown as a shot.
+    """
+    try:
+        await page.bring_to_front()
+    except Exception:                                   # noqa: BLE001
+        pass
+
+    last: Exception | None = None
+    for kwargs in ({}, {"animations": "disabled", "caret": "hide"}):
+        try:
+            data = await page.screenshot(
+                full_page=False, timeout=_SHOT_TIMEOUT_MS, **kwargs)
+            if data:
+                return data
+        except Exception as e:                          # noqa: BLE001
+            last = e
+
+    try:
+        cdp = await page.context.new_cdp_session(page)
+        try:
+            res = await cdp.send("Page.captureScreenshot", {"format": "png"})
+        finally:
+            try:
+                await cdp.detach()
+            except Exception:                           # noqa: BLE001
+                pass
+        data = base64.b64decode(res.get("data") or "")
+        if data:
+            return data
+    except Exception as e:                              # noqa: BLE001
+        last = last or e
+
+    raise last or RuntimeError("screenshot returned no data")
+
+
 def profiles_root() -> Path:
     from backend.config.settings import settings
 
@@ -806,9 +870,9 @@ class Session:
         await humanize_interaction(page, scroll=scroll, moves=moves)
 
     async def wait_for_visible_content(
-        self, page, min_chars: int = 200, timeout_ms: int = 4000, poll_ms: int = 250,
-        *, content_selector: str = "", content_timeout_ms: int = 5000,
-        settle_images_ms: int = 1500,
+        self, page, min_chars: int = 200, timeout_ms: int = 10000, poll_ms: int = 250,
+        *, content_selector: str = "", content_timeout_ms: int = 12000,
+        settle_images_ms: int = 3000,
     ) -> None:
         """Block until the page has actually PAINTED real content, not just
         parsed enough DOM to satisfy `domcontentloaded` or a data-readiness
@@ -926,8 +990,8 @@ class Session:
             before = 0
         try:
             await scroll_to_top(page)
-            await self._settle_images(page, 1500)
-            return await page.screenshot(full_page=False)
+            await self._settle_images(page, 3000)
+            return await shoot(page)
         finally:
             if before:
                 try:

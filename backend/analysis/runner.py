@@ -1022,6 +1022,10 @@ class AnalysisRunner:
                 evidence=None,
                 ephemeral_screenshot=True,
                 delay=settings.analysis_delay_sec,
+                # The configured values, not ScanOptions' own defaults:
+                # those are a 6s data wait that a slower laptop misses.
+                timeout=settings.request_timeout_sec,
+                settle=settings.analysis_settle_sec,
                 concurrency=concurrency,
                 headful=not settings.headless,
                 # Handed to the SCRAPER, so an adapter that visits several

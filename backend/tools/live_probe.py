@@ -185,7 +185,8 @@ async def _analyse(plat, session_item: dict, profiles: list[str], out: Path,
                    log: list[str], known_by_url: dict[str, dict]) -> None:
     options = ScanOptions(evidence=None, ephemeral_screenshot=True,
                           delay=settings.analysis_delay_sec, headful=not settings.headless,
-                          warmup=True)
+                          timeout=settings.request_timeout_sec,
+                          settle=settings.analysis_settle_sec, warmup=True)
     scraper = plat.scraper()(options, session_item.get("cookies", []),
                              session_id=str(session_item.get("id") or ""))
     inner = getattr(scraper, "session", None)

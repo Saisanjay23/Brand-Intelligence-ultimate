@@ -190,6 +190,23 @@ _CHROME_BINARY_CACHED: str | None = None
 _CHROME_BINARY_RESOLVED = False
 
 
+_VERSION_DIR = re.compile(r"^(\d+)\.\d+\.\d+\.\d+$")
+
+
+def _version_from_install_dir(binary_path: str) -> tuple[str, str] | None:
+    """(major, full) from the version-named directory beside chrome.exe, or
+    None. When an update leaves two, the highest is the one that runs."""
+    try:
+        names = [p.name for p in Path(binary_path).parent.iterdir() if p.is_dir()]
+    except OSError:
+        return None
+    versions = [n for n in names if _VERSION_DIR.match(n)]
+    if not versions:
+        return None
+    best = max(versions, key=lambda v: tuple(int(x) for x in v.split(".")))
+    return best.split(".")[0], best
+
+
 def _detect_chrome_version(binary_path: str | None) -> tuple[str, str]:
     """Dynamically extract major and full version strings from installed Chrome."""
     default_major = FALLBACK_CHROME_MAJOR
@@ -198,12 +215,23 @@ def _detect_chrome_version(binary_path: str | None) -> tuple[str, str]:
         return default_major, default_full
     try:
         if os.name == "nt":
+            # A Windows Chrome install keeps a sibling directory named after
+            # its full version (...\Application\146.0.7680.72\). Reading it
+            # costs nothing and cannot time out. It replaces what used to be
+            # the ONLY route: starting PowerShell under a 4s limit, which a
+            # cold or antivirus-scanned laptop misses -- the lookup then
+            # fell through to the stale fallback and that laptop claimed
+            # Chrome 132 while running a far newer build, a mismatch X
+            # answers with degraded pages (missing follower counts, blank
+            # timelines) on exactly the machines it happens on.
+            if found := _version_from_install_dir(binary_path):
+                return found
             cmd = (
                 f'powershell -NoProfile -Command "(Get-Item -LiteralPath '
                 f'\'{binary_path}\').VersionInfo.ProductVersion"'
             )
             res = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, timeout=4, check=False
+                cmd, shell=True, capture_output=True, text=True, timeout=20, check=False
             )
             if match := re.search(r"(\d+)\.(\d+\.\d+\.\d+)", res.stdout):
                 return match.group(1), match.group(0)

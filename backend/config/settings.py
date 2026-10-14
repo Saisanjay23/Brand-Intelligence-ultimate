@@ -117,6 +117,14 @@ class Settings(BaseSettings):
     # pacing, the single most important knob for staying unremarkable
     request_timeout_sec: int = 45
     analysis_delay_sec: float = 2.5
+    # HOW LONG ANALYSIS WAITS FOR A PROFILE'S DATA TO ARRIVE, in seconds. A
+    # CEILING, not a delay: a fast laptop gets its answer in ~4s and never
+    # touches it. It was a fixed 6s, which a slower laptop or connection
+    # simply misses -- the profile loaded fine, the numbers arrived at 8s,
+    # and the row came back with no follower count. The same code then
+    # "worked" on one machine and not another. Raise it further on a very
+    # slow link; it only ever costs time on a profile that never answers.
+    analysis_settle_sec: float = 15.0
     # HOW MANY BROWSER WORKERS ANALYSIS MAY HOLD OPEN AT ONCE, PROCESS-WIDE.
     # A job scrapes every platform concurrently and each platform now works
     # its URLs through as many pooled sessions as it can safely claim (see

@@ -46,7 +46,7 @@ class FakePage:
     async def wait_for_timeout(self, ms):
         return None
 
-    async def screenshot(self, full_page=False):
+    async def screenshot(self, full_page=False, **kw):
         if self.shot_raises:
             raise self.shot_raises
         self.shot_at_y = self.y

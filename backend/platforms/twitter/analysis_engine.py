@@ -25,7 +25,9 @@ timeline instead of waiting longer or re-requesting.
 from __future__ import annotations
 
 import asyncio
+import json
 import random
+import re
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -34,7 +36,8 @@ from backend.shared.tasks import spawn
 from backend.shared.models.row import Row
 from backend.shared.avatars import hd_picture_url
 from backend.platforms.scan_options import captures_screenshot
-from backend.shared.text import name_score, normalized_host, parse_normalized_url
+from backend.shared.text import (name_score, normalized_host, parse_count,
+                                 parse_normalized_url)
 from backend.stealth.mouse_movement import humanize_interaction
 from backend.platforms.twitter.discovery_engine import (ABOUT_QUERY,
                                                          REPOSTS_QUERY,
@@ -157,10 +160,21 @@ _DOM_TIMELINE_WAIT_MS = 3000
 # Both parse the SAME rendered value, so agreeing tiers are not extra
 # confidence -- the point is that a change breaking one rarely breaks both.
 JS_DISPLAY_NAME = r"""
-() => {
-  const clean = (t) => (t || '').replace(/\u00a0/g, ' ').trim();
-  const block = document.querySelector('[data-testid="UserName"]');
-  if (block) {
+(handle) => {
+  const clean = (t) => (t || '').replace(/\xa0/g, ' ').trim();
+  const me = handle ? '@' + handle.toLowerCase() : '';
+  // The page can hold several UserName blocks: the profile's own AND the
+  // who-to-follow cards beside it. Read before the profile has painted and
+  // the first block in the document is a sidebar card, whose first span is
+  // its "Follow" button -- which is how a real account's name came back as
+  // "Follow". So: prefer the main column, and when the handle is known
+  // accept only the block that carries THIS account's @handle.
+  const blocks = [...document.querySelectorAll('[data-testid="UserName"]')];
+  blocks.sort((a, b) =>
+    (b.closest('[data-testid="primaryColumn"]') ? 1 : 0) -
+    (a.closest('[data-testid="primaryColumn"]') ? 1 : 0));
+  for (const block of blocks) {
+    if (me && !clean(block.textContent).toLowerCase().includes(me)) continue;
     // The block renders the display name first and the @handle second.
     // Taking the first span that is not the handle is what makes this
     // independent of how many wrapper spans X nests them in this week.
@@ -175,8 +189,9 @@ JS_DISPLAY_NAME = r"""
   }
   // "Display Name (@handle) / X" -- the parenthesised handle is the anchor,
   // so this does not depend on the suffix X is using today.
-  const m = clean(document.title).match(/^(.*?)\s*\(@[^)]+\)/);
-  return m ? clean(m[1]) : '';
+  const m = clean(document.title).match(/^(.*?)\s*\(@([^)]+)\)/);
+  return m && (!handle || m[2].toLowerCase() === handle.toLowerCase())
+    ? clean(m[1]) : '';
 }
 """
 
@@ -194,8 +209,18 @@ async def dom_display_name(page, handle: str = "") -> str:
     otherwise produce a nameless row -- a profile payload that never
     arrived, and one that arrived carrying no name.
     """
+    # Give the header a moment to paint: this runs right after navigation on
+    # the paths where the data payload never arrived, i.e. on exactly the
+    # slow machines where the page is least likely to be ready yet.
     try:
-        name = (await page.evaluate(JS_DISPLAY_NAME) or "").strip()
+        await page.wait_for_selector(
+            '[data-testid="UserName"]', timeout=_DOM_TIMELINE_WAIT_MS,
+            state="attached")
+    except Exception:
+        pass
+    try:
+        h = json.dumps((handle or "").strip().lstrip("@"))
+        name = (await page.evaluate(f"({JS_DISPLAY_NAME})({h})") or "").strip()
     except Exception:
         return ""
     if not name:
@@ -221,6 +246,88 @@ async def dom_last_post(page) -> str:
         if c.get("dt") and not c.get("repostOrPinned")
     ]
     return max(dates) if dates else ""
+
+
+# DOM follower / following fallback
+# The counts normally come from the UserByScreenName payload as typed
+# integers. They are ALSO printed in the profile header, as links to
+# /<handle>/verified_followers (older layouts: /followers) and
+# /<handle>/following, so a payload that arrives late, never arrives, or
+# arrives without them does not have to cost the row its follower count --
+# which is exactly what happened on slower laptops, where the data landed
+# after the wait gave up.
+#
+# Matched on the EXACT path for THIS handle rather than any link ending in
+# "/followers": the page also renders who-to-follow cards for other people,
+# and taking one of their counts as this account's is worse than none.
+JS_COUNT_LINKS = r"""
+(handle) => {
+  const h = '/' + handle.toLowerCase();
+  const out = {};
+  const want = {
+    followers: [h + '/verified_followers', h + '/followers'],
+    following: [h + '/following'],
+  };
+  for (const a of document.querySelectorAll('a[href]')) {
+    const href = (a.getAttribute('href') || '').toLowerCase().split('?')[0].replace(/\/$/, '');
+    for (const [key, paths] of Object.entries(want)) {
+      if (out[key] === undefined && paths.includes(href)) {
+        out[key] = (a.textContent || '').replace(/\xa0/g, ' ').trim();
+      }
+    }
+  }
+  return out;
+}
+"""
+
+_COUNT_TOKEN = re.compile(r"(\d[\d.,]*)\s*([KMBkmb])?(?![A-Za-z])")
+
+
+def count_from_text(text: str):
+    """(value, is_exact) from a header link's text ("1.2M Followers",
+    "12,345 Following"), or (None, False). The first number in the text is
+    the count; anything unreadable is None, never a guess."""
+    m = _COUNT_TOKEN.search(text or "")
+    if not m:
+        return None, False
+    return parse_count(f"{m.group(1)}{m.group(2) or ''}")
+
+
+async def dom_counts(page, handle: str) -> dict:
+    """{"followers": (n, exact), "following": (n, exact)} read off the
+    rendered profile header; a key is absent when it could not be read.
+    Never raises. LINKED TO: Scraper.process(), as the tier behind the
+    GraphQL payload for followers/following."""
+    try:
+        await page.wait_for_selector(
+            'a[href$="/followers"], a[href$="/verified_followers"], a[href$="/following"]',
+            timeout=_DOM_TIMELINE_WAIT_MS, state="attached")
+    except Exception:
+        pass
+    try:
+        raw = await page.evaluate(JS_COUNT_LINKS, handle) or {}
+    except Exception:
+        return {}
+    out = {}
+    for key, text in raw.items():
+        n, exact = count_from_text(text)
+        if n is not None:
+            out[key] = (n, exact)
+    return out
+
+
+def apply_dom_counts(row: Row, counts: dict) -> None:
+    """Fill ONLY the counts the payload left empty, tagged "dom" so a run
+    that quietly slid from payload to page is visible on the row. A
+    "1.2M" read is recorded as not exact -- approximate, labelled so."""
+    if row.followers is None and "followers" in counts:
+        n, exact = counts["followers"]
+        row.followers = n
+        row.followers_exact = "yes" if exact else "no"
+        row.mark("followers", "dom")
+    if row.friends is None and "following" in counts:
+        row.friends = counts["following"][0]
+        row.mark("friends", "dom")
 
 
 class Scraper:
@@ -411,6 +518,26 @@ class Scraper:
             except Exception:
                 pass
 
+            # LATE IS NOT THE SAME AS MISSING. No payload after the wait,
+            # on a page that is not a wall, is most often a slow machine or
+            # connection -- the profile rendered, the data was still on its
+            # way. One reload gives it a full second window before the row
+            # is written off. Never retried on a rate limit, checkpoint,
+            # login or suspended page: reloading those only adds a request
+            # to an account that is already in trouble.
+            if not found and not rate_limited and not self._is_wall(page, body):
+                try:
+                    await page.reload(
+                        wait_until="domcontentloaded",
+                        timeout=self.a.timeout * 1000)
+                    await asyncio.wait_for(got.wait(), timeout=self.a.settle)
+                except Exception:
+                    pass
+                try:
+                    body = await page.inner_text("body")
+                except Exception:
+                    pass
+
             if not found:
                 if rate_limited or "rate limit" in body.lower():
                     row.status = "CHECKPOINT"
@@ -446,6 +573,11 @@ class Scraper:
                         row.profile_name = name
                         row.name_score = name_score(name, row.target)
                         row.mark("name", "dom")
+                # The counts are printed in the header too. Only on a page
+                # that rendered a profile: a wall has none to read.
+                if row.status == "PARTIAL":
+                    apply_dom_counts(
+                        row, await dom_counts(page, row.profile_id))
                 # See instagram/analysis_engine.py: a row we could not
                 # read is the one most worth having a picture of, and
                 # returning before screenshot() threw that away.
@@ -479,6 +611,10 @@ class Scraper:
                     # posts_seen as it found it
                     pass
             self.fill(row, found[0])
+            # The payload arrived but carried no counts (X moves these
+            # fields between A/B variants): read them off the header.
+            if row.followers is None or row.friends is None:
+                apply_dom_counts(row, await dom_counts(page, row.profile_id))
             # The payload arrived but carried no name -- a shape change that
             # moved the field again, or a node that only had counts on it.
             # Same reasoning as the no-payload path above: read it off the
@@ -583,6 +719,20 @@ class Scraper:
                 await page.close()
             except Exception:
                 pass
+
+    @staticmethod
+    def _is_wall(page, body: str) -> bool:
+        """Is this X's own wall (rate limit, checkpoint, login, suspended)
+        rather than a profile that is merely slow to deliver its data?"""
+        url = page.url or ""
+        return bool(
+            "rate limit" in body.lower()
+            or RE_CHECKPOINT.search(body)
+            or RE_LOGIN.search(body)
+            or RE_GONE.search(body)
+            or "/login" in url
+            or "/i/flow/login" in url
+        )
 
     @staticmethod
     def fill(row: Row, u: TwitterUser) -> None:
@@ -856,10 +1006,15 @@ class Scraper:
         # A rendered tweet cell is X's "the timeline has painted"
         # signal. Without it the capture is a correct header above a
         # spinner where the posts belong.
+        # An account that has posted nothing never paints a tweet cell, so
+        # waiting for one would just burn the whole ceiling on every such
+        # profile now that the ceiling is generous enough for slow laptops.
         await evidence.capture(
             self.session, page, row, evidence=self.evidence,
             ephemeral=getattr(self.a, 'ephemeral_screenshot', False),
-            content_selector='[data-testid="tweet"]', platform="twitter")
+            content_selector=('' if row.posts_seen == "no"
+                              else '[data-testid="tweet"]'),
+            platform="twitter")
 
     # ─────────────────────────── orchestration ────────────────────────── #
 
