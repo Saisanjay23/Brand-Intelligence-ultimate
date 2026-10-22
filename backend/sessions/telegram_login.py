@@ -13,6 +13,7 @@ forwarded straight to Telegram's own sign-in call and never written anywhere.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -24,12 +25,28 @@ log = get_logger("sessions.telegram_login")
 
 try:
     from telethon import TelegramClient
-    from telethon.errors import (PasswordHashInvalidError, PhoneCodeExpiredError,
-                                  PhoneCodeInvalidError, SessionPasswordNeededError)
+    from telethon.errors import (ApiIdInvalidError, PasswordHashInvalidError,
+                                  PhoneCodeExpiredError, PhoneCodeInvalidError,
+                                  SessionPasswordNeededError)
     HAVE_TELETHON = True
 except ImportError:  # pragma: no cover
     HAVE_TELETHON = False
     TelegramClient = None  # type: ignore
+    ApiIdInvalidError = None  # type: ignore
+
+# Telegram's api_hash is always 32 hexadecimal characters. Checked before any
+# network call so a hash that is cut short, or has a stray character from a
+# copy-paste, is named as such instead of coming back as Telegram's bare
+# "combination is invalid".
+_API_HASH_RE = re.compile(r"[0-9a-fA-F]{32}")
+
+API_PAIR_HELP = (
+    "Telegram rejected this API ID / API Hash pair. They must be copied together "
+    "from the SAME app at https://my.telegram.org/apps (log in with the phone "
+    "number, open 'API development tools'). A pair mixed from two apps, or from "
+    "an app that was deleted, is refused. If you already have a working Telegram "
+    "session here you do not need to log in again."
+)
 
 
 @dataclass
@@ -61,6 +78,12 @@ async def send_code(api_id: int, api_hash: str, phone: str) -> dict:
         raise UpstreamPlatformError("telethon is not installed (pip install telethon)")
     if not (api_id and api_hash and phone):
         raise ValidationError("api_id, api_hash and phone are all required")
+    api_hash = api_hash.strip()
+    if not _API_HASH_RE.fullmatch(api_hash):
+        raise ValidationError(
+            f"the API Hash should be exactly 32 letters/digits (0-9, a-f); this one is "
+            f"{len(api_hash)} characters or contains something else. Copy it again from "
+            "https://my.telegram.org/apps")
 
     await _teardown()
     settings.session_blob_path.mkdir(parents=True, exist_ok=True)
@@ -86,6 +109,8 @@ async def send_code(api_id: int, api_hash: str, phone: str) -> dict:
         sent = await client.send_code_request(phone)
     except Exception as e:
         await client.disconnect()
+        if ApiIdInvalidError is not None and isinstance(e, ApiIdInvalidError):
+            raise ValidationError(f"could not request a code: {API_PAIR_HELP}") from e
         raise ValidationError(f"could not request a code: {e}") from e
 
     global _pending
