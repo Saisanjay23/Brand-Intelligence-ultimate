@@ -55,6 +55,7 @@ from urllib.parse import parse_qs, quote, urlparse
 from backend.platforms.scan_options import cancelled
 from backend.shared import diagnostics
 from backend.shared.tasks import spawn
+from backend.shared.pushback import STOP_CODE as _PUSHBACK_STOP, note_response
 from backend.shared.extraction import run_strategies
 from backend.shared.schema_probe import SchemaProbe, probe_or_null
 from backend.shared.avatars import looks_like_placeholder
@@ -1575,6 +1576,10 @@ class Discovery:
         processed_ids: set[str] = set()
         state: Optional[PageState] = None
         arrived = asyncio.Event()
+        # How many result edges every payload has yielded, and what the
+        # platform said when it pushed back. See on_response().
+        iterated = 0
+        pushed: list = []
         kind = kind_for_tab(tab)
         # One tally per sweep of which targeted attributes Facebook still
         # serves -- see shared/schema_probe.py. Rides out on the Sweep, into
@@ -1588,8 +1593,9 @@ class Discovery:
             """Folds one search payload into the running result set,
             enforcing the cap as it goes. See the note below for why the
             cap is applied HERE and not only between scrolls."""
-            nonlocal state
+            nonlocal state, iterated
             for hit in iter_results(blob, probe):
+                iterated += 1
                 # capped here, not only in the while-loop's own check below:
                 # one response can carry a whole page's worth of edges at
                 # once, so checking only between scrolls let by_id overshoot
@@ -1632,10 +1638,39 @@ class Discovery:
                 text = await resp.text()
             except Exception:
                 return
+            edges_before = iterated
             for blob in parse_lines(text):
                 absorb(blob)
-            out.pages += 1
+            # A SEARCH RESPONSE IS NOT ALWAYS A PAGE OF RESULTS. This handler
+            # used to count every one as a page and wake the scroll loop, so a
+            # rate-limit or checkpoint body read as "zero new results, scroll
+            # again" until the sweep ended `stalled` -- a stop code with no
+            # session verdict, so nothing cooled down. The STATUS is always
+            # read. The BODY is read only when it yielded no result edges at
+            # all and is small: a real results page can quote any words (a
+            # profile may be called "Captcha"), an error body cannot be
+            # mistaken for one.
+            body = None
+            if iterated == edges_before and len(text) < 4000:
+                body = text
+            sig = note_response("facebook", resp.status, body)
+            if sig.is_pushback:
+                pushed.append(sig)
+            else:
+                out.pages += 1
             arrived.set()
+
+        def _pushback_stop() -> bool:
+            """If the platform pushed back, end the sweep with a stop code
+            `classify_failure` understands, so the account is cooled down and
+            the keyword goes to another account instead of being retried
+            into the same wall. Everything already parsed is still returned."""
+            if not pushed:
+                return False
+            sig = pushed[-1]
+            out.stopped = _PUSHBACK_STOP[sig.kind]
+            out.error = f"facebook search answered with a {sig.kind} signal ({sig.reason})"
+            return True
 
         page.on("response", lambda r: spawn(on_response(r)))
 
@@ -1791,6 +1826,8 @@ class Discovery:
                 if cancelled(self.a):
                     out.stopped = "cancelled"
                     break
+                if _pushback_stop():
+                    break
                 if cap and len(by_id) >= cap:
                     out.stopped = "cap:results"
                     break
@@ -1818,6 +1855,12 @@ class Discovery:
                     await asyncio.wait_for(arrived.wait(), timeout=self.a.page_wait)
                 except asyncio.TimeoutError:
                     pass
+
+                # BEFORE the stall accounting below: a throttled response
+                # adds no results, so left to run it would be counted as a
+                # stall and the sweep would end `stalled` -- no verdict.
+                if _pushback_stop():
+                    break
 
                 if len(by_id) > before:
                     stalls = 0

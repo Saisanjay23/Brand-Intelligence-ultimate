@@ -69,6 +69,7 @@ from typing import Optional
 from backend.shared.logging import get_logger
 from backend.shared.tasks import spawn
 from backend.platforms.scan_options import cancelled
+from backend.shared.pushback import governor_for
 from backend.stealth.human import BASE, Human
 from backend.stealth.fingerprint import (
     LAUNCH_ARGS,
@@ -857,7 +858,12 @@ class Session:
             return
         configured = getattr(self.o, "delay", 0) or 0
         scale = (configured / BASE["between_profiles"]) if configured else 1.0
-        await self.human.pause("between_profiles", scale * mult)
+        # THE GOVERNOR'S SAY. 1.0 whenever the platform has not pushed back,
+        # so a healthy run is paced exactly as before; after a throttle or a
+        # challenge every account behind this IP waits longer, and the extra
+        # decays on its own (shared/pushback.py).
+        gov = governor_for(self.platform).gap_multiplier()
+        await self.human.pause("between_profiles", scale * mult * gov)
         # Every platform's per-profile pause funnels through here, so this is
         # the one place that needs to fire for should_rest()/maybe_rest() to
         # actually do anything, previously computed but never called.

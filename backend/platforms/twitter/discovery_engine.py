@@ -32,6 +32,7 @@ from urllib.parse import quote, urlparse
 from backend.platforms.scan_options import cancelled
 from backend.shared import diagnostics
 from backend.shared.tasks import spawn
+from backend.shared.pushback import note_response
 from backend.shared.extraction import run_strategies
 from backend.shared.schema_probe import SchemaProbe, probe_or_null
 from backend.shared.avatars import hd_picture_url, looks_like_placeholder
@@ -974,7 +975,13 @@ class Discovery:
                 if SEARCH_QUERY not in resp.url:
                     return
                 # Check HTTP 429 Too Many Requests
-                if getattr(resp, "status", 200) == 429:
+                status = getattr(resp, "status", 200)
+                if status == 429:
+                    # Tell the shared governor too: this account being
+                    # throttled is evidence about every account behind this
+                    # IP, and the pacing layer reads the governor, not this
+                    # engine's local flag.
+                    note_response("x", status, None)
                     rate_limited = True
                     arrived.set()
                     return
@@ -984,12 +991,14 @@ class Discovery:
 
             # Detect Twitter-specific rate-limit and error indicators in payload
             if "Rate limit exceeded" in text or '"code":88' in text or "OverCapacity" in text:
+                note_response("x", status, text[:2000])
                 rate_limited = True
                 arrived.set()
                 return
-
+            users_in_payload = 0
             for blob in parse_lines(text):
                 st = search_state(blob, probe)
+                users_in_payload += len(st.users)
                 for u in st.users:
                     # setdefault, never assignment: the first sighting of a
                     # user is the one X ranked, and overwriting it on a
@@ -998,6 +1007,15 @@ class Discovery:
                     by_id.setdefault(u.entity_id or u.handle, u)
                 if st.bottom_cursor:
                     cursor = st.bottom_cursor
+            # 401/403 and challenge codes were invisible to pacing before
+            # (control flow is unchanged -- the stall branch below already
+            # reads the page for a wall). The body is passed only when it was
+            # small and carried no users, so a profile whose name contains a
+            # trigger word cannot raise an alarm.
+            note_response(
+                "x", status,
+                text if (users_in_payload == 0 and len(text) < 4000) else None,
+            )
             out.pages += 1
             arrived.set()
 

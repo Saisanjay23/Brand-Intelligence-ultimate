@@ -416,6 +416,23 @@ class Settings(BaseSettings):
         ]
     )
 
+    # --- platform pushback: governor + circuit breaker -------------------
+    # See shared/pushback.py. The governor is invisible while a platform is
+    # happy (gap multiplier 1.0, every tab allowed); after a throttle or a
+    # challenge it lengthens every gap behind that IP and the extra decays on
+    # its own. The BREAKER is the harder stop: several throttle/challenge
+    # signals in a short window hold the platform's workers instead of
+    # replaying keywords onto the next account from the same IP.
+    #
+    # Turn the breaker off and workers never hold -- the governor still slows
+    # pacing. Only for diagnosing a suspected false positive.
+    pushback_breaker_enabled: bool = True
+    # How long one worker will wait for an open breaker before the platform
+    # is stopped and its remaining keywords are recorded as owed (never
+    # silently dropped). Default is longer than the breaker's own 20 minutes,
+    # so a normal trip is waited out inside the same run.
+    pushback_max_wait_minutes: float = 30.0
+
     # --- session quarantine backoff -------------------------------------
     # One 429 used to burn a session for a full day. Quarantine now grows
     # with CONSECUTIVE failures and resets the moment a session works

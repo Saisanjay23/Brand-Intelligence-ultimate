@@ -27,6 +27,7 @@ from backend.platforms.scan_options import cancelled
 from backend.shared import diagnostics
 from backend.shared.avatars import extract_instagram_hd_avatar, looks_like_placeholder
 from backend.shared.extraction import run_strategies
+from backend.shared.pushback import UNKNOWN, governor_for, note_response
 from backend.shared.schema_probe import SchemaProbe, probe_or_null
 from backend.shared.models.row import Row
 from backend.shared.text import iter_dicts
@@ -1039,6 +1040,19 @@ class Discovery:
 
                 if res.status != 200:
                     out.stopped = f"http-{res.status}"
+                    # READ WHAT THE REFUSAL SAYS. A bare 400 used to classify
+                    # as nothing, yet Instagram answers a wrong client pairing
+                    # or a challenge with a 400 whose body names it
+                    # (`challenge_required`). Cheap -- it is a small error
+                    # body -- and wrapped so a body that cannot be read costs
+                    # only the extra detail, never the sweep.
+                    try:
+                        err_body = (await res.text())[:2000]
+                    except Exception:
+                        err_body = ""
+                    sig = note_response("instagram", res.status, err_body)
+                    if sig.is_pushback or sig.kind == UNKNOWN:
+                        out.error = f"{sig.kind}: {sig.reason}"
                     break
 
                 text = await res.text()
@@ -1052,13 +1066,23 @@ class Discovery:
                 if isinstance(data, dict) and data.get("status") not in (None, "ok"):
                     out.stopped = "http-200-status-" + str(data.get("status"))
                     out.error = str(data.get("message") or data.get("status"))[:200]
+                    note_response("instagram", 200, text[:2000])
                     break
 
                 new_users = 0
+                seen_users = 0
                 for user in iter_mobile_search_users(data, probe):
+                    seen_users += 1
                     if user.username.lower() not in by_name:
                         by_name[user.username.lower()] = user
                         new_users += 1
+                # The body is read only when it carried no users and is small:
+                # a real results page can quote any words (a username can be
+                # "captcha"), an error body cannot be mistaken for one.
+                note_response(
+                    "instagram", 200,
+                    text if (seen_users == 0 and len(text) < 4000) else None,
+                )
 
                 if new_users > 0:
                     out.pages += 1
@@ -1119,6 +1143,14 @@ class Discovery:
                 # cleanly complete (http-403, cap:pages, an exception)
                 # falls through to the web fallback below.
                 out.users = []
+                # ...EXCEPT right after the platform pushed back. An empty
+                # answer from an account Instagram is throttling is exactly
+                # what a throttle looks like, and filing it `exhausted`
+                # (complete, satisfied, zero results) is the clean zero this
+                # tool exists to refuse. Healthy platform: unchanged. Under
+                # pushback: owed again, not silently "nothing there".
+                if not governor_for("instagram").healthy():
+                    out.stopped, out.complete = "empty-unconfirmed", False
             else:
                 # Private mobile API first (richer), rendered search page
                 # second. The DOM pass only runs when the API produced
@@ -1144,6 +1176,17 @@ class Discovery:
                     # "challenge_required" from the mobile leg would have the
                     # runner quarantine an account whose search just worked.
                     out.error = ""
+                    # ...but the EVIDENCE is not erased: the governor already
+                    # recorded what the mobile leg answered (note_response
+                    # above), so repeated throttles still slow the platform
+                    # down and can open its breaker. Say so in the log too --
+                    # a fallback that fires on every sweep means the primary
+                    # path is being refused, which someone should see.
+                    from backend.shared.logging import get_logger as _gl
+                    _gl("instagram").warning(
+                        f"instagram: mobile search for {keyword!r} was refused; the "
+                        f"web endpoint answered instead "
+                        f"(governor: {governor_for('instagram').snapshot()})")
 
             out.hits = [
                 user_to_row(u, keyword, source=out.source)

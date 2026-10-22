@@ -51,6 +51,7 @@ from backend.shared import resilience
 from backend.shared.job_store import JobStore
 from backend.shared.logging import get_logger
 from backend.shared.models.row import Row
+from backend.shared.pushback import governor_for
 from backend.shared.resilience import classify_failure
 from backend.shared.tasks import spawn
 from backend.shared.text import (contiguous_letters_match, handle_from_url,
@@ -245,6 +246,47 @@ def _worker_semaphore() -> asyncio.Semaphore:
         sem = asyncio.Semaphore(max(1, settings.discovery_max_browser_workers))
         _worker_slots[loop] = sem
     return sem
+
+
+async def _hold_for_breaker(
+    platform_id: str, job, run, label: str, tick: float = 1.0,
+) -> None:
+    """Hold a worker while this platform's circuit breaker is open.
+
+    WHY HOLD INSTEAD OF CARRY ON. Every account on a platform leaves from one
+    IP, so repeated throttle/challenge signals are evidence about all of them.
+    Before this, a keyword that drew a throttle was replayed on the next
+    account straight away -- the same IP, seconds later. Holding costs
+    nothing while the platform is healthy (the breaker is closed and this
+    returns at once) and is the difference between one cooled-down account
+    and a burned pool when it is not.
+
+    NEVER A SILENT DROP. If the breaker is still open after
+    `pushback_max_wait_minutes`, the platform is stopped the way every other
+    "this platform cannot continue" case is (`hard_stop` plus a note), and
+    the keywords still on the queue are recorded as owed by the same
+    `_abandon` path -- so they are searched on the next run, not forgotten.
+    A Stop is honoured within a second.
+    """
+    gov = governor_for(platform_id)
+    if not settings.pushback_breaker_enabled or not gov.is_open():
+        return
+    reason = gov.open_reason()
+    budget = max(0.0, float(settings.pushback_max_wait_minutes)) * 60.0
+    log.warning(
+        f"[{platform_id}] holding {label}: {reason}. Resuming in "
+        f"~{gov.resume_in_s():.0f}s (waits at most {budget / 60:.0f} min)")
+    waited = 0.0
+    while gov.is_open() and not job.cancel.is_set() and not run.hard_stop:
+        if waited >= budget:
+            run.hard_stop = True
+            run.prog.note = (
+                f"stopped early: {platform_id} kept pushing back ({reason}); "
+                f"the remaining keywords are recorded as owed")
+            log.error(f"[{platform_id}] {run.prog.note}")
+            return
+        await asyncio.sleep(tick)
+        waited += tick
 
 
 async def _claim_rounds_for(platform_id: str) -> int:
@@ -2190,6 +2232,12 @@ class DiscoveryRunner:
                         return stop_reason
 
                     while run.queue and not job.cancel.is_set() and not run.hard_stop:
+                        # The platform's circuit breaker, asked BEFORE a
+                        # keyword is taken off the queue so a held worker
+                        # never has a keyword in its hands.
+                        await _hold_for_breaker(platform_id, job, run, label)
+                        if not run.queue or job.cancel.is_set() or run.hard_stop:
+                            break
                         item = run.queue.popleft()
                         item.attempts += 1
                         prog.current_keyword = item.keyword
