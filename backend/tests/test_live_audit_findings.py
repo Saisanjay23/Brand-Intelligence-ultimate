@@ -168,4 +168,5 @@ class TestKeywordWhitespace:
         client = {"keyword_groups": {"individual": [{
             "parent": "Mr. Yash Pal Mendiratta",
             "children": ["Yash Pal Mendiratta", "Yash  Mendiratta", "yash mendiratta"]}]}}
-        assert [p.search for p in build_plans(client)] == ["Yash Pal Mendiratta", "Yash Mendiratta"]
+        assert [p.search for p in build_plans(client)] == [
+            "Mr. Yash Pal Mendiratta", "Yash Pal Mendiratta", "Yash Mendiratta"]

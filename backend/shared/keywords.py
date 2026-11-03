@@ -20,20 +20,27 @@ THE PROBLEM THIS SOLVES
                  dropdown offers, and the name the analysis export reports
                  in its AssetName column.
 
-                 It is searched ONLY when it has no children -- see
-                 `build_plans`, which sweeps `children or [parent]`. An
-                 analyst who has curated permutations has said what to
-                 search for, and the real name is rarely among the terms
-                 worth spending a sweep on; one who has curated none still
-                 gets their keyword searched, so nothing is ever configured
-                 and then silently not run. An analyst who DOES want the
-                 exact name queried alongside the permutations adds it as
-                 one of them.
+                 It is ALWAYS searched, alongside its children -- see
+                 `build_plans`, which sweeps `[parent, *children]`.
+
+                 THIS REVERSES AN EARLIER RULE (2026-10-23). Parents used
+                 to be searched only when they had no children, on the
+                 reasoning that a curated permutation set says what to
+                 search for. That left a configured keyword silently
+                 un-run: a client saved with 36 keywords (parents plus
+                 permutations) ran 25 searches, the other 11 being parents
+                 such as "Mr. Ashok Kumar Agarwal" or "Globe capital". The
+                 analyst's requirement is that every keyword they
+                 configured is searched on every platform -- a keyword
+                 nobody searched is an impersonator nobody looked for -- and
+                 the Keywords tab already told them so ("N + 1 searches"
+                 for N permutations), so the backend was running one fewer
+                 search than the screen promised.
 
         CHILDREN the analyst's permutations. Searched on every platform,
-                 and when there is at least one they are the WHOLE search
-                 set for that parent. Never scored against, never stored as
-                 the hit's keyword, never shown as a filter option.
+                 in addition to the parent. Never scored against as a
+                 bucket, never stored as the hit's keyword, never shown as
+                 a filter option.
 
     One parent's children all roll up into that one parent, so an analyst
     filtering the results grid by "Gautam Adani" sees everything all twelve
@@ -302,9 +309,9 @@ def build_plans(
 ) -> list[KeywordPlan]:
     """The searches one sweep should run, resolved from a client's groups.
 
-    Each requested parent contributes its CHILDREN, or -- when it has
-    none -- itself. See the module docstring for why permutations
-    replace the parent rather than joining it.
+    Each requested parent contributes ITSELF AND its children: every
+    keyword the analyst configured is searched. See the module docstring
+    for why the parent is no longer dropped when it has permutations.
 
     `requested` scopes the sweep to a subset of the client's PARENTS -- the
     keyword list a caller passed to `POST /discovery`, which is always
@@ -355,15 +362,15 @@ def build_plans(
                 parent=parent,
                 terms=match_terms_for(parent, group.get("children") or []),
             )
-            # PERMUTATIONS REPLACE THE PARENT; the parent is the fallback.
-            # A parent that has permutations is NOT searched under its own
-            # name -- the analyst's permutations are the search set, and the
-            # parent's job is to be what those hits are matched and filed
-            # against. A parent with none searches itself, which is what
-            # keeps a client who has curated nothing sweeping exactly as
-            # before. See this module's docstring.
+            # EVERY CONFIGURED KEYWORD IS SEARCHED: the parent first, then
+            # each permutation, in the analyst's own order. A parent used to
+            # be dropped as soon as it had a single child, which left a
+            # configured keyword silently un-run -- see this module's
+            # docstring. `_dedup` is case-insensitive, so a child that
+            # repeats its parent (normalize_groups already drops that, this
+            # guards any other route) is still one search, not two.
             children = _dedup(group.get("children") or [])
-            terms_to_search = children or [parent]
+            terms_to_search = _dedup([parent, *children])
             for term in terms_to_search:
                 key = term.lower()
                 if key not in by_search:

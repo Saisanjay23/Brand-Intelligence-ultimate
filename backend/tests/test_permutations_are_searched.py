@@ -19,12 +19,13 @@ The half that DID work is worth pinning too: whatever is in the plan is
 swept by every ready platform, one entry at a time. That is what made the
 gap invisible -- the sweep ran perfectly, over the wrong list.
 
-THE RULE, as specified by the analysts who use this: a parent's
-permutations ARE its search set -- they replace the parent rather than
-joining it. A parent with no permutations is searched under its own name,
-so a keyword can never be configured and then silently not run. Both halves
-matter, and the boundary between them is "has children", not "has groups":
-one client routinely has permutations for one keyword and none for the next.
+THE RULE (revised 2026-10-23): EVERY keyword an analyst configured is
+searched -- each parent AND each of its permutations, parent first. This
+reverses the earlier rule, under which a parent with permutations was not
+searched itself. That rule left a configured keyword silently un-run: a
+client saved with 36 keywords (parents plus permutations) ran 25 searches.
+A keyword nobody searched is an impersonator nobody looked for, and the
+Keywords tab already promised "N + 1 searches" for N permutations.
 """
 
 from __future__ import annotations
@@ -78,29 +79,23 @@ async def _plans(monkeypatch, doc, ind, dom):
 
 class TestEveryPermutationIsPlanned:
     @pytest.mark.asyncio
-    async def test_permutations_are_the_search_set_parents_the_fallback(self, monkeypatch):
-        """THE RULE, end to end, over a client carrying both shapes at
-        once: parents with permutations, and one without."""
+    async def test_every_configured_keyword_is_searched(self, monkeypatch):
+        """THE RULE, end to end: each parent, then each of its permutations,
+        in the analyst's own order -- nothing configured is left out."""
         plans = await _plans(monkeypatch, ADANI, ADANI["name_keywords"], ADANI["domain_keywords"])
         assert [p.search for p in plans] == [
-            # Gautam Adani has three permutations -> they are the search set
-            "gautamadani", "gautam.adani.hq", "gautam adani official",
-            # Jeet Adani has one -> likewise, and the real name is not swept
-            "jeetadani",
-            # adani.com has one
-            "adani-group.com",
+            "Gautam Adani", "gautamadani", "gautam.adani.hq", "gautam adani official",
+            "Jeet Adani", "jeetadani",
+            "adani.com", "adani-group.com",
         ]
-        assert "Gautam Adani" not in [p.search for p in plans]
 
     @pytest.mark.asyncio
-    async def test_a_parent_with_permutations_is_not_searched_itself(self, monkeypatch):
-        """An analyst who curated permutations has said what to search for.
-        Adding the real name back would spend a sweep per platform on a
-        term they deliberately did not ask for -- and one who does want it
-        queried adds it as a permutation."""
+    async def test_a_parent_with_permutations_is_searched_too(self, monkeypatch):
+        """The reversed half. A parent used to be dropped the moment it had
+        one permutation, leaving a configured keyword silently un-run."""
         plans = await _plans(monkeypatch, ADANI, ["Gautam Adani"], [])
         assert [p.search for p in plans] == [
-            "gautamadani", "gautam.adani.hq", "gautam adani official"]
+            "Gautam Adani", "gautamadani", "gautam.adani.hq", "gautam adani official"]
 
     @pytest.mark.asyncio
     async def test_a_parent_without_permutations_is_searched(self, monkeypatch):
@@ -111,15 +106,14 @@ class TestEveryPermutationIsPlanned:
         assert [p.search for p in plans] == ["Solo Name"]
 
     @pytest.mark.asyncio
-    async def test_the_two_halves_coexist_in_one_client(self, monkeypatch):
-        """The boundary is per PARENT ("has children"), not per client --
-        one config routinely has both."""
+    async def test_parents_with_and_without_permutations_coexist(self, monkeypatch):
+        """One config routinely has both shapes; both are fully searched."""
         doc = _client(individual=[
             {"parent": "With Perms", "children": ["withperms"]},
             {"parent": "Without", "children": []},
         ])
         plans = await _plans(monkeypatch, doc, ["With Perms", "Without"], [])
-        assert [p.search for p in plans] == ["withperms", "Without"]
+        assert [p.search for p in plans] == ["With Perms", "withperms", "Without"]
 
     @pytest.mark.asyncio
     async def test_the_analysts_own_ordering_is_kept(self, monkeypatch):
@@ -128,7 +122,8 @@ class TestEveryPermutationIsPlanned:
         order results arrive in."""
         plans = await _plans(monkeypatch, ADANI, ["Gautam Adani", "Jeet Adani"], [])
         assert [p.search for p in plans] == [
-            "gautamadani", "gautam.adani.hq", "gautam adani official", "jeetadani"]
+            "Gautam Adani", "gautamadani", "gautam.adani.hq", "gautam adani official",
+            "Jeet Adani", "jeetadani"]
 
     @pytest.mark.asyncio
     async def test_each_permutation_keeps_its_parents_keyword_type(self, monkeypatch):
@@ -154,6 +149,7 @@ class TestHitsFileUnderTheParent:
         plans = await _plans(monkeypatch, ADANI, ["Gautam Adani"], [])
         items = [R._KeywordItem(p.search, p.kw_type, p.parent) for p in plans]
         assert [(i.keyword, i.parent) for i in items] == [
+            ("Gautam Adani", "Gautam Adani"),
             ("gautamadani", "Gautam Adani"),
             ("gautam.adani.hq", "Gautam Adani"),
             ("gautam adani official", "Gautam Adani"),
@@ -238,14 +234,14 @@ class TestScopingToOneKeywordType:
         assert "adani-group.com" not in [p.search for p in plans]
 
     @pytest.mark.asyncio
-    async def test_a_domain_only_sweep_still_brings_its_permutations(self, monkeypatch):
+    async def test_a_domain_only_sweep_brings_the_parent_and_its_permutations(self, monkeypatch):
         plans = await _plans(monkeypatch, ADANI, [], ADANI["domain_keywords"])
-        assert [p.search for p in plans] == ["adani-group.com"]
+        assert [p.search for p in plans] == ["adani.com", "adani-group.com"]
 
     @pytest.mark.asyncio
-    async def test_one_parent_of_several_sweeps_only_its_own_children(self, monkeypatch):
+    async def test_one_parent_of_several_sweeps_only_its_own_terms(self, monkeypatch):
         plans = await _plans(monkeypatch, ADANI, ["Jeet Adani"], [])
-        assert [p.search for p in plans] == ["jeetadani"]
+        assert [p.search for p in plans] == ["Jeet Adani", "jeetadani"]
 
 
 class TestEveryPlatformSweepsEveryTerm:
@@ -266,12 +262,79 @@ class TestEveryPlatformSweepsEveryTerm:
         show a sweep as finished with most of its work still queued."""
         plans = await _plans(monkeypatch, ADANI, ADANI["name_keywords"], [])
         tabs = R.PLATFORM_TABS["facebook"]
-        # 3 permutations for Gautam Adani + 1 for Jeet Adani, x 3 tabs
-        assert len(plans) * len(tabs) == 4 * 3
+        # (Gautam Adani + 3 permutations) + (Jeet Adani + 1), x 3 tabs
+        assert len(plans) * len(tabs) == 6 * 3
 
     @pytest.mark.asyncio
     async def test_the_job_reports_the_searches_it_will_run(self, monkeypatch):
         plans = await _plans(monkeypatch, ADANI, ["Gautam Adani"], [])
         job = R.DiscoveryJob(id="j", group_id="acme", keyword_plan=plans)
         assert job.keywords == [
-            "gautamadani", "gautam.adani.hq", "gautam adani official"]
+            "Gautam Adani", "gautamadani", "gautam.adani.hq", "gautam adani official"]
+
+
+# --------------------------------------------------------------------------
+# THE GUARD. Written against the shape of a real client (parents carrying
+# titles, permutations without them, mixed with childless parents) because
+# the defect was invisible to every test that used a tidy one.
+
+GLOBE_LIKE = _client(
+    individual=[
+        {"parent": "Mr. Ashok Kumar Agarwal",
+         "children": ["ashok_agarwal", "ashok kumar", "ashok kumar agarwal"]},
+        {"parent": "Mr. Arpit Agarwal", "children": ["Arpit Agarwal"]},
+        {"parent": "Dhiraj Kumar Jaiswal", "children": ["Dhiraj Kumar"]},
+        {"parent": "Gautam Gupta", "children": []},
+    ],
+    domain=[
+        {"parent": "Globe capital",
+         "children": ["globecapital", "globe.capital", "globe-capital"]},
+        {"parent": "SF EXPRESS", "children": ["sf-express.com"]},
+    ],
+)
+
+
+def _configured_terms(doc) -> list[str]:
+    out = []
+    for kind in ("individual", "domain"):
+        for g in doc["keyword_groups"][kind]:
+            out += [g["parent"], *g["children"]]
+    return out
+
+
+class TestNothingConfiguredIsLeftOut:
+    @pytest.mark.asyncio
+    async def test_every_parent_and_permutation_of_both_types_is_a_search(self, monkeypatch):
+        plans = await _plans(
+            monkeypatch, GLOBE_LIKE,
+            GLOBE_LIKE["name_keywords"], GLOBE_LIKE["domain_keywords"])
+        searched = {p.search.lower() for p in plans}
+        missing = [t for t in _configured_terms(GLOBE_LIKE) if t.lower() not in searched]
+        assert missing == [], f"configured but never searched: {missing}"
+
+    @pytest.mark.asyncio
+    async def test_the_search_count_equals_the_configured_count(self, monkeypatch):
+        """Counts, not just membership: when no keyword repeats, N configured
+        keywords must be N searches. A drop is visible here as a number."""
+        plans = await _plans(
+            monkeypatch, GLOBE_LIKE,
+            GLOBE_LIKE["name_keywords"], GLOBE_LIKE["domain_keywords"])
+        assert len(plans) == len(_configured_terms(GLOBE_LIKE))
+
+    @pytest.mark.asyncio
+    async def test_every_platform_queues_every_configured_keyword(self, monkeypatch):
+        plans = await _plans(
+            monkeypatch, GLOBE_LIKE,
+            GLOBE_LIKE["name_keywords"], GLOBE_LIKE["domain_keywords"])
+        want = sorted(t.lower() for t in _configured_terms(GLOBE_LIKE))
+        for platform in ("facebook", "twitter", "instagram", "tiktok", "youtube", "telegram"):
+            queue = deque(R._KeywordItem(p.search, p.kw_type, p.parent) for p in plans)
+            assert sorted(i.keyword.lower() for i in queue) == want, platform
+
+    @pytest.mark.asyncio
+    async def test_a_parents_own_hits_file_under_that_parent(self, monkeypatch):
+        """Searching the parent must not move its results into another
+        bucket: the parent's own search files under the parent."""
+        plans = await _plans(monkeypatch, GLOBE_LIKE, ["Mr. Arpit Agarwal"], [])
+        own = next(p for p in plans if p.search == "Mr. Arpit Agarwal")
+        assert own.parent == "Mr. Arpit Agarwal"

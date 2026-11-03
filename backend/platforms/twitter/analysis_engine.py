@@ -39,7 +39,9 @@ from backend.platforms.scan_options import captures_screenshot
 from backend.shared.text import (name_score, normalized_host, parse_count,
                                  parse_normalized_url)
 from backend.stealth.mouse_movement import humanize_interaction
+from backend.shared.walls import chrome_text, url_path
 from backend.platforms.twitter.discovery_engine import (ABOUT_QUERY,
+                                                         _X_CONTENT_SELECTORS,
                                                          REPOSTS_QUERY,
                                                          RE_CHECKPOINT,
                                                          RE_GONE, RE_LOGIN,
@@ -523,11 +525,10 @@ class Scraper:
             except asyncio.TimeoutError:
                 pass
 
-            body = ""
-            try:
-                body = await page.inner_text("body")
-            except Exception:
-                pass
+            # The page's own interface, bios and posts cut out -- see
+            # shared/walls.py. A profile whose bio says "Confirm your order"
+            # used to read as a checkpoint when the payload was missed.
+            body = await chrome_text(page, _X_CONTENT_SELECTORS)
 
             # LATE IS NOT THE SAME AS MISSING. No payload after the wait,
             # on a page that is not a wall, is most often a slow machine or
@@ -544,10 +545,7 @@ class Scraper:
                     await asyncio.wait_for(got.wait(), timeout=self.a.settle)
                 except Exception:
                     pass
-                try:
-                    body = await page.inner_text("body")
-                except Exception:
-                    pass
+                body = await chrome_text(page, _X_CONTENT_SELECTORS) or body
 
             if not found:
                 if rate_limited or "rate limit" in body.lower():
@@ -557,8 +555,7 @@ class Scraper:
                     row.status = "CHECKPOINT"
                     row.note("session checkpointed")
                 elif (
-                    "/login" in page.url
-                    or "/i/flow/login" in page.url
+                    url_path(page.url).startswith(("/login", "/i/flow/login"))
                     or RE_LOGIN.search(body)
                 ):
                     row.status = "LOGIN_REQUIRED"
@@ -741,8 +738,7 @@ class Scraper:
             or RE_CHECKPOINT.search(body)
             or RE_LOGIN.search(body)
             or RE_GONE.search(body)
-            or "/login" in url
-            or "/i/flow/login" in url
+            or url_path(url).startswith(("/login", "/i/flow/login"))
         )
 
     @staticmethod

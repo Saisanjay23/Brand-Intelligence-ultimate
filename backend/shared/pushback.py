@@ -38,6 +38,7 @@ so every behaviour here is tested without sleeping.
 
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 from collections import deque
@@ -308,3 +309,45 @@ def note_response(platform: str, status: Optional[int], body: Optional[str] = No
     """Classify one response and feed the platform's governor in one call.
     The shape an engine's response handler wants."""
     return governor_for(platform).record(classify_response(platform, status, body))
+
+
+# ------------------------------------------------------------- holding for it
+
+async def wait_for_breaker(
+    platform_id: str,
+    should_stop: Callable[[], bool],
+    tick: float = 1.0,
+    log=None,
+    label: str = "",
+) -> str:
+    """Hold while this platform's circuit breaker is open.
+
+    Returns "" when it is clear to carry on -- the breaker was closed, closed
+    while we waited, was switched off, or the run was stopped (a Stop is not a
+    platform failure and is honoured within one `tick`). Returns the reason
+    when the wait outlasted `pushback_max_wait_minutes`: the caller decides
+    what giving up means for ITS work (discovery stops the platform and
+    records the keywords as owed; analysis fails the remaining URLs with this
+    reason) -- what it must never do is drop work without saying so.
+
+    Shared by both runners so the rule is one rule. Costs nothing while the
+    platform is healthy: the breaker is closed and this returns at once.
+    """
+    from backend.config.settings import settings
+
+    gov = governor_for(platform_id)
+    if not settings.pushback_breaker_enabled or not gov.is_open():
+        return ""
+    reason = gov.open_reason()
+    budget = max(0.0, float(settings.pushback_max_wait_minutes)) * 60.0
+    if log is not None:
+        log.warning(
+            f"[{platform_id}] holding {label or 'worker'}: {reason}. Resuming in "
+            f"~{gov.resume_in_s():.0f}s (waits at most {budget / 60:.0f} min)")
+    waited = 0.0
+    while gov.is_open() and not should_stop():
+        if waited >= budget:
+            return reason
+        await asyncio.sleep(tick)
+        waited += tick
+    return ""

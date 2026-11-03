@@ -21,6 +21,7 @@ from backend.shared import diagnostics, evidence
 from backend.shared.tasks import spawn
 from backend.shared.avatars import looks_like_placeholder
 from backend.shared.models.row import Row
+from backend.shared.walls import is_wall_url
 from backend.platforms.scan_options import captures_screenshot
 from backend.shared.text import (MONTHS, epoch_to_dt, is_place, iter_dicts, iter_kv, name_score,
                                parse_count)
@@ -1414,10 +1415,18 @@ class Scraper:
 
     @classmethod
     def blocked_status(cls, row: Row, page_url: str, txt: str, h: Harvest) -> bool:
-        """Session or availability problems that make field reading pointless."""
-        if "/checkpoint" in page_url or RE_CHECKPOINT.search(txt):
+        """Session or availability problems that make field reading pointless.
+
+        The URL is judged by path (shared/walls.py) and the TEXT only on a
+        page that did not hand over the profile's own data. `txt` is the
+        whole body, posts included, so a profile whose timeline says "We've
+        temporarily closed" used to be written off as a checkpoint and
+        quarantine the session; a page that delivered a name and a follower
+        count is not a wall whatever its posts say."""
+        walled = not cls.has_profile_content(h, txt)
+        if is_wall_url(page_url, ("checkpoint",)) or (walled and RE_CHECKPOINT.search(txt)):
             row.status, msg = "CHECKPOINT", "session checkpointed"
-        elif "/login" in page_url or RE_LOGIN.search(txt):
+        elif is_wall_url(page_url, ("login", "login.php")) or (walled and RE_LOGIN.search(txt)):
             row.status, msg = "LOGIN_REQUIRED", "cookies rejected/expired"
         # The content gate is what stops a live profile being written off as
         # taken down because one post in its timeline is restricted -- see

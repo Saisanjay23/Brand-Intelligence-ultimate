@@ -112,8 +112,11 @@ from typing import Optional
 from urllib.parse import quote, urlparse
 
 from backend.shared import diagnostics, evidence
+from backend.shared.pushback import (CHALLENGED, EXPIRED, THROTTLED, Signal,
+                                     governor_for, note_response)
 from backend.shared.tasks import spawn
 from backend.shared.models.row import Row
+from backend.shared.walls import is_wall_url, url_path
 from backend.platforms.scan_options import captures_screenshot
 from backend.stealth.mouse_movement import humanize_interaction
 from backend.shared.text import (MONTHS, _letters_only, name_score,
@@ -134,6 +137,46 @@ from backend.platforms.instagram.discovery_engine import (ABOUT_PANEL_APPID,
                                                            timeline_latest_post)
 
 BAD_SEGMENTS = {"p", "reel", "reels", "explore", "stories", "accounts", "direct", "tv"}
+
+# Consecutive profile visits that returned no payload, with no explicit
+# pushback, before the governor is told Instagram is probably soft-blocking.
+NO_PAYLOAD_STREAK_LIMIT = 3
+
+
+def pushback_verdict(sig) -> Optional[tuple[str, str]]:
+    """What Instagram's own answer says about the ACCOUNT, as (row status,
+    note) -- or None when it says nothing about the account.
+
+    A challenge or a rejected login is an account verdict (the runner
+    quarantines it and hands the rest of the batch to another account). A
+    throttle is NOT: it says the platform wants us slower, which is the
+    governor's job (shared/pushback.py), so it returns None here and the
+    caller only records it on the row."""
+    if sig.kind == CHALLENGED:
+        return "CHECKPOINT", f"instagram challenge ({sig.reason})"
+    if sig.kind == EXPIRED:
+        return "LOGIN_REQUIRED", f"instagram login rejected ({sig.reason})"
+    return None
+
+
+def register_no_payload(state, pushed: bool) -> str:
+    """Count one profile visit that ended with no payload and, when
+    `NO_PAYLOAD_STREAK_LIMIT` of them have come in a row WITHOUT an explicit
+    pushback, tell the governor Instagram is probably soft-blocking.
+
+    `state` is any object that can carry `_no_payload_streak` (the scraper).
+    Returns the note to put on the row, "" when there is nothing to say.
+    Explicit pushback is excluded because the response handler has already
+    fed the governor with it -- counting it twice would open the breaker on
+    one bad moment."""
+    state._no_payload_streak = getattr(state, "_no_payload_streak", 0) + 1
+    if state._no_payload_streak >= NO_PAYLOAD_STREAK_LIMIT and not pushed:
+        governor_for("instagram").record(Signal(
+            THROTTLED,
+            f"{state._no_payload_streak} consecutive profiles returned no payload"))
+        return (f"{state._no_payload_streak} profiles in a row returned no payload "
+                "-- possible soft block, pacing slowed")
+    return ""
 
 # How long to let the profile's timeline response land before giving up on
 # reading a post date from it. Measured live: the profile payload answers at
@@ -861,6 +904,11 @@ class Scraper:
         post_dates: list[str] = []
         got = asyncio.Event()
         timeline_got = asyncio.Event()
+        # What Instagram said when it pushed back during THIS visit (a 429, a
+        # challenge body). Until now the response status of these endpoints
+        # was never read, so a throttled visit looked identical to a profile
+        # that simply had no payload -- see the PARTIAL branch below.
+        pushed: list = []
 
         async def on_response(resp):
             """Collects the profile and timeline payloads. Watches every
@@ -875,13 +923,25 @@ class Scraper:
                 text = await resp.text()
             except Exception:
                 return
+            parsed_any = False
             for blob in parse_lines(text):
                 if user := profile_from(blob, wanted):
                     found.append(user)
                     got.set()
+                    parsed_any = True
                 if iso := timeline_latest_post(blob, wanted):
                     post_dates.append(iso)
                     timeline_got.set()
+                    parsed_any = True
+            # The STATUS is always read. The BODY only when it yielded
+            # nothing and is small: a real profile payload can quote any
+            # words (a bio saying "captcha"), an error body cannot be
+            # mistaken for one.
+            sig = note_response(
+                "instagram", getattr(resp, "status", None),
+                text if (not parsed_any and len(text) < 4000) else None)
+            if sig.is_pushback:
+                pushed.append(sig)
 
         page.on("response", lambda r: spawn(on_response(r)))
 
@@ -925,12 +985,16 @@ class Scraper:
                 )
                 self.fill(row, best)
                 private = best.private
+                self._no_payload_streak = 0
             else:
-                if RE_CHECKPOINT.search(body) or "challenge" in page.url:
+                # By PATH, not substring: `instagram.com/fitnesschallenge`
+                # is a profile, and used to be filed CHECKPOINT and
+                # quarantine the account (shared/walls.py).
+                if RE_CHECKPOINT.search(body) or is_wall_url(page.url, ("challenge",)):
                     row.status = "CHECKPOINT"
                     row.note("session checkpointed")
                     return row
-                if "/accounts/login" in page.url or RE_LOGIN.search(body):
+                if url_path(page.url).startswith("/accounts/login") or RE_LOGIN.search(body):
                     row.status = "LOGIN_REQUIRED"
                     row.note("cookies rejected/expired")
                     return row
@@ -939,15 +1003,39 @@ class Scraper:
                     row.note("removed or unavailable -- may already be down")
                     return row
 
+                # WHAT INSTAGRAM ITSELF SAID, read from the response rather
+                # than guessed from the page text. A challenge or an expired
+                # login that arrives as an API answer (and leaves the page
+                # looking ordinary) used to fall through to "payload not
+                # seen". A throttle is recorded on the row but is NOT an
+                # account verdict: the governor (shared/pushback.py) slows the
+                # platform down and opens its breaker if it keeps happening.
+                if pushed:
+                    sig = pushed[-1]
+                    if verdict := pushback_verdict(sig):
+                        row.status, note = verdict
+                        row.note(note)
+                        return row
+                    row.note(f"instagram throttled this visit ({sig.reason})")
+
                 # the payload interception has not been observed to fire in
                 # practice (see module docstring), read the rendered header
                 dom = await self.read_dom(page, row.profile_id)
                 if dom.get("posts") or dom.get("followers") or dom.get("name"):
                     self.fill_from_dom(row, dom)
                     private = bool(dom.get("isPrivate"))
+                    self._no_payload_streak = 0
                 else:
                     row.status = "PARTIAL"
                     row.note("profile payload not seen")
+                    # THREE IN A ROW IS NOT A COINCIDENCE. One profile with
+                    # nothing to read is ordinary (deleted, odd layout).
+                    # Several consecutive ones, with no explicit pushback,
+                    # is what a soft block looks like from the inside -- and
+                    # PARTIAL carries no session verdict, so nothing else
+                    # would ever notice. Fed to the governor as a throttle.
+                    if streak_note := register_no_payload(self, bool(pushed)):
+                        row.note(streak_note)
                     # Capture anyway. A row whose fields could not be
                     # read is exactly the one an analyst most needs a
                     # picture of, and the screenshot is often the only

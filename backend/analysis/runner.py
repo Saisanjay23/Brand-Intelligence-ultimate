@@ -69,8 +69,10 @@ from backend.shared.job_store import JobStore
 from backend.shared.logging import get_logger
 from backend.shared.models.row import Row
 from backend.shared.models.scoring import compute_incident_risk_score
+from backend.shared.pushback import wait_for_breaker
 from backend.shared.resilience import classify_failure
 from backend.shared.tasks import spawn
+from backend.stealth import levels as stealth_levels
 
 log = get_logger("analysis.runner")
 
@@ -296,6 +298,9 @@ def _sessions_wanted(platform_id: str, item_count: int, concurrency: int) -> int
     plat = registry.PLATFORMS.get(platform_id)
     if plat is not None and (plat.uses_api_key or plat.env_keys):
         cap = 1
+    # The platform's stealth level may only LOWER this (Instagram "high" = one
+    # account at a time). See stealth/levels.py.
+    cap = stealth_levels.session_cap(platform_id, cap)
     chunks = -(-item_count // max(1, concurrency))
     return max(1, min(cap, item_count, chunks))
 
@@ -546,6 +551,10 @@ class _PlatformRun:
     # batch, e.g. "acct-a: session checkpointed". Named on any URL left
     # stranded afterwards, instead of a generic "every session failed".
     last_session_failure: str = ""
+    # Set when the platform's circuit breaker (shared/pushback.py) stayed open
+    # past `pushback_max_wait_minutes`: the reason, which then becomes the
+    # stated cause on every URL that was never analysed. Empty = not stopped.
+    hard_stop: str = ""
 
 
 # ROW STATUSES THAT ARE ABOUT THE ACCOUNT, NOT THE PROFILE. Every engine
@@ -1035,8 +1044,9 @@ class AnalysisRunner:
                 cancel=job.cancel,
             ),
             concurrency=concurrency,
-            inter_batch_delay=_PLATFORM_INTER_BATCH_DELAY.get(
-                platform_id, _DEFAULT_INTER_BATCH_DELAY),
+            inter_batch_delay=stealth_levels.value(
+                platform_id, "batch_gap",
+                _PLATFORM_INTER_BATCH_DELAY.get(platform_id, _DEFAULT_INTER_BATCH_DELAY)),
             progress=progress,
         )
 
@@ -1047,7 +1057,8 @@ class AnalysisRunner:
         session_died = False
         rounds = 0
 
-        while rounds < _MAX_CLAIM_ROUNDS and run.queue and not job.cancel.is_set():
+        while (rounds < _MAX_CLAIM_ROUNDS and run.queue and not job.cancel.is_set()
+               and not run.hard_stop):
             rounds += 1
             try:
                 plat, claimed = await self._claim_sessions(platform_id, want)
@@ -1107,7 +1118,7 @@ class AnalysisRunner:
             # into a screenful of errors.
             progress["status"] = "done"
         elif stranded:
-            detail = setup_error or worker_error or (
+            detail = run.hard_stop or setup_error or worker_error or (
                 f"no healthy session left to continue with -- last one stopped "
                 f"({run.last_session_failure})"
                 if run.last_session_failure else
@@ -1282,7 +1293,24 @@ class AnalysisRunner:
                             job, platform_id, batch, scraper, session_item, progress)
                         return False
 
-                    while run.queue and not job.cancel.is_set():
+                    while run.queue and not job.cancel.is_set() and not run.hard_stop:
+                        # The platform's circuit breaker, asked BEFORE a chunk
+                        # leaves the queue so a held worker never has URLs in
+                        # its hands. Free while the platform is healthy. If the
+                        # wait outlasts the budget the platform stops and the
+                        # URLs still queued are failed with that reason (below)
+                        # -- stated, never silently dropped.
+                        why = await wait_for_breaker(
+                            platform_id,
+                            lambda: job.cancel.is_set() or bool(run.hard_stop),
+                            log=log, label=label)
+                        if why:
+                            run.hard_stop = (
+                                f"{platform_id} kept pushing back ({why}); not analysed "
+                                f"-- re-run these URLs later")
+                            log.error(f"[{platform_id}] {run.hard_stop}")
+                        if run.hard_stop or not run.queue or job.cancel.is_set():
+                            break
                         chunk = [run.queue.popleft()
                                  for _ in range(min(run.concurrency, len(run.queue)))]
                         fatal = await asyncio.gather(

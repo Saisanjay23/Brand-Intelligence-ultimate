@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import re
 import time
 from dataclasses import dataclass, field
@@ -31,6 +32,7 @@ from backend.shared.pushback import UNKNOWN, governor_for, note_response
 from backend.shared.schema_probe import SchemaProbe, probe_or_null
 from backend.shared.models.row import Row
 from backend.shared.text import iter_dicts
+from backend.stealth import levels as stealth_levels
 from backend.stealth.browser import Session
 
 # Session / login state
@@ -74,6 +76,13 @@ class InstagramSession(Session):
     # which reached Meta while they were being stubbed. See
     # Session.ALWAYS_LOAD_IMAGES.
     ALWAYS_LOAD_IMAGES = True
+
+    # Discovery opens instagram.com itself, on the tab it searches from, and
+    # does its own dwell there (Discovery._search_tab), so the generic
+    # warm-up would be a second home-feed load seconds before it. Analysis
+    # goes straight to profiles and keeps the generic warm-up. Read by
+    # Session._warmup.
+    WARMUP_BY_ENGINE = True
 
     async def check_session(self) -> bool:  # type: ignore[override]
         """WHAT: are these cookies still logged in? HOW: visits the
@@ -833,6 +842,22 @@ class _PageResponse:
         return self._body
 
 
+async def _page_gap(options) -> None:
+    """Wait between two result pages: a jittered gap, interruptible.
+
+    Sliced rather than one sleep so a Stop lands within a fifth of a second
+    (the same reasoning as stealth/human.py::Human.sleep) -- the gap at the
+    high stealth level is long enough that a flat sleep would hold a cancelled
+    sweep for several seconds per page."""
+    wait = stealth_levels.jittered(stealth_levels.value("instagram", "page_gap", 2.5))
+    deadline = time.monotonic() + wait
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or cancelled(options):
+            return
+        await asyncio.sleep(min(0.2, remaining))
+
+
 async def _swap_to_app_ua(route) -> None:
     """Route handler: this request, and only this one, goes out with the
     app User-Agent and without Chrome's Client Hints. Everything else about
@@ -923,6 +948,22 @@ class Discovery:
             await tab.route("**/api/v1/users/search/**", _swap_to_app_ua)
             await tab.goto("https://www.instagram.com/", wait_until="domcontentloaded",
                            timeout=self.a.timeout * 1000)
+            # THIS IS THE WARM-UP, AND THE ONLY ONE. Session._warmup used to
+            # open the same home feed in a throwaway tab a few seconds
+            # earlier, so an Instagram sweep loaded instagram.com twice in
+            # quick succession -- a pattern no person produces. The session's
+            # own warm-up is skipped for Instagram discovery (see
+            # InstagramSession.WARMUP_BY_ENGINE) and its dwell and one wheel
+            # tick happen here instead, on the tab the searches are made
+            # from, so the token exchange it exists for still takes place.
+            # Best effort and never fatal: a courtesy must not fail a search.
+            try:
+                if not cancelled(self.a):
+                    await asyncio.sleep(random.uniform(2.0, 3.8))
+                    await tab.mouse.wheel(0, random.randint(150, 320))
+                    await asyncio.sleep(random.uniform(0.8, 1.5))
+            except Exception:
+                pass
             self._tab = tab
             return tab
         except Exception:
@@ -1111,8 +1152,11 @@ class Discovery:
                     out.complete = True
                     break
 
-                # Respect limits between pages
-                await asyncio.sleep(2.5)
+                # Respect limits between pages. NOT a fixed number: the same
+                # gap between every page of every keyword is the metronome a
+                # rate model finds first. Drawn around the stealth level's
+                # median (2.5s standard, 6s high), and cut short by a Stop.
+                await _page_gap(self.a)
 
             if not out.stopped:
                 # Ran the whole page budget without the API ever saying it

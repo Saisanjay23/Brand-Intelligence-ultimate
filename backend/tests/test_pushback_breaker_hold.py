@@ -109,3 +109,53 @@ async def test_other_platforms_are_unaffected():
     run = _run()
     await asyncio.wait_for(runner._hold_for_breaker("facebook", _job(), run, "acct"), 0.5)
     assert run.hard_stop is False
+
+
+# ----------------------------------------------------------------------------
+# The shared core both runners now call (discovery wraps it, analysis calls it
+# directly). Tested without either runner so the rule is pinned in one place.
+
+from backend.shared.pushback import wait_for_breaker  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_shared_wait_returns_clear_when_the_breaker_is_closed():
+    assert await asyncio.wait_for(wait_for_breaker("facebook", lambda: False), 0.5) == ""
+
+
+@pytest.mark.asyncio
+async def test_shared_wait_returns_clear_once_the_breaker_closes():
+    gov, clock = _open_breaker()
+    task = asyncio.create_task(wait_for_breaker("instagram", lambda: False, tick=0.01))
+    await asyncio.sleep(0.04)
+    assert not task.done()
+    clock.t += gov.cfg.open_s + 1
+    assert await asyncio.wait_for(task, 1.0) == ""
+
+
+@pytest.mark.asyncio
+async def test_shared_wait_gives_a_reason_not_silence_when_it_gives_up(monkeypatch):
+    _open_breaker()
+    monkeypatch.setattr(runner.settings, "pushback_max_wait_minutes", 0.0005)
+    reason = await asyncio.wait_for(
+        wait_for_breaker("instagram", lambda: False, tick=0.01), 2.0)
+    assert "3 pushback signals" in reason          # names what happened
+
+
+@pytest.mark.asyncio
+async def test_shared_wait_stops_when_asked_and_is_not_a_failure():
+    _open_breaker()
+    stop = {"now": False}
+    task = asyncio.create_task(
+        wait_for_breaker("instagram", lambda: stop["now"], tick=0.01))
+    await asyncio.sleep(0.03)
+    stop["now"] = True
+    assert await asyncio.wait_for(task, 1.0) == ""    # "" = no failure to report
+
+
+def test_an_analysis_run_starts_unstopped():
+    from backend.analysis.runner import _PlatformRun
+    from collections import deque
+    run = _PlatformRun(platform_id="instagram", queue=deque(), options=None,
+                       concurrency=1, inter_batch_delay=0.0, progress={})
+    assert run.hard_stop == ""

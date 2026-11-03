@@ -62,6 +62,7 @@ from backend.shared.avatars import looks_like_placeholder
 from backend.shared.models.hit import Hit, hit_to_row
 from backend.shared.models.row import Row
 from backend.shared.text import iter_dicts, normalized_host, parse_normalized_url
+from backend.shared.walls import is_wall_url, url_path
 from backend.stealth.browser import Session
 from backend.stealth.mouse_movement import humanize_interaction, natural_scroll_down
 
@@ -84,9 +85,14 @@ ME = "https://www.facebook.com/me"
 # a visited profile page to decide LOGIN_REQUIRED, so a string that also
 # occurs anywhere in logged-in chrome would mark real profiles unreadable.
 RE_LOGIN = re.compile(r"(You must log in|Log in to Facebook|Log In or Sign Up)", re.I)
+# NO BARE "checkpoint" OR "suspicious activity": both are ordinary words in
+# ordinary content (a bank's page, a post, a result called "Border
+# Checkpoint"), and this regex runs over whole page bodies. A real
+# checkpoint is a /checkpoint/ URL, which `_session_blocked` and
+# `shared/walls.py` decide by path; what is left here is wording only a wall
+# uses.
 RE_CHECKPOINT = re.compile(
-    r"(checkpoint|suspicious activity|Confirm Your Identity|"
-    r"account has been locked|We've temporarily)",
+    r"(Confirm Your Identity|account has been locked|We've temporarily)",
     re.I,
 )
 RE_GONE = re.compile(
@@ -468,18 +474,30 @@ async def _shows_no_results(page) -> bool:
         return False
 
 
-async def _session_blocked(page) -> str:
+async def _session_blocked(page, have_results: bool = False) -> str:
     """"checkpoint" / "login" when the search page is a wall instead of
     results, "" otherwise. URL first (unambiguous), then the page text
-    against the same patterns the session check and analysis use."""
+    against the same patterns the session check and analysis use.
+
+    The URL is judged by its PATH's first segment only (shared/walls.py): a
+    keyword such as `bank.com/login` sits in the query string and a profile
+    called `loginradius` is a later segment, and neither is a wall.
+
+    The TEXT is only trusted on a page that has produced no results, as X's
+    check already does: a page showing real results is not a wall however
+    its bios and posts are worded, and a false wall here quarantines a
+    healthy account and replays the keyword on the next one."""
     try:
         url = page.url or ""
     except Exception:
         url = ""
-    if "/checkpoint" in url:
+    if is_wall_url(url, ("checkpoint",)):
         return "checkpoint"
-    if "/login" in url or "/index.php?next=" in url:
+    if (is_wall_url(url, ("login", "login.php"))
+            or (url_path(url) == "/index.php" and "next=" in url)):
         return "login"
+    if have_results:
+        return ""
     try:
         body = await page.inner_text("body")
     except Exception:
@@ -1687,7 +1705,7 @@ class Discovery:
             # If domcontentloaded timed out or raised:
             if nav_error is not None:
                 # 1. Did Facebook redirect to a login wall or checkpoint during navigation?
-                if blocked := await _session_blocked(page):
+                if blocked := await _session_blocked(page, have_results=bool(by_id)):
                     out.stopped = blocked
                     out.error = f"facebook search page shows a {blocked} wall"
                     return out
@@ -1720,7 +1738,7 @@ class Discovery:
                         for blob in parse_embedded(await page.evaluate(JS_EMBEDDED), probe):
                             absorb(blob)
                     except Exception as retry_err:
-                        if blocked := await _session_blocked(page):
+                        if blocked := await _session_blocked(page, have_results=bool(by_id)):
                             out.stopped = blocked
                             out.error = f"facebook search page shows a {blocked} wall"
                             return out
@@ -1896,7 +1914,8 @@ class Discovery:
                     # another account and every keyword after it ran into the
                     # same dead session. Named here so classify_failure
                     # quarantines the account and the runner re-queues.
-                    if stalls >= 2 and (blocked := await _session_blocked(page)):
+                    if stalls >= 2 and (blocked := await _session_blocked(
+                            page, have_results=bool(by_id))):
                         out.stopped = blocked
                         out.error = f"facebook search page shows a {blocked} wall"
                         break

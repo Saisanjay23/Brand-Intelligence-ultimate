@@ -144,12 +144,14 @@ class TestTheParentIsStillTheBucket:
         plan = _plan("Gautam Adani", ["adani gautam", "gautamadanihq"])
         assert _grade(plan, "Adani Gautam", searched)["keyword"] == "Gautam Adani"
 
-    def test_the_children_are_what_gets_searched(self):
-        """Unchanged, and restated here because the whole split depends on
-        it: children are the search set, the parent is the bucket."""
-        plan = _plan("Gautam Adani", ["adani gautam", "gautamadanihq"])
-        assert plan.search in ("adani gautam", "gautamadanihq")
-        assert plan.parent == "Gautam Adani"
+    def test_the_children_are_searched_alongside_the_parent(self):
+        """Restated here because the split depends on it: the parent AND
+        its children are searched (every configured keyword is), while the
+        parent alone is the bucket every hit files under."""
+        plans = K.build_plans({"keyword_groups": {"individual": [
+            {"parent": "Gautam Adani", "children": ["adani gautam", "gautamadanihq"]}]}})
+        assert [p.search for p in plans] == ["Gautam Adani", "adani gautam", "gautamadanihq"]
+        assert {p.parent for p in plans} == {"Gautam Adani"}
 
     def test_only_parents_are_offered_as_filter_options(self):
         groups = K.groups_for_client({"keyword_groups": {"individual": [

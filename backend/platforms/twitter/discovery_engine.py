@@ -38,6 +38,7 @@ from backend.shared.schema_probe import SchemaProbe, probe_or_null
 from backend.shared.avatars import hd_picture_url, looks_like_placeholder
 from backend.shared.models.row import Row
 from backend.shared.text import iter_dicts
+from backend.shared.walls import chrome_text
 from backend.stealth.browser import Session
 from backend.stealth.mouse_movement import (
     hover_element_safely,
@@ -782,6 +783,15 @@ async def _x_says_no_results(page) -> bool:
         return False
 
 
+# What X is DISPLAYING rather than saying: people in a search, posts and bios
+# on a profile. Cut out before any wall wording is looked for.
+_X_CONTENT_SELECTORS = (
+    '[data-testid="UserCell"]',
+    "article",
+    '[data-testid="UserDescription"]',
+)
+
+
 async def _x_session_blocked(page, *, have_results: bool) -> str:
     """"checkpoint" / "login" when the search page is a wall instead of
     results, "" otherwise -- the X counterpart of facebook/
@@ -804,9 +814,11 @@ async def _x_session_blocked(page, *, have_results: bool) -> str:
         return "checkpoint"
     if "/login" in path or path.startswith("/i/flow/"):
         return "login"
-    try:
-        body = await page.inner_text("body")
-    except Exception:
+    # The page's OWN interface, with the people it is showing cut out: a
+    # bio or a post that says "Confirm your booking" is a result, not X
+    # speaking, and used to read as a checkpoint and quarantine the account.
+    body = await chrome_text(page, _X_CONTENT_SELECTORS)
+    if not body:
         return ""
     if RE_CHECKPOINT.search(body):
         return "checkpoint"
@@ -981,7 +993,7 @@ class Discovery:
                     # throttled is evidence about every account behind this
                     # IP, and the pacing layer reads the governor, not this
                     # engine's local flag.
-                    note_response("x", status, None)
+                    note_response("twitter", status, None)
                     rate_limited = True
                     arrived.set()
                     return
@@ -991,7 +1003,7 @@ class Discovery:
 
             # Detect Twitter-specific rate-limit and error indicators in payload
             if "Rate limit exceeded" in text or '"code":88' in text or "OverCapacity" in text:
-                note_response("x", status, text[:2000])
+                note_response("twitter", status, text[:2000])
                 rate_limited = True
                 arrived.set()
                 return
@@ -1013,7 +1025,7 @@ class Discovery:
             # small and carried no users, so a profile whose name contains a
             # trigger word cannot raise an alarm.
             note_response(
-                "x", status,
+                "twitter", status,
                 text if (users_in_payload == 0 and len(text) < 4000) else None,
             )
             out.pages += 1
@@ -1160,7 +1172,11 @@ class Discovery:
                             out.stopped, out.complete = "no-results", True
                             break
                         try:
-                            body_text = (await page.inner_text("body")).lower()
+                            # Outside the result cells, for the same reason
+                            # as `_x_session_blocked`: a support account's
+                            # bio reading "Something went wrong? DM us" is
+                            # a result, and ended the sweep as a rate limit.
+                            body_text = (await chrome_text(page, _X_CONTENT_SELECTORS)).lower()
                             if "rate limit" in body_text or "something went wrong" in body_text:
                                 out.stopped = "rate_limited"
                                 break

@@ -416,6 +416,15 @@ class Settings(BaseSettings):
         ]
     )
 
+    # --- per-platform stealth level ---------------------------------------
+    # "high" (default) is one coherent posture for Instagram: one account at a
+    # time and longer gaps between keywords, result pages and analysis
+    # batches -- a sweep takes about twice as long. "standard" restores the
+    # numbers the tool used before levels existed. Nothing collected changes
+    # at either level (see backend/stealth/levels.py). A value other than
+    # these two is rejected at startup rather than silently ignored.
+    instagram_stealth: Literal["standard", "high"] = "high"
+
     # --- platform pushback: governor + circuit breaker -------------------
     # See shared/pushback.py. The governor is invisible while a platform is
     # happy (gap multiplier 1.0, every tab allowed); after a throttle or a

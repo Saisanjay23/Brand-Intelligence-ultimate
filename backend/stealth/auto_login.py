@@ -76,6 +76,7 @@ except ImportError:                                   # pragma: no cover
 
 from backend.config.settings import settings
 from backend.shared.logging import get_logger
+from backend.shared.walls import url_path
 from backend.stealth.browser import Session
 from backend.stealth.mouse_movement import hover_element_safely
 
@@ -163,6 +164,39 @@ _FLOWS: dict[str, dict] = {
 # sessions/manager.py::LOGIN_FLOW; read from there at call time so the two
 # can never drift apart.
 _PROOF_TIMEOUT_S = 25.0
+
+# THE COOKIE THAT MUST CHANGE for a login to count as having happened.
+#
+# The proof cookie alone is not proof. This runs inside the account's saved
+# browser profile, which ALREADY holds the old cookies, so an account stuck
+# at a checkpoint still has its `c_user` and the check passed within 1.5
+# seconds -- the stale cookies were saved as fresh, the account was marked
+# ready, and the failed-attempt count reset to 0, so a checkpointed account
+# was "re-logged-in" every few hours forever and its 3-attempt limit never
+# fired. Facebook's `c_user` is the account id and never changes, so the
+# cookie that rotates on a real sign-in (the session secret) is the witness.
+_ROTATING_COOKIE = {
+    "facebook": "xs",
+    "twitter": "auth_token",
+    "instagram": "sessionid",
+}
+
+# A signed-in browser is not sitting on one of these. Judged by path.
+_WALL_PATHS = (
+    "/login", "/checkpoint", "/two_step_verification", "/i/flow",
+    "/accounts/login", "/challenge",
+)
+
+
+def _login_is_fresh(platform_id: str, before: dict, now: dict) -> bool:
+    """Did the sign-in actually issue a new session, rather than the profile
+    simply still holding the old one?"""
+    rotating = _ROTATING_COOKIE.get(platform_id)
+    old = before.get(rotating) if rotating else None
+    if not old:
+        return True                      # nothing to have been stale
+    new = now.get(rotating)
+    return bool(new) and new != old
 
 
 async def _human_type(page: Page, selector: str, text: str, *, timeout: int = 15000) -> None:
@@ -609,6 +643,13 @@ async def run_auto_login(
 
     try:
         ctx = await session.start()
+        # WHAT THE PROFILE ALREADY HELD, before a single page is opened --
+        # see `_ROTATING_COOKIE`.
+        before: dict = {}
+        try:
+            before = {c.get("name"): c.get("value") for c in await ctx.cookies()}
+        except Exception:                             # noqa: BLE001 - a bonus
+            pass
         page = await ctx.new_page()
         try:
             if platform_id == "twitter":
@@ -625,7 +666,13 @@ async def run_auto_login(
             while loop.time() < deadline:
                 await asyncio.sleep(1.5)
                 cookies = await ctx.cookies()
-                if any(c.get("name") == proof_cookie for c in cookies):
+                now = {c.get("name"): c.get("value") for c in cookies}
+                try:
+                    on_wall = url_path(page.url).startswith(_WALL_PATHS)
+                except Exception:                     # noqa: BLE001
+                    on_wall = False
+                if (proof_cookie in now and not on_wall
+                        and _login_is_fresh(platform_id, before, now)):
                     try:
                         state = await ctx.storage_state()
                     except Exception:                 # noqa: BLE001 - a bonus
@@ -636,8 +683,10 @@ async def run_auto_login(
                     return LoginResult(cookies=cookies, storage_state=state or {})
 
             raise TimeoutError(
-                f"signed-in cookie {proof_cookie!r} never appeared -- the login most "
-                "likely stopped at a CAPTCHA, a checkpoint or a wrong password"
+                f"no NEW signed-in session appeared (cookie {proof_cookie!r} "
+                "missing, unchanged from before, or the browser still on a "
+                "login/checkpoint page) -- the login most likely stopped at a "
+                "CAPTCHA, a checkpoint or a wrong password"
             )
         finally:
             try:

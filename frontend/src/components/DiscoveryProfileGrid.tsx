@@ -93,9 +93,11 @@ function EntityTypeTag({ p }: { p: DiscoveredProfile }) {
 //
 // The 🔑 tag is the PARENT -- the investigation this row belongs to, and the
 // only thing the filter dropdown offers. When an analyst has curated
-// permutations, that parent was never typed into a search box: one of its
-// permutations was, and which one is the thing that answers "why did this
-// come up at all?" and "is this permutation earning its place?".
+// permutations, a row may have been surfaced by one of them rather than by the
+// parent's own name, and which one is the thing that answers "why did this
+// come up at all?" and "is this permutation earning its place?". (The parent
+// is searched too, so a row found by the parent's own search carries no tag --
+// there is nothing to distinguish.)
 //
 // Rendered only when it differs from the parent. The backend already drops
 // a matched keyword equal to its parent, and this guards the same case

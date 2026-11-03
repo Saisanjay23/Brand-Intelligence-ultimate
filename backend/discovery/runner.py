@@ -51,9 +51,10 @@ from backend.shared import resilience
 from backend.shared.job_store import JobStore
 from backend.shared.logging import get_logger
 from backend.shared.models.row import Row
-from backend.shared.pushback import governor_for
+from backend.shared.pushback import wait_for_breaker
 from backend.shared.resilience import classify_failure
 from backend.shared.tasks import spawn
+from backend.stealth import levels as stealth_levels
 from backend.shared.text import (contiguous_letters_match, handle_from_url,
                                  name_score)
 
@@ -266,27 +267,18 @@ async def _hold_for_breaker(
     "this platform cannot continue" case is (`hard_stop` plus a note), and
     the keywords still on the queue are recorded as owed by the same
     `_abandon` path -- so they are searched on the next run, not forgotten.
-    A Stop is honoured within a second.
+    A Stop is honoured within a second. The waiting itself is
+    `shared/pushback.wait_for_breaker`, shared with the analysis runner.
     """
-    gov = governor_for(platform_id)
-    if not settings.pushback_breaker_enabled or not gov.is_open():
-        return
-    reason = gov.open_reason()
-    budget = max(0.0, float(settings.pushback_max_wait_minutes)) * 60.0
-    log.warning(
-        f"[{platform_id}] holding {label}: {reason}. Resuming in "
-        f"~{gov.resume_in_s():.0f}s (waits at most {budget / 60:.0f} min)")
-    waited = 0.0
-    while gov.is_open() and not job.cancel.is_set() and not run.hard_stop:
-        if waited >= budget:
-            run.hard_stop = True
-            run.prog.note = (
-                f"stopped early: {platform_id} kept pushing back ({reason}); "
-                f"the remaining keywords are recorded as owed")
-            log.error(f"[{platform_id}] {run.prog.note}")
-            return
-        await asyncio.sleep(tick)
-        waited += tick
+    reason = await wait_for_breaker(
+        platform_id, lambda: job.cancel.is_set() or run.hard_stop,
+        tick=tick, log=log, label=label)
+    if reason:
+        run.hard_stop = True
+        run.prog.note = (
+            f"stopped early: {platform_id} kept pushing back ({reason}); "
+            f"the remaining keywords are recorded as owed")
+        log.error(f"[{platform_id}] {run.prog.note}")
 
 
 async def _claim_rounds_for(platform_id: str) -> int:
@@ -330,6 +322,9 @@ def _sessions_wanted(platform_id: str, keyword_count: int) -> int:
     plat = registry.PLATFORMS.get(platform_id)
     if plat is not None and (plat.uses_api_key or plat.env_keys or not plat.session_path):
         cap = 1
+    # The platform's stealth level may only LOWER this (Instagram "high" = one
+    # account at a time). See stealth/levels.py.
+    cap = stealth_levels.session_cap(platform_id, cap)
     return max(1, min(cap, keyword_count))
 
 
@@ -1720,8 +1715,11 @@ class DiscoveryRunner:
         prog = run.prog
         session_id = str(session_item.get("id") or "")
         label = session_item.get("identifier") or session_id or "anonymous"
-        inter_keyword_delay = _PLATFORM_INTER_KEYWORD_DELAY.get(
-            platform_id, _DEFAULT_INTER_KEYWORD_DELAY)
+        # The platform's stealth level (stealth/levels.py) may set its own
+        # median; every other platform keeps the table above.
+        inter_keyword_delay = stealth_levels.value(
+            platform_id, "keyword_gap",
+            _PLATFORM_INTER_KEYWORD_DELAY.get(platform_id, _DEFAULT_INTER_KEYWORD_DELAY))
 
         try:
             if worker_index:

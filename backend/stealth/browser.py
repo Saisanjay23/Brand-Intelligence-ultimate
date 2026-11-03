@@ -68,7 +68,7 @@ from typing import Optional
 
 from backend.shared.logging import get_logger
 from backend.shared.tasks import spawn
-from backend.platforms.scan_options import cancelled
+from backend.platforms.scan_options import DiscoveryOptions, cancelled
 from backend.shared.pushback import governor_for
 from backend.stealth.human import BASE, Human
 from backend.stealth.fingerprint import (
@@ -702,6 +702,12 @@ class Session:
             return
         home = PLATFORM_HOME.get(self.platform)
         if not home or self.ctx is None:
+            return
+        # A platform whose DISCOVERY engine opens the home feed itself and
+        # dwells there (Instagram) skips this one for discovery -- otherwise
+        # the same page loads twice within seconds. Analysis still warms up:
+        # it goes straight to profiles.
+        if getattr(self, "WARMUP_BY_ENGINE", False) and isinstance(self.o, DiscoveryOptions):
             return
 
         key = f"{self.platform}:{self.session_id or 'ephemeral'}"

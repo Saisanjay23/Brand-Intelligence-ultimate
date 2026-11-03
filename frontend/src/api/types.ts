@@ -15,17 +15,18 @@ export type JobKind = "discovery" | "analysis";
 
 // One protected name and the search terms an analyst generated for it.
 //
-// `parent` is the real name -- it is NEVER searched. It is what discovered
-// profiles are scored against (name_score / the High-Low match badge) and
-// the keyword bucket every result is filed under, so filtering the results
-// grid by the parent shows everything all of its children turned up.
+// `parent` is the real name. It is searched on every platform AND it is what
+// discovered profiles are scored against (name_score / the High-Low match
+// badge) and the keyword bucket every result is filed under, so filtering the
+// results grid by the parent shows everything all of its children turned up.
 //
 // `children` are the analyst's own permutations ("gautamadani",
-// "gautam adani official", ...) -- these ARE what gets typed into each
-// platform's search box, and are never scored against.
+// "gautam adani official", ...) -- these are ALSO typed into each platform's
+// search box, in addition to the parent. Every configured keyword is searched,
+// so N permutations means N + 1 searches per platform.
 //
-// A parent with no children searches itself, which is exactly how every
-// client behaved before this existed. See backend/shared/keywords.py.
+// (Until 2026-10-23 a parent with permutations was not searched itself; see
+// backend/shared/keywords.py for why that changed.)
 export interface KeywordGroup {
   parent: string;
   children: string[];
