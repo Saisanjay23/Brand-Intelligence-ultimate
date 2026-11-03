@@ -35,6 +35,7 @@ from typing import Optional
 from fastapi import APIRouter, Path, status
 from pydantic import BaseModel, Field
 
+from backend.api.models import Cap
 from backend.database.repositories import client_repository as clients_db
 from backend.database.repositories import logo_repository as logos_db
 from backend.shared.errors import ValidationError
@@ -66,11 +67,11 @@ class ClientBody(BaseModel):
     # Per-platform result caps, scoped separately to individual-keyword and
     # domain-keyword sweeps. A platform absent from either map means
     # "scrape everything" for that keyword type.
-    platform_limits_individual: dict[str, int] = Field(default_factory=dict)
-    platform_limits_domain: dict[str, int] = Field(default_factory=dict)
+    platform_limits_individual: dict[str, Cap] = Field(default_factory=dict)
+    platform_limits_domain: dict[str, Cap] = Field(default_factory=dict)
     # {platform: {tab: {"individual"|"domain": cap}}}, for platforms with
     # more than one discovery tab (currently only Facebook).
-    platform_tab_limits: dict[str, dict[str, dict[str, int]]] = Field(default_factory=dict)
+    platform_tab_limits: dict[str, dict[str, dict[str, Cap]]] = Field(default_factory=dict)
     cron: Optional[str] = None
 
 

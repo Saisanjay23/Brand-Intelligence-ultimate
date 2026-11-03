@@ -84,7 +84,13 @@ def parse_count(raw: str):
     rather than merely survived; anything genuinely unparseable ("1.2.3")
     returns None, which every caller already handles.
     """
-    s = re.sub(r"[\s,]", "", raw.strip())
+    raw = raw.strip()
+    # "1,5M" / "1,2 K": a comma before 1-2 digits and a K/M/B suffix is a
+    # DECIMAL comma (German, French, Spanish, ...). Stripped as a thousands
+    # separator it read as 15,000,000 -- ten times the real count.
+    if re.match(r"^\d+,\d{1,2}\s*[KMB]$", raw, re.I):
+        raw = raw.replace(",", ".")
+    s = re.sub(r"[\s,]", "", raw)
     if _DOTTED_THOUSANDS.match(s):
         return int(s.replace(".", "")), True
     m = re.match(r"^([\d.]+)([KMB])?$", s, re.I)
@@ -96,7 +102,9 @@ def parse_count(raw: str):
         return None, False
     suf = (m.group(2) or "").upper()
     mult = {"": 1, "K": 1_000, "M": 1_000_000, "B": 1_000_000_000}[suf]
-    return int(val * mult), (suf == "" and "." not in m.group(1))
+    # round, not truncate: 4.1 * 1_000_000 is 4099999.9999999995 in floats, so
+    # int() reported "4.1M" as 4,099,999 (and "32.3K" as 32,299).
+    return int(round(val * mult)), (suf == "" and "." not in m.group(1))
 
 
 def epoch_to_dt(ts: Any) -> Optional[datetime]:

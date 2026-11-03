@@ -116,7 +116,7 @@ from backend.shared.pushback import (CHALLENGED, EXPIRED, THROTTLED, Signal,
                                      governor_for, note_response)
 from backend.shared.tasks import spawn
 from backend.shared.models.row import Row
-from backend.shared.walls import is_wall_url, url_path
+from backend.shared.walls import first_segment, is_wall_url, url_path
 from backend.platforms.scan_options import captures_screenshot
 from backend.stealth.mouse_movement import humanize_interaction
 from backend.shared.text import (MONTHS, _letters_only, name_score,
@@ -505,8 +505,16 @@ class Scraper:
         if not m:
             return ""
         author = cls._RE_ALT_AUTHOR.search(text)
-        if author and cls._owner_mismatch(author.group(1), owners):
-            return ""
+        if author:
+            # "Photo by X in Ahmedabad, India on ..." -- the lazy capture
+            # swallows the location tag into the author, so the owner check
+            # called the account's own newest posts somebody else's. Accept
+            # the capture as written OR with a trailing " in <place>" /
+            # " with <tagged>" removed.
+            raw = author.group(1)
+            heads = {raw, re.split(r"\s+(?:in|with)\s+", raw, maxsplit=1)[0]}
+            if all(cls._owner_mismatch(h, owners) for h in heads):
+                return ""
         mon_name, day, year = m.groups()
         month = next(
             (i for i, name in enumerate(MONTHS, start=1)
@@ -859,6 +867,14 @@ class Scraper:
         url = normalize_url(raw_url)
         row = Row(url=url, target=target, original_feed=feed)
         row.profile_id = username_of(url)
+        if not row.profile_id:
+            # A post, reel or explore link has no username. `wanted` would be
+            # empty, which switches OFF the payload's owner filter -- the
+            # first record the page happened to carry (the analyst's own
+            # account) would be written to this row as an OK profile.
+            row.status = "ERROR"
+            row.note("not an Instagram profile URL (no username) -- not visited")
+            return row
         if known:
             if known.get("location"):
                 row.location = known["location"]
@@ -990,17 +1006,26 @@ class Scraper:
                 # By PATH, not substring: `instagram.com/fitnesschallenge`
                 # is a profile, and used to be filed CHECKPOINT and
                 # quarantine the account (shared/walls.py).
-                if RE_CHECKPOINT.search(body) or is_wall_url(page.url, ("challenge",)):
+                if is_wall_url(page.url, ("challenge",)):
                     row.status = "CHECKPOINT"
                     row.note("session checkpointed")
                     return row
-                if url_path(page.url).startswith("/accounts/login") or RE_LOGIN.search(body):
+                if url_path(page.url).startswith("/accounts/login"):
                     row.status = "LOGIN_REQUIRED"
                     row.note("cookies rejected/expired")
                     return row
-                if RE_GONE.search(body):
-                    row.status = "GONE"
-                    row.note("removed or unavailable -- may already be down")
+                # A SUSPENDED / DISABLED ACCOUNT is not a missing profile. It
+                # used to fall through to PARTIAL "payload not seen", which
+                # the runner files as done: the dead account was never taken
+                # out of the pool, every remaining URL was visited with it,
+                # and the pacing governor was told the PLATFORM was soft
+                # blocking. Re-logging in cannot fix this one, so say so.
+                if (first_segment(page.url) == "accounts" and wanted != "accounts"
+                        and any(w in url_path(page.url)
+                                for w in ("/suspended", "/disabled"))):
+                    row.status = "CHECKPOINT"
+                    row.note("account suspended or disabled by Instagram -- "
+                             "re-login will not fix it, use another account")
                     return row
 
                 # WHAT INSTAGRAM ITSELF SAID, read from the response rather
@@ -1026,6 +1051,23 @@ class Scraper:
                     private = bool(dom.get("isPrivate"))
                     self._no_payload_streak = 0
                 else:
+                    # The page TEXT is only consulted once nothing could be
+                    # read from the profile header. These patterns ("Sign up
+                    # to see", "page isn't available", "confirm it's you")
+                    # match ordinary bios and captions, so run first they read
+                    # a real profile as a wall and quarantined a good account.
+                    if RE_CHECKPOINT.search(body):
+                        row.status = "CHECKPOINT"
+                        row.note("session checkpointed")
+                        return row
+                    if RE_LOGIN.search(body):
+                        row.status = "LOGIN_REQUIRED"
+                        row.note("cookies rejected/expired")
+                        return row
+                    if RE_GONE.search(body):
+                        row.status = "GONE"
+                        row.note("removed or unavailable -- may already be down")
+                        return row
                     row.status = "PARTIAL"
                     row.note("profile payload not seen")
                     # THREE IN A ROW IS NOT A COINCIDENCE. One profile with
@@ -1230,7 +1272,7 @@ class Scraper:
             row.mark("name", "dom-header")
             row.name_score = name_score(name, row.target)
 
-        val, exact = count("followers", "followers")
+        val, exact = count("followers", "followers?")
         if val is not None:
             row.followers = val
             row.followers_exact = "yes" if exact else "no"
@@ -1241,7 +1283,7 @@ class Scraper:
             row.friends = val
             row.mark("friends", "dom-header")
 
-        val, _ = count("posts", "posts")
+        val, _ = count("posts", "posts?")
         if val is not None:
             row.posts_seen = "yes" if val > 0 else "no"
             row.mark("posts", "dom-header")

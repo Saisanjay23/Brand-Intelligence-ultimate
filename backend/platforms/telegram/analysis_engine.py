@@ -31,7 +31,14 @@ from backend.platforms.telegram.discovery_engine import (FloodWait,
                                                           Telegram,
                                                           TelegramEntity)
 
-BAD_SEGMENTS = {"s", "c", "joinchat", "addstickers", "share", "proxy", "i"}
+# t.me paths that are NOT an account. A name here used to be looked up as a
+# username -- `t.me/addlist/xyz` resolved a stranger called "addlist" or was
+# reported GONE ("may already be taken down").
+BAD_SEGMENTS = {
+    "s", "c", "joinchat", "addstickers", "share", "proxy", "i", "addlist", "boost",
+    "giftcode", "m", "iv", "login", "invoice", "setlanguage", "addtheme", "bg",
+    "confirmphone", "socks", "contact", "addemoji",
+}
 
 
 def normalize_url(url: str) -> str:
@@ -65,6 +72,10 @@ def username_of(url: str) -> str:
     if not seg:
         return ""
     name = seg[0].lstrip("@")
+    # `t.me/+AbCd...` is a private INVITE link, not a username. Telethon cannot
+    # resolve it, which read as GONE -- a live private group filed as taken down.
+    if name.startswith("+"):
+        return ""
     if name.lower() in BAD_SEGMENTS:
         # https://t.me/s/<name> is the web preview of the same channel
         return seg[1] if name.lower() == "s" and len(seg) > 1 else ""

@@ -20,9 +20,16 @@ Two conventions this API keeps everywhere:
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
 
 from pydantic import BaseModel, Field
+
+# A per-keyword result cap. 0 means "uncapped" and is the only way to say so: a
+# negative number used to be accepted and then read as uncapped by the runner
+# (`c > 0`), so a typo for a protective cap quietly became an unlimited
+# sweep. The ceiling is a sanity bound, not a policy.
+MAX_CAP = 1_000_000
+Cap = Annotated[int, Field(ge=0, le=MAX_CAP)]
 
 
 class JobStatus(str, Enum):

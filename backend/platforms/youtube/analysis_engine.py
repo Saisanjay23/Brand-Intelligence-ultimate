@@ -48,6 +48,12 @@ def normalize_url(url: str) -> str:
     return f"https://{host}{p.path.rstrip('/')}"
 
 
+_NOT_A_CHANNEL = frozenset({
+    "watch", "shorts", "playlist", "live", "embed", "results", "feed", "hashtag",
+    "post", "gaming", "music", "premium", "podcasts", "t", "clip", "oembed",
+})
+
+
 def channel_ref(url: str) -> tuple[str, str]:
     """WHAT: -> (kind, value) where kind is 'id' or 'handle', naming which
     API lookup can resolve this URL. HOW: YouTube has four surviving
@@ -70,6 +76,11 @@ def channel_ref(url: str) -> tuple[str, str]:
         return "handle", seg[1]
     if seg[0].startswith("UC") and len(seg[0]) >= 20:
         return "id", seg[0]
+    # Not a channel at all. A video, a playlist or a search page fell through
+    # to a "handle" lookup -- `forHandle=@watch` can resolve an unrelated real
+    # channel, and the rest cost ~100 quota units to end up GONE.
+    if seg[0].lower() in _NOT_A_CHANNEL:
+        return "", ""
     return "handle", seg[0]
 
 
@@ -320,7 +331,10 @@ class Scraper:
         row.mark("name", "api")
         row.name_score = name_score(row.profile_name, row.target)
 
-        if (subs := stats.get("subscriberCount")) is not None:
+        # A hidden count is UNKNOWN, not zero: the API can still return
+        # "0" for it, which was written as a definite 0 followers.
+        if (subs := stats.get("subscriberCount")) is not None and not stats.get(
+                "hiddenSubscriberCount"):
             row.followers = int(subs)
             # YouTube rounds public subscriber counts to 3 significant figures
             row.followers_exact = "no" if stats.get("hiddenSubscriberCount") else "yes"

@@ -51,7 +51,7 @@ from backend.stealth.mouse_movement import (
 HOME = "https://x.com/home"
 
 RE_LOGIN = re.compile(
-    r"(Sign in to X|Log in to Twitter|Sign up for X|" r"Don't miss what's happening)",
+    r"(Sign in to X|Log in to Twitter|Sign up for X|" r"Don.t miss what.s happening)",
     re.I,
 )
 RE_CHECKPOINT = re.compile(

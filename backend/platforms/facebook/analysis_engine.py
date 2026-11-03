@@ -858,8 +858,11 @@ def read_location(row: Row, h: Harvest) -> None:
         row.location = v
         row.mark("location", "graphql-address-tile")
         return
+    # ABOUT TEXT ONLY. The main timeline's text holds posts, comments and the
+    # intro; a post line such as "From the team at Acme" became the location.
+    about = "\n".join(t for k, t in h.text.items() if k != "main")
     for rx in (RE_LIVES_IN, RE_FROM):
-        if m := rx.search(h.all_text()):
+        if m := rx.search(about):
             if is_place(m.group(1)):
                 row.location = m.group(1).strip(" ,·|")
                 row.mark("location", "about-text")
@@ -956,8 +959,11 @@ def read_pic(row: Row, h: Harvest) -> None:
         # the single most expensive misread in the rubric: a stock image
         # scored as "using the brand's photo", which alone forces High.
         row.has_custom_pic = not looks_like_placeholder("facebook", url)
-    elif RE_DEFAULT_PIC.search(main) or looks_like_placeholder("facebook", main):
-        row.has_custom_pic = False
+    # NO FALLBACK ON THE WHOLE PAGE. `RE_DEFAULT_PIC` matches `/rsrc.php/` and
+    # `static.xx.fbcdn.net`, which sit in the script tags of EVERY Facebook
+    # page, so a page with no picture URL at all (entity unresolved, half
+    # loaded) was recorded as "no custom picture" -- a firm "No logo" for what
+    # is really UNKNOWN. With no picture URL the answer stays None.
 
 
 def read_verified(row: Row, h: Harvest) -> None:

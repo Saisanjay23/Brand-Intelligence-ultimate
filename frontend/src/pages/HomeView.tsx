@@ -9,6 +9,13 @@ import {
   parseBulkKeywordGroups,
   mergeBulkKeywordGroups,
 } from "../services/keywordGroups";
+import {
+  parseCapMap,
+  parseSweepSeconds,
+  parseTabCaps,
+  sameCaps,
+  sameKeywordGroups,
+} from "../services/scrapeLimits";
 import { PlatformIcon } from "../components/PlatformIcon";
 import { KeywordLogoCell } from "../components/KeywordLogoCell";
 import { logosApi, type ClientLogo } from "../api/logosApi";
@@ -88,7 +95,7 @@ interface Props {
 function splitKeywordList(raw: string): string[] {
   return raw
     .split(/[,\n]/)
-    .map((s) => s.trim())
+    .map((s) => cleanKeyword(s))
     .filter(Boolean);
 }
 
@@ -111,8 +118,13 @@ function ChipInput({
   onRemove,
   placeholder,
   disabled,
+  reserved = [],
 }: {
   chips: string[];
+  // Terms that are already searched without being a chip here -- a child
+  // equal to its own parent. The server drops such a child, so accepting it
+  // only made the "N searches" count promise one more than ran.
+  reserved?: string[];
   onAdd: (v: string) => void;
   // Adding several at once (paste, bulk import) needs ONE state update
   // carrying the whole batch, not N calls to onAdd -- see addMany's own
@@ -128,10 +140,15 @@ function ChipInput({
   const [bulkOpen, setBulkOpen] = useState(false);
   const [bulkText, setBulkText] = useState("");
 
+  const taken = (kw: string) => {
+    const key = cleanKeyword(kw).toLowerCase();
+    return reserved.some((r) => cleanKeyword(r).toLowerCase() === key);
+  };
+
   const commit = () => {
-    const trimmed = input.trim();
+    const trimmed = cleanKeyword(input);
     if (trimmed) {
-      if (chips.some((c) => c.toLowerCase() === trimmed.toLowerCase())) {
+      if (taken(trimmed) || chips.some((c) => cleanKeyword(c).toLowerCase() === trimmed.toLowerCase())) {
         toast(`⚠️ "${trimmed}" already exists`, { id: `dup-${trimmed.toLowerCase()}` });
       } else {
         onAdd(trimmed);
@@ -149,12 +166,12 @@ function ChipInput({
   // since React batches these into one re-render, only the LAST call's
   // result survives. A paste of 4 terms silently kept just the last one.
   const addMany = (items: string[]) => {
-    const seen = new Set(chips.map((c) => c.toLowerCase()));
+    const seen = new Set(chips.map((c) => cleanKeyword(c).toLowerCase()));
     const fresh: string[] = [];
     let dupCount = 0;
     for (const kw of items) {
       const key = kw.toLowerCase();
-      if (seen.has(key)) {
+      if (seen.has(key) || taken(kw)) {
         dupCount++;
       } else {
         seen.add(key);
@@ -908,7 +925,7 @@ function KeywordGroupEditor({
     if (!pTrimmed && !cTrimmed) return;
 
     // If input contains bulk separator or multiple lines, apply bulk parser
-    if (/[,\n]/.test(pTrimmed) || pTrimmed.includes(":") || pTrimmed.includes("->") || pTrimmed.includes("=>")) {
+    if (/[,\n]/.test(pTrimmed) || /:(?!\/\/)|->|=>/.test(pTrimmed)) {
       applyBulkText(pTrimmed);
       setParentInput("");
       setChildInput("");
@@ -1074,6 +1091,7 @@ function KeywordGroupEditor({
                 <td style={{ padding: "6px 10px", verticalAlign: "top" }}>
                   <ChipInput
                     chips={g.children}
+                    reserved={[g.parent]}
                     onAdd={(v) => setChildren(idx, [...g.children, v])}
                     onAddMany={(vs) => setChildren(idx, [...g.children, ...vs])}
                     onRemove={(i) => setChildren(idx, g.children.filter((_, j) => j !== i))}
@@ -1130,7 +1148,7 @@ function KeywordGroupEditor({
                     }}
                     onPaste={(e) => {
                       const text = e.clipboardData.getData("text");
-                      if (/[,\n]/.test(text) || text.includes(":") || text.includes("->")) {
+                      if (/[,\n]/.test(text) || /:(?!\/\/)|->|=>/.test(text)) {
                         e.preventDefault();
                         applyBulkText(text);
                         setParentInput("");
@@ -1166,7 +1184,21 @@ function KeywordGroupEditor({
                   }}
                   onPaste={(e) => {
                     const text = e.clipboardData.getData("text");
-                    if (text.includes(":") || text.includes("->") || text.includes("\n")) {
+                    // A parent is already typed: what lands in THIS box are
+                    // its permutations. Pasted lines used to be read as a
+                    // list of new parents instead -- each became its own
+                    // group and the typed parent was thrown away. Only an
+                    // explicit "parent: child, child" line is a bulk import.
+                    const structured = /:(?!\/\/)|->|=>/.test(text);
+                    if (cleanKeyword(parentInput) && !structured) {
+                      if (/[,;\n]/.test(text)) {
+                        e.preventDefault();
+                        const pasted = text.split(/[,;\n]+/).map((s) => cleanKeyword(s)).filter(Boolean);
+                        setChildInput((prev) => [cleanKeyword(prev), ...pasted].filter(Boolean).join(", "));
+                      }
+                      return;
+                    }
+                    if (structured || text.includes("\n")) {
                       e.preventDefault();
                       applyBulkText(text);
                       setParentInput("");
@@ -1567,6 +1599,28 @@ function groupsOf(c: Client | null, type: "individual" | "domain", flat: string[
   return (flat || []).map((parent) => ({ parent, children: [] }));
 }
 
+// A saved client's Facebook sub-tab caps, as the text the limit boxes hold.
+// Also reads the older flat shape (one number for both keyword types).
+function tabLimitsFormOf(c: Client): FacebookTabLimits {
+  const fbTabs = (c.platform_tab_limits?.facebook || {}) as Record<string, unknown>;
+  const readTab = (v: unknown): { individual: string; domain: string } => {
+    if (v && typeof v === "object") {
+      const o = v as { individual?: number; domain?: number };
+      return {
+        individual: o.individual !== undefined ? String(o.individual) : "",
+        domain: o.domain !== undefined ? String(o.domain) : "",
+      };
+    }
+    const flat = v !== undefined && v !== null ? String(v) : "";
+    return { individual: flat, domain: flat };
+  };
+  return {
+    people: readTab(fbTabs.people),
+    pages: readTab(fbTabs.pages),
+    groups: readTab(fbTabs.groups),
+  };
+}
+
 export function HomeView({
   clientId,
   platforms,
@@ -1664,23 +1718,7 @@ export function HomeView({
     setPlatformLimitsDomain(
       Object.fromEntries(Object.entries(c.platform_limits_domain || {}).map(([k, v]) => [k, String(v)])),
     );
-    const fbTabs = c.platform_tab_limits?.facebook || {};
-    const readTab = (v: unknown): { individual: string; domain: string } => {
-      if (v && typeof v === "object") {
-        const o = v as { individual?: number; domain?: number };
-        return {
-          individual: o.individual !== undefined ? String(o.individual) : "",
-          domain: o.domain !== undefined ? String(o.domain) : "",
-        };
-      }
-      const flat = v !== undefined && v !== null ? String(v) : "";
-      return { individual: flat, domain: flat };
-    };
-    setFacebookTabLimits({
-      people: readTab(fbTabs.people),
-      pages: readTab(fbTabs.pages),
-      groups: readTab(fbTabs.groups),
-    });
+    setFacebookTabLimits(tabLimitsFormOf(c));
     setCron(c.cron || "");
   };
 
@@ -1765,6 +1803,10 @@ export function HomeView({
     setPlatformLimitsDomain(
       Object.fromEntries(Object.entries(c.platform_limits_domain || {}).map(([k, v]) => [k, String(v)])),
     );
+    // switchToCreate() above blanked the Facebook sub-tab caps, and this
+    // used to leave them blank: the clone silently ran Facebook's People /
+    // Pages / Groups UNCAPPED where the original was capped.
+    setFacebookTabLimits(tabLimitsFormOf(c));
     toast.success(`Cloned configuration from "${c.name || c.client_id}". Review and save!`, { icon: "📋" });
   };
 
@@ -1825,25 +1867,14 @@ export function HomeView({
     setSaving(true);
     setSaved(false);
     try {
-      const parseLimits = (raws: Record<string, string>): Record<string, number> => {
-        const out: Record<string, number> = {};
-        for (const [platform, raw] of Object.entries(raws)) {
-          const n = Number(raw);
-          if (raw.trim() && Number.isFinite(n) && n > 0) out[platform] = Math.floor(n);
-        }
-        return out;
-      };
-      const parsedLimitsIndividual = parseLimits(platformLimitsIndividual);
-      const parsedLimitsDomain = parseLimits(platformLimitsDomain);
-      const fbTabLimits: Record<string, Record<string, number>> = {};
-      for (const [tab, byType] of Object.entries(facebookTabLimits)) {
-        const perType: Record<string, number> = {};
-        for (const [kwType, raw] of Object.entries(byType)) {
-          const n = Number(raw);
-          if (raw.trim() && Number.isFinite(n) && n > 0) perType[kwType] = Math.floor(n);
-        }
-        if (Object.keys(perType).length) fbTabLimits[tab] = perType;
-      }
+      // A limit that is not a whole number is REFUSED, not saved as "no cap":
+      // see services/scrapeLimits.ts. The throw lands in the catch below and
+      // reaches the analyst through onError.
+      const parsedLimitsIndividual = parseCapMap(
+        platformLimitsIndividual, (p) => `${nameOf(p)} individual cap`);
+      const parsedLimitsDomain = parseCapMap(
+        platformLimitsDomain, (p) => `${nameOf(p)} domain cap`);
+      const fbTabLimits = parseTabCaps(facebookTabLimits);
       const upsertBody: ClientConfig = {
         client_id: id,
         name,
@@ -1877,6 +1908,10 @@ export function HomeView({
         ? await updateDirectoryClient(id, config)
         : await createDirectoryClient(upsertBody);
       setActiveClient(client);
+      // Show what the server actually stored (it collapses spacing and drops
+      // duplicates), so the form and the saved client agree and the
+      // unsaved-changes check below has nothing to report.
+      loadIntoForm(client);
       setMode("select");
       setEditing(false);
       onClient(client.client_id, client.name);
@@ -1896,6 +1931,32 @@ export function HomeView({
     }
   };
 
+  // What the form holds that the saved client does not. Empty when the form
+  // is exactly the saved client, or when no saved client is open. A limit
+  // box that cannot be parsed counts as changed: it differs from whatever
+  // was saved, and saving will say why.
+  const unsavedChanges = (): string[] => {
+    if (!activeClient) return [];
+    const out: string[] = [];
+    if (
+      !sameKeywordGroups(nameGroups, groupsOf(activeClient, "individual", activeClient.name_keywords || [])) ||
+      !sameKeywordGroups(domainGroups, groupsOf(activeClient, "domain", activeClient.domain_keywords || []))
+    ) {
+      out.push("keyword");
+    }
+    let limitsChanged = false;
+    try {
+      limitsChanged =
+        !sameCaps(parseCapMap(platformLimitsIndividual, String), activeClient.platform_limits_individual) ||
+        !sameCaps(parseCapMap(platformLimitsDomain, String), activeClient.platform_limits_domain) ||
+        !sameCaps(parseTabCaps(facebookTabLimits), parseTabCaps(tabLimitsFormOf(activeClient)));
+    } catch {
+      limitsChanged = true;
+    }
+    if (limitsChanged) out.push("scrape-limit");
+    return out;
+  };
+
   const handleSearch = async () => {
     if (!activeClient) return;
     if (!activeKeywordCount) {
@@ -1912,6 +1973,25 @@ export function HomeView({
     }
     if (sweepKeywordScope === "domain" && !activeDomainCount) {
       onError("This client has no domain keywords configured — pick All Keywords or Individual, or add some in the Keywords tab.");
+      return;
+    }
+    // WHAT IS SWEPT IS WHAT WAS SAVED. The request below is built from the
+    // saved client, not from the form, so a keyword added (or a cap changed)
+    // and not yet saved was silently left out: the analyst saw their new
+    // keyword on screen, pressed Discover, and it was never searched. That
+    // is the one thing this tool must not do, so it is refused until saved.
+    const unsaved = unsavedChanges();
+    if (unsaved.length) {
+      onError(
+        `You have unsaved ${unsaved.join(" and ")} changes. Discover searches what is saved, ` +
+          "so save them first (Save Keyword Changes / Save Scrape Limits).");
+      return;
+    }
+    let maxSeconds: number | undefined;
+    try {
+      maxSeconds = parseSweepSeconds(sweepMaxMinutes);
+    } catch (e) {
+      onError((e as Error).message);
       return;
     }
     try {
@@ -1934,7 +2014,7 @@ export function HomeView({
         // platform. Sent unconditionally: the backend ignores it for every
         // platform that has only one tab.
         facebook_tabs: [...sweepFbTabs],
-        max_seconds: sweepMaxMinutes.trim() ? Number(sweepMaxMinutes) * 60 : undefined,
+        max_seconds: maxSeconds,
       });
       if (res.skipped.length) {
         onError(`Skipped: ${res.skipped.map((s) => `${s.value} (${s.reason})`).join(", ")}`);

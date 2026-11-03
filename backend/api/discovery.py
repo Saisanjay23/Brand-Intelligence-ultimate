@@ -43,7 +43,7 @@ from pydantic import BaseModel, Field
 
 from backend.analysis.runner import analysis_runner
 from backend.api.analysis import StartAnalysisAccepted
-from backend.api.models import (CancelResult, JobAccepted, JobStatus, Platform,
+from backend.api.models import (CancelResult, Cap, JobAccepted, JobStatus, Platform,
                                  PlatformState, PlatformStateList, SkippedInput)
 from backend.database.repositories import client_repository as clients_db
 from backend.database.repositories import coverage_repository as coverage_db
@@ -105,8 +105,8 @@ class StartDiscovery(BaseModel):
                     "Naming a platform with no usable session returns it under "
                     "`skipped` with the reason, rather than failing the request.",
     )
-    max_results: int = Field(
-        0, ge=0,
+    max_results: Cap = Field(
+        0,
         description="Blanket per-(keyword,tab) cap, used only where the more "
                     "specific caps below don't set a tighter one for that cell "
                     "(see platform_limits_individual/_domain and "
@@ -115,17 +115,17 @@ class StartDiscovery(BaseModel):
                     "what you want somewhere in this stack.",
     )
     max_seconds: Optional[float] = Field(
-        None, gt=0,
+        None, gt=0, le=24 * 3600,
         description="Per-sweep time budget. Omit to use the server default.",
     )
-    platform_limits_individual: dict[str, int] = Field(
+    platform_limits_individual: dict[str, Cap] = Field(
         default_factory=dict,
         description="platform id -> max results per individual-type keyword "
                     "on that platform, across all its tabs. 0/absent = uncapped "
                     "by this cap specifically (a less specific cap may still apply).",
         examples=[{"facebook": 20, "twitter": 50}],
     )
-    platform_limits_domain: dict[str, int] = Field(
+    platform_limits_domain: dict[str, Cap] = Field(
         default_factory=dict,
         description="Same as platform_limits_individual, for domain-type keywords.",
     )
@@ -154,7 +154,7 @@ class StartDiscovery(BaseModel):
                     "without spending a session on it. See "
                     "GET /discovery/coverage/{group_id} for what is owed.",
     )
-    platform_tab_limits: dict[str, dict[str, dict[str, int]]] = Field(
+    platform_tab_limits: dict[str, dict[str, dict[str, Cap]]] = Field(
         default_factory=dict,
         description="platform id -> tab -> keyword type (\"individual\"/\"domain\") "
                     "-> max results for that exact cell. Only Facebook has more "

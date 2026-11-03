@@ -39,7 +39,7 @@ from backend.platforms.scan_options import captures_screenshot
 from backend.shared.text import (name_score, normalized_host, parse_count,
                                  parse_normalized_url)
 from backend.stealth.mouse_movement import humanize_interaction
-from backend.shared.walls import chrome_text, url_path
+from backend.shared.walls import chrome_text, is_wall_url, url_path
 from backend.platforms.twitter.discovery_engine import (ABOUT_QUERY,
                                                          _X_CONTENT_SELECTORS,
                                                          REPOSTS_QUERY,
@@ -69,6 +69,14 @@ BAD_SEGMENTS = {
 }
 
 
+def _on_login_page(url: str) -> bool:
+    """Is this URL X's own login door? By path SEGMENT: `x.com/loginradius`
+    is a profile (and a suspended/deleted one has no payload, which is exactly
+    when this is asked), so a prefix test read it as a dead session and
+    quarantined a healthy account."""
+    return is_wall_url(url, ("login",)) or url_path(url).startswith("/i/flow/login")
+
+
 def normalize_url(url: str) -> str:
     """WHAT: one canonical `https://x.com/<handle>` form for any Twitter/X
     URL variant. HOW: delegates host/path parsing to
@@ -80,7 +88,9 @@ def normalize_url(url: str) -> str:
     if p is None:
         return ""
     host = normalized_host(p)
-    if "twitter.com" in host or "x.com" in host:
+    # The host itself, not a substring of it: "x.com" in "dropbox.com" is
+    # true, and a link to any such site was rewritten onto x.com.
+    if host in ("twitter.com", "x.com") or host.endswith((".twitter.com", ".x.com")):
         host = "x.com"
     return f"https://{host}{p.path.rstrip('/')}"
 
@@ -555,7 +565,7 @@ class Scraper:
                     row.status = "CHECKPOINT"
                     row.note("session checkpointed")
                 elif (
-                    url_path(page.url).startswith(("/login", "/i/flow/login"))
+                    _on_login_page(page.url)
                     or RE_LOGIN.search(body)
                 ):
                     row.status = "LOGIN_REQUIRED"
@@ -738,7 +748,7 @@ class Scraper:
             or RE_CHECKPOINT.search(body)
             or RE_LOGIN.search(body)
             or RE_GONE.search(body)
-            or url_path(url).startswith(("/login", "/i/flow/login"))
+            or _on_login_page(url)
         )
 
     @staticmethod

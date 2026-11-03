@@ -102,7 +102,11 @@ export function parseBulkKeywordGroups(raw: string): KeywordGroup[] {
     // "Coca-Cola: coke, cocacola" failed to match and was read as two
     // separate parents, "Coca-Cola: coke" and "cocacola" -- the first of
     // which was then searched literally, colon and all.
-    const sepMatch = line.match(/^(.+?)\s*(?::|->|=>)\s*(.+)$/);
+    //
+    // A colon that opens "//" is part of a URL ("https://acme.com"), not a
+    // separator: it used to split that into the parent "https" and a child
+    // "//acme.com", and both were then searched literally.
+    const sepMatch = line.match(/^(.+?)\s*(?::(?!\/\/)|->|=>)\s*(.+)$/);
     if (sepMatch) {
       const parent = cleanKeyword(sepMatch[1]);
       const rawChildren = sepMatch[2];
