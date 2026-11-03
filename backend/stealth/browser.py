@@ -270,10 +270,26 @@ async def shoot(page) -> bytes:
     raise last or RuntimeError("screenshot returned no data")
 
 
+_warned_synced = False
+
+
 def profiles_root() -> Path:
     from backend.config.settings import settings
 
-    return Path(settings.session_blob_path) / "browser_profiles"
+    root = Path(settings.session_blob_path) / "browser_profiles"
+    global _warned_synced
+    if not _warned_synced and "onedrive" in str(root.resolve()).lower():
+        # Each profile holds a logged-in browser: cookies, local storage, the
+        # lot. In a synced folder those files are uploaded to the cloud and
+        # are locked/rewritten by the sync client while Chrome is using them.
+        # Not moved automatically -- that would log every account out.
+        _warned_synced = True
+        log.warning(
+            f"browser profiles live inside a OneDrive folder ({root}) -- logged-in "
+            "sessions are being synced to the cloud. Point SESSION_BLOB_PATH at a "
+            "local, non-synced folder (accounts must be logged in again after a move)."
+        )
+    return root
 
 
 def profile_dir_for(platform: str, session_id: str) -> Path:
@@ -1044,6 +1060,11 @@ class Session:
         settled path exactly, never as a prefix, so it cannot swallow a real
         profile path.
         """
+        # WHY the last check failed -- "suspended", "checkpointed", "expired" or
+        # "" -- so callers can say which instead of calling every failure a
+        # checkpoint. A suspended account in particular cannot be fixed by
+        # logging in again.
+        self.last_check_reason = ""
         page = await self.ctx.new_page()
         try:
             await page.goto(
@@ -1057,9 +1078,18 @@ class Session:
             body = await page.inner_text("body")
             if "/checkpoint" in page.url or checkpoint_re.search(body):
                 log.error("session CHECKPOINTED -- clear it in a real browser")
+                self.last_check_reason = "checkpointed"
+                return False
+            from urllib.parse import urlparse as _urlparse
+
+            _landed_path = _urlparse(page.url).path.lower()
+            if "/suspended" in _landed_path or "/disabled" in _landed_path:
+                log.error(f"session SUSPENDED -- the platform disabled this account ({page.url})")
+                self.last_check_reason = "suspended"
                 return False
             if "/login" in page.url or login_re.search(body):
                 log.error("session INVALID -- cookies expired or incomplete")
+                self.last_check_reason = "expired"
                 return False
             if expect_path or deny_paths:
                 from urllib.parse import urlparse
@@ -1070,6 +1100,7 @@ class Session:
                         f"session INVALID -- redirected off {expect_path!r} to {page.url} "
                         "(authenticated page not reachable, so these cookies are not logged in)"
                     )
+                    self.last_check_reason = "expired"
                     return False
                 # "" is the settled path of the site root once rstripped
                 if any(landed == p.rstrip("/") for p in deny_paths):
@@ -1077,6 +1108,7 @@ class Session:
                         f"session INVALID -- {probe_url} landed on the logged-out "
                         f"door {page.url} (these cookies are not logged in)"
                     )
+                    self.last_check_reason = "expired"
                     return False
             log.info(f"session valid -> {page.url}")
             return True

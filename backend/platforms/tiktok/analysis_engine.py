@@ -38,6 +38,7 @@ payload, so that column stays blank rather than guessed.
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -45,18 +46,53 @@ from backend.shared import diagnostics, evidence
 from backend.shared.models.row import Row
 from backend.platforms.scan_options import captures_screenshot
 from backend.shared.text import name_score, normalized_host, parse_count, parse_normalized_url
-from backend.platforms.tiktok.discovery_engine import (RE_CHECKPOINT, RE_GONE,
-                                                        RE_LOGIN, TikTokSession,
-                                                        TikTokUser, geoblocked,
+from backend.shared.walls import chrome_text, is_wall_url
+from backend.platforms.tiktok.discovery_engine import (RE_CHECKPOINT, RE_GEOBLOCK,
+                                                        RE_GONE, RE_LOGIN,
+                                                        TikTokSession, TikTokUser,
+                                                        geoblock_redirect,
                                                         newest_post_iso,
                                                         newest_post_via_search,
                                                         profile_from, read_hydration,
                                                         search_users_in)
 
+# Kept for anything that still imports it. username_of() no longer needs it:
+# a profile is identified by an `@` first segment, and a route name can never
+# start with one, so there is nothing to blocklist.
 BAD_SEGMENTS = {
     "video", "live", "tag", "music", "discover", "explore", "upload",
     "messages", "following", "notification", "search", "foryou", "login",
+    "t", "embed", "legal", "business", "about",
 }
+
+# TikTok handles are letters, digits, underscore and full stop. Anything else
+# is not a handle, and it must not reach the page URL we build or the JS.
+_HANDLE_RE = re.compile(r"^[A-Za-z0-9._]{1,64}$")
+
+# The `Row.src["last_post"]` value that means "the newest post search happened
+# to show", i.e. a floor under the real date. analysis/runner.py keys on it.
+LAST_POST_LOWER_BOUND = "search-lowerbound"
+
+
+def _int_status(resp) -> Optional[int]:
+    """An HTTP status off a Playwright response, or None when there is none
+    (no response object, or something that is not a real status)."""
+    s = getattr(resp, "status", None)
+    return s if isinstance(s, int) and not isinstance(s, bool) else None
+
+# The parts of a profile page that show the ACCOUNT'S OWN content -- its bio,
+# its title line and its video grid. Text inside them is the account speaking,
+# not TikTok, so it is cut out before the page is read for walls: a bio that
+# says "Government of India", "captcha" or "log in to TikTok" is a profile,
+# not a block. See shared/walls.py.
+_PROFILE_CONTENT_SELECTORS = (
+    '[data-e2e="user-bio"]',
+    '[data-e2e="user-title"]',
+    '[data-e2e="user-subtitle"]',
+    '[data-e2e="user-post-item-list"]',
+    '[data-e2e="user-post-item"]',
+    '[data-e2e="user-link"]',
+)
 
 
 def normalize_url(url: str) -> str:
@@ -79,18 +115,20 @@ def normalize_url(url: str) -> str:
 
 def username_of(url: str) -> str:
     """WHAT: the account handle out of a normalized TikTok URL, or "".
-    HOW: the first path segment with its leading @ stripped, rejected if
-    it is one of BAD_SEGMENTS -- tiktok.com/video/... and
-    tiktok.com/tag/... are real URLs whose first segment is a route name,
-    not an account, and treating "video" as a username would produce a
-    confident row about a profile that does not exist. LINKED TO:
+    HOW: the first path segment, and ONLY when it starts with "@". A
+    profile URL is tiktok.com/@handle; tiktok.com/video/..., /tag/...,
+    /t/<code> (a short link), /embed, /legal, /business, /about and the rest
+    are routes whose first segment is a name, not an account, and treating
+    "t" or "video" as a username produced a confident row about a profile
+    that does not exist. /@handle/video/123 yields "handle" (the author);
+    the caller decides what to do with the rest of the path. LINKED TO:
     process() sets row.profile_id from this, and an empty result is what
     makes a URL an immediate ERROR there."""
     seg = [s for s in urlparse(normalize_url(url)).path.split("/") if s]
-    if not seg:
+    if not seg or not seg[0].startswith("@"):
         return ""
-    u = seg[0].lstrip("@")
-    return "" if u.lower() in BAD_SEGMENTS else u
+    u = seg[0][1:]
+    return u if _HANDLE_RE.match(u) else ""
 
 
 class Scraper:
@@ -206,14 +244,38 @@ class Scraper:
         else if (/^followers$/i.test(lines[i])) followers = lines[i - 1];
         else if (/^likes$/i.test(lines[i])) likes = lines[i - 1];
       }
-      const h = document.querySelector('h1, h2');
-      const nickname = h ? (h.textContent || '').trim() : '';
-      const img = document.querySelector(
-        `img[alt*="${username}"], header img, img[class*="avatar" i]`);
+      // The account's own title line. `user-title` is the @handle and
+      // `user-subtitle` the display name; a bare h1/h2 can just as well be
+      // an error heading ("Couldn't find this account"), a "Log in" prompt
+      // or the viewer's own name, so it is only a last resort and never when
+      // it is the handle itself or reads like a page message.
+      const clean = (el) => el ? (el.textContent || '').trim() : '';
+      const title = clean(document.querySelector('[data-e2e="user-title"]'));
+      let nickname = clean(document.querySelector('[data-e2e="user-subtitle"]'));
+      if (!nickname) {
+        const h = document.querySelector('h1, h2');
+        const t = clean(h);
+        const handle = (username || '').toLowerCase();
+        if (t && t.replace(/^@/, '').toLowerCase() !== handle
+            && !/error|went wrong|couldn.t|can.t be found|not found|log in|sign up|private|something/i.test(t)) {
+          nickname = t;
+        }
+      }
+      // The PROFILE'S avatar only: the header's own avatar element, or an
+      // image whose alt names this account. Never `img[class*=avatar]` --
+      // that also matches the signed-in viewer's sidebar avatar, which would
+      // be hashed and stored as this account's picture.
+      let img = document.querySelector('[data-e2e="user-avatar"] img, [data-e2e="user-avatar"]');
+      if (img && img.tagName !== 'IMG') img = img.querySelector('img');
+      if (!img) {
+        const want = (username || '').toLowerCase();
+        img = Array.from(document.querySelectorAll('img')).find(
+          (i) => want && (i.getAttribute('alt') || '').toLowerCase().includes(want)) || null;
+      }
       const verified = !!document.querySelector('[data-e2e="user-verified"], svg[aria-label="Verified"]');
       const bodyText = document.body.innerText || "";
       return {
-        following, followers, likes, nickname,
+        following, followers, likes, nickname, title,
         avatar: img ? (img.getAttribute('src') || '') : '',
         verified,
         isPrivate: /this account is private/i.test(bodyText),
@@ -273,88 +335,111 @@ class Scraper:
 
         if not row.profile_id:
             row.status = "ERROR"
-            row.note("no @username in the URL -- private/video links cannot be resolved")
+            row.note(
+                "not a profile URL -- expected tiktok.com/@handle. Short links "
+                "(vm.tiktok.com, tiktok.com/t/...) and video links with no @handle "
+                "cannot be resolved without opening them; paste the account's own URL"
+            )
             return row
+
+        # ALWAYS THE PROFILE PAGE, NEVER THE PASTED PATH. `/@foo/video/123` is
+        # a post and `/@foo/anything` is not the profile either; visiting it
+        # and reading it as a profile would give a confident row about the
+        # wrong page. The handle came out of the URL, so the profile is built
+        # from the handle.
+        profile_url = f"https://www.tiktok.com/@{row.profile_id}"
+        if url.rstrip("/").lower() != profile_url.lower():
+            row.canonical_url = profile_url
+            row.note("pasted link was not a bare profile URL -- the account's profile page was analysed")
 
         page = await self.ctx.new_page()
         try:
-            try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=self.a.timeout * 1000)
-            except Exception as nav_err:
-                # NAME THE CAUSE. Chromium collapses an HTTP error carrying an
-                # empty body into net::ERR_HTTP_RESPONSE_CODE_FAILURE, which
-                # `page.goto` raises as an exception with no status on it --
-                # so a refusal and a dead network looked identical, and both
-                # were reported as the bare note "navigation failed".
-                #
-                # Measured live (2026-09-08, logged out): TikTok answers the
-                # homepage 200 and /search/user 200, and returns 403 with a
-                # ZERO-BYTE body for every /@handle -- its own @tiktok
-                # account included. That is a policy on the endpoint, not a
-                # problem with the profile, and the only thing that changes
-                # it is arriving with a session. An analyst reading
-                # "navigation failed" has no way to know that; one reading
-                # "refused 403" does.
-                #
-                # The status probe runs ONLY on the failure path, so the
-                # normal case costs nothing.
-                status = None
+            # THE STATUS OF THE PAGE LOAD, SEEN PASSIVELY. Chromium collapses
+            # an HTTP error carrying an empty body into a bare exception with
+            # no status on it, so a refusal and a dead network read alike. The
+            # status is taken from the response events the load already
+            # produces -- never from a second request, which is what this used
+            # to do (`ctx.request.get`, a non-browser fetch with no page
+            # behind it and no cookies of the page's own, on exactly the URL
+            # that had just been refused).
+            nav: dict = {"status": None}
+
+            def _on_response(resp) -> None:
                 try:
-                    probe = await self.ctx.request.get(url, timeout=15000)
-                    status = probe.status
+                    req = resp.request
+                    if req.is_navigation_request() and req.frame == page.main_frame:
+                        s = _int_status(resp)
+                        if s is not None:
+                            nav["status"] = s
                 except Exception:
                     pass
+
+            try:
+                page.on("response", _on_response)
+            except Exception:
+                pass
+
+            try:
+                resp = await page.goto(
+                    profile_url, wait_until="domcontentloaded", timeout=self.a.timeout * 1000)
+                if (s := _int_status(resp)) is not None:
+                    nav["status"] = s
+            except Exception as nav_err:
+                # NAME THE CAUSE. Measured live (2026-09-08, logged out):
+                # TikTok answers the homepage 200 and /search/user 200, and
+                # returns 403 with a ZERO-BYTE body for every /@handle -- its
+                # own @tiktok account included. That is a policy on the
+                # endpoint, not a problem with the profile.
+                status = nav["status"]
                 # REFUSED IS NOT THE END. The profile page is one source, not
                 # the only one: TikTok's user search answers 200 while
                 # /@handle answers 403, and its cards carry most of what this
-                # scraper reads anyway -- name, bio, followers, following,
-                # avatar, verified, private. Falling back to it turns a row
-                # that reported nothing into one that reports nearly
-                # everything, with the two genuinely page-only fields left
-                # honestly blank.
+                # scraper reads anyway. Falling back to it turns a row that
+                # reported nothing into one that reports nearly everything,
+                # with the two genuinely page-only fields left honestly blank.
                 if await self._recover_via_search(row, page, status):
                     return row
-                row.status = "ERROR"
-                if status == 403:
-                    row.note(
-                        "refused (HTTP 403) -- TikTok is not serving profile pages to this "
-                        "browser, and the account was not found in user search either. "
-                        "Add a TikTok session under Sessions."
-                    )
-                elif status and status >= 400:
-                    row.note(f"navigation failed -- TikTok answered HTTP {status}")
-                else:
-                    row.note(f"navigation failed -- {type(nav_err).__name__}")
+                self._refused(row, status, nav_err)
                 return row
+            http_status = nav["status"]
 
             # give the hydration script (and, on a suspicious-traffic
             # response, whatever TikTok replaces it with) a moment to settle
             await page.wait_for_timeout(min(2500, int(self.a.settle * 1000)))
 
-            body = ""
-            try:
-                body = await page.inner_text("body")
-            except Exception:
-                pass
-
             # A blocked region serves the same notice for every profile, so
             # without this the row reads PARTIAL "profile payload not seen"
             # -- a retryable status that will keep re-spending attempts on
-            # something no retry can fix. See RE_GEOBLOCK in
-            # discovery_engine.py.
-            if geoblocked(page.url, body):
-                row.status = "ERROR"
-                row.note(
-                    "TikTok is blocked for this IP (redirected to "
-                    f"{page.url}) -- route this platform through a proxy"
-                )
+            # something no retry can fix. The REDIRECT is the proof (a URL
+            # cannot be written by a bio); the notice text is only trusted
+            # below, once no profile was read, and only outside the account's
+            # own content.
+            if geoblock_redirect(page.url):
+                self._geoblocked(row, page.url)
                 return row
+
+            # What TikTok itself is showing, with the account's own bio, title
+            # and video grid taken out -- see _PROFILE_CONTENT_SELECTORS.
+            chrome = await self._chrome_text(page)
 
             hydration = await read_hydration(page)
             user = profile_from(hydration, row.profile_id) if hydration else None
 
+            challenged = False
             if user:
                 self.fill(row, user)
+                # A CAPTCHA / slide-verify OVERLAY can sit on top of a profile
+                # whose payload still loaded. The fields are real, but the
+                # session is being challenged and the page is not what an
+                # analyst would see, so the row is PARTIAL with the reason,
+                # never a clean OK, and no further request is spent on it.
+                challenged = bool(RE_CHECKPOINT.search(chrome)) or is_wall_url(
+                    page.url, ("captcha",))
+                if challenged:
+                    row.note(
+                        "a verification challenge was on screen over this profile -- "
+                        "the fields were read from the page payload but the visit may be incomplete"
+                    )
                 if not row.last_post_iso:
                     iso = newest_post_iso(hydration, row.profile_id)
                     if iso:
@@ -362,25 +447,58 @@ class Scraper:
                         row.posts_seen = "yes"
                         row.mark("last_post", "hydration")
             else:
-                if RE_CHECKPOINT.search(body) or "/captcha" in page.url:
-                    row.status = "CHECKPOINT"
-                    row.note("session checkpointed")
+                if RE_CHECKPOINT.search(chrome) or is_wall_url(page.url, ("captcha",)):
+                    if self.anonymous:
+                        # NO COOKIES, NOTHING TO CHECKPOINT. Saying "session
+                        # checkpointed" about a browser with no session sends
+                        # an analyst to a login that does not exist.
+                        row.status = "ERROR"
+                        row.note(
+                            "TikTok showed a human-verification page to this logged-out "
+                            "browser, so the profile was not read -- try again later, or "
+                            "add a TikTok session under Sessions"
+                        )
+                    else:
+                        row.status = "CHECKPOINT"
+                        row.note("session checkpointed")
                     return row
-                if "/login" in page.url or RE_LOGIN.search(body):
-                    row.status = "LOGIN_REQUIRED"
-                    row.note("cookies rejected/expired")
+                if is_wall_url(page.url, ("login",)) or RE_LOGIN.search(chrome):
+                    if self.anonymous:
+                        row.status = "ERROR"
+                        row.note(
+                            "TikTok asked this logged-out browser to sign in before showing "
+                            "the profile, so it was not read -- add a TikTok session under Sessions"
+                        )
+                    else:
+                        row.status = "LOGIN_REQUIRED"
+                        row.note("cookies rejected/expired")
                     return row
-                if RE_GONE.search(body):
+                if RE_GONE.search(chrome):
                     row.status = "GONE"
                     row.note("removed or unavailable -- may already be down")
+                    return row
+                if RE_GEOBLOCK.search(chrome):
+                    self._geoblocked(row, page.url)
+                    return row
+                if http_status is not None and http_status >= 400:
+                    # The page answered with an error and carried no profile.
+                    if await self._recover_via_search(row, page, http_status):
+                        return row
+                    self._refused(row, http_status, None)
                     return row
 
                 dom = await self.read_dom(page, row.profile_id)
-                if dom.get("notFound"):
+                followers_n, _ = parse_count(str(dom.get("followers") or ""))
+                title_ok = (str(dom.get("title") or "").strip().lstrip("@").lower()
+                            == row.profile_id.lower())
+                if dom.get("notFound") and followers_n is None and not title_ok:
                     row.status = "GONE"
                     row.note("removed or unavailable -- may already be down")
                     return row
-                if dom.get("followers") or dom.get("nickname"):
+                # PROOF THE PROFILE LOADED: a followers count, or the page's
+                # own title line naming THIS handle. A heading or a nickname
+                # alone proves nothing -- an error page has headings too.
+                if followers_n is not None or title_ok:
                     self.fill_from_dom(row, dom)
                 else:
                     row.status = "PARTIAL"
@@ -392,12 +510,13 @@ class Scraper:
                     await self.screenshot(page, row)
                     return row
 
-            if not row.last_post_iso:
+            if not row.last_post_iso and not challenged:
                 # the free, no-extra-navigation attempt above came up empty
                 # (it always does today, see module docstring), fall
                 # back to the CAPTCHA-free search-based lookup, one extra
                 # page visit. Best-effort: any failure here must not fail
-                # the whole profile visit.
+                # the whole profile visit. Skipped while a challenge is on
+                # screen: that session is already being watched.
                 try:
                     iso = await newest_post_via_search(self.ctx, row.profile_id)
                 except Exception:
@@ -405,29 +524,99 @@ class Scraper:
                 if iso:
                     row.last_post_iso = iso
                     row.posts_seen = "yes"
-                    row.mark("last_post", "search")
+                    # A LOWER BOUND, NOT THE LAST POST. Search surfaces the
+                    # newest video it happens to rank, not the newest video
+                    # there is, so a newer post can exist. The runner reads
+                    # this source and leaves "active" unknown unless the date
+                    # alone already proves it.
+                    row.mark("last_post", LAST_POST_LOWER_BOUND)
+                    row.note(
+                        "last post date came from search only -- a lower bound, "
+                        "newer posts may exist"
+                    )
 
             await self.screenshot(page, row)
             # NOT `or row.profile_id` -- profile_id is derived from the URL
             # at the very top of this method and is unconditionally
             # non-empty by this point (a blank one already returned ERROR
             # earlier), so `or row.profile_id` made this condition always
-            # True regardless of whether anything was actually read.
-            # Concrete case this let through as "OK": the DOM fallback tier
-            # runs when `dom.get("followers") or dom.get("nickname")` is
-            # truthy (line 341) -- if only `followers` came back and
-            # `nickname` didn't, `fill_from_dom` leaves `row.profile_name`
-            # blank (it's only ever set from `dom.get("nickname")`), a
-            # genuinely weak read missing the one field this whole tool is
-            # about (the name to compare against the keyword) -- and this
-            # line still stamped it "OK", hiding that from the analyst.
-            row.status = "OK" if row.profile_name else "PARTIAL"
+            # True regardless of whether anything was actually read. A weak
+            # read missing the name -- the one field this whole tool is about
+            # -- must not be stamped "OK".
+            row.status = "OK" if row.profile_name and not challenged else "PARTIAL"
             return row
         finally:
             try:
                 await page.close()
             except Exception:
                 pass
+
+    @staticmethod
+    async def _chrome_text(page) -> str:
+        """The page's VISIBLE text with the account's own bio, title and video
+        grid removed -- what TikTok itself is saying, as opposed to what the
+        profile says. Falls back to the whole body when the page cannot be
+        queried, which is exactly how loose the check was before: a failure
+        here can only make it looser, never stricter. (shared/walls.py's
+        chrome_text does the same job on textContent, which also reads the
+        page's <script> payloads and so contains the word "captcha" on every
+        TikTok page; this one works on the rendered text.)"""
+        try:
+            text = await page.evaluate(
+                """(sels) => {
+                    let t = document.body ? (document.body.innerText || '') : '';
+                    for (const s of sels) {
+                        document.querySelectorAll(s).forEach((n) => {
+                            const x = (n.innerText || '').trim();
+                            if (x) t = t.split(x).join(' ');
+                        });
+                    }
+                    return t;
+                }""",
+                list(_PROFILE_CONTENT_SELECTORS),
+            )
+            if isinstance(text, str):
+                return text
+        except Exception:
+            pass
+        try:
+            return await page.inner_text("body")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _geoblocked(row: Row, page_url: str) -> None:
+        row.status = "ERROR"
+        row.note(
+            "TikTok is blocked for this IP (redirected to "
+            f"{page_url}) -- route this platform through a proxy"
+        )
+
+    def _refused(self, row: Row, status: Optional[int], nav_err: Optional[BaseException]) -> None:
+        """An ERROR row for a profile page TikTok would not serve.
+
+        THE WORDING IS NOT COSMETIC. The runner reads every ERROR row's note
+        through resilience.classify_failure, and a bare "403" in it reads as
+        "this session's cookies are dead": one not-found handle was marking a
+        good session failed and stopping the worker with the rest of the batch
+        still queued. A per-URL refusal says nothing about the session, so the
+        403 is spelled out in words the classifier does not match.
+        """
+        row.status = "ERROR"
+        if status == 403:
+            row.note(
+                "refused (access denied) -- TikTok is not serving this profile page to "
+                "this browser, and the account was not found in user search either. "
+                + ("Add a TikTok session under Sessions."
+                   if self.anonymous else
+                   "This is about this one URL and is not treated as a dead session.")
+            )
+        elif status and status >= 400:
+            row.note(f"navigation failed -- TikTok answered HTTP {status}")
+        elif nav_err is not None:
+            row.note(f"navigation failed -- {type(nav_err).__name__}")
+        else:
+            row.note("navigation failed")
 
     @staticmethod
     def fill(row: Row, u: TikTokUser) -> None:
@@ -536,7 +725,7 @@ class Scraper:
                 if iso := await newest_post_via_search(self.ctx, handle):
                     row.last_post_iso = iso
                     row.posts_seen = "yes"
-                    row.mark("last_post", "search-card")
+                    row.mark("last_post", LAST_POST_LOWER_BOUND)
             except Exception:
                 pass  # best effort; the row is already worth keeping
 

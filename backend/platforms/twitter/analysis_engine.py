@@ -35,7 +35,7 @@ from backend.shared import diagnostics, evidence
 from backend.shared.tasks import spawn
 from backend.shared.models.row import Row
 from backend.shared.avatars import hd_picture_url
-from backend.platforms.scan_options import captures_screenshot
+from backend.platforms.scan_options import cancelled, captures_screenshot
 from backend.shared.text import (name_score, normalized_host, parse_count,
                                  parse_normalized_url)
 from backend.stealth.mouse_movement import humanize_interaction
@@ -90,9 +90,24 @@ def normalize_url(url: str) -> str:
     host = normalized_host(p)
     # The host itself, not a substring of it: "x.com" in "dropbox.com" is
     # true, and a link to any such site was rewritten onto x.com.
+    path = p.path.rstrip("/")
     if host in ("twitter.com", "x.com") or host.endswith((".twitter.com", ".x.com")):
         host = "x.com"
-    return f"https://{host}{p.path.rstrip('/')}"
+        # A profile is ONE segment. `x.com/NASA/with_replies` and
+        # `x.com/NASA/status/1` used to stay as they were, and every helper
+        # then appended its own tab to them (`.../status/1/about`). Reserved
+        # routes (/i/..., /search ...) are left alone: handle_of() rejects
+        # them and they must not be turned into somebody's profile.
+        segs = [x for x in path.split("/") if x]
+        if segs and segs[0].lstrip("@").lower() not in BAD_SEGMENTS:
+            path = "/" + segs[0].lstrip("@")
+    return f"https://{host}{path}"
+
+
+def _profile_url(handle: str) -> str:
+    """The canonical profile URL for a handle -- what every tab URL is built
+    from, never from the URL the analyst pasted."""
+    return f"https://x.com/{handle}" if handle else ""
 
 
 def handle_of(url: str) -> str:
@@ -123,10 +138,33 @@ def handle_of(url: str) -> str:
 # -insensitive substring) alongside the confirmed "repost", an unmatched
 # pinned tweet would only make this fallback occasionally too generous by
 # one tweet, never wrong in the direction that hides real inactivity.
+#
+# TWO MORE KINDS OF CELL are not this account's activity and are skipped: a
+# promoted/Ad cell (X wraps it in `placementTracking`), and -- on /with_replies
+# -- the thread-context cells of OTHER authors shown above a reply. Counting
+# either let max(dates) make a dormant account look active. When the handle is
+# known, only a cell whose own header (`User-Name`, first block, so a quoted
+# post's author does not count) links to /<handle> is kept; a cell with no
+# readable header is dropped rather than guessed at.
 JS_TWEET_TIMES = """
-() => {
+(handle) => {
   const out = [];
+  const me = '/' + String(handle || '').toLowerCase().replace(/^@/, '');
+  const filterAuthor = me.length > 1;
   for (const cell of document.querySelectorAll('[data-testid="tweet"]')) {
+    if (cell.closest('[data-testid="placementTracking"]')
+        || cell.querySelector('[data-testid="placementTracking"]')) continue;
+    if (filterAuthor) {
+      const head = cell.querySelector('[data-testid="User-Name"]');
+      if (!head) continue;
+      let mine = false;
+      for (const a of head.querySelectorAll('a[href]')) {
+        const href = (a.getAttribute('href') || '').split('?')[0].split('#')[0]
+          .replace(/[/]$/, '').toLowerCase();
+        if (href === me) { mine = true; break; }
+      }
+      if (!mine) continue;
+    }
     const time = cell.querySelector('time[datetime]');
     if (!time) continue;
     const ctx = cell.querySelector('[data-testid="socialContext"]');
@@ -254,14 +292,14 @@ async def dom_display_name(page, handle: str = "") -> str:
     return name
 
 
-async def dom_last_post(page) -> str:
+async def dom_last_post(page, handle: str = "") -> str:
     """Newest ORGANIC post date read off the already-rendered timeline.
     '' when nothing usable is on screen, never a guess. LINKED TO: called
     from Scraper.process() when the UserTweets/UserOriginalsTimeline
     payload missed its window, and from `replies_tab_last_post()` below
     as its own last-resort tier on the /with_replies tab."""
     try:
-        cells = await page.evaluate(JS_TWEET_TIMES)
+        cells = await page.evaluate(JS_TWEET_TIMES, (handle or "").strip().lstrip("@"))
     except Exception:
         return ""
     dates = [
@@ -303,17 +341,46 @@ JS_COUNT_LINKS = r"""
 }
 """
 
-_COUNT_TOKEN = re.compile(r"(\d[\d.,]*)\s*([KMBkmb])?(?![A-Za-z])")
+_COUNT_NUMBER = re.compile(r"\d[\d.,]*")
+_COUNT_SUFFIX_ADJACENT = re.compile(r"([KMBkmb])(?=\s|$)")
+_COUNT_SUFFIX_SPACED = re.compile(r"\s+([KMBkmb])(?=\s|$)")
 
 
 def count_from_text(text: str):
     """(value, is_exact) from a header link's text ("1.2M Followers",
     "12,345 Following"), or (None, False). The first number in the text is
-    the count; anything unreadable is None, never a guess."""
-    m = _COUNT_TOKEN.search(text or "")
+    the count; anything unreadable is None, never a guess.
+
+    What FOLLOWS the number is checked, because the number alone can be the
+    wrong one: "12.3萬 位追蹤者" is 123,000 and read as a plain 12; "1,5 Mio.
+    Follower" is 1.5 million and read as an exact 15. After the number (and
+    an optional K/M/B) there must be whitespace or the end of the text, and
+    the next word must not start like a magnitude word (Mio, Mrd, Mil, ...).
+    Anything else is unreadable -- None, not a wrong number."""
+    text = text or ""
+    m = _COUNT_NUMBER.search(text)
     if not m:
         return None, False
-    return parse_count(f"{m.group(1)}{m.group(2) or ''}")
+    num = m.group().rstrip(".,")
+    tail = text[m.end():]
+    suffix = ""
+    if tail and not tail[0].isspace():
+        sm = _COUNT_SUFFIX_ADJACENT.match(tail)
+        if not sm:
+            return None, False
+        suffix, tail = sm.group(1), tail[sm.end():]
+    else:
+        sm = _COUNT_SUFFIX_SPACED.match(tail)
+        if sm:
+            suffix, tail = sm.group(1), tail[sm.end():]
+        else:
+            nxt = tail.split(None, 1)[0] if tail.strip() else ""
+            # "1,5 Mio." / "2 Mrd." / "3 mil": a magnitude word, not a label
+            if nxt[:1] in ("K", "M", "B", "k", "m", "b"):
+                return None, False
+    if not num:
+        return None, False
+    return parse_count(f"{num}{suffix}")
 
 
 async def dom_counts(page, handle: str) -> dict:
@@ -455,6 +522,10 @@ class Scraper:
         url = normalize_url(raw_url)
         row = Row(url=url, target=target, original_feed=feed)
         row.profile_id = handle_of(url)
+        # Pinned before fill() overwrites profile_id with the numeric id: the
+        # tab URLs are built from THIS, never from the pasted URL.
+        handle = row.profile_id
+        profile_url = _profile_url(handle)
         if known and known.get("location"):
             row.location = known["location"]
             row.mark("location", "discovery")
@@ -628,6 +699,18 @@ class Scraper:
                     # DOM read below will return "" and the caller keeps
                     # posts_seen as it found it
                     pass
+            # A PAYLOAD IS NOT PROOF OF A LOGGED-IN PAGE. X answers a guest
+            # UserByScreenName too, so expired cookies could still land a
+            # profile payload under a login modal: an OK row, a screenshot of
+            # the modal, a blank last post, and a session nobody flagged.
+            # Same chrome-text test as the no-payload path, read again now
+            # that the page has had time to raise the wall.
+            body = await chrome_text(page, _X_CONTENT_SELECTORS) or body
+            if _on_login_page(page.url) or RE_LOGIN.search(body):
+                row.status = "LOGIN_REQUIRED"
+                row.note("logged out -- login wall over the profile "
+                         "(cookies rejected/expired); payload not trusted")
+                return row
             self.fill(row, found[0])
             # The payload arrived but carried no counts (X moves these
             # fields between A/B variants): read them off the header.
@@ -652,11 +735,22 @@ class Scraper:
                 # is not the case (posts_seen != "no"), so read the same
                 # information off the timeline that's already rendered on
                 # screen instead of waiting longer or re-requesting
-                iso = await dom_last_post(page)
+                iso = await dom_last_post(page, handle)
                 if iso:
                     row.last_post_iso = iso
                     row.posts_seen = "yes"
                     row.mark("last_post", "dom-time")
+
+            # THE TIMELINE WAS THROTTLED. `rate_limited` was only ever read on
+            # the no-payload path, so a UserTweets 429 after a good profile
+            # payload sent the session on to /with_replies, /reposts and
+            # /about -- three more page loads on an account X had just told to
+            # slow down -- and the row came back OK with a blank last post
+            # and no explanation. Back off, and say so.
+            if rate_limited:
+                row.note("timeline rate-limited -- last post unknown"
+                         if not row.last_post_iso else
+                         "timeline rate-limited -- extra tabs not read")
 
             # Last resort: the /with_replies tab, for an account whose posts
             # are all replies and whose originals timeline is therefore
@@ -665,13 +759,19 @@ class Scraper:
             # known to have posts, so a zero-post or protected account never
             # pays for it. Runs on its own page; `page` stays parked on the
             # profile for the screenshot below.
+            tiers_open = not rate_limited
             if (
-                not row.last_post_iso
+                tiers_open
+                and not row.last_post_iso
                 and row.posts_seen == "yes"
                 and "protected" not in row.notes.lower()
             ):
+                if self._stopped(row):
+                    return row
+                await self._between_tiers()
                 iso = await self.replies_tab_last_post(
-                    url, wanted, found[0].entity_id if found else "")
+                    profile_url, wanted, found[0].entity_id if found else "",
+                    row=row)
                 if iso:
                     row.last_post_iso = iso
                     row.mark("last_post", "replies-tab")
@@ -681,12 +781,17 @@ class Scraper:
             # header counts every repost (see latest_repost). Same gate, so a
             # zero-post or protected account never pays for it.
             if (
-                not row.last_post_iso
+                tiers_open
+                and not row.last_post_iso
                 and row.posts_seen == "yes"
                 and "protected" not in row.notes.lower()
             ):
+                if self._stopped(row):
+                    return row
+                await self._between_tiers()
                 iso = await self.reposts_tab_last_post(
-                    url, wanted, found[0].entity_id if found else "")
+                    profile_url, wanted, found[0].entity_id if found else "",
+                    row=row)
                 if iso:
                     row.last_post_iso = iso
                     row.mark("last_post", "reposts-tab")
@@ -702,8 +807,13 @@ class Scraper:
             # signal for matching a brand; `account_based_in` is X's
             # inference about where the account operates from. Tagged with
             # its own source so the two never read as the same field.
-            if not row.location:
-                if about := await self.read_about_panel(url):
+            if not row.location and not tiers_open:
+                row.note("about tab not read -- rate limited")
+            elif not row.location:
+                if self._stopped(row):
+                    return row
+                await self._between_tiers()
+                if about := await self.read_about_panel(profile_url, row=row):
                     if about.account_based_in:
                         row.location = about.account_based_in
                         row.mark("location", "about-panel")
@@ -737,6 +847,45 @@ class Scraper:
                 await page.close()
             except Exception:
                 pass
+
+    def _stopped(self, row: Row) -> bool:
+        """Has the owning job been told to stop? Asked before every extra tab
+        so a cancelled run does not keep loading pages. The row so far is
+        kept but demoted to PARTIAL with a note: an unfinished reading must
+        not pass as a complete OK."""
+        if not cancelled(self.a):
+            return False
+        row.note("stopped -- remaining tabs not read")
+        row.status = "PARTIAL"
+        return True
+
+    async def _between_tiers(self) -> None:
+        """A jittered gap before each extra tab. The profile visit and its
+        follow-up tabs are the same account, in the same minute, from the
+        same session -- back-to-back navigations are the one rhythm a person
+        never has."""
+        base = float(getattr(self.a, "delay", 0) or 0)
+        if base > 0:
+            await asyncio.sleep(base * random.uniform(0.6, 1.4))
+
+    @staticmethod
+    async def _wall_on(page) -> str:
+        """Text naming the wall a helper tab landed on ("" when none): a
+        login door, a checkpoint or a rate-limit panel. Read off the page that
+        is already open -- no extra request."""
+        try:
+            if _on_login_page(page.url or ""):
+                return "login wall"
+            body = await chrome_text(page, _X_CONTENT_SELECTORS)
+        except Exception:
+            return ""
+        if RE_LOGIN.search(body):
+            return "login wall"
+        if RE_CHECKPOINT.search(body):
+            return "checkpoint"
+        if "rate limit" in body.lower():
+            return "rate limit"
+        return ""
 
     @staticmethod
     def _is_wall(page, body: str) -> bool:
@@ -788,9 +937,14 @@ class Scraper:
             row.has_custom_pic = u.has_custom_pic
             row.mark("logo", "graphql-default-flag" if u.default_pic is not None
                      else "graphql")
+        # Row.verified is a real PLATFORM-ISSUED badge. A blue check is
+        # bought (is_blue_verified), so it no longer sets it -- it is noted,
+        # so the analyst still sees it without it reading as an endorsement.
         if u.verified:
             row.verified = True
             row.note("verified account")
+        elif u.verified_type == "blue":
+            row.note("blue (paid) check")
         if u.protected:
             row.note("protected account -- posts not visible")
 
@@ -812,7 +966,8 @@ class Scraper:
                 row.posts_seen = "yes"
                 row.note(f"{u.posts:,} posts")
 
-    async def read_about_panel(self, url: str) -> Optional[AboutAccount]:
+    async def read_about_panel(self, url: str,
+                               row: Optional[Row] = None) -> Optional[AboutAccount]:
         """X's "About this account" panel -> the country it believes the
         account operates from, plus how many times it has been renamed.
 
@@ -831,6 +986,11 @@ class Scraper:
 
         Runs on its own page so the caller's page stays parked on the
         profile for the evidence screenshot.
+
+        `url` is the profile URL (`https://x.com/<handle>`). When `row` is
+        given, a read that comes back empty leaves a note on it saying why
+        (wall, timeout, error) -- None alone cannot tell "no panel" from "never
+        loaded".
         """
         page = await self.ctx.new_page()
         found: list[AboutAccount] = []
@@ -861,12 +1021,20 @@ class Scraper:
                 await humanize_interaction(page, scroll=False, moves=1)
             except Exception:
                 pass
+            timed_out = False
             try:
                 await asyncio.wait_for(landed.wait(), timeout=self.a.settle)
             except asyncio.TimeoutError:
-                pass
+                timed_out = True
+            if not found and row is not None:
+                wall = await self._wall_on(page)
+                row.note(f"about tab not read -- {wall}" if wall else
+                         "about tab not read -- timed out" if timed_out else
+                         "about tab not read")
             return found[0] if found else None
-        except Exception:
+        except Exception as e:
+            if row is not None:
+                row.note(f"about tab not read -- {type(e).__name__}")
             return None
         finally:
             try:
@@ -874,7 +1042,8 @@ class Scraper:
             except Exception:
                 pass
 
-    async def replies_tab_last_post(self, url: str, wanted: str, entity_id: str) -> str:
+    async def replies_tab_last_post(self, url: str, wanted: str, entity_id: str,
+                                    row: Optional[Row] = None) -> str:
         """Newest post date off the /with_replies tab. "" when there is none.
 
         WHY THIS TIER EXISTS
@@ -951,8 +1120,15 @@ class Scraper:
                 )
             except Exception:
                 pass
-            return await dom_last_post(page)
-        except Exception:
+            iso = await dom_last_post(page, wanted)
+            if not iso and row is not None:
+                wall = await self._wall_on(page)
+                row.note(f"replies tab not read -- {wall}" if wall
+                         else "replies tab showed no dated post")
+            return iso
+        except Exception as e:
+            if row is not None:
+                row.note(f"replies tab not read -- {type(e).__name__}")
             return ""
         finally:
             try:
@@ -960,7 +1136,8 @@ class Scraper:
             except Exception:
                 pass
 
-    async def reposts_tab_last_post(self, url: str, wanted: str, entity_id: str) -> str:
+    async def reposts_tab_last_post(self, url: str, wanted: str, entity_id: str,
+                                    row: Optional[Row] = None) -> str:
         """Newest REPOST time off the /reposts tab. "" when there is none.
 
         Direct navigation to `/<handle>/reposts` lands on the tab and fires
@@ -995,12 +1172,19 @@ class Scraper:
                 await humanize_interaction(page, scroll=False, moves=1)
             except Exception:
                 pass
+            timed_out = False
             try:
                 await asyncio.wait_for(landed.wait(), timeout=self.a.settle)
             except asyncio.TimeoutError:
-                pass
+                timed_out = True
+            if not found and row is not None:
+                wall = await self._wall_on(page)
+                if wall or timed_out:
+                    row.note(f"reposts tab not read -- {wall or 'timed out'}")
             return max(found) if found else ""
-        except Exception:
+        except Exception as e:
+            if row is not None:
+                row.note(f"reposts tab not read -- {type(e).__name__}")
             return ""
         finally:
             try:

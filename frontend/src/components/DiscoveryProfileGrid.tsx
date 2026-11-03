@@ -1284,20 +1284,38 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
   const handleCopyAllValidated = async () => {
     setCopyingAll(true);
     try {
-      const res = await discoveryApi.listProfiles({
-        group_id: groupId, platform: platform || undefined, status: "validated",
-        keyword: keywordFilter || undefined, search: search || undefined,
-        // "All" means everything matching the CURRENT filters, so the date
-        // window belongs here as much as the keyword does -- copying a wider
-        // set than the screen shows is the specific way this button betrays
-        // an analyst who thinks they scoped it.
-        first_seen_from: seenFrom,
-        logo_matched: logoOnly || undefined,
-        is_original: originalFilter ?? undefined,
-        validated_age: validatedAge,
-        limit: BULK_FETCH_CAP,
-      });
-      await copyUrls(res.items.map((p) => p.url), "validated");
+      // EVERY filter the screen applies, and EVERY page. This used to leave out
+      // match level, entity type and keyword match type (so "High Match Only"
+      // copied the unfiltered set) and read a single page of BULK_FETCH_CAP,
+      // so a client with more validated profiles than that copied the first
+      // thousand and reported success.
+      const urls: string[] = [];
+      let total = 0;
+      for (let offsetNow = 0; ; offsetNow += BULK_FETCH_CAP) {
+        const res = await discoveryApi.listProfiles({
+          group_id: groupId, platform: platform || undefined, status: "validated",
+          keyword: keywordFilter || undefined, search: search || undefined,
+          match_level: matchLevel || undefined, entity_type: entityType || undefined,
+          keyword_match_type: keywordMatchType || undefined,
+          // "All" means everything matching the CURRENT filters, so the date
+          // window belongs here as much as the keyword does -- copying a wider
+          // set than the screen shows is the specific way this button betrays
+          // an analyst who thinks they scoped it.
+          first_seen_from: seenFrom,
+          logo_matched: logoOnly || undefined,
+          is_original: originalFilter ?? undefined,
+          validated_age: validatedAge,
+          limit: BULK_FETCH_CAP,
+          offset: offsetNow,
+        });
+        total = res.total;
+        urls.push(...res.items.map((p) => p.url));
+        if (!res.items.length || urls.length >= total) break;
+      }
+      if (urls.length < total) {
+        toast.error(`Only ${urls.length} of ${total} validated profiles could be read -- copy again or narrow the filters`);
+      }
+      await copyUrls(urls, "validated");
     } catch (e) {
       toast.error((e as Error).message);
     } finally {

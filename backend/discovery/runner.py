@@ -1818,11 +1818,14 @@ class DiscoveryRunner:
                             )
                         else:
                             if not await session.check_session():
+                                why = getattr(session, "last_check_reason", "")
                                 await sessions_engine.mark_session_failed(
-                                    platform_id, session_id, "expired")
+                                    platform_id, session_id,
+                                    "checkpointed" if why in ("suspended", "checkpointed") else "expired")
                                 raise RuntimeError(
-                                    f"{registry.display_name(platform_id)} session is not usable -- "
-                                    "check credentials under /sessions")
+                                    f"{registry.display_name(platform_id)} session is not usable"
+                                    + (f" ({why})" if why else "")
+                                    + " -- check credentials under /sessions")
                             await sessions_engine.mark_session_ok(platform_id, session_id)
                         if session is not None and hasattr(session, "sync_cookies"):
                             await session.sync_cookies()

@@ -90,7 +90,7 @@ _PLATFORM_HOSTS: dict[str, str] = {
     "twitter.com": "twitter", "x.com": "twitter",
     "instagram.com": "instagram",
     "youtube.com": "youtube", "youtu.be": "youtube",
-    "t.me": "telegram", "telegram.me": "telegram",
+    "t.me": "telegram", "telegram.me": "telegram", "telegram.dog": "telegram",
     "tiktok.com": "tiktok",
 }
 
@@ -238,6 +238,54 @@ _PREFLIGHT_TIMEOUT_S = 8.0
 _PREFLIGHT_CONTROL_MIN = 3
 
 
+# HOW LONG ONE URL (OR A SESSION'S OPENING) MAY TAKE BEFORE IT IS GIVEN UP ON.
+#
+# `scraper.one()`, `scraper.start()` and `scraper.check_session()` were awaited
+# with no ceiling. Each engine bounds its own navigations, but a page that
+# loads and then never settles, a stuck evaluate or a wedged browser has no
+# bound of its own -- and one such await held its worker, and with it the
+# whole batch behind it, for ever with nothing on screen to say why. Generous
+# on purpose (three navigation timeouts, never under two minutes): a bound
+# that fires on a slow-but-working read would turn a good profile into an
+# error, which is the opposite of what it is for.
+_MIN_STEP_TIMEOUT_S = 120.0
+
+
+def _step_timeout_s() -> float:
+    try:
+        nav = float(settings.request_timeout_sec or 0)
+    except (TypeError, ValueError):
+        nav = 0.0
+    return max(_MIN_STEP_TIMEOUT_S, 3.0 * nav)
+
+
+async def _bounded(coro, what: str):
+    """Await `coro`, but never past `_step_timeout_s()`. A timeout becomes a
+    RuntimeError that names what hung, so it travels the same path as any other
+    worker failure and is reported, never raised as a bare TimeoutError."""
+    bound = _step_timeout_s()
+    try:
+        return await asyncio.wait_for(coro, timeout=bound)
+    except asyncio.TimeoutError:
+        raise RuntimeError(f"{what} timed out after {bound:.0f}s") from None
+
+
+# WHAT AN ITEM THAT WAS NEVER READ SAYS. A cancelled job used to leave its
+# unread URLs "pending" (and any in flight "running" for ever), so a stopped
+# batch looked like one that was still going or had simply finished. They are
+# marked, in memory only: persisting them would overwrite a good saved reading
+# of the same profile with a non-result.
+NOT_ANALYSED_CANCELLED = "cancelled -- not analysed"
+
+
+def _mark_not_analysed(it: "AnalysisItem", why: str = NOT_ANALYSED_CANCELLED) -> None:
+    it.status = "error"
+    it.error = why
+    it.comments = why
+    it.row_status = "CANCELLED"
+    it.analysed_at = None
+
+
 async def _close_quietly(what: str, close) -> None:
     """Await a teardown, but never past `_TEARDOWN_TIMEOUT_S`, and never let
     it raise. `close` is a zero-arg callable rather than an already-created
@@ -314,7 +362,14 @@ def parse_direct_url(raw: str) -> Optional[tuple[str, str, str]]:
     raw = (raw or "").strip()
     if not raw:
         return None
-    url = raw if raw.startswith(("http://", "https://")) else f"https://{raw}"
+    # The scheme is case-insensitive ("HTTPS://x.com/a" is a URL, not a host
+    # called "HTTPS:"), and is lower-cased here so every normalizer downstream,
+    # which compares it as written, sees a scheme it recognises.
+    m = re.match(r"^(https?)://", raw, re.I)
+    if m:
+        url = m.group(1).lower() + raw[m.end(0) - 3:]
+    else:
+        url = f"https://{raw}"
     try:
         parsed = urlparse(url)
     except Exception:
@@ -328,7 +383,7 @@ def parse_direct_url(raw: str) -> Optional[tuple[str, str, str]]:
     # "not a supported platform URL": never analysed, and never surfaced as
     # a failure either. Stripping is safe because the dict lookup still has
     # to match: an unrelated `m.example.com` simply stays unknown.
-    for _prefix in ("www.", "web.", "m.", "mobile."):
+    for _prefix in ("www.", "web.", "m.", "mobile.", "mbasic."):
         if host.startswith(_prefix):
             host = host[len(_prefix):]
             break
@@ -347,7 +402,43 @@ def parse_direct_url(raw: str) -> Optional[tuple[str, str, str]]:
 
     parts = [s for s in parsed.path.rstrip("/").split("/") if s]
     entity_id = parts[-1].lstrip("@") if parts else ""
+    if platform == "tiktok":
+        # The account is the "@handle" segment, not the last one: for
+        # /@foo/video/123 the last segment is the video's id.
+        entity_id = next((s[1:] for s in parts if s.startswith("@")), entity_id.lstrip("@"))
     return platform, url, entity_id
+
+
+def _dedupe_key(platform: str, url: str, entity_id: str = "") -> str:
+    """WHAT makes two pasted URLs the same account, for de-duplication only --
+    the URL that is actually scraped is untouched.
+
+    The key used to be the pasted string itself, so `twitter.com/Foo`,
+    `x.com/foo`, `x.com/foo/` and `x.com/foo?s=20` were four "different" URLs:
+    one account analysed (and billed to a session) four times, and four rows
+    competing for one saved result. Each spelling difference that cannot change
+    which account is meant is folded away: the host (through the same alias
+    table as the platform lookup), the query string and fragment, a trailing
+    slash and -- where the platform's handles are case-insensitive -- case.
+
+    CASE IS KEPT where it is meaningful: a YouTube /channel/UC... id and a
+    Facebook numeric id are exact strings.
+    """
+    try:
+        path = (urlparse(url).path or "").rstrip("/")
+    except Exception:                                # noqa: BLE001 - never fatal
+        return f"{platform}:{url}"
+    if platform == "facebook":
+        if "profile.php" in path.lower() and entity_id:
+            return f"facebook:profile:{entity_id}"
+        return f"facebook:{path.lower()}"
+    if platform == "telegram":
+        low = path.lower()
+        return f"telegram:{low[2:] if low.startswith('/s/') else low}"
+    if platform == "youtube":
+        return f"youtube:{path.lower() if path.startswith('/@') else path}"
+    # twitter, instagram, tiktok: handles are case-insensitive
+    return f"{platform}:{path.lower()}"
 
 
 def to_ddmmyyyy(iso: Optional[str]) -> str:
@@ -695,7 +786,9 @@ class AnalysisRunner:
 
         skipped: list[dict] = []
         items: list[AnalysisItem] = []
-        seen: set[str] = set()
+        # canonical key -> the first pasted URL (and its normalized form) that
+        # claimed it, so a duplicate can say WHICH input it duplicates.
+        seen: dict[str, tuple[str, str]] = {}
 
         # Callers key `seed_by_url` by the url they hold (discovery passes
         # the profile document's own `url`), but every lookup downstream is
@@ -722,13 +815,25 @@ class AnalysisRunner:
             if plat is None or not plat.enabled:
                 skipped.append({"url": raw, "reason": f"{platform} is not available"})
                 continue
-            if url in seen:
-                skipped.append({"url": raw, "reason": "duplicate of another URL in this batch"})
-                continue
-            seen.add(url)
             # Accept either spelling: the url the caller handed us, or one
             # already in normal form.
-            if (entry_seed := raw_seed.get(raw) or raw_seed.get(url)) is not None:
+            entry_seed = raw_seed.get(raw) or raw_seed.get(url)
+            key = _dedupe_key(platform, url, entity_id)
+            if key in seen:
+                first_raw, first_url = seen[key]
+                # REPORTED, NOT DROPPED: every pasted input comes out as
+                # exactly one result or one stated reason. A seed that was
+                # filed under THIS spelling is handed to the first one rather
+                # than lost with the duplicate.
+                if entry_seed is not None:
+                    seed_by_url.setdefault(first_url, entry_seed)
+                skipped.append({
+                    "url": raw,
+                    "reason": f"duplicate of {first_raw} (same account) earlier in this batch",
+                })
+                continue
+            seen[key] = (raw, url)
+            if entry_seed is not None:
                 seed_by_url.setdefault(url, entry_seed)
             items.append(AnalysisItem(
                 id=uuid.uuid4().hex[:12], raw_url=raw, url=url,
@@ -825,6 +930,7 @@ class AnalysisRunner:
                             job.platform_progress[pid]["completed"] += 1
 
             if job.cancel.is_set():
+                self._mark_unread_not_analysed(job)
                 job.status = CANCELLED
                 job.message = f"cancelled after {job.completed}/{job.total}"
             else:
@@ -845,6 +951,7 @@ class AnalysisRunner:
             # and re-raising would leave the job reported as RUNNING to
             # every poller. Results already scraped are already saved --
             # each item is written as it completes, not at the end.
+            self._mark_unread_not_analysed(job)
             job.status = CANCELLED
             job.message = f"stopped after {job.completed}/{job.total}"
             log.info(f"analysis job {job.id}: {job.message}")
@@ -864,6 +971,15 @@ class AnalysisRunner:
                 except Exception as e:                          # noqa: BLE001
                     log.error(f"analysis job {job.id}: failure alert not sent -- "
                               f"{type(e).__name__}: {e}")
+
+    @staticmethod
+    def _mark_unread_not_analysed(job: AnalysisJob) -> None:
+        """Every item a cancelled job never finished reading -- still queued, or
+        in flight when the stop landed -- is stated as not analysed, so the
+        stopped batch can never be mistaken for a complete one."""
+        for it in job.items:
+            if it.status in ("pending", "running"):
+                _mark_not_analysed(it)
 
     async def _preflight(
         self, job: AnalysisJob, by_platform: dict[str, list[AnalysisItem]],
@@ -1255,7 +1371,7 @@ class AnalysisRunner:
                     inner = getattr(scraper, "session", None)
                     if inner is not None:
                         inner.on_cookies = sessions_engine.cookie_saver(platform_id, session_id)
-                    await scraper.start()
+                    await _bounded(scraper.start(), f"{platform_id} browser start")
 
                     # SKIPPED WHEN THE ANSWER IS ALREADY KNOWN -- the same reasoning
                     # and the same PROVEN_FRESH_S window discovery/runner.py uses.
@@ -1272,7 +1388,8 @@ class AnalysisRunner:
                             f"{(time.time() - float(session_item.get('last_ok') or 0)) / 60:.0f}m ago"
                         )
                     else:
-                        if not await scraper.check_session():
+                        if not await _bounded(
+                                scraper.check_session(), f"{platform_id} session check"):
                             await sessions_engine.mark_session_failed(
                                 platform_id, session_id, "expired")
                             raise RuntimeError(
@@ -1418,16 +1535,31 @@ class AnalysisRunner:
 
         jobs = [(it.url, job.target_name, job.official_feed) for it in items]
         t0 = time.time()
+        # THE SAME LIST THE ENGINE APPENDS EACH ROW TO AS IT SETTLES. A hard
+        # cancel never lets `run()` return, so without this every channel read
+        # before the stop was thrown away with it.
+        sink: list[Row] = []
         try:
             # Discovery's record per URL goes with the batch, so a channel
             # whose @handle changed since discovery still resolves by its
             # stored id instead of being reported GONE.
-            rows = await scraper.run(jobs, known_by_url=job.seed_by_url)
+            await scraper.run(jobs, known_by_url=job.seed_by_url, rows_out=sink)
+        except asyncio.CancelledError:
+            # KEEP WHAT WAS READ. Whatever the engine had settled is written
+            # as a normal result; the rest is stated as not analysed (by `_run`,
+            # which marks every unread item once the stop lands).
+            await self._settle_youtube_rows(
+                job, platform_id, items, list(sink), scraper, session_item, progress,
+                dur=time.time() - t0)
+            raise
         except Exception as e:
             dur = time.time() - t0
             detail = f"{type(e).__name__}: {e}"
             log.error(f"analysis job {job.id}: youtube batch failed -- {detail}")
-            for it in items:
+            # What was read before the failure is still a reading.
+            await self._settle_youtube_rows(
+                job, platform_id, items, list(sink), scraper, session_item, progress, dur=dur)
+            for it in items[len(sink):]:
                 it.duration_seconds = round(dur / max(1, len(items)), 2)
                 await self._fail_item(job, it, detail)
                 job.completed += 1
@@ -1435,29 +1567,64 @@ class AnalysisRunner:
             progress["status"] = "failed"
             return
 
-        dur = time.time() - t0
-        per_item_dur = round(dur / max(1, len(rows)), 2)
-        quota_hit = False
-        for it, row in zip(items, rows):
-            it.duration_seconds = per_item_dur
-            if row.status == "CHECKPOINT":
-                quota_hit = True
-                await sessions_engine.mark_session_failed(
-                    platform_id, session_item.get("id", ""), "rate_limited",
-                    detail=row.notes or "quota exhausted",
-                )
-            known = job.seed_by_url.get(it.url)
-            await self._populate(job, it, row, known)
-            job.completed += 1
-            progress["completed"] += 1
+        rows = list(sink)
+        quota_hit = await self._settle_youtube_rows(
+            job, platform_id, items, rows, scraper, session_item, progress,
+            dur=time.time() - t0)
 
-        for it in items[len(rows):]:
-            it.duration_seconds = 0.0
-            await self._fail_item(job, it, "youtube quota exhausted mid-batch -- not attempted")
-            job.completed += 1
-            progress["completed"] += 1
+        rest = items[len(rows):]
+        if rest and job.cancel.is_set():
+            # A stop, not a failure: left as they are for `_run` to state as
+            # not analysed, not reported as quota errors.
+            pass
+        else:
+            for it in rest:
+                it.duration_seconds = 0.0
+                await self._fail_item(job, it, "youtube quota exhausted mid-batch -- not attempted")
+                job.completed += 1
+                progress["completed"] += 1
 
         progress["status"] = "failed" if quota_hit else "done"
+
+    async def _settle_youtube_rows(
+        self, job: AnalysisJob, platform_id: str, items: list[AnalysisItem],
+        rows: list[Row], scraper: Any, session_item: dict, progress: dict, *, dur: float,
+    ) -> bool:
+        """Map and SAVE each row the batch produced. -> True when one of them
+        was the daily quota running out.
+
+        ONE ITEM CANNOT STRAND ITS SIBLINGS. Each item's populate/settle is its
+        own try: a mapping error on one channel used to raise out of the loop
+        and leave every channel after it "running" for ever with no row, no
+        count and no error. It is now recorded as that item's own failure and
+        the loop carries on.
+
+        SAVED HERE, as `_scrape_one` does for the browser platforms -- this path
+        called `_populate` only, so a YouTube batch was never written to
+        storage and did not survive a reload.
+        """
+        quota_hit = False
+        per_item_dur = round(dur / max(1, len(rows)), 2)
+        for it, row in zip(items, rows):
+            it.duration_seconds = per_item_dur
+            try:
+                if row.status == "CHECKPOINT":
+                    quota_hit = True
+                    await sessions_engine.mark_session_failed(
+                        platform_id, session_item.get("id", ""), "rate_limited",
+                        detail=row.notes or "quota exhausted",
+                    )
+                known = job.seed_by_url.get(it.url)
+                await self._populate(job, it, row, known)
+                await self._settle(job, it, screenshot=row.screenshot_bytes)
+            except Exception as e:                    # noqa: BLE001 - see docstring
+                log.error(f"analysis job {job.id}: youtube {it.url} could not be recorded -- "
+                          f"{type(e).__name__}: {e}")
+                it.where = diagnostics.where(e)
+                await self._fail_item(job, it, f"{type(e).__name__}: {e}")
+            job.completed += 1
+            progress["completed"] += 1
+        return quota_hit
 
     async def _scrape_one(
         self, job: AnalysisJob, it: AnalysisItem, scraper: Any,
@@ -1473,10 +1640,32 @@ class AnalysisRunner:
         prog["current_step"] = "Extracting profile & screenshots..."
         prog["item_started_at_ts"] = time.time()
         fatal = False
+        # COUNTED ONLY ONCE IT HAS ACTUALLY SETTLED. This used to be a bare
+        # `finally: job.completed += 1`, which also ran when a hard cancel
+        # unwound the task: the item was counted done, never read, and left
+        # "running" for ever -- a stopped batch reporting itself further along
+        # than it was.
+        finished = False
+        # An anonymous session has no cookies, so there is nothing a row note
+        # can say about them: it is never marked failed, never fatal.
+        anonymous = bool(session_item.get("anonymous"))
         t0 = time.time()
         try:
             known = job.seed_by_url.get(it.url)
-            row = await scraper.one(it.url, job.target_name, job.official_feed, known=known)
+            try:
+                row = await asyncio.wait_for(
+                    scraper.one(it.url, job.target_name, job.official_feed, known=known),
+                    timeout=_step_timeout_s())
+            except asyncio.TimeoutError:
+                # A page that never settles must not hold the worker (and the
+                # batch queued behind it) for ever. An ordinary ERROR row for
+                # this one URL: nothing about it says the session is dead.
+                bound = _step_timeout_s()
+                log.warning(f"[{platform_id}] {it.url} did not finish within {bound:.0f}s -- given up on")
+                row = Row(url=it.url, target=job.target_name, original_feed=job.official_feed)
+                row.status = "ERROR"
+                row.note(f"timed out after {bound:.0f}s -- the page never finished loading, "
+                         f"so this profile was not analysed")
             it.duration_seconds = round(time.time() - t0, 2)
             await self._populate(job, it, row, known)
             # SAVED HERE, NOT INSIDE _populate. `_populate` is a pure
@@ -1488,6 +1677,7 @@ class AnalysisRunner:
             # job's own lifecycle is what owns durability, so the write
             # belongs at this level.
             await self._settle(job, it, screenshot=row.screenshot_bytes)
+            finished = True
             # A BLOCKED SESSION RETURNS, IT DOES NOT RAISE. Only exceptions
             # were classified here, so a row the engine had already marked
             # CHECKPOINT/LOGIN_REQUIRED left this worker visiting every
@@ -1508,7 +1698,16 @@ class AnalysisRunner:
                     reason = _blocked_reason(platform_id, row)
                 elif row.status == "ERROR":
                     reason = classify_failure(row.notes or "")
-                if reason:
+                if reason and anonymous:
+                    # NOT A SESSION FAILURE. A logged-out browser has no
+                    # cookies to be rejected or expired: a wall or a refusal
+                    # there is about this URL (or this IP), and treating it as
+                    # a dead session ended the worker and stranded the rest of
+                    # the batch. The row already says what happened.
+                    log.warning(
+                        f"[{platform_id}] anonymous visit to {it.url} read as {reason!r} "
+                        f"({row.status}) -- recorded on the row; there is no session to fail")
+                elif reason:
                     await sessions_engine.mark_session_failed(
                         platform_id, session_item.get("id", ""), reason,
                         detail=row.notes or row.status)
@@ -1519,6 +1718,7 @@ class AnalysisRunner:
             it.duration_seconds = round(time.time() - t0, 2)
             it.where = diagnostics.where(e)
             await self._fail_item(job, it, f"{type(e).__name__}: {e}")
+            finished = True
             # A STOP IS NOT A BAD ACCOUNT. Tearing a browser down under an
             # in-flight page produces platform-shaped error text: a Playwright
             # timeout still carries the URL it was navigating to, and on
@@ -1530,16 +1730,23 @@ class AnalysisRunner:
             # pool as expired on cookies that were never touched. A cancel
             # says nothing about the session, so it is recorded against the
             # item/keyword and nowhere else.
-            if (reason := classify_failure(e)) and not job.cancel.is_set():
+            if (reason := classify_failure(e)) and not job.cancel.is_set() and not anonymous:
                 await sessions_engine.mark_session_failed(
                     platform_id, session_item.get("id", ""), reason, detail=str(e))
                 fatal = True
             elif _browser_gone(f"{type(e).__name__}: {e}") and not job.cancel.is_set():
                 fatal = True
+        except asyncio.CancelledError:
+            # The hard stop landed mid-read. Not counted (see `finished`), and
+            # stated rather than left "running".
+            if not finished:
+                _mark_not_analysed(it)
+            raise
         finally:
-            job.completed += 1
-            if platform_id in job.platform_progress:
-                job.platform_progress[platform_id]["completed"] += 1
+            if finished:
+                job.completed += 1
+                if platform_id in job.platform_progress:
+                    job.platform_progress[platform_id]["completed"] += 1
         return fatal
 
     # -------------------------------------------------------------- mapping
@@ -1592,6 +1799,13 @@ class AnalysisRunner:
         it.last_post_date = row.last_post_iso
         it.created_date = row.created_iso
         it.is_active = _tri(row.active_yes)
+        # A LAST-POST DATE THAT IS ONLY A FLOOR (TikTok's search-derived one:
+        # the newest post search happened to show, not the newest there is)
+        # can prove an account active -- a post inside the window exists -- but
+        # can never prove it inactive, because a newer post may sit beyond what
+        # search showed. "No" there is "unknown", not a finding.
+        if it.is_active is False and str(row.src.get("last_post") or "").endswith("lowerbound"):
+            it.is_active = None
         it.has_logo = _tri(row.logo_yes)
         it.has_name_match = _tri(row.name_yes)
         it.name_score = row.name_score

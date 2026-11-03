@@ -241,9 +241,16 @@ def user_to_row(u: "TwitterUser", keyword: str, *, source: str = "graphql") -> R
         url=u.url, target=keyword, entity_type="profile",
         profile_id=u.entity_id, username=u.handle, profile_name=u.name,
         profile_pic_url=u.avatar, has_custom_pic=u.has_custom_pic,
-        verified=u.verified, followers=u.followers, friends=u.following,
+        # A DOM-read card cannot say whether a badge is platform-issued, so
+        # its verdict is unknown (None), not "not verified".
+        verified=(None if source == "dom" else u.verified),
+        followers=u.followers, friends=u.following,
         bio=u.description, location=u.location, created_iso=u.created_iso,
     )
+    if u.verified_type == "blue":
+        row.note("blue (paid) check")
+    elif u.verified_type == "badge":
+        row.note("badge shown (type not readable from the page)")
     always = ("profile_name", "profile_pic_url", "verified")
     # the DOM fallback (see dom_users below) carries none of the extra
     # fields -- only mark what this particular extraction tier actually
@@ -341,7 +348,11 @@ async def dom_users(page) -> list[TwitterUser]:
             handle=handle,
             name=(r.get("name") or "").strip(),
             avatar=hd_picture_url((r.get("avatar") or "").strip()),
-            verified=bool(r.get("verified")),
+            # `icon-verified` is drawn for the paid blue check too, so the DOM
+            # cannot establish a platform-issued badge: it is recorded as an
+            # unclassified badge, never as verified.
+            verified=False,
+            verified_type="badge" if r.get("verified") else "",
         ))
     return users
 
@@ -470,17 +481,30 @@ def _user_from_result(res: dict, probe: Any = None) -> Optional[TwitterUser]:
         location=location.strip(),
         # request the larger render; _normal is a 48px thumbnail
         avatar=hd_picture_url(avatar),
-        verified=bool(
-            res.get("is_blue_verified")
-            or legacy.get("verified")
-            or verification.get("verified")
-        ),
+        # `verified` means a PLATFORM-ISSUED badge (Row.verified). A blue check
+        # is is_blue_verified -- a paid subscription -- and used to set this,
+        # so every subscriber read as "verified". Only a legacy/verification
+        # flag or a non-blue type (business/government ...) counts now; the
+        # paid check survives as verified_type == "blue".
+        verified=_platform_verified(legacy, verification, verified_type),
         verified_type=verified_type,
         protected=bool(legacy.get("protected") or privacy.get("protected")),
         description=description.strip(),
         external_url=external_url,
         default_pic=default_pic,
     )
+
+
+def _platform_verified(legacy: dict, verification: dict, verified_type: str) -> bool:
+    """True only for a badge X itself issued: the legacy `verified` flag,
+    `verification.verified`, or a typed badge that is not the paid blue one
+    (business/gold, government/grey ...)."""
+    # an explicit type other than the paid blue one is a real badge
+    own_type = str(legacy.get("verified_type")
+                   or verification.get("verified_type") or "").strip().lower()
+    if own_type and own_type != "blue":
+        return True
+    return bool(legacy.get("verified") or verification.get("verified"))
 
 
 ABOUT_QUERY = "AboutAccountQuery"

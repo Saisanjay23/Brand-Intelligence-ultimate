@@ -91,10 +91,21 @@ RE_LOGIN = re.compile(r"(You must log in|Log in to Facebook|Log In or Sign Up)",
 # checkpoint is a /checkpoint/ URL, which `_session_blocked` and
 # `shared/walls.py` decide by path; what is left here is wording only a wall
 # uses.
+#
+# "Temporarily Blocked" is Facebook's own throttle heading ("You're Temporarily
+# Blocked" / "You\u2019re ..."); apostrophes are written `.` because the page
+# serves a curly one. Like every pattern here it is trusted only OUTSIDE result
+# content (callers gate on chrome text / "no profile data came back").
 RE_CHECKPOINT = re.compile(
-    r"(Confirm Your Identity|account has been locked|We've temporarily)",
+    r"(Confirm Your Identity|account has been locked|We.ve temporarily|"
+    r"Temporarily Blocked)",
     re.I,
 )
+# Facebook's soft-throttle wording. Kept apart from RE_CHECKPOINT because
+# "try again later" is also ordinary prose: it is only ever searched on a page
+# that handed over no profile/results (analysis blocked_status, the search
+# page's `_session_blocked`), never on content.
+RE_TRY_LATER = re.compile(r"(Try again later|Please try again later)", re.I)
 RE_GONE = re.compile(
     r"(isn't available|Page Not Found|content is currently unavailable)", re.I
 )
@@ -502,7 +513,7 @@ async def _session_blocked(page, have_results: bool = False) -> str:
         body = await page.inner_text("body")
     except Exception:
         return ""
-    if RE_CHECKPOINT.search(body):
+    if RE_CHECKPOINT.search(body) or RE_TRY_LATER.search(body):
         return "checkpoint"
     if RE_LOGIN.search(body):
         return "login"
@@ -812,6 +823,54 @@ JS_DOM_SEARCH_HITS = """
 """
 
 
+def _dom_identity_keys(hit: "Hit") -> list[tuple]:
+    """Every identity a DOM-scraped result can be recognised by: its canonical
+    id (a vanity slug is case-insensitive; a numeric id is itself), and -- only
+    when it has a real picture -- (name, picture file), which ties the numeric
+    and vanity URL forms of one person together."""
+    keys: list[tuple] = [("id", (hit.entity_id or "").strip().lower())]
+    pid = profile_id(hit.url or "")
+    if pid:
+        keys.append(("id", pid.lower()))
+    if hit.avatar and hit.name:
+        try:
+            pic = urlparse(hit.avatar).path.rsplit("/", 1)[-1]
+        except Exception:
+            pic = ""
+        if pic:
+            keys.append(("pic", hit.name.strip().casefold(), pic))
+    return keys
+
+
+def dedupe_dom_hits(hits: list["Hit"]) -> list["Hit"]:
+    """One hit per person from a DOM scrape, in the page's own order.
+
+    The scrape keys its own `seen` set on the raw id/slug, so the same person
+    linked as `profile.php?id=N` and as `/Vanity` (or `/vanity`) came back as
+    two results. The first sighting keeps its position; when the later form is
+    the numeric id (what discovery and analysis key a profile by everywhere
+    else) it is adopted, and any blank field is filled from the duplicate."""
+    out: list[Hit] = []
+    index: dict[tuple, int] = {}
+    for h in hits:
+        keys = _dom_identity_keys(h)
+        at = next((index[k] for k in keys if k in index), None)
+        if at is None:
+            out.append(h)
+            at = len(out) - 1
+        else:
+            kept = out[at]
+            if h.entity_id.isdigit() and not kept.entity_id.isdigit():
+                kept.entity_id, kept.url = h.entity_id, h.url
+            if not kept.avatar and h.avatar:
+                kept.avatar, kept.has_custom_pic = h.avatar, h.has_custom_pic
+            if not kept.name and h.name:
+                kept.name = h.name
+        for k in _dom_identity_keys(out[at]) + keys:
+            index.setdefault(k, at)
+    return out
+
+
 async def dom_search_hits(page, keyword: str, tab: str) -> list["Hit"]:
     """Scrape the rendered search results page. Only runs when the GraphQL
     payload produced nothing at all, see Discovery.sweep."""
@@ -837,7 +896,7 @@ async def dom_search_hits(page, keyword: str, tab: str) -> list["Hit"]:
             rank=i,
             source="dom",
         ))
-    return hits
+    return dedupe_dom_hits(hits)
 
 
 @dataclass
@@ -933,7 +992,20 @@ RESOLVE_CONCURRENCY = 2
 # isn't the same fixed set every time (real-world timing varies), so a
 # later re-sweep has a genuinely different chance at any of them, not a
 # permanently-doomed subset.
-def _worth_visiting(missing: set[str], *, cap: int, parsed: int) -> set[str]:
+def _in_platform_order(ids, order=None) -> list[str]:
+    """`ids` in the order Facebook rendered them (`order`, top to bottom),
+    ids it never listed last in a stable sorted tail. A cap that cuts a list
+    must cut it from the BOTTOM of Facebook's ranking; sorting by id cut it
+    by an arbitrary number instead, and kept whichever profiles happened to
+    have the smallest ids."""
+    want = set(ids)
+    ranked = [i for i in (order or []) if i in want]
+    seen = set(ranked)
+    return ranked + sorted(want - seen)
+
+
+def _worth_visiting(missing: set[str], *, cap: int, parsed: int,
+                    order=None) -> set[str]:
     """Which rendered-but-unparsed ids are worth a profile visit.
 
     Backfilled hits sort BEHIND the graphql-confirmed ones and are then
@@ -953,7 +1025,7 @@ def _worth_visiting(missing: set[str], *, cap: int, parsed: int) -> set[str]:
     if not cap:
         return set(missing)
     room = max(0, cap - parsed)
-    return set(sorted(missing)[:room])
+    return set(_in_platform_order(missing, order)[:room])
 
 
 RESOLVE_TIME_BUDGET_SEC = 180
@@ -1611,6 +1683,9 @@ class Discovery:
 
         parsed_any: dict[str, Hit] = {}
         rendered_ids: set[str] = set()
+        # The same ids in Facebook's own top-to-bottom order (a set has none),
+        # so a cap that trims the backfill keeps the highest-ranked ones.
+        rendered_order: list[str] = []
         processed_ids: set[str] = set()
         state: Optional[PageState] = None
         arrived = asyncio.Event()
@@ -1659,7 +1734,10 @@ class Discovery:
                     by_id[hit.entity_id] = hit
             if st := page_state(blob, probe):
                 state = st
-                rendered_ids.update(st.ids_shown)
+                for _rid in st.ids_shown:
+                    if _rid not in rendered_ids:
+                        rendered_order.append(_rid)
+                        rendered_ids.add(_rid)
                 processed_ids.update(st.ids_processed)
 
         async def on_response(resp):
@@ -2037,8 +2115,10 @@ class Discovery:
             # downloaded and understood.
             already_known = missing & parsed_any.keys()
             missing_worth_visiting = _worth_visiting(
-                missing - already_known, cap=cap, parsed=len(by_id))
-            to_resolve = sorted(missing_worth_visiting | unresolved_in_by_id)
+                missing - already_known, cap=cap, parsed=len(by_id),
+                order=rendered_order)
+            to_resolve = _in_platform_order(
+                missing_worth_visiting | unresolved_in_by_id, rendered_order)
             out.resolved_visits = len(to_resolve)
             # WHY a visit was needed, not just how many. The resolve phase is
             # ~80% of a sweep's wall clock (measured: 57.8s of 72.4s across
@@ -2102,7 +2182,7 @@ class Discovery:
                             h.avatar = r.avatar
                             h.has_custom_pic = r.has_custom_pic
 
-            for eid in sorted(missing):
+            for eid in _in_platform_order(missing, rendered_order):
                 # FIRST: the edge we already parsed this sweep, if we have
                 # one. `missing` means "rendered but not absorbed", and the
                 # commonest reason is the cap stopping absorption mid-payload

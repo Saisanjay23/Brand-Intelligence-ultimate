@@ -480,8 +480,11 @@ async def status(platform_id: str, live_health: Optional[dict] = None) -> dict:
     if health is not None and not _health_predates_credentials(items, health.get("checked_at")):
         out["last_verified"] = _as_iso(health.get("checked_at"))
         if out["state"] == "ready" and not health.get("ok", True):
-            out["state"] = "checkpointed"
-            out["message"] = health.get("detail", "")
+            detail = health.get("detail", "") or ""
+            # "expired" is a logged-out jar; anything else (checkpoint,
+            # suspended, unknown) needs a human to look at the account.
+            out["state"] = "expired" if detail.startswith("expired") else "checkpointed"
+            out["message"] = detail
 
     if run := _logins.get(p.id):
         out["login"] = run
@@ -1340,6 +1343,22 @@ async def launch_login(platform_id: str, timeout_s: int = 300, identifier: str =
 
 # ---------- background health monitor ----------
 
+_CHECK_REASON_TEXT = {
+    "suspended": "suspended -- the platform disabled this account; logging in again will not fix it, use another account",
+    "checkpointed": "checkpointed -- clear the challenge in a real browser, then paste fresh cookies",
+    "expired": "expired -- these cookies are logged out; log in again or paste fresh cookies",
+}
+
+
+def _why_check_failed(scraper) -> str:
+    """The honest reason a health check failed, read off the session the
+    platform adapter wraps. Every failure used to be reported as "invalid or
+    checkpointed", so a logged-out jar and a banned account looked alike."""
+    holder = getattr(scraper, "session", scraper)
+    reason = getattr(holder, "last_check_reason", "") or getattr(scraper, "last_check_reason", "")
+    return _CHECK_REASON_TEXT.get(reason, "session invalid or checkpointed")
+
+
 async def verify_session_item(
     platform_id: str, cookies: list[dict], session_id: str = "",
 ) -> tuple[bool, str, bool]:
@@ -1434,7 +1453,9 @@ async def verify_session_item(
         return False, f"{type(e).__name__}: {e}", False
     try:
         ok = await scraper.check_session()
-        return ok, "" if ok else "session invalid or checkpointed", True
+        if ok:
+            return True, "", True
+        return False, _why_check_failed(scraper), True
     except Exception as e:
         return False, f"{type(e).__name__}: {e}", False
     finally:
@@ -1514,7 +1535,9 @@ async def _verify_credential_item(platform_id: str, item: dict) -> tuple[bool, s
         return False, f"{type(e).__name__}: {e}", False
     try:
         ok = await scraper.check_session()
-        return ok, "" if ok else "session invalid or checkpointed", True
+        if ok:
+            return True, "", True
+        return False, _why_check_failed(scraper), True
     except Exception as e:
         return False, f"{type(e).__name__}: {e}", False
     finally:

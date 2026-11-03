@@ -351,8 +351,17 @@ def _latest_post(node: dict, posts: Optional[int] = None) -> str:
     """
     if posts == 0:
         return ""
+    own = str(node.get("username") or "").strip().lower() if isinstance(node, dict) else ""
     best = 0
     for d in iter_dicts(node):
+        # A media object that NAMES a different author is not this profile's
+        # post: the record also carries tagged posts and suggested-account
+        # previews, and a tagged post published today would otherwise become
+        # "last post = today" on an account that has not posted for a year.
+        # One naming nobody is kept (the node is already this profile's own).
+        owner = _media_owner(d)
+        if owner and own and owner != own:
+            continue
         best = max(best, _media_timestamp(d))
     if not best:
         return ""
@@ -850,13 +859,28 @@ async def _page_gap(options) -> None:
     (the same reasoning as stealth/human.py::Human.sleep) -- the gap at the
     high stealth level is long enough that a flat sleep would hold a cancelled
     sweep for several seconds per page."""
+    # Scaled by the pacing governor, like every other gap that goes through
+    # the browser session (stealth/browser.py): 1.0 while the platform is
+    # happy, up to 8x after it pushed back, so a throttled sweep slows down
+    # instead of paging at full speed into the same refusal.
     wait = stealth_levels.jittered(stealth_levels.value("instagram", "page_gap", 2.5))
+    wait *= max(1.0, governor_for("instagram").gap_multiplier())
     deadline = time.monotonic() + wait
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0 or cancelled(options):
             return
         await asyncio.sleep(min(0.2, remaining))
+
+
+async def _close_quietly(page) -> None:
+    """Close a Playwright page, never raising (it may already be gone)."""
+    if page is None:
+        return
+    try:
+        await page.close()
+    except Exception:
+        pass
 
 
 async def _swap_to_app_ua(route) -> None:
@@ -944,6 +968,7 @@ class Discovery:
             except Exception:
                 pass
             self._tab = None
+        tab = None
         try:
             tab = await self.ctx.new_page()
             await tab.route("**/api/v1/users/search/**", _swap_to_app_ua)
@@ -968,6 +993,10 @@ class Discovery:
             self._tab = tab
             return tab
         except Exception:
+            # The tab opened but never became usable (the route or the home
+            # feed failed): close it, or every retry leaves another blank
+            # instagram.com tab open for the rest of the session.
+            await _close_quietly(tab)
             return None
 
     async def _get(self, url: str, headers: dict):
@@ -987,6 +1016,9 @@ class Discovery:
                     res = await tab.evaluate(_JS_PAGE_GET, [same_origin, browser_headers])
                 return _PageResponse(int(res.get("status") or 0), res.get("text") or "")
             except Exception:
+                # Dropped, so it must be closed too -- forgetting a tab is
+                # not closing it.
+                await _close_quietly(self._tab)
                 self._tab = None
         return await self.ctx.request.get(url, headers=headers, timeout=self.a.timeout * 1000)
 
@@ -1234,6 +1266,10 @@ class Discovery:
                     # about it (http-403) no longer describes the sweep's
                     # outcome
                     out.stopped = "mobile-api-failed-web-recovered"
+                    # The web leg is the shallow endpoint (a handful of
+                    # accounts, no pagination): never "reached the end of
+                    # the results", whatever the mobile leg had claimed.
+                    out.complete = False
                     # ...and its error text describes the MOBILE leg, which
                     # is not the sweep's outcome -- so a throttle or a plain
                     # refusal is cleared, rather than have the runner

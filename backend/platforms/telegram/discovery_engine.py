@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import random
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -143,6 +144,18 @@ class NotCached(LookupError):
     is gone -- only that there is no access hash to reach it with."""
 
 
+class EntityInaccessible(RuntimeError):
+    """The name resolved to something Telegram will not show this session --
+    NOT the same as "taken down". `reason` is "private" (a private/forbidden
+    channel or group), "invalid" (not a legal username) or "unresolved"
+    (Telethon could not turn the reference into an entity). Filing any of
+    these as GONE told an analyst a live account may already be down."""
+
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(detail or reason)
+        self.reason = reason
+
+
 class FloodWait(RuntimeError):
     """Telegram asked us to slow down. Treated like a checkpoint."""
 
@@ -170,8 +183,19 @@ class TelegramEntity:
     fake: bool = False
     premium: bool = False
     avatar: str = ""
-    has_photo: bool = False
+    # None = unknown (the object carried no photo attribute, or it is a
+    # *Forbidden stub); False = the account provably has no picture.
+    has_photo: Optional[bool] = None
     last_post_iso: str = ""
+    bot: bool = False
+    # A ChannelForbidden / ChatForbidden stub: Telegram refused to show it.
+    forbidden: bool = False
+    # Channel.date is the JOIN date when the session is a member, so it is
+    # not offered as a creation date; this records that it was withheld.
+    created_withheld: bool = False
+    # Reading gaps found while resolving (members/last post not read ...),
+    # copied onto the row so a gap never looks like an empty answer.
+    notes: list = field(default_factory=list)
 
     @property
     def url(self) -> str:
@@ -208,6 +232,8 @@ def entity_to_row(e: "TelegramEntity", keyword: str) -> Row:
         row.note("Telegram flags this account as fake")
     if e.restricted:
         row.note("Telegram flags this account as restricted")
+    if e.bot:
+        row.note("bot account")
     return row
 
 
@@ -260,15 +286,32 @@ def entity_from(obj: Any, probe: Any = None) -> Optional[TelegramEntity]:
         return None
     (probe.hit if getattr(obj, "id", "") else probe.miss)(K_TG_ID)
     (probe.hit if kind else probe.miss)(K_TG_KIND)
-    photo = getattr(obj, "photo", None)
-    has_photo = photo is not None and "Empty" not in type(photo).__name__
+    forbidden = "Forbidden" in type(obj).__name__
+    # UNKNOWN is not "no picture": an object with no `photo` attribute, or a
+    # *Forbidden stub (which never carries one), has told us nothing.
+    has_photo: Optional[bool]
+    if forbidden or not hasattr(obj, "photo"):
+        has_photo = None
+    else:
+        photo = getattr(obj, "photo", None)
+        has_photo = photo is not None and "Empty" not in type(photo).__name__
+    # Channel.date is the date the SESSION JOINED when it is a member, and
+    # only the creation date when it is not (Telegram sets `left` for a
+    # non-member). Anything short of a provable non-member is withheld
+    # rather than reported as a creation date.
+    raw_date = _iso(getattr(obj, "date", None)) if kind != "profile" else ""
+    non_member = getattr(obj, "left", None) is True
+    created_iso = raw_date if non_member else ""
     return TelegramEntity(
         entity_id=str(getattr(obj, "id", "") or ""),
         username=username,
         title=name,
         kind=kind,
         members=getattr(obj, "participants_count", None),
-        created_iso=_iso(getattr(obj, "date", None)) if kind != "profile" else "",
+        created_iso=created_iso,
+        created_withheld=bool(raw_date and not created_iso),
+        bot=bool(getattr(obj, "bot", False)),
+        forbidden=forbidden,
         verified=bool(getattr(obj, "verified", False)),
         scam=bool(getattr(obj, "scam", False)),
         restricted=bool(getattr(obj, "restricted", False)),
@@ -332,6 +375,9 @@ class Telegram:
             # connect(), never start(): start() prompts for a phone code on stdin
             await self.client.connect()
             authorised = await self.client.is_user_authorized()
+        except FloodWaitError as e:
+            await self.stop()
+            raise FloodWait(int(getattr(e, "seconds", 0) or 0)) from e
         except BaseException:
             # CLOSE ON A FAILED START. Callers only call stop() after a
             # start() that returned, so a connect that raised (no network,
@@ -351,6 +397,14 @@ class Telegram:
                 "telegram session is not authenticated -- run an interactive login "
                 "once to create session/telegram.session"
             )
+        # EVERY flood wait must reach our handlers. Telethon's default
+        # (flood_sleep_threshold=60) sleeps through any wait of 60s or less
+        # without telling anyone, so the platform was never asked to back
+        # off. Set AFTER the authorisation probe on purpose: Telethon's
+        # is_user_authorized() swallows every RPC error as "not logged in",
+        # so a flood wait on that one call with threshold 0 would read as a
+        # dead session and quarantine a healthy account.
+        self.client.flood_sleep_threshold = 0
 
     async def stop(self) -> None:
         """Disconnects and releases the MTProto client, freeing the local
@@ -477,17 +531,34 @@ class Telegram:
                 raise NotCached(
                     f"id {username} is not in this Telegram session's cache -- re-run "
                     "discovery for this client, then analyse it again") from e
+            # "No user has ... as username" is Telethon's wording for a
+            # username nobody holds -- the one real "gone". "Cannot find any
+            # entity corresponding to ..." is a reference it could not turn
+            # into an entity at all, which says nothing about whether an
+            # account exists.
+            if "Cannot find any entity" in str(e):
+                raise EntityInaccessible(
+                    "unresolved", f"telegram could not resolve {username!r}: {e}") from e
             return None
-        except (UsernameInvalidError, UsernameNotOccupiedError):
+        except UsernameNotOccupiedError:
             return None
+        except UsernameInvalidError as e:
+            raise EntityInaccessible(
+                "invalid", f"{username!r} is not a valid Telegram username") from e
         except FloodWaitError as e:
             raise FloodWait(int(getattr(e, "seconds", 0))) from e
-        except ChannelPrivateError:
-            return None
+        except ChannelPrivateError as e:
+            raise EntityInaccessible(
+                "private", f"{username!r} is a private channel/group, or this "
+                "account was banned from it") from e
 
         ent = entity_from(obj)
         if ent is None:
             return None
+        if ent.forbidden:
+            # A *Forbidden stub carries no members, about or messages, and
+            # asking for them only adds failing requests.
+            return ent
 
         if ent.has_photo:
             try:
@@ -504,6 +575,7 @@ class Telegram:
                 raise FloodWait(int(getattr(e, "seconds", 0))) from e
             except Exception as e:
                 log.debug(f"could not download photo for @{username}: {e}")
+                ent.notes.append("profile picture not read")
 
         try:
             if ent.kind == "profile":
@@ -519,28 +591,46 @@ class Telegram:
             raise
         except Exception as e:
             log.debug(f"no full detail for @{username}: {type(e).__name__}")
+            # A gap on the row, not just a debug line: without it a failed
+            # read looked exactly like a channel with no members/about.
+            ent.notes.append(
+                "bio not read" if ent.kind == "profile"
+                else "members/bio not read")
 
-        ent.last_post_iso = await self.last_post(obj)
+        # `get_messages(user, limit=1)` on a USER returns the DM history with
+        # the session's own account, so its own sent message became that
+        # person's "last post". Only channels and groups have a feed.
+        if ent.kind != "profile":
+            ent.last_post_iso = await self.last_post(obj, ent.notes)
         return ent
 
-    async def last_post(self, entity: Any) -> str:
-        """Newest message date. Users' own messages are not readable; channels' are."""
+    async def last_post(self, entity: Any, notes: Optional[list] = None) -> str:
+        """Newest real post date of a channel/group, "" when none could be
+        read. Service messages (joins, pins, title changes) are not posts and
+        are skipped. A failed read is appended to `notes` when given;
+        FloodWait always propagates."""
         try:
-            msgs = await self.client.get_messages(entity, limit=1)
+            msgs = await self.client.get_messages(entity, limit=5)
         except FloodWaitError as e:
             raise FloodWait(int(getattr(e, "seconds", 0))) from e
-        except Exception:
+        except Exception as e:
+            log.debug(f"last post not read: {type(e).__name__}: {e}")
+            if notes is not None:
+                notes.append("last post not read")
             return ""
-        if not msgs:
+        posts = [m for m in (msgs or [])
+                 if "MessageService" not in type(m).__name__
+                 and _iso(getattr(m, "date", None))]
+        if not posts:
             return ""
-        return _iso(getattr(msgs[0], "date", None))
+        return max(_iso(getattr(m, "date", None)) for m in posts)
 
     async def pause(self, seconds: float) -> None:
-        """Plain pacing sleep -- MTProto has no per-page/scroll rhythm to
-        wait on, so unlike the browser platforms this is a flat delay,
-        not a wait-for-a-real-signal poll."""
+        """Pacing sleep, jittered +-30% -- MTProto has no per-page/scroll
+        rhythm to wait on, but an exactly-constant interval between calls is
+        a machine's signature."""
         if seconds > 0:
-            await asyncio.sleep(seconds)
+            await asyncio.sleep(seconds * random.uniform(0.7, 1.3))
 
 
 # Crawling / search

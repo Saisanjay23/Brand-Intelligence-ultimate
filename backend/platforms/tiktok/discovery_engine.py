@@ -62,7 +62,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterator, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from backend.config.settings import settings
 from backend.platforms.scan_options import cancelled
@@ -112,6 +112,19 @@ RE_GEOBLOCK = re.compile(
     r"(decided to block|Government of India|Govt\. of India"
     r"|not available in your (country|region))", re.I,
 )
+
+
+def geoblock_redirect(page_url: str) -> bool:
+    """The redirect signal alone: did the browser land on an `/<cc>/about`
+    path? Only the region block does that to a profile/search request, and a
+    URL cannot be forged by a bio. The analysis visit uses this on its own
+    BEFORE it has read the page, because the body-text test below can be
+    tripped by a profile whose own bio says "Government of India"."""
+    try:
+        path = urlparse(page_url or "").path or ""
+    except Exception:                                # noqa: BLE001 - never fatal
+        return False
+    return bool(re.match(r"^/[a-z]{2}/about/?$", path, re.I))
 
 
 def geoblocked(page_url: str, body: str) -> bool:

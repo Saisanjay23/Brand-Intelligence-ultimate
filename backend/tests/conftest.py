@@ -53,6 +53,21 @@ def _isolate_audit_log(tmp_path_factory):
         settings.log_path = original
 
 
+@pytest.fixture(autouse=True)
+def _fresh_pushback_governors():
+    """Every test starts with healthy pacing governors.
+
+    They are process-wide, so a test that feeds a platform a 429 left it
+    "unhealthy" for every test that ran after it -- the Instagram stealth
+    test failed or passed depending on file order.
+    """
+    from backend.shared import pushback
+
+    pushback.reset_all()
+    yield
+    pushback.reset_all()
+
+
 # Every SMTP send the suite attempted, for tests that want to assert on it.
 SENT_EMAILS: list[dict] = []
 

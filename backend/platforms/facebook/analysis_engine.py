@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import re
 from datetime import datetime, timezone
 from typing import Any, Iterator, Optional
@@ -22,12 +23,14 @@ from backend.shared.tasks import spawn
 from backend.shared.avatars import looks_like_placeholder
 from backend.shared.models.row import Row
 from backend.shared.walls import is_wall_url
-from backend.platforms.scan_options import captures_screenshot
+from backend.platforms.scan_options import cancelled, captures_screenshot
+from backend.shared.pushback import CHALLENGED, EXPIRED, note_response
 from backend.shared.text import (MONTHS, epoch_to_dt, is_place, iter_dicts, iter_kv, name_score,
                                parse_count)
 from backend.platforms.facebook.discovery_engine import (RE_CHECKPOINT,
                                                           RE_DEFAULT_PIC,
                                                           RE_GONE, RE_LOGIN,
+                                                          RE_TRY_LATER,
                                                           FacebookSession,
                                                           hd_picture_url,
                                                           normalize_url,
@@ -54,6 +57,11 @@ K_FOLLOWERS = (
     "subscriber_count",
     "follower_count_int",
 )
+# `fan_count` is a Page's LIKES, a different (usually larger) number from its
+# followers. Kept out of the follower tier so max() can never let likes win
+# over followers; read_counts uses it only when nothing else answered.
+K_LIKES = ("fan_count",)
+K_FOLLOWER_ONLY = tuple(k for k in K_FOLLOWERS if k not in K_LIKES)
 # "created_time" deliberately excluded. Confirmed live, in the raw payload:
 # it belongs to COMMENT objects specifically:
 # `"comment":{"created_time":...}` under an `XFBCommentTimestampBadge`
@@ -80,11 +88,27 @@ RE_FOLLOWERS = re.compile(
     r"([\d][\d.,\s]{0,15}[KMB]?)\s*(?:followers|people follow this)", re.I
 )
 # one header counter chip, e.g. "154M followers" / "53 friends" / "1.2K likes"
+# A count suffix spelled as a word, as localized pages render it: "1.2 million
+# followers", "1,2 Mio. Follower", "1,2 mil seguidores". "mil" is the
+# Spanish/Portuguese THOUSAND, so it normalizes to K (see _count_token).
+_COUNT_WORD = r"(?:million(?:es|s)?|mill\u00f3n|milh(?:\u00e3o|\u00f5es)|mio\.?|mln\.?|mil)"
 RE_CHIP = re.compile(
-    r"^([\d][\d.,\s]{0,15}[KMB]?)\s*"
+    r"^([\d][\d.,\s]{0,15}(?:" + _COUNT_WORD + r"|[KMB])?)\s*"
     r"(followers?|following|friends?|likes?|people follow this)\b",
     re.I,
 )
+_RE_COUNT_WORD = re.compile(r"^(.*?)\s*(" + _COUNT_WORD + r")$", re.I)
+
+
+def _count_token(raw: str) -> str:
+    """"1.2 million" -> "1.2M", "1,2 mil" -> "1,2K"; anything else unchanged.
+    parse_count (shared) only understands K/M/B letters, so a spelled-out
+    suffix is folded to its letter first."""
+    s = (raw or "").strip()
+    m = _RE_COUNT_WORD.match(s)
+    if not m or not m.group(1).strip():
+        return s
+    return m.group(1).strip() + ("K" if m.group(2).lower() == "mil" else "M")
 # Anchored to the start of a line because these are About-tab FIELD labels,
 # not prose. Unanchored, "From" matched mid-sentence marketing copy, a
 # live Page produced "From classrooms to cement plants, from learning
@@ -95,12 +119,60 @@ RE_CHIP = re.compile(
 RE_LIVES_IN = re.compile(r"(?:^|\n)\s*Lives in\s+([^\n·|]{2,70})", re.M)
 RE_FROM = re.compile(r"(?:^|\n)\s*From\s+([^\n·|]{2,70})", re.M)
 RE_NO_POSTS = re.compile(
-    r"(No posts yet|hasn't (?:added|shared|posted)|nothing to show|"
+    r"(No posts yet|hasn.t (?:added|shared|posted)|nothing to show|"
     r"No posts available)",
     re.I,
 )
+# A real post/video/reel permalink among the page's own links.
+_RE_POST_HREF = re.compile(
+    r"""href=["'][^"']*(?:/posts/[\w-]|story_fbid|/videos/\d|/reel/\d|permalink)""",
+    re.I,
+)
+
+
+# The notice AS A LINE OF ITS OWN: the whole line is the phrase (optionally
+# "<name> hasn't shared any posts yet"), not a sentence that contains it.
+_RE_NO_POSTS_LINE = re.compile(
+    r"^(?:no posts (?:yet|available)|nothing to show|"
+    r"[^\n]{1,60}?\s+hasn.t\s+(?:added|shared|posted)"
+    r"(?:\s+(?:any|anything|a\s+post|posts?)){0,2}(?:\s+yet)?)\s*[.!]?$",
+    re.I,
+)
+
+
+def no_posts_notice(text: str, html: Optional[str]) -> bool:
+    """Is Facebook SAYING this profile has no posts?
+
+    The phrases ("nothing to show", "hasn't shared") are ordinary words, so
+    searching a whole page's text let any post or comment containing them
+    declare the profile post-less -- and then skip the DOM last-post
+    fallback. Concluded only when the phrase is a short line of its own AND
+    no post permalink exists in the markup. `html` None means the markup could
+    not be read: that is unknown, never "no posts"."""
+    if html is None:
+        return False
+    if _RE_POST_HREF.search(html):
+        return False
+    for line in (text or "").splitlines():
+        if _RE_NO_POSTS_LINE.match(line.strip()):
+            return True
+    return False
 
 GENERIC_NAMES = {"facebook", "notifications"}
+
+# Name tiers whose answer can be believed. Anything else (the unscoped
+# "graphql-loose" read, the first "Actions for this post by X" label) is a
+# guess about WHO this page is and may be a stranger.
+TRUSTED_NAME_TIERS = ("graphql", "dom-header", "og:title", "title-tag")
+# Wording of an error/removed page's <title>/og:title, never a profile name.
+_RE_NOT_A_NAME = re.compile(
+    r"not found|isn.t available|unavailable|log ?in|sign ?up|error", re.I
+)
+
+
+def _jit(ms: int) -> int:
+    """A fixed in-page wait, +-25%, so the rhythm is not identical per visit."""
+    return int(ms * random.uniform(0.75, 1.25))
 
 
 # Harvest
@@ -151,6 +223,10 @@ class Harvest:
         # see visit(). Kept here rather than on the Scraper because several
         # profiles are visited at once through one Scraper.
         self.nav_errors: dict[str, str] = {}
+        # HTTP status and the pushback verdict of each tab's navigation
+        # response, by tag (see visit()).
+        self.http: dict[str, Optional[int]] = {}
+        self.signals: dict[str, Any] = {}
         self._scopes: dict[str, "Harvest"] = {}
         self.pid: str = ""  # set on a scoped view, see scoped()
         self._parent: Optional["Harvest"] = None
@@ -395,21 +471,23 @@ class Harvest:
 # what makes them testable against a saved payload.
 
 
-def read_name(row: Row, h: Harvest) -> None:
+def read_name(row: Row, h: Harvest, strict: bool = False) -> None:
     """WHAT: the profile's display name, into `row.profile_name`, plus
     the resulting name_score against `row.target`. HOW: tries five
     sources in trust order (graphql entity -> DOM header -> DOM post-author
     label -> og:title -> <title> tag -> loose unscoped graphql), taking
     the first non-generic hit; see the inline comments below for why each
-    one is or isn't trusted. LINKED TO: called from read_profile() below,
-    which Scraper.process() calls once the visit has landed."""
+    one is or isn't trusted. `strict` (a removed/unavailable page) uses ONLY
+    the og:title/<title> tiers: nothing else on such a page can be about this
+    profile. LINKED TO: called from read_profile() below, which
+    Scraper.process() calls once the visit has landed."""
     # the entity's own "name" is the full display name; "short_name" is the
     # first name only and would fall under NAME_THRESHOLD, so never use it.
     # og:title is absent on logged-in renders and <title> is "(2) Facebook".
     # the third flag says whether a generic name is believable from that
     # source: an entity really can be called "Facebook", but a <title>
     # reading "Facebook" is just the browser tab.
-    cands = [
+    cands = [] if strict else [
         ("graphql", h.ent_scalar("name"), True),
         ("dom-header", h.dom.get("name"), True),
         ("dom-post-label", h.dom.get("postAuthor"), True),
@@ -438,14 +516,16 @@ def read_name(row: Row, h: Harvest) -> None:
             )
     # The unscoped tier reads ANY payload's name keys -- a suggested page, a
     # commenter, the viewer. Only allowed when this profile's own entity
-    # could not be found at all (no `ents`), and labelled so the row says
-    # how weak it is; with the entity in hand it could only ever supply a
-    # stranger's name.
-    if not h.ents:
+    # could not be found at all (no `ents`), never on a removed page (where
+    # it could only supply a stranger's name), and labelled so the row says
+    # how weak it is: settle_status() will not let it make a row OK.
+    if not strict and not h.ents:
         cands += [("graphql-loose", v, True) for v in h.gql_strs(K_NAME)]
     for tag, c, trusted in cands:
         c = (c or "").strip()
         if not c or (not trusted and c.lower() in GENERIC_NAMES):
+            continue
+        if strict and _RE_NOT_A_NAME.search(c):
             continue
         row.profile_name = c
         row.mark("name", tag)
@@ -453,32 +533,61 @@ def read_name(row: Row, h: Harvest) -> None:
     row.name_score = name_score(row.profile_name, row.target)
 
 
-def take_chip(row: Row, chip: str, source: str) -> None:
+def name_is_trusted(row: Row) -> bool:
+    """Did the name come from a tier that is provably THIS profile's?"""
+    src = row.src.get("name", "")
+    return src in TRUSTED_NAME_TIERS or src.startswith("adaptive-healed")
+
+
+def settle_status(row: Row, degraded: "tuple[str, ...] | list[str]" = ()) -> None:
+    """OK / PARTIAL for a row that was read to the end. OK needs a name from a
+    trustworthy tier and nothing that undermines the read (`degraded` holds
+    the reasons: landed elsewhere, a reader that crashed, a cancelled run)."""
+    for d in degraded:
+        row.note(d)
+    if not row.profile_name:
+        row.status = "PARTIAL"
+        return
+    if not name_is_trusted(row):
+        row.note(f"name from weak tier '{row.src.get('name', '?')}' -- unverified")
+        row.status = "PARTIAL"
+        return
+    row.status = "PARTIAL" if degraded else "OK"
+
+
+def take_chip(row: Row, chip: str, source: str, mode: str = "all") -> None:
     """One header counter, '154M followers', '53 friends', '1.2K likes'.
 
     Pages publish followers (and older ones only likes), personal profiles
     usually publish friends instead, creator profiles publish both.
-    """
+
+    `mode` orders the two audiences: "no-likes" (followers and friends, the
+    first pass), "likes-only" (the second, used only when no follower chip was
+    found -- a "likes" chip printed first must not suppress the real followers
+    chip), or "all" (the old single pass)."""
     m = RE_CHIP.match(chip)
     if not m:
         return
-    val, exact = parse_count(m.group(1))
+    val, exact = parse_count(_count_token(m.group(1)))
     if val is None or not (0 <= val < MAX_FOLLOWERS):
         return
     kind = m.group(2).lower()
     if kind.startswith("friend"):
-        if row.friends is None:
+        if mode != "likes-only" and row.friends is None:
             row.friends = val
             row.mark("friends", source)
         return
     if kind.startswith("following"):
+        return
+    is_like = kind.startswith("like")
+    if (mode == "no-likes" and is_like) or (mode == "likes-only" and not is_like):
         return
     if row.followers is not None:
         return
     row.followers = val
     row.followers_exact = "yes" if exact else "no"
     row.mark("followers", source)
-    if kind.startswith("like"):
+    if is_like:
         row.note(f"page publishes likes, not followers ({chip})")
     if not exact:
         row.note(f"followers rounded ({chip})")
@@ -506,7 +615,7 @@ def followers_from_friends(row: Row, chips: "list[tuple[str, str]]") -> None:
         m = RE_CHIP.match(chip)
         if not m or not m.group(2).lower().startswith("friend"):
             continue
-        val, exact = parse_count(m.group(1))
+        val, exact = parse_count(_count_token(m.group(1)))
         if val is None or not (0 <= val < MAX_FOLLOWERS):
             continue
         row.followers = val
@@ -518,23 +627,71 @@ def followers_from_friends(row: Row, chips: "list[tuple[str, str]]") -> None:
         return
 
 
+_RE_AUDIENCE_TEXT = re.compile(
+    r"\b(followers?|friends?|likes?|following|people follow this)\b", re.I
+)
+
+
+def _unparsed_chips(chips: "list[tuple[str, str]]") -> list[str]:
+    """Header chips that look like a count ("1,2 Mio. Follower", "5 abonn\u00e9s")
+    but did not read as one. A chip we cannot read is not a chip that is not
+    there."""
+    out: list[str] = []
+    for chip, _src in chips:
+        c = (chip or "").strip()
+        if not c or not c[0].isdigit() or re.search(r"mutual|others?\b", c, re.I):
+            continue
+        m = RE_CHIP.match(c)
+        if m:
+            val, _ex = parse_count(_count_token(m.group(1)))
+            if val is not None and 0 <= val < MAX_FOLLOWERS:
+                continue
+        out.append(c)
+    return out
+
+
+def _audience_text_lines(text: str) -> list[str]:
+    """Short lines of the page text that look like an audience counter."""
+    out: list[str] = []
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if 0 < len(s) <= 60 and s[0].isdigit() and _RE_AUDIENCE_TEXT.search(s) \
+                and not re.search(r"mutual", s, re.I):
+            out.append(s)
+    return out
+
+
 def read_counts(row: Row, h: Harvest) -> None:
     """The audience number, whichever of the three Facebook publishes."""
     chips = [(s, "graphql-social-context") for s in h.ent_social()]
     # the header line holds the same counters when the entity is unreadable
     chips += [
         (part.strip(), "dom-header")
-        for part in re.split(r"[•·|]", str(h.dom.get("counter") or ""))
+        for part in re.split(r"[\u2022\u00b7|]", str(h.dom.get("counter") or ""))
     ]
+    # Follower chips first: a "likes" chip printed before the real "followers"
+    # chip used to win and suppress it.
     for chip, src in chips:
-        take_chip(row, chip, src)
+        take_chip(row, chip, src, "no-likes")
     if row.followers is not None:
         return
-    ents = [n for n in h.ent_ints(K_FOLLOWERS) if 0 <= n < MAX_FOLLOWERS]
+    ents = [n for n in h.ent_ints(K_FOLLOWER_ONLY) if 0 <= n < MAX_FOLLOWERS]
     if ents:
         row.followers = max(ents)
         row.followers_exact = "yes"
         row.mark("followers", "graphql")
+        return
+    # Likes only when no followers number exists anywhere above.
+    for chip, src in chips:
+        take_chip(row, chip, src, "likes-only")
+    if row.followers is not None:
+        return
+    likes = [n for n in h.ent_ints(K_LIKES) if 0 <= n < MAX_FOLLOWERS]
+    if likes:
+        row.followers = max(likes)
+        row.followers_exact = "yes"
+        row.mark("followers", "graphql")
+        row.note("page publishes likes, not followers (fan_count)")
         return
     # NO UNSCOPED TIERS HERE ANY MORE. There used to be two: the largest
     # `follower_count` in ANY payload on the page ("graphql-loose"), and the
@@ -547,11 +704,22 @@ def read_counts(row: Row, h: Harvest) -> None:
     # actually is; when neither has one, blank is the honest answer.
     followers_from_friends(row, chips)
     if row.followers is None and row.friends is None and h.ents:
+        # A chip or counter line that EXISTED but did not parse (a localized
+        # "1,2 Mio. Follower") is an unread number, not an absent one: leave
+        # followers blank and say so, never claim "publishes no audience
+        # count" over text that may hold one.
+        unparsed = _unparsed_chips(chips)
+        if not unparsed:
+            unparsed = _audience_text_lines(h.text.get("main", ""))
+        if unparsed:
+            row.note("audience chip unparsed: " + " | ".join(unparsed)[:160])
+            return
         # Every tier above came up empty on a profile we DID successfully
         # read (`h.ents` is non-empty: the entity resolved, and the name,
-        # avatar and post dates all came out of its payload). That
-        # combination is not a parser failure -- it is Facebook declining
-        # to publish an audience number for this profile at all.
+        # avatar and post dates all came out of its payload) AND no chip or
+        # counter text existed at all. That combination is not a parser
+        # failure -- it is Facebook declining to publish an audience number
+        # for this profile at all.
         #
         # Confirmed live (2026-08-22) on the real stored rows that showed
         # this: a brand-new locked-down personal profile renders its name,
@@ -679,7 +847,7 @@ def read_last_post(row: Row, h: Harvest) -> None:
     owner = getattr(h, "pid", "") or ""
     if not owner:
         row.note("id unresolved -- last-post date not attributed")
-        if RE_NO_POSTS.search(h.all_text()):
+        if no_posts_notice(h.all_text(), h.all_html()):
             row.posts_seen = "no"
             row.mark("last_post", "no-posts-notice")
         return
@@ -702,7 +870,7 @@ def read_last_post(row: Row, h: Harvest) -> None:
         row.last_post_iso = max(dts).date().isoformat()
         row.posts_seen = "yes"
         row.mark("last_post", tag)
-    elif RE_NO_POSTS.search(h.all_text()):
+    elif no_posts_notice(h.all_text(), h.all_html()):
         row.posts_seen = "no"
         row.mark("last_post", "no-posts-notice")
 
@@ -762,6 +930,9 @@ JS_POST_TIMES = """
   const out = [];
   const sel = 'a[href*="/posts/"], a[href*="story_fbid"], a[href*="/videos/"], a[href*="/reel/"], a[href*="permalink"]';
   for (const a of root.querySelectorAll(sel)) {
+    // a comment's own timestamp links to its post WITH a comment_id; it is
+    // not a post, and a stranger's comment must not date this profile's feed
+    if ((a.getAttribute('href') || '').includes('comment_id')) continue;
     const author = authorOf(a);
     if (author && want.length && !want.some(w => author.includes(w))) continue;
     const al = a.getAttribute('aria-label') || a.getAttribute('title') || '';
@@ -989,7 +1160,20 @@ def read_profile(row: Row, h: Harvest) -> None:
     read_verified(row, h)
 
 
+ADAPTIVE_FAILED_NOTE = "adaptive healing failed"
+
+
 async def read_profile_adaptive(row: Row, h: Harvest) -> None:
+    """Never lets the optional healer destroy a row: whatever was already
+    read is kept, the failure is noted, and settle_status() will not call
+    the row OK (see ADAPTIVE_FAILED_NOTE)."""
+    try:
+        await _read_profile_adaptive(row, h)
+    except Exception as e:  # noqa: BLE001 - keep the fields already read
+        row.note(f"{ADAPTIVE_FAILED_NOTE}: {type(e).__name__}: {str(e)[:120]}")
+
+
+async def _read_profile_adaptive(row: Row, h: Harvest) -> None:
     """Last-resort adaptive schema healing for analysis fields.
 
     Runs off the main asyncio thread via asyncio.to_thread with strict node and
@@ -1168,10 +1352,10 @@ class Scraper:
       for (let i = 0; i < lines.length; i++) {
         // the header counter line: "70 followers - 8 following" on creators,
         // "53 friends" on personal profiles, "154M followers" on pages
-        const m = /^([\\d][\\d.,\\s]{0,15}[KMB]?)\\s*(followers?|friends?|likes)\\b/i.exec(lines[i]);
+        const m = /^([\\d][\\d.,\\s]{0,15}(?:million|mio\\.?|mln\\.?|mil|[KMB])?)\\s*(followers?|friends?|likes)\\b/i.exec(lines[i]);
         if (!m) continue;
         counter = lines[i];
-        const fm = /([\\d][\\d.,\\s]{0,15}[KMB]?)\\s*followers?\\b/i.exec(lines[i]);
+        const fm = /([\\d][\\d.,\\s]{0,15}(?:million|mio\\.?|mln\\.?|mil|[KMB])?)\\s*followers?\\b/i.exec(lines[i]);
         if (fm) followers = fm[1];
         for (let j = i - 1; j >= 0 && j >= i - 4; j--) {
           const c = lines[j];
@@ -1221,14 +1405,18 @@ class Scraper:
         asked (the main timeline visit only). LINKED TO: called from
         process() below for every tab a profile visit touches (main,
         about, about_profile_transparency)."""
+        status: Optional[int] = None
         try:
-            await page.goto(
+            resp = await page.goto(
                 url, wait_until="domcontentloaded", timeout=self.a.timeout * 1000
             )
+            code = getattr(resp, "status", None)
+            status = code if isinstance(code, int) and not isinstance(code, bool) else None
         except Exception as e:
             first = (str(e).splitlines() or [""])[0][:200]
             h.nav_errors[tag] = f"{type(e).__name__}: {first}"
             return False
+        h.http[tag] = status
         try:
             if needle is not None:
                 try:
@@ -1238,12 +1426,12 @@ class Scraper:
                 except Exception:
                     # gone, login-walled or an unusual layout, fall through and
                     # let the field readers and status checks report what they see
-                    await page.wait_for_timeout(1500)
+                    await page.wait_for_timeout(_jit(1500))
             else:
-                await page.wait_for_timeout(1500)
+                await page.wait_for_timeout(_jit(1500))
             for _ in range(scrolls):
                 await page.mouse.wheel(0, 2600)
-                await page.wait_for_timeout(1200)
+                await page.wait_for_timeout(_jit(1200))
         except Exception:
             pass
         try:
@@ -1253,11 +1441,28 @@ class Scraper:
         try:
             h.text[tag] = await page.inner_text("body")
         except Exception:
-            h.text[tag] = re.sub(r"<[^>]+>", " ", h.html.get(tag, ""))
+            # The tags-stripped HTML still holds every <script> JSON blob and
+            # <style> rule, whose text can match RE_GONE / RE_LOGIN and
+            # quarantine a healthy session. Visible text only.
+            no_code = re.sub(
+                r"<(script|style)\b[^>]*>.*?</\1\s*>", " ", h.html.get(tag, ""),
+                flags=re.S | re.I,
+            )
+            h.text[tag] = re.sub(r"<[^>]+>", " ", no_code)
         try:
             h.add_embedded(await page.evaluate(self.JS_EMBEDDED))
         except Exception:
             pass
+        # WHAT FACEBOOK ITSELF SAID about this navigation: its HTTP status, and
+        # -- only when the page handed over no profile data and is small, so a
+        # bio saying "try again later" can never trip it -- its body.
+        if status is not None:
+            txt = h.text.get(tag, "")
+            body = txt if (len(txt) < 4000 and not self.has_profile_content(h, txt)) else None
+            try:
+                h.signals[tag] = note_response("facebook", status, body)
+            except Exception:
+                pass
         return bool(h.html[tag])
 
     # How long read_dom will wait for the photo-album anchors that
@@ -1298,7 +1503,7 @@ class Scraper:
             if scrolled:
                 # scrolling can unmount the intro block, go back up first
                 await page.evaluate("window.scrollTo(0, 0)")
-                await page.wait_for_timeout(700)
+                await page.wait_for_timeout(_jit(700))
             if await_ids:
                 try:
                     await page.wait_for_selector(
@@ -1391,7 +1596,7 @@ class Scraper:
     RE_AUDIENCE_LINE = re.compile(r"[\d][\d,.\s]*[KMB]?\s*(followers?|friends?|following)\b", re.I)
 
     @classmethod
-    def has_profile_content(cls, h: Harvest, txt: str) -> bool:
+    def has_profile_content(cls, h: Harvest, txt: str, pid: str = "") -> bool:
         """Did this page carry the profile's OWN data, whatever else is on it?
 
         Facebook reuses ONE string -- "This content isn't available at the
@@ -1408,14 +1613,23 @@ class Scraper:
         byte-identical in both cases, so no amount of tightening RE_GONE can
         separate them -- the text genuinely does not know the difference.
 
-        What does separate them, cleanly, is whether the profile's own
-        audience number came back: on the 3 genuinely-removed pages the body
-        was 257 characters of pure chrome with no count anywhere, in the
-        payload or the DOM; on all 5 live ones a real count was readable.
-        """
-        if [n for n in h.ent_ints(K_FOLLOWERS) if 0 <= n < MAX_FOLLOWERS]:
+        What does separate them, cleanly, is whether the profile's own data
+        came back: on the 3 genuinely-removed pages the body was 257
+        characters of pure chrome with no count anywhere; on all 5 live ones
+        a real count was readable. "Own" is the point: the profile's SCOPED
+        entity (a count, its header chips, or its name) or the rendered
+        audience line. The unscoped "any follower_count in any payload" tier
+        is gone -- a removed profile's page still carries suggested Pages,
+        each with a count, and one of them kept a dead profile alive.
+
+        `pid` scopes the payloads to that profile when `h` is not already a
+        scoped view (blocked_status runs before the visit is scoped)."""
+        scope = h
+        if pid and pid.isdigit() and not (getattr(h, "pid", "") or h.ents):
+            scope = h.scoped(pid)
+        if [n for n in scope.ent_ints(K_FOLLOWERS) if 0 <= n < MAX_FOLLOWERS]:
             return True
-        if [n for n in h.gql_ints(K_FOLLOWERS) if 0 <= n < MAX_FOLLOWERS]:
+        if scope.ent_social() or scope.ent_scalar("name"):
             return True
         return bool(cls.RE_AUDIENCE_LINE.search(txt))
 
@@ -1429,11 +1643,15 @@ class Scraper:
         temporarily closed" used to be written off as a checkpoint and
         quarantine the session; a page that delivered a name and a follower
         count is not a wall whatever its posts say."""
-        walled = not cls.has_profile_content(h, txt)
+        pid = row.profile_id if (row.profile_id or "").isdigit() else \
+            cls.entity_id_for(h, page_url or row.url)
+        walled = not cls.has_profile_content(h, txt, pid)
         if is_wall_url(page_url, ("checkpoint",)) or (walled and RE_CHECKPOINT.search(txt)):
             row.status, msg = "CHECKPOINT", "session checkpointed"
         elif is_wall_url(page_url, ("login", "login.php")) or (walled and RE_LOGIN.search(txt)):
             row.status, msg = "LOGIN_REQUIRED", "cookies rejected/expired"
+        elif walled and RE_TRY_LATER.search(txt):
+            row.status, msg = "CHECKPOINT", "facebook is throttling this session (try again later)"
         # The content gate is what stops a live profile being written off as
         # taken down because one post in its timeline is restricted -- see
         # has_profile_content. Without it this returned GONE for 5 of the 8
@@ -1441,13 +1659,61 @@ class Scraper:
         # had just handed over the name and follower count, and, because
         # GONE is terminal in shared/completeness.py, marking the row
         # analysis_complete so it was never retried either.
-        elif RE_GONE.search(txt) and not cls.has_profile_content(h, txt):
+        elif RE_GONE.search(txt) and walled:
             row.status = "GONE"
             msg = "removed or unavailable -- may already be taken down"
         else:
             return False
         row.note(msg)
         return True
+
+    @staticmethod
+    def tab_wall(page_url: str, txt: str, sig=None) -> "tuple[str, str] | None":
+        """(row status, note) when an About tab landed on a wall, else None.
+
+        The URL is judged by path, exactly as for the main visit. The TEXT
+        checks are applied only to a short body: by now the main page has
+        already proved it carries profile data, so blocked_status's "no data
+        came back" gate cannot apply, and what is left that separates a wall
+        from a long About page is its length. Deliberately does NOT use the
+        GONE wording: the About refusal ("This content isn't available at
+        the moment", see RE_CONTENT_UNAVAILABLE) is not a removed profile."""
+        if is_wall_url(page_url, ("checkpoint",)):
+            return "CHECKPOINT", "session checkpointed (About tab)"
+        if is_wall_url(page_url, ("login", "login.php")):
+            return "LOGIN_REQUIRED", "cookies rejected/expired (About tab)"
+        if sig is not None and getattr(sig, "is_pushback", False):
+            st = "LOGIN_REQUIRED" if sig.kind == EXPIRED else "CHECKPOINT"
+            return st, f"facebook pushed back on the About tab ({sig.reason})"
+        t = txt or ""
+        if len(t) < 2000:
+            if RE_CHECKPOINT.search(t):
+                return "CHECKPOINT", "session checkpointed (About tab)"
+            if RE_LOGIN.search(t):
+                return "LOGIN_REQUIRED", "cookies rejected/expired (About tab)"
+            if RE_TRY_LATER.search(t):
+                return "CHECKPOINT", "facebook is throttling this session (About tab)"
+        return None
+
+    @staticmethod
+    def landed_on(requested: str, pid: str, landed_url: str, h: Harvest) -> bool:
+        """Is the page we landed on the profile we asked for? `requested` is
+        the id/vanity in the URL we visited, `pid` the numeric id resolved from
+        the payloads. A redirect between a vanity URL and its numeric id is the
+        same profile; anything else is not, and what was read belongs to
+        whoever Facebook sent us to. Unknowable (no id on either side) is
+        treated as a match -- there is nothing to compare."""
+        landed = profile_id(landed_url or "")
+        if not landed or not requested:
+            return True
+        low = landed.lower()
+        if low == requested.lower() or (pid and low == pid.lower()):
+            return True
+        if not low.isdigit():
+            owner = Scraper.entity_id_for(h, landed_url)
+            if owner and (owner == pid or owner == requested):
+                return True
+        return False
 
     # ───────────────────────────── per URL ────────────────────────────── #
 
@@ -1531,18 +1797,43 @@ class Scraper:
                 return row
 
             txt = h.text.get("main", "")
+            # What Facebook's own answer said (HTTP status / small error body)
+            # outranks the page text: a 429 or a "Temporarily Blocked" panel
+            # is a throttle/wall, never PARTIAL, and its text must not be
+            # misread as "removed".
+            sig = h.signals.get("main")
+            pushed = sig is not None and sig.is_pushback
+            if pushed and not self.has_profile_content(h, txt, row.profile_id):
+                row.status = "LOGIN_REQUIRED" if sig.kind == EXPIRED else "CHECKPOINT"
+                row.note(f"facebook pushed back ({sig.kind}: {sig.reason})")
+                return row
             if self.blocked_status(row, page.url, txt, h):
                 if row.status == "GONE":
-                    read_name(row, h)
+                    # a removed page's own entity does not exist: only its
+                    # og:title/<title> can name it, never a stray payload
+                    read_name(row, h, strict=True)
                 return row
+            if pushed:
+                row.note(f"facebook pushed back on this visit but the profile loaded ({sig.reason})")
 
             # `needle` is empty exactly when the URL is a vanity one, which
             # is the only case where the numeric id has to come out of the
             # DOM -- see read_dom's `await_ids`.
             await self.read_dom(page, h, scrolled=self.a.scrolls > 0,
                                 await_ids=not needle)
+            requested = profile_id(url)
             pid = self.resolve_id(row, h, url)
             hs = h.scoped(pid)
+            degraded: list[str] = []
+            try:
+                landed_url = page.url or ""
+            except Exception:
+                landed_url = ""
+            if not self.landed_on(requested, pid, landed_url, h):
+                degraded.append(
+                    f"landed on a different profile ({profile_id(landed_url)}) "
+                    f"than requested ({requested}) -- fields may belong to it"
+                )
 
             # the URL itself is the most reliable signal for a group visit:
             # /groups/<id>/ is unambiguous, unlike sniffing a payload
@@ -1563,6 +1854,8 @@ class Scraper:
 
             read_profile(row, hs)
             await read_profile_adaptive(row, hs)
+            if ADAPTIVE_FAILED_NOTE in row.notes:
+                degraded.append("adaptive healer crashed -- row kept, not verified complete")
             await self.screenshot(page, row)
 
             # Payload timestamps first (read_profile -> read_last_post,
@@ -1581,7 +1874,7 @@ class Scraper:
             # actually fell back to anything. Running it here, while the
             # page is still the timeline that was just visited, is what
             # makes it work.
-            if not row.last_post_iso and row.posts_seen != "no":
+            if not row.last_post_iso:
                 iso = await dom_last_post(page, (pid, profile_id(url)))
                 if iso:
                     row.last_post_iso = iso
@@ -1595,7 +1888,9 @@ class Scraper:
             # so the page is read once more before the question is left open.
             if not row.last_post_iso and not row.posts_seen:
                 try:
-                    if RE_NO_POSTS.search(await page.inner_text("body")):
+                    body_now = await page.inner_text("body")
+                    html_now = await page.content()
+                    if no_posts_notice(body_now, html_now):
                         row.posts_seen = "no"
                         row.mark("last_post", "no-posts-notice")
                 except Exception:
@@ -1613,7 +1908,14 @@ class Scraper:
             # expose it to an ordinary session at all, not in the rendered
             # tab and not in any payload, so attempting it never succeeded
             # and wasn't worth the two extra page loads either way.
-            if not row.location:
+            if not row.location and not (hs.ents or row.profile_name):
+                # No entity and no name: the main page was not a real profile,
+                # so its About tabs are not worth two more loads.
+                row.note("About tabs skipped -- main page did not resolve to a profile")
+            elif not row.location and cancelled(self.a):
+                row.note("About tabs skipped -- run cancelled")
+                degraded.append("run cancelled before the About tabs")
+            elif not row.location:
                 await self.pause(0.4)
                 # `about` FIRST, and stop as soon as it answers.
                 #
@@ -1636,8 +1938,26 @@ class Scraper:
                 # most detectable thing analysis does -- so a skipped one is
                 # worth more than the seconds it saves.
                 for sk in ("about", "about_profile_transparency"):
+                    if cancelled(self.a):
+                        row.note("About tabs skipped -- run cancelled")
+                        degraded.append("run cancelled during the About tabs")
+                        break
                     await self.visit(page, tab_url(url, sk), h, sk)
                     await self.pause(0.3)
+                    # A wall on an About tab is a session verdict, not "no
+                    # location": record it and stop loading tabs.
+                    try:
+                        tab_url_now = page.url or ""
+                    except Exception:
+                        tab_url_now = ""
+                    wall = self.tab_wall(tab_url_now, h.text.get(sk, ""), h.signals.get(sk))
+                    if wall:
+                        row.status = wall[0]
+                        row.note(wall[1])
+                        return row
+                    if sk in h.nav_errors:
+                        row.note(f"about tab nav failed ({sk}): {h.nav_errors[sk]}")
+                        break
                     read_location(row, h.scoped(pid))
                     if row.location:
                         break
@@ -1649,7 +1969,7 @@ class Scraper:
                         row.note("About tab not visible to this session")
                         break
 
-            row.status = "OK" if row.profile_name else "PARTIAL"
+            settle_status(row, degraded)
             return row
         finally:
             try:

@@ -17,7 +17,7 @@ for people, the honest answer rather than a guess.
 
 from __future__ import annotations
 
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from typing import Optional
 
@@ -26,7 +26,8 @@ from backend.shared.avatars import hd_picture_url
 from backend.shared.models.row import Row
 from backend.shared.text import (name_score, normalized_host,
                                    parse_normalized_url)
-from backend.platforms.telegram.discovery_engine import (FloodWait,
+from backend.platforms.telegram.discovery_engine import (EntityInaccessible,
+                                                          FloodWait,
                                                           NotAuthorised,
                                                           Telegram,
                                                           TelegramEntity)
@@ -53,6 +54,8 @@ def normalize_url(url: str) -> str:
     stripped = (url or "").strip().strip("\"'")
     if stripped.startswith("@"):
         return f"https://t.me/{stripped[1:]}"
+    if stripped.lower().startswith("tg://"):
+        return _normalize_tg_link(stripped)
     p = parse_normalized_url(stripped, extra_schemes=("tg://",))
     if p is None:
         return ""
@@ -60,6 +63,25 @@ def normalize_url(url: str) -> str:
     if host in ("telegram.me", "telegram.dog", "t.me"):
         host = "t.me"
     return f"https://{host}{p.path.rstrip('/')}"
+
+
+def _normalize_tg_link(link: str) -> str:
+    """A `tg://` deep link -> a t.me URL, or "" when it names no account.
+
+    `tg://resolve?domain=NAME` is the link form of t.me/NAME, and
+    `tg://join?invite=HASH` of the private invite t.me/+HASH. Both used to
+    parse as the host "resolve"/"join" -- `https://resolve` -- and an invite
+    was then looked up as a username and reported GONE."""
+    p = urlparse(link)
+    kind = (p.netloc or p.path.strip("/")).lower()
+    q = parse_qs(p.query)
+    if kind == "resolve":
+        name = (q.get("domain") or [""])[0].strip().lstrip("@")
+        return f"https://t.me/{name}" if name else ""
+    if kind == "join":
+        invite = (q.get("invite") or [""])[0].strip()
+        return f"https://t.me/+{invite}" if invite else ""
+    return ""
 
 
 def username_of(url: str) -> str:
@@ -181,13 +203,32 @@ class Scraper:
             row.note("no @username in the URL -- private links cannot be resolved")
             return row
 
-        ent = await self.tg.resolve(ref)
+        try:
+            ent = await self.tg.resolve(ref)
+        except EntityInaccessible as e:
+            # NOT GONE: Telegram refused to show it, which says nothing
+            # about whether it still exists. Only UsernameNotOccupied (a
+            # None from resolve) is a real "no such account".
+            row.status = "ERROR"
+            if e.reason == "private":
+                row.note("private/inaccessible -- Telegram will not show this "
+                         "channel/group to this account (private, or banned from it)")
+            elif e.reason == "invalid":
+                row.note("invalid handle -- not a legal Telegram username")
+            else:
+                row.note(f"could not be resolved -- {e}")
+            return row
         if ent is None:
             row.status = "GONE"
             row.note("no such user or channel -- may already be taken down")
             return row
 
         self.fill(row, ent)
+        if ent.forbidden:
+            # a ChannelForbidden/ChatForbidden stub is Telegram refusing us,
+            # not a reading -- never OK
+            row.status = "ERROR"
+            return row
         row.status = "OK" if row.profile_name else "PARTIAL"
         return row
 
@@ -219,6 +260,9 @@ class Scraper:
             row.mark("created", "mtproto")
         elif e.kind == "profile":
             row.note("telegram exposes no creation date for user accounts")
+        elif e.created_withheld:
+            row.note("creation date withheld -- this account is a member, so "
+                     "telegram gives the join date, not the creation date")
         if e.avatar:
             # data: URIs (MTProto base64) pass through unchanged;
             # URL-based avatars (t.me/i/userpic/) get HD rewritten.
@@ -228,8 +272,11 @@ class Scraper:
             )
         # has_photo comes straight from Telethon's own PhotoEmpty check, not
         # a guess from whether the avatar URL happened to resolve
-        row.has_custom_pic = e.has_photo
-        row.mark("logo", "mtproto")
+        # None stays None: a stub or an object with no photo attribute never
+        # said "no picture"
+        if e.has_photo is not None:
+            row.has_custom_pic = e.has_photo
+            row.mark("logo", "mtproto")
         if e.last_post_iso:
             row.last_post_iso = e.last_post_iso
             row.posts_seen = "yes"
@@ -243,6 +290,14 @@ class Scraper:
             row.note("FLAGGED BY TELEGRAM AS SCAM")
         if e.restricted:
             row.note("restricted by telegram")
+        if e.fake:
+            row.note("FLAGGED BY TELEGRAM AS FAKE")
+        if e.bot:
+            row.note("bot account")
+        if e.forbidden:
+            row.note("private/inaccessible -- restricted stub, nothing could be read")
+        for n in e.notes:
+            row.note(n)
 
     # ─────────────────────────── orchestration ────────────────────────── #
 

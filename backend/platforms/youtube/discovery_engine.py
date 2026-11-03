@@ -305,16 +305,21 @@ class YouTubeAPI:
             {"forHandle": want},
             {"forUsername": want},
         ):
-            try:
-                data = await self.get(
-                    "channels",
-                    part="snippet,statistics,contentDetails,brandingSettings",
-                    **params,
-                )
-                if items := data.get("items"):
-                    return items[0]
-            except (QuotaExceeded, RuntimeError):
-                continue
+            # AN ERROR IS NOT AN EMPTY ANSWER. This used to `continue` past a
+            # RuntimeError (a transient 5xx, a bad response) and then run the
+            # search below, which -- finding no EXACT match for a handle that
+            # does exist -- returned None, which the caller files as GONE:
+            # "no such channel -- may already be taken down" about a channel
+            # that is up. Only a CLEAN empty result may fall through to the
+            # next lookup; a failure (and QuotaExceeded, a RuntimeError too)
+            # propagates and becomes an ERROR/CHECKPOINT row that says so.
+            data = await self.get(
+                "channels",
+                part="snippet,statistics,contentDetails,brandingSettings",
+                **params,
+            )
+            if items := data.get("items"):
+                return items[0]
 
         items, _ = await self.search_channels(handle, per_page=5)
         for it in items:

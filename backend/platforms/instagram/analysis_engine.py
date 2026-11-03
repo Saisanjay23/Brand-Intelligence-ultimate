@@ -106,6 +106,7 @@ this account" panel, so that column stays blank rather than guessed.
 from __future__ import annotations
 
 import asyncio
+import random
 import re
 from datetime import datetime, timezone
 from typing import Optional
@@ -117,7 +118,7 @@ from backend.shared.pushback import (CHALLENGED, EXPIRED, THROTTLED, Signal,
 from backend.shared.tasks import spawn
 from backend.shared.models.row import Row
 from backend.shared.walls import first_segment, is_wall_url, url_path
-from backend.platforms.scan_options import captures_screenshot
+from backend.platforms.scan_options import cancelled, captures_screenshot
 from backend.stealth.mouse_movement import humanize_interaction
 from backend.shared.text import (MONTHS, _letters_only, name_score,
                                    normalized_host, parse_count,
@@ -141,6 +142,20 @@ BAD_SEGMENTS = {"p", "reel", "reels", "explore", "stories", "accounts", "direct"
 # Consecutive profile visits that returned no payload, with no explicit
 # pushback, before the governor is told Instagram is probably soft-blocking.
 NO_PAYLOAD_STREAK_LIMIT = 3
+
+# What Instagram's own error / rate-limit page says. Consulted only after the
+# profile header could not be read, so a bio quoting these words never
+# matches. This is a THROTTLE, not a verdict on the profile.
+_RE_THROTTLE_PAGE = re.compile(
+    r"(something went wrong|try again later|please wait a few minutes|"
+    r"we limit how often)", re.I)
+
+
+def _jitter_ms(base_ms: float) -> int:
+    """A fixed wait made human: +-25% around `base_ms`, stretched by the
+    pacing governor's multiplier (1.0 while Instagram is happy)."""
+    mult = max(1.0, governor_for("instagram").gap_multiplier())
+    return int(base_ms * random.uniform(0.75, 1.25) * mult)
 
 
 def pushback_verdict(sig) -> Optional[tuple[str, str]]:
@@ -424,9 +439,12 @@ class Scraper:
     }
     """
 
-    # Instagram's own pin cap is 3, visiting this many candidate links
-    # guarantees at least one genuinely-newest, non-pinned post is checked
-    # regardless of how many (0 to 3) are actually pinned right now.
+    # Instagram's own pin cap is 3. Visiting this many candidate links
+    # reaches a non-pinned post only when AT MOST TWO are pinned; with all
+    # three pinned, every candidate here is a pinned post and a newer
+    # unpinned one in 4th position is not visited. That is a deliberate
+    # stealth trade-off (owner decision: no more than 3 extra page loads per
+    # profile), not a guarantee -- see read_last_post_date's docstring.
     JS_GRID_POST_LINKS = """
     () => {
       const scope = document.querySelector('main') || document.body;
@@ -573,6 +591,7 @@ class Scraper:
     async def read_last_post_date(
         self, page, private: bool, has_posts: bool,
         owners: tuple[str, ...] = (),
+        notes: Optional[list] = None,
     ) -> str:
         """The real last-post date, robust to grid pinning (see
         JS_GRID_ALT_DATES' comment above for the live-confirmed gap this
@@ -607,6 +626,19 @@ class Scraper:
         `<time datetime="2026-07-23T16:00:21.000Z">` element with an exact
         UTC timestamp.
 
+        KNOWN LIMITATION, said on the row instead of hidden: a Reel tile's
+        alt text is only its caption, so when one of the first tiles is
+        undated and a later PHOTO tile is dated, tier 1 can report that older
+        photo's date although a newer Reel exists. Running tier 2 for those
+        profiles would add up to 3 page loads that are skipped today, which
+        the stealth budget does not allow, so instead a note is appended to
+        `notes` (when given) saying the date may be stale.
+
+        Stops at once when the job is cancelled and returns what was read so
+        far, and skips the permalink visits while the platform is being
+        throttled (the row says so) -- an extra page load is the last thing a
+        throttled platform should get.
+
         Returns "" on anything short of a clean read: a private account, an
         account not confirmed to have posts, no candidates, or failed
         navigations, never a guess.
@@ -618,9 +650,23 @@ class Scraper:
             alts = await page.evaluate(self.JS_GRID_ALT_DATES) or []
         except Exception:
             alts = []
-        dates = [d for d in (self._parse_alt_date(a, owners) for a in alts) if d]
+        parsed = [self._parse_alt_date(a, owners) for a in alts]
+        dates = [d for d in parsed if d]
         if dates:
+            if notes is not None and not all(parsed[:3]):
+                notes.append(
+                    "last-post date read from dated photo tiles only: one of "
+                    "the newest tiles (likely a Reel) carries no date, so a "
+                    "newer post may exist")
             return max(dates)
+
+        if cancelled(self.a):
+            return ""
+        if not governor_for("instagram").healthy():
+            if notes is not None:
+                notes.append("last-post permalink visits skipped: Instagram "
+                             "is throttling this session, date not read")
+            return ""
 
         try:
             hrefs = await page.evaluate(self.JS_GRID_POST_LINKS) or []
@@ -629,9 +675,17 @@ class Scraper:
         wanted = {_letters_only(o) for o in owners if o}
         wanted.discard("")
         found: list[str] = []
+        visited = 0
         for href in hrefs:
             if not href:
                 continue
+            if cancelled(self.a):
+                break
+            if visited:
+                # A small jittered pause between permalink visits, never
+                # back-to-back; scaled by the pacing governor.
+                await page.wait_for_timeout(_jitter_ms(2000))
+            visited += 1
             try:
                 await page.goto(
                     f"https://www.instagram.com{href}",
@@ -639,7 +693,7 @@ class Scraper:
                     timeout=self.a.timeout * 1000,
                 )
                 await humanize_interaction(page, scroll=False, moves=1)
-                await page.wait_for_timeout(1500)
+                await page.wait_for_timeout(_jitter_ms(1500))
                 res = await page.evaluate(self.JS_POST_TIME) or {}
                 iso = res.get("time") or ""
                 handles = {_letters_only(h) for h in (res.get("handles") or [])}
@@ -708,7 +762,7 @@ class Scraper:
             return ""  # Instagram launched in 2010
         return f"{y:04d}-{month:02d}"
 
-    async def read_about_panel(self, username: str) -> dict:
+    async def read_about_panel(self, username: str, page=None) -> dict:
         """Instagram's "About this account" -> {country, joined}.
 
         Two fields this engine could not otherwise report AT ALL: location
@@ -723,13 +777,19 @@ class Scraper:
         session-derived tokens. Driving the page is what keeps those tokens
         correct without this engine forging any of them.
 
-        Runs on its OWN page: the panel is a modal over the profile, so
-        opening it on the caller's page would put a dialog across the
-        evidence screenshot.
+        WHEN `page` IS GIVEN it is the profile page the caller has already
+        loaded, and it is reused: no second tab, no second load of the same
+        profile URL (two loads of one profile seconds apart is a pattern no
+        person produces). The caller must have taken its evidence screenshot
+        first, because the panel is a modal over the profile; the modal is
+        dismissed before returning. Without `page`, the old behaviour: its
+        own tab, its own load.
 
         Returns {} on anything short of a clean read -- never a guess.
         """
-        page = await self.ctx.new_page()
+        reuse = page is not None
+        if not reuse:
+            page = await self.ctx.new_page()
         bodies: list[str] = []
 
         async def on_response(resp):
@@ -743,13 +803,15 @@ class Scraper:
             except Exception:
                 pass
 
-        page.on("response", lambda r: spawn(on_response(r)))
+        listener = lambda r: spawn(on_response(r))  # noqa: E731
+        page.on("response", listener)
         try:
-            await page.goto(
-                f"https://www.instagram.com/{quote(username)}/",
-                wait_until="domcontentloaded", timeout=self.a.timeout * 1000,
-            )
-            await humanize_interaction(page, scroll=False, moves=2)
+            if not reuse:
+                await page.goto(
+                    f"https://www.instagram.com/{quote(username)}/",
+                    wait_until="domcontentloaded", timeout=self.a.timeout * 1000,
+                )
+            await humanize_interaction(page, scroll=False, moves=1 if reuse else 2)
             # The Options button is NOT on the page at domcontentloaded --
             # measured live, it first exists somewhere between 0 and 3
             # seconds in. Clicking without this wait is why the panel
@@ -814,10 +876,22 @@ class Scraper:
         except Exception:
             return {}
         finally:
-            try:
-                await page.close()
-            except Exception:
-                pass
+            if reuse:
+                # The caller's page lives on: stop listening and dismiss the
+                # modal so whatever it does next sees the profile, not a dialog.
+                try:
+                    page.remove_listener("response", listener)
+                except Exception:
+                    pass
+                try:
+                    await page.keyboard.press("Escape")
+                except Exception:
+                    pass
+            else:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
 
     # ───────────────────────────── per URL ────────────────────────────── #
 
@@ -857,10 +931,13 @@ class Scraper:
              page to a permalink (see the inline comment at that call
              site for the live incident this ordering fixes).
           5. If no last-post date yet: try the already-intercepted
-             timeline response first (`timeline_latest_post`, free), then
-             `read_last_post_date()`'s grid-alt/permalink-visit tiers.
+             timeline response first (`timeline_latest_post`, free).
           6. If location or join date are still blank: `read_about_panel()`
-             (the About-this-account panel, a click-driven visit).
+             on THIS page (the About-this-account panel, click-driven, no
+             second page load; skipped while throttled or cancelled).
+          7. If still no last-post date: `read_last_post_date()`'s grid-alt
+             read, then up to three permalink visits (these navigate the
+             page away, which is why 6 runs first).
 
         LINKED TO: called by `one()` below.
         """
@@ -962,10 +1039,29 @@ class Scraper:
         page.on("response", lambda r: spawn(on_response(r)))
 
         try:
+            doc_status: Optional[int] = None
             try:
-                await page.goto(
+                resp = await page.goto(
                     url, wait_until="domcontentloaded", timeout=self.a.timeout * 1000
                 )
+                # THE PROFILE PAGE'S OWN HTTP STATUS. It used to be thrown
+                # away, so a 429/403 on the document itself looked like a
+                # profile with no payload. Read here, fed to the governor,
+                # and pushed like any other pushback. The body is fetched
+                # only for an error status (those pages are tiny) -- never
+                # for a 200, which is the whole profile HTML.
+                st = getattr(resp, "status", None)
+                if isinstance(st, int) and not isinstance(st, bool):
+                    doc_status = st
+                    err_body = None
+                    if st >= 400:
+                        try:
+                            err_body = (await resp.text())[:4000]
+                        except Exception:
+                            err_body = None
+                    sig = note_response("instagram", st, err_body)
+                    if sig.is_pushback:
+                        pushed.append(sig)
             except Exception as e:
                 # The error itself, first line only (Playwright appends a
                 # call log): without it the runner could not tell a dead
@@ -1064,12 +1160,33 @@ class Scraper:
                         row.status = "LOGIN_REQUIRED"
                         row.note("cookies rejected/expired")
                         return row
+                    # "Something went wrong" / "try again later" is Instagram
+                    # refusing to serve, NOT a statement about this profile.
+                    # It is a throttle: recorded on the row and on the
+                    # governor (once -- an explicit pushback this visit has
+                    # already been), never filed as GONE, and never counted
+                    # toward the no-payload streak (which would double-count
+                    # the same refusal).
+                    if _RE_THROTTLE_PAGE.search(body):
+                        row.status = "PARTIAL"
+                        row.note("instagram served an error / try-again-later "
+                                 "page -- throttled, not a verdict on this "
+                                 "profile; pacing slowed")
+                        if not pushed:
+                            governor_for("instagram").record(Signal(
+                                THROTTLED, "error page: something went wrong / try again later"))
+                        await self.screenshot(page, row)
+                        return row
                     if RE_GONE.search(body):
                         row.status = "GONE"
-                        row.note("removed or unavailable -- may already be down")
+                        # A real 404 corroborates the text, never replaces it.
+                        row.note("removed or unavailable -- may already be down"
+                                 + (" (HTTP 404)" if doc_status == 404 else ""))
                         return row
                     row.status = "PARTIAL"
-                    row.note("profile payload not seen")
+                    row.note("profile payload not seen"
+                             + (f" (page answered HTTP {doc_status})"
+                                if doc_status and doc_status != 200 else ""))
                     # THREE IN A ROW IS NOT A COINCIDENCE. One profile with
                     # nothing to read is ordinary (deleted, odd layout).
                     # Several consecutive ones, with no explicit pushback,
@@ -1139,6 +1256,34 @@ class Scraper:
             # the handle from the URL (row.profile_id has been reassigned
             # to the numeric pk by fill() at this point, which is why the
             # pinned copy is used here too).
+            #
+            # "ABOUT THIS ACCOUNT" RUNS HERE, ON THIS SAME PAGE, before the
+            # last-post tiers below navigate it away. It used to open a new
+            # tab and load the same profile a second time and click through on
+            # nearly every row. The screenshot is already taken (the panel is
+            # a modal), the profile is still on screen, and the modal is
+            # dismissed afterwards. Skipped while Instagram is throttling us
+            # and once the job is cancelled -- it is a bonus field and never
+            # worth an extra interaction then.
+            if (not row.location or not row.created_iso) and (row.profile_name or row.profile_id):
+                if cancelled(self.a):
+                    pass
+                elif not governor_for("instagram").healthy():
+                    row.note("About-this-account panel skipped: Instagram is "
+                             "throttling this session (location / join date left blank)")
+                else:
+                    about = await self.read_about_panel(wanted, page)
+                    if about.get("country") and not row.location:
+                        row.location = about["country"]
+                        row.mark("location", "about-panel")
+                    if about.get("joined") and not row.created_iso:
+                        row.created_iso = about["joined"]
+                        row.mark("created", "about-panel")
+                        # Month precision, because that is all the panel
+                        # gives. Said out loud so a YYYY-MM here is never
+                        # mistaken for a truncated full date.
+                        row.note("join date is month-precision (Instagram publishes no day)")
+
             if not row.last_post_iso:
                 if row.posts_seen == "":
                     # SAID OUT LOUD, not skipped quietly. These tiers read
@@ -1152,30 +1297,16 @@ class Scraper:
                     row.note("post count unreadable -- last-post date not "
                              "attempted (an unowned tile cannot be dated "
                              "to this account)")
+                tier_notes: list[str] = []
                 last_post = await self.read_last_post_date(
                     page, private, row.posts_seen == "yes",
-                    (wanted, row.profile_name),
+                    (wanted, row.profile_name), tier_notes,
                 )
+                for n in tier_notes:
+                    row.note(n)
                 if last_post:
                     row.last_post_iso = last_post
                     row.mark("last_post", "post-page")
-            # "About this account" -- the only source for two fields this
-            # engine could not otherwise report at all. Runs when at least
-            # one of them is still missing, and never for a row we could
-            # not read in the first place (no name and no id means there is
-            # no profile there to ask about).
-            if (not row.location or not row.created_iso) and (row.profile_name or row.profile_id):
-                about = await self.read_about_panel(wanted)
-                if about.get("country") and not row.location:
-                    row.location = about["country"]
-                    row.mark("location", "about-panel")
-                if about.get("joined") and not row.created_iso:
-                    row.created_iso = about["joined"]
-                    row.mark("created", "about-panel")
-                    # Month precision, because that is all the panel gives.
-                    # Said out loud so a YYYY-MM here is never mistaken for
-                    # a truncated full date.
-                    row.note("join date is month-precision (Instagram publishes no day)")
 
             row.status = "OK" if row.profile_name or row.profile_id else "PARTIAL"
             return row

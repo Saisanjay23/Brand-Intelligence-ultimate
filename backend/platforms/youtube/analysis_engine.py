@@ -19,6 +19,7 @@ import urllib.request
 from typing import Optional
 from urllib.parse import unquote, urlparse
 
+from backend.platforms.scan_options import cancelled
 from backend.shared import diagnostics
 from backend.shared.avatars import (YOUTUBE_GENERATED_PREFIX,
                                     hd_picture_url,
@@ -232,7 +233,11 @@ class Scraper:
             found = await self.api.channels([seed_id])
             ch = found[0] if found else None
 
-        if ch is None:
+        # A /channel/UC... id that the channels lookup did not return is a
+        # deleted or terminated channel. Asking the HANDLE endpoint about an id
+        # cannot find it -- it costs three lookups and a search (~103 quota
+        # units) to arrive at the same GONE -- so it is only for vanity forms.
+        if ch is None and kind != "id":
             ch = await self.api.channel_by_handle(ref)
 
         if ch is None:
@@ -336,8 +341,10 @@ class Scraper:
         if (subs := stats.get("subscriberCount")) is not None and not stats.get(
                 "hiddenSubscriberCount"):
             row.followers = int(subs)
-            # YouTube rounds public subscriber counts to 3 significant figures
-            row.followers_exact = "no" if stats.get("hiddenSubscriberCount") else "yes"
+            # YouTube rounds public subscriber counts to 3 significant
+            # figures, so a count of 1,000 or more is an approximation and
+            # only a count under 1,000 is exact.
+            row.followers_exact = "yes" if row.followers < 1000 else "no"
             row.mark("followers", "api")
         if stats.get("hiddenSubscriberCount"):
             row.note("subscriber count hidden by the channel")
@@ -445,6 +452,7 @@ class Scraper:
     async def run(
         self, jobs: list[tuple[str, str, str]],
         known_by_url: Optional[dict[str, dict]] = None,
+        rows_out: Optional[list[Row]] = None,
     ) -> list[Row]:
         """WHAT: drives a whole batch of (url, target, feed) jobs. HOW:
         resolves every job's channel reference up front, then fetches every
@@ -463,9 +471,13 @@ class Scraper:
         why it's already the cheap way to get an activity date.
 
         Stops the moment a row comes back CHECKPOINT (daily quota gone,
-        every remaining job would fail the same way); rows gathered before
-        the stop are still returned. LINKED TO: the standalone entry
-        point; the API path drives this directly."""
+        every remaining job would fail the same way) or the owning job is
+        cancelled (checked between channels); rows gathered before the stop
+        are still returned. `rows_out`, when given, is the SAME list rows are
+        appended to as they settle, so a caller whose task is cancelled
+        outright -- no return value ever arrives -- still holds everything
+        read so far. LINKED TO: the standalone entry point; the API path
+        drives this directly."""
         from backend.shared.logging import get_logger as _gl
         log = _gl("platforms.youtube.analysis")
 
@@ -521,8 +533,11 @@ class Scraper:
                 by_id[cid] = found[0]
             return found[0] if found else None
 
-        rows: list[Row] = []
+        rows: list[Row] = rows_out if rows_out is not None else []
         for i, (url, tgt, feed, kind, ref) in enumerate(resolved, 1):
+            if cancelled(self.a):
+                log.info(f"cancelled -- stopping after {len(rows)} of {len(resolved)} channel(s)")
+                break
             row = Row(url=url, target=tgt, original_feed=feed, entity_type="channel")
             self._seed_readable_url(row, kind, ref, knowns[i - 1])
             seed_id = seed_ids[i - 1]
@@ -536,7 +551,9 @@ class Scraper:
                 ch = await by_channel_id(ref) if kind == "id" else None
                 if ch is None and seed_id.startswith("UC") and seed_id != ref:
                     ch = await by_channel_id(seed_id)
-                if ch is None:
+                # Not for an id: one the batch did not return is deleted, and
+                # the handle endpoints cannot find it (~103 units to say GONE).
+                if ch is None and kind != "id":
                     ch = await self.api.channel_by_handle(ref)
                 if ch is None:
                     row.status = "GONE"

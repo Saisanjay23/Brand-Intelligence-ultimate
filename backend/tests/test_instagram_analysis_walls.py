@@ -163,3 +163,337 @@ class TestCountsAndChannelUrls:
         from backend.platforms.youtube.analysis_engine import channel_ref
         assert channel_ref("https://www.youtube.com/@NASA") == ("handle", "@NASA")
         assert channel_ref("https://www.youtube.com/channel/UC" + "a" * 22)[0] == "id"
+
+
+# --------------------------------------------------------------------------
+# Review round 2: document status, throttle pages, tier-1 staleness, About
+# panel reuse, cancel, discovery owner / pacing / tab hygiene.
+# --------------------------------------------------------------------------
+
+import asyncio as _asyncio
+from types import SimpleNamespace as _NS
+
+from backend.platforms.instagram import analysis_engine as _ae
+from backend.platforms.instagram import discovery_engine as _ig
+from backend.shared import pushback as _pb
+
+
+@pytest.fixture
+def fresh_governor():
+    _pb.reset_all()
+    yield _pb.governor_for("instagram")
+    _pb.reset_all()
+
+
+def _resp(status, text=""):
+    r = MagicMock()
+    r.status = status
+    r.text = AsyncMock(return_value=text)
+    return r
+
+
+async def _run_s(url, page, scraper_setup=None):
+    s = _scraper(page)
+    s.read_dom = AsyncMock(return_value=page._dom)
+    s.screenshot = AsyncMock()
+    if scraper_setup:
+        scraper_setup(s)
+    row = await s.process("https://www.instagram.com/" + url, "target", "feed", None)
+    return row, s
+
+
+@pytest.mark.usefixtures("fresh_governor")
+class TestDocumentStatusIsRead:
+    @pytest.mark.asyncio
+    async def test_a_429_on_the_profile_page_is_a_throttle_signal(self, fresh_governor):
+        page = _page("https://www.instagram.com/shop/", "")
+        page.goto = AsyncMock(return_value=_resp(429))
+        row, _ = await _run_s("shop/", page)
+        assert row.status == "PARTIAL"
+        assert "throttled" in row.notes
+        assert fresh_governor.gap_multiplier() > 1.0
+
+    @pytest.mark.asyncio
+    async def test_a_403_on_the_profile_page_is_a_session_verdict(self):
+        page = _page("https://www.instagram.com/shop/", "")
+        page.goto = AsyncMock(return_value=_resp(403))
+        row, _ = await _run_s("shop/", page)
+        assert row.status == "LOGIN_REQUIRED"
+
+    @pytest.mark.asyncio
+    async def test_a_200_costs_nothing_and_its_body_is_never_read(self, fresh_governor):
+        resp = _resp(200, "<html>whole profile</html>")
+        page = _page("https://www.instagram.com/shop/", "")
+        page.goto = AsyncMock(return_value=resp)
+        await _run_s("shop/", page)
+        resp.text.assert_not_awaited()
+        assert fresh_governor.gap_multiplier() == 1.0
+
+    @pytest.mark.asyncio
+    async def test_a_404_with_the_not_available_text_is_gone(self):
+        page = _page("https://www.instagram.com/shop/", "Sorry, this page isn't available.")
+        page.goto = AsyncMock(return_value=_resp(404))
+        row, _ = await _run_s("shop/", page)
+        assert row.status == "GONE"
+        assert "404" in row.notes
+
+    @pytest.mark.asyncio
+    async def test_a_404_alone_is_not_gone(self):
+        page = _page("https://www.instagram.com/shop/", "")
+        page.goto = AsyncMock(return_value=_resp(404))
+        row, _ = await _run_s("shop/", page)
+        assert row.status == "PARTIAL"
+        assert "404" in row.notes
+
+
+@pytest.mark.usefixtures("fresh_governor")
+class TestSomethingWentWrongIsAThrottle:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("text", ["Something went wrong", "Please try again later."])
+    async def test_it_is_recorded_not_filed_as_a_profile_verdict(self, text, fresh_governor):
+        page = _page("https://www.instagram.com/shop/", text)
+        row, s = await _run_s("shop/", page)
+        assert row.status == "PARTIAL"
+        assert "throttled" in row.notes
+        assert fresh_governor.pushbacks == 1
+        assert s._no_payload_streak == 0          # not a no-payload visit
+
+    @pytest.mark.asyncio
+    async def test_it_is_not_recorded_twice_when_the_http_status_already_said_so(self, fresh_governor):
+        page = _page("https://www.instagram.com/shop/", "Something went wrong")
+        page.goto = AsyncMock(return_value=_resp(429))
+        await _run_s("shop/", page)
+        assert fresh_governor.pushbacks == 1
+
+
+class TestLastPostTier1:
+    @staticmethod
+    def _page_with(alts, hrefs=(), post_time=None):
+        p = _page("https://www.instagram.com/acct/", "")
+
+        async def evaluate(js, *a):
+            if js == Scraper.JS_GRID_ALT_DATES:
+                return list(alts)
+            if js == Scraper.JS_GRID_POST_LINKS:
+                return list(hrefs)
+            if js == Scraper.JS_POST_TIME:
+                return post_time() if callable(post_time) else (post_time or {})
+            return {}
+        p.evaluate = AsyncMock(side_effect=evaluate)
+        return p
+
+    @pytest.mark.asyncio
+    async def test_an_undated_newest_tile_is_said_out_loud(self):
+        # the first tile is a Reel (caption only), a later one a dated photo
+        page = self._page_with(["just a caption", "Photo by acct on March 03, 2024."])
+        s = _scraper(page)
+        notes = []
+        got = await s.read_last_post_date(page, False, True, ("acct",), notes)
+        assert got == "2024-03-03"
+        assert any("newer post may exist" in n for n in notes)
+        page.goto.assert_not_awaited()            # no page visit was added
+
+    @pytest.mark.asyncio
+    async def test_all_dated_tiles_say_nothing(self):
+        page = self._page_with(["Photo by acct on March 03, 2024.",
+                                "Photo by acct on March 01, 2024."])
+        s = _scraper(page)
+        notes = []
+        assert await s.read_last_post_date(page, False, True, ("acct",), notes) == "2024-03-03"
+        assert notes == []
+
+
+@pytest.mark.usefixtures("fresh_governor")
+class TestPermalinkTier:
+    @staticmethod
+    def _setup(monkeypatch, n=3, cancel_after=None):
+        monkeypatch.setattr(_ae, "humanize_interaction", AsyncMock())
+        stamp = {"time": "2025-05-0%dT10:00:00.000Z", "handles": ["acct"]}
+        page = TestLastPostTier1._page_with([], ["/p/a/", "/p/b/", "/p/c/"][:n],
+                                            post_time=lambda: dict(stamp, time=stamp["time"] % 5))
+        s = _scraper(page)
+        if cancel_after:
+            s.a.cancel = False
+
+            async def goto(*a, **k):
+                if page.goto.await_count >= cancel_after:
+                    s.a.cancel = True
+            page.goto = AsyncMock(side_effect=goto)
+        return s, page
+
+    @pytest.mark.asyncio
+    async def test_waits_are_jittered_and_visits_are_spaced(self, monkeypatch):
+        s, page = self._setup(monkeypatch)
+        assert await s.read_last_post_date(page, False, True, ("acct",)) == "2025-05-05"
+        waits = [c.args[0] for c in page.wait_for_timeout.await_args_list]
+        assert len(waits) == 3 + 2                 # a settle per visit + a pause between visits
+        settles, pauses = waits[1::2], waits[0::2]
+        # order is: settle(1) pause settle(2) pause settle(3)
+        assert all(1125 <= w <= 1875 for w in (waits[0], waits[2], waits[4]))
+        assert all(1500 <= w <= 2500 for w in (waits[1], waits[3]))
+        assert settles and pauses
+
+    @pytest.mark.asyncio
+    async def test_a_cancel_stops_the_visits_and_keeps_what_was_read(self, monkeypatch):
+        s, page = self._setup(monkeypatch, cancel_after=1)
+        assert await s.read_last_post_date(page, False, True, ("acct",)) == "2025-05-05"
+        assert page.goto.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_no_visits_while_the_platform_is_throttling(self, monkeypatch, fresh_governor):
+        s, page = self._setup(monkeypatch)
+        for _ in range(2):
+            _pb.note_response("instagram", 429)
+        notes = []
+        assert await s.read_last_post_date(page, False, True, ("acct",), notes) == ""
+        page.goto.assert_not_awaited()
+        assert any("throttling" in n for n in notes)
+
+
+@pytest.mark.usefixtures("fresh_governor")
+class TestAboutPanelReusesThePage:
+    GOOD = {"name": "Shop", "followers": "1,234 followers", "posts": "10 posts"}
+
+    @staticmethod
+    def _prep(monkeypatch):
+        monkeypatch.setattr(_ae, "_TIMELINE_WAIT_S", 0.01)
+
+    @pytest.mark.asyncio
+    async def test_no_second_tab_and_no_second_load_of_the_profile(self):
+        page = _page("https://www.instagram.com/shop/", "")
+        page.wait_for_selector = AsyncMock(side_effect=RuntimeError("no options button"))
+        page.keyboard = MagicMock()
+        page.keyboard.press = AsyncMock()
+        page.remove_listener = MagicMock()
+        s = _scraper(page)
+        assert await s.read_about_panel("shop", page) == {}
+        s.session.ctx.new_page.assert_not_awaited()
+        page.goto.assert_not_awaited()
+        page.close.assert_not_awaited()            # the caller's page lives on
+        page.remove_listener.assert_called_once()
+        page.keyboard.press.assert_awaited_once_with("Escape")
+
+    @pytest.mark.asyncio
+    async def test_process_passes_its_own_page_and_runs_it_before_the_date_tiers(self, monkeypatch):
+        self._prep(monkeypatch)
+        page = _page("https://www.instagram.com/shop/", "")
+        page._dom = self.GOOD
+        order = []
+
+        def setup(s):
+            async def about(username, pg=None):
+                order.append(("about", pg))
+                return {}
+
+            async def last(*a, **k):
+                order.append(("last", None))
+                return ""
+            s.read_about_panel = about
+            s.read_last_post_date = last
+        row, s = await _run_s("shop/", page, setup)
+        assert [o[0] for o in order] == ["about", "last"]
+        assert order[0][1] is page
+        assert s.session.ctx.new_page.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_skipped_while_throttled_and_said_so(self, monkeypatch):
+        self._prep(monkeypatch)
+        for _ in range(2):
+            _pb.note_response("instagram", 429)
+        page = _page("https://www.instagram.com/shop/", "")
+        page._dom = self.GOOD
+
+        def setup(s):
+            s.read_about_panel = AsyncMock(return_value={})
+            s.read_last_post_date = AsyncMock(return_value="")
+        row, s = await _run_s("shop/", page, setup)
+        s.read_about_panel.assert_not_awaited()
+        assert "About-this-account panel skipped" in row.notes
+
+    @pytest.mark.asyncio
+    async def test_skipped_once_cancelled(self, monkeypatch):
+        self._prep(monkeypatch)
+        page = _page("https://www.instagram.com/shop/", "")
+        page._dom = self.GOOD
+
+        def setup(s):
+            s.a.cancel = True
+            s.read_about_panel = AsyncMock(return_value={})
+            s.read_last_post_date = AsyncMock(return_value="")
+        row, s = await _run_s("shop/", page, setup)
+        s.read_about_panel.assert_not_awaited()
+
+
+class TestDiscoveryLatestPostOwner:
+    @staticmethod
+    def _node(extra):
+        return {"username": "acct", "media_count": 5, "biography": "b",
+                "edge_felix_video_timeline": extra}
+
+    def test_a_tagged_post_by_another_account_is_not_this_profiles_last_post(self):
+        own = {"taken_at": 1_700_000_000, "user": {"username": "acct"}}
+        tagged = {"taken_at": 1_790_000_000, "user": {"username": "someone_else"}}
+        iso = _ig._latest_post(self._node([own, tagged]), 5)
+        assert iso == "2023-11-14"
+
+    def test_unowned_and_own_media_still_count(self):
+        unowned = {"taken_at": 1_700_000_000}
+        own = {"taken_at": 1_710_000_000, "owner": {"username": "ACCT"}}
+        assert _ig._latest_post(self._node([unowned, own]), 5) == "2024-03-09"
+
+
+class TestDiscoveryPacingAndTabs:
+    @staticmethod
+    def _fake_clock(monkeypatch):
+        clock = [0.0]
+
+        async def sleep(d):
+            clock[0] += d
+        monkeypatch.setattr(_ig.asyncio, "sleep", sleep)
+        monkeypatch.setattr(_ig, "time", _NS(monotonic=lambda: clock[0], time=lambda: 0.0))
+        monkeypatch.setattr(_ig.stealth_levels, "jittered", lambda m, *a, **k: 1.0)
+        return clock
+
+    @pytest.mark.asyncio
+    async def test_the_page_gap_is_unchanged_while_healthy(self, monkeypatch):
+        _pb.reset_all()
+        clock = self._fake_clock(monkeypatch)
+        await _ig._page_gap(_NS())
+        assert 1.0 <= clock[0] <= 1.21
+
+    @pytest.mark.asyncio
+    async def test_the_page_gap_stretches_after_pushback(self, monkeypatch):
+        _pb.reset_all()
+        _pb.note_response("instagram", 429)         # multiplier 2.0
+        clock = self._fake_clock(monkeypatch)
+        try:
+            await _ig._page_gap(_NS())
+        finally:
+            _pb.reset_all()
+        assert clock[0] >= 1.9
+
+    @pytest.mark.asyncio
+    async def test_a_tab_that_failed_to_load_is_closed(self):
+        tab = MagicMock()
+        tab.route = AsyncMock()
+        tab.goto = AsyncMock(side_effect=RuntimeError("net::ERR"))
+        tab.close = AsyncMock()
+        ctx = MagicMock()
+        ctx.new_page = AsyncMock(return_value=tab)
+        disc = _ig.Discovery(_NS(timeout=5), ctx)
+        assert await disc._search_tab() is None
+        tab.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_dropped_tab_is_closed_not_just_forgotten(self):
+        tab = MagicMock()
+        tab.is_closed = MagicMock(return_value=False)
+        tab.evaluate = AsyncMock(side_effect=RuntimeError("target closed"))
+        tab.close = AsyncMock()
+        ctx = MagicMock()
+        ctx.request.get = AsyncMock(return_value=_NS(status=200))
+        disc = _ig.Discovery(_NS(timeout=5), ctx)
+        disc._tab = tab
+        await disc._get("https://www.instagram.com/x", {})
+        tab.close.assert_awaited_once()
+        assert disc._tab is None

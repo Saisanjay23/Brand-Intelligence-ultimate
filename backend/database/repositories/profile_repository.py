@@ -456,6 +456,20 @@ def _without(query: dict, field: str) -> dict:
     return out
 
 
+def _without_keyword_value(query: dict, keyword: Optional[str]) -> dict:
+    """`query` minus the clause that pins ONE keyword (`{"keywords": kw}`),
+    leaving the keyword-category clause (`{"keywords": {"$in": [...]}}`) in
+    place. See the keyword facet in `list_profiles`."""
+    out = dict(query)
+    if keyword and out.get("$and"):
+        rest = [c for c in out["$and"] if c != {"keywords": keyword}]
+        if rest:
+            out["$and"] = rest
+        else:
+            out.pop("$and", None)
+    return out
+
+
 def _oid(doc_id: str) -> ObjectId:
     try:
         return ObjectId(doc_id)
@@ -1393,7 +1407,11 @@ async def find(
 
     plat_task = _group(_without(q, "platform"), _by("platform"))
     status_task = _group(_without(q, "status"), _by("status"))
-    keyword_task = _group(_without(q, "keywords"),
+    # Drops ONLY the selected-keyword clause. `_without(q, "keywords")` also
+    # dropped the Individual/Domain category clause (it constrains the same
+    # field), so with a category chosen the dropdown listed and counted
+    # keywords from the other category too.
+    keyword_task = _group(_without_keyword_value(q, keyword),
                           [{"$unwind": "$keywords"}, *_by("keywords")])
 
     # New/Old totals for the grid's tab badges. Counted over the query with
