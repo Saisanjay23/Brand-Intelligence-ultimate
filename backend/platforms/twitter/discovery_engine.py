@@ -928,6 +928,16 @@ class Discovery:
 
         by_id: dict[str, TwitterUser] = {}
         cursor = ""
+        # X'S LAST RESPONSE HELD NOBODY NEW. Measured live: at the true end of
+        # a search X sends one small empty SearchTimeline response and then
+        # sends NOTHING more -- further scrolls fire no request at all. So
+        # silence after an empty answer is the end, while silence with no
+        # empty answer since the last new users is X being slow, which is
+        # not. Set by the RESPONSE HANDLER, not the scroll loop: the empty
+        # answer can land before the loop's first scroll (while the page is
+        # still being checked), and a flag set only inside the loop missed it
+        # and called a finished search "stalled".
+        empty_answer_seen = False
         arrived = asyncio.Event()
         rate_limited = False
 
@@ -982,7 +992,7 @@ class Discovery:
             cursor, which X carries in the response BODY rather than a
             header -- so the only way to page is to read it back out of
             what arrived."""
-            nonlocal cursor, rate_limited
+            nonlocal cursor, rate_limited, empty_answer_seen
             try:
                 if SEARCH_QUERY not in resp.url:
                     return
@@ -1008,6 +1018,7 @@ class Discovery:
                 arrived.set()
                 return
             users_in_payload = 0
+            ids_before = len(by_id)
             for blob in parse_lines(text):
                 st = search_state(blob, probe)
                 users_in_payload += len(st.users)
@@ -1019,6 +1030,7 @@ class Discovery:
                     by_id.setdefault(u.entity_id or u.handle, u)
                 if st.bottom_cursor:
                     cursor = st.bottom_cursor
+            empty_answer_seen = len(by_id) == ids_before
             # 401/403 and challenge codes were invisible to pacing before
             # (control flow is unchanged -- the stall branch below already
             # reads the page for a wall). The body is passed only when it was
@@ -1114,10 +1126,17 @@ class Discovery:
                     out.error = f"scroll failed: {e}"
                     break
 
+                # DID X ANSWER THIS SCROLL AT ALL? A timeout leaves the cursor
+                # exactly where it was, which is also what "the same cursor
+                # twice" looks like, so two slow pages could be read as the end
+                # of the results -- `exhausted`, complete, satisfied -- while X
+                # was merely throttling. See `empty_answer_seen` below for how
+                # a genuine end is told apart.
+                answered = True
                 try:
                     await asyncio.wait_for(arrived.wait(), timeout=self.a.page_wait)
                 except asyncio.TimeoutError:
-                    pass
+                    answered = False
 
                 if rate_limited:
                     out.stopped = "rate_limited"
@@ -1125,6 +1144,7 @@ class Discovery:
 
                 if len(by_id) > before:
                     stalls = 0
+                    empty_answer_seen = False
                     # Straight after the scroll that found them, so results
                     # reach the screen while the sweep is still running
                     # rather than all at once when it ends.
@@ -1184,7 +1204,7 @@ class Discovery:
                             pass
 
                     # the same bottom cursor twice with no new users is the end
-                    if cursor and cursor == last_cursor and stalls >= 2:
+                    if empty_answer_seen and cursor and cursor == last_cursor and stalls >= 2:
                         if not by_id and not await _x_says_no_results(page):
                             # NOTHING FOUND, AND X NEVER SAID SO. A genuinely
                             # empty search renders "No results for ..."; a

@@ -622,12 +622,24 @@ async def coverage(
     gid = group_id.strip()
     report = await coverage_db.summary(gid)
     items = await coverage_db.owed(gid, [platform.value] if platform else None)
+    # KEYWORDS THE LEDGER HAS NEVER HEARD OF. A keyword added after a
+    # platform's last sweep has no cell, so the ledger alone reported
+    # `owed: 0` for exactly the term nobody had searched. Compared against
+    # the client's current plan here; a client that cannot be read leaves the
+    # ledger's own answer standing rather than failing the report.
+    try:
+        from backend.shared import keywords as kw_groups
+        plans = kw_groups.build_plans(await clients_db.get(gid))
+        swept = [platform.value] if platform else list(report["by_platform"])
+        items = items + await coverage_db.unplanned(gid, swept, plans)
+    except Exception:                            # noqa: BLE001 - report still stands
+        pass
     return CoverageReport(
         group_id=gid,
         cells=report["cells"],
         # Recounted from the filtered list when a platform was named, so
         # the number and the list below it can never disagree.
-        owed=len(items) if platform else report["owed"],
+        owed=len(items),
         by_outcome=report["by_outcome"],
         by_platform=report["by_platform"],
         items=[OwedCell(**c) for c in items],

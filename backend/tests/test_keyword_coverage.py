@@ -506,3 +506,49 @@ class TestASkippedPlatformTakesEveryKeywordWithIt:
         assert ("facebook", "people", "kw1") in owed
         assert "no usable session" in ledger.reason_for("facebook", "people", "kw0")
         assert job.platforms["facebook"].status == "skipped"
+
+
+class TestTheLedgerIsPlannedBeforeItIsRead:
+    """A keyword added since the last sweep has no ledger cell. Reading what
+    is owed BEFORE planning concluded "nothing owed" for exactly the keywords
+    that had never been searched, and the platform said "already fully
+    covered"."""
+
+    @pytest.mark.asyncio
+    async def test_the_plan_is_written_before_owed_is_read(self, monkeypatch):
+        order: list[str] = []
+
+        class Ledger(FakeLedger):
+            async def owed(self, group_id, platforms=None):
+                order.append("owed")
+                return await super().owed(group_id, platforms)
+
+            async def plan(self, *a, **kw):
+                order.append("plan")
+                return await super().plan(*a, **kw)
+
+        ledger = Ledger(owed_cells=[
+            {"kw_type": "individual", "search": "kw0", "tab": "people"},
+        ])
+        _wire(monkeypatch, "twitter", [_session("a")], ledger=ledger)
+        job = _job(["kw0", "kw1"], "twitter", ["people"], only_owed=True)
+
+        await _sweep(job, "twitter")
+
+        assert order.index("plan") < order.index("owed")
+
+    @pytest.mark.asyncio
+    async def test_a_plan_that_could_not_be_written_sweeps_everything(self, monkeypatch):
+        """If the ledger cannot say what is owed, "nothing" is not an answer."""
+        class Ledger(FakeLedger):
+            async def plan(self, *a, **kw):
+                return 0                      # the repository's "write failed"
+
+        ledger = Ledger(owed_cells=[])
+        _wire(monkeypatch, "twitter", [_session("a")], ledger=ledger)
+        job = _job(["kw0", "kw1"], "twitter", ["people"], only_owed=True)
+
+        prog = await _sweep(job, "twitter")
+
+        assert prog.status == "done"
+        assert len(ledger.searched()) == 2

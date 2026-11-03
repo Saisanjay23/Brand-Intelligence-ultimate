@@ -326,11 +326,16 @@ def build_plans(
     always DOMAIN -- the individual-asset-name signal it used to consult is
     gone with that feature.
 
-    Deduped by SEARCH TERM: the same permutation listed under two parents
-    is one search, not two, since running the same query twice against the
-    same platform costs a real page load and risks the session for nothing.
-    When that happens the single plan carries BOTH parents as targets, and
-    `resolve_parent` picks per hit.
+    Deduped by (TYPE, SEARCH TERM): the same permutation listed under two
+    parents OF THE SAME TYPE is one search, not two, since running the same
+    query twice against the same platform costs a real page load and risks
+    the session for nothing. When that happens the single plan carries BOTH
+    parents as targets, and `resolve_parent` picks per hit.
+
+    A term configured under BOTH types ("Acme" as a person and "Acme" as a
+    brand) is two searches, one per type, exactly as `start()` documents:
+    the two carry different result caps, and deduping on the term alone
+    silently dropped the second type's parent and every permutation it had.
 
     `requested_types` maps a lowered term to INDIVIDUAL/DOMAIN and is
     consulted ONLY for a term the client's groups do not contain. Callers
@@ -347,9 +352,9 @@ def build_plans(
         if cleaned:
             wanted = {c.lower() for c in cleaned}
 
-    # search term (lowered) -> {"search", "kw_type", "targets": [MatchTarget]}
-    by_search: dict[str, dict] = {}
-    order: list[str] = []
+    # (type, search term lowered) -> {"search", "kw_type", "targets": [MatchTarget]}
+    by_search: dict[tuple[str, str], dict] = {}
+    order: list[tuple[str, str]] = []
     matched_parents: set[str] = set()
 
     for kw_type in KEYWORD_TYPES:
@@ -372,7 +377,7 @@ def build_plans(
             children = _dedup(group.get("children") or [])
             terms_to_search = _dedup([parent, *children])
             for term in terms_to_search:
-                key = term.lower()
+                key = (kw_type, term.lower())
                 if key not in by_search:
                     by_search[key] = {"search": term, "kw_type": kw_type, "targets": [target]}
                     order.append(key)
@@ -383,14 +388,15 @@ def build_plans(
     # still gets swept, on its own, rather than vanishing.
     if wanted is not None:
         for term in _dedup(requested or []):
-            if term.lower() in matched_parents or term.lower() in by_search:
+            if term.lower() in matched_parents or any(
+                    (t, term.lower()) in by_search for t in KEYWORD_TYPES):
                 continue
             kw_type = (requested_types or {}).get(term.lower()) or classify_unknown(client, term)
-            by_search[term.lower()] = {
+            by_search[(kw_type, term.lower())] = {
                 "search": term, "kw_type": kw_type,
                 "targets": [MatchTarget(parent=term, terms=match_terms_for(term))],
             }
-            order.append(term.lower())
+            order.append((kw_type, term.lower()))
 
     return [
         KeywordPlan(

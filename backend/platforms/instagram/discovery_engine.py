@@ -29,6 +29,7 @@ from backend.shared import diagnostics
 from backend.shared.avatars import extract_instagram_hd_avatar, looks_like_placeholder
 from backend.shared.extraction import run_strategies
 from backend.shared.pushback import UNKNOWN, governor_for, note_response
+from backend.shared.resilience import classify_failure
 from backend.shared.schema_probe import SchemaProbe, probe_or_null
 from backend.shared.models.row import Row
 from backend.shared.text import iter_dicts
@@ -1065,10 +1066,13 @@ class Discovery:
                     out.stopped = "cancelled"
                     break
                 url = MOBILE_SEARCH_API.format(q=quote(keyword), count=100)
+                # ENCODED: these are opaque base64-ish tokens, and a `+`, `/`
+                # or `=` left raw is rewritten in transit -- the next page
+                # then silently comes back wrong or empty.
                 if page_token:
-                    url += f"&page_token={page_token}"
+                    url += f"&page_token={quote(str(page_token), safe='')}"
                 if rank_token:
-                    url += f"&rank_token={rank_token}"
+                    url += f"&rank_token={quote(str(rank_token), safe='')}"
 
                 res = await self._get(
                     url,
@@ -1144,12 +1148,26 @@ class Discovery:
 
                 # Check for pagination
                 has_more = data.get("has_more")
+                prev_cursor = (page_token, rank_token)
                 rank_token = data.get("rank_token")
                 page_token = data.get("page_token") or data.get("next_max_id")
 
                 if not has_more and not page_token:
                     out.stopped = "exhausted"
                     out.complete = True
+                    break
+
+                # A CURSOR THAT CANNOT ADVANCE IS NOT "MORE RESULTS". `has_more`
+                # with no page token to ask with, or the very same cursor
+                # coming back, used to re-send the identical request until
+                # `max_pages` ran out -- up to ten copies of one call, which
+                # is exactly what a script does, and the log counted only
+                # pages that added users so the repetition was invisible.
+                # Stopped as a page-budget stop: what was fetched stands, and
+                # the sweep says it did not reach the end.
+                if not page_token or (page_token, rank_token) == prev_cursor:
+                    out.stopped = "cap:pages"
+                    out.complete = False
                     break
 
                 # Respect limits between pages. NOT a fixed number: the same
@@ -1216,10 +1234,23 @@ class Discovery:
                     # about it (http-403) no longer describes the sweep's
                     # outcome
                     out.stopped = "mobile-api-failed-web-recovered"
-                    # ...and neither does its error text. Left in place, a
-                    # "challenge_required" from the mobile leg would have the
-                    # runner quarantine an account whose search just worked.
-                    out.error = ""
+                    # ...and its error text describes the MOBILE leg, which
+                    # is not the sweep's outcome -- so a throttle or a plain
+                    # refusal is cleared, rather than have the runner
+                    # quarantine an account whose search just worked.
+                    #
+                    # EXCEPT WHEN THE PLATFORM SAID THE SESSION ITSELF IS
+                    # DEAD. A `login_required` or `challenge_required` is not
+                    # a flaky endpoint: the web leg answers a logged-out
+                    # browser too, with the 5 accounts the shallow endpoint
+                    # gives instead of the ~37 the mobile one does, so every
+                    # remaining keyword was "searched" through it, closed as
+                    # covered, and the account never flagged. Kept, so the
+                    # runner marks the session and replays the keyword on
+                    # another account (what it was found to be doing, and
+                    # why, is in the log line below).
+                    if classify_failure(out.error) not in ("expired", "checkpointed"):
+                        out.error = ""
                     # ...but the EVIDENCE is not erased: the governor already
                     # recorded what the mobile leg answered (note_response
                     # above), so repeated throttles still slow the platform

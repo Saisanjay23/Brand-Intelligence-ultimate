@@ -1392,10 +1392,22 @@ class DiscoveryRunner:
         # searched" a question with an answer after the job is gone. A
         # ledger write failing is logged and swallowed inside the
         # repository: bookkeeping must never cost the sweep itself.
-        items = await self._queue_for(job, platform_id, tabs)
-        prog.keywords_total = sum(len(it.tabs or tabs) for it in items)
-        await coverage_db.plan(
+        #
+        # PLANNED FIRST, THEN READ. Gap-closing mode asks the ledger what is
+        # owed, and a keyword added since the last sweep has no cell yet --
+        # so reading before planning concluded "nothing owed" for exactly
+        # the keywords that had never been searched, and the platform said
+        # "already fully covered". `plan()` creates the missing cells in
+        # the owed state and leaves covered ones alone, so after it the
+        # ledger describes everything this job is supposed to do. If the
+        # plan could not be written at all, the ledger cannot be trusted to
+        # say what is owed, and the whole plan is swept instead.
+        planned = await coverage_db.plan(
             job.group_id, job.id, platform_id, tabs, job.keyword_plan)
+        items = await self._queue_for(
+            job, platform_id, tabs,
+            ledger_ok=bool(planned) or not job.keyword_plan)
+        prog.keywords_total = sum(len(it.tabs or tabs) for it in items)
 
         run = _PlatformSweepRun(
             platform_id=platform_id,
@@ -1555,6 +1567,7 @@ class DiscoveryRunner:
 
     async def _queue_for(
         self, job: DiscoveryJob, platform_id: str, tabs: list[str],
+        ledger_ok: bool = True,
     ) -> list["_KeywordItem"]:
         """The keyword items this platform should actually sweep.
 
@@ -1573,6 +1586,11 @@ class DiscoveryRunner:
             for p in job.keyword_plan
         ]
         if not job.only_owed:
+            return full
+        if not ledger_ok:
+            log.error(
+                f"[{platform_id}] coverage plan could not be written -- sweeping "
+                f"the full plan rather than trust a ledger that is missing cells")
             return full
         try:
             cells = await coverage_db.owed(job.group_id, [platform_id])
@@ -2229,6 +2247,28 @@ class DiscoveryRunner:
                                 )
                         return stop_reason
 
+                    async def _breathe() -> None:
+                        """The gap between one keyword and the next, spent
+                        through the session's own `pause()` so jitter,
+                        fatigue and the occasional longer rest apply.
+
+                        A function because TWO paths need it: the ordinary
+                        end of a keyword, and a keyword that broke and went
+                        to the back of the queue. The retry path used to
+                        `continue` straight past the pause, so the very
+                        moment a platform had just refused a search the
+                        next one left with no gap at all."""
+                        if not (run.queue and inter_keyword_delay > 0
+                                and not job.cancel.is_set() and not run.hard_stop
+                                and session is not None and hasattr(session, "pause")):
+                            return
+                        base = settings.discovery_delay_sec or 0
+                        mult = (inter_keyword_delay / base) if base > 0 else 1.0
+                        try:
+                            await session.pause(mult)
+                        except Exception:
+                            pass
+
                     while run.queue and not job.cancel.is_set() and not run.hard_stop:
                         # The platform's circuit breaker, asked BEFORE a
                         # keyword is taken off the queue so a held worker
@@ -2386,6 +2426,8 @@ class DiscoveryRunner:
                                     pass
                                 except Exception:
                                     pass
+                            else:
+                                await _breathe()
                             continue
 
                         if fatal_kind[0] == "session":
@@ -2448,15 +2490,7 @@ class DiscoveryRunner:
                         # the target seconds are converted into one rather than
                         # slept flat -- that keeps jitter, fatigue and the
                         # occasional longer rest in play (stealth/browser.py).
-                        if (run.queue and inter_keyword_delay > 0
-                                and not job.cancel.is_set() and not run.hard_stop
-                                and session is not None and hasattr(session, "pause")):
-                            base = settings.discovery_delay_sec or 0
-                            mult = (inter_keyword_delay / base) if base > 0 else 1.0
-                            try:
-                                await session.pause(mult)
-                            except Exception:
-                                pass
+                        await _breathe()
                     return False
                 finally:
                     prog.current_keyword = ""

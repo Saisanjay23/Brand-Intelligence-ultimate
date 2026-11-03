@@ -105,7 +105,13 @@ def _now() -> float:
 
 
 def _is_available(item: dict, now: float) -> bool:
-    if item["status"] in DEAD_STATES or item["status"] in PENDING_STATES:
+    # "incomplete" is a cookie export that is missing a required cookie (set
+    # when a login or an import finished without one). It used to read as
+    # available, and `_claim_one` then rewrote its status to "ready" -- so a
+    # job was handed a half-filled account, ran logged out, and the marker
+    # that said why was erased on the way.
+    if (item["status"] in DEAD_STATES or item["status"] in PENDING_STATES
+            or item["status"] == "incomplete"):
         return False
     return item["rate_limited_until"] <= now
 
@@ -1413,6 +1419,15 @@ async def verify_session_item(
         scraper = plat.scraper()(options, cookies, session_id=session_id)
     except Exception as e:
         return False, f"could not construct scraper: {type(e).__name__}: {e}", False
+    # THE PROBE KEEPS WHAT THE PLATFORM ROTATES. Without this the check opened
+    # the profile on the stored cookies, the platform reissued its session
+    # tokens during the visit, and they were thrown away on close -- so the
+    # next job loaded the older, already-replaced tokens over the profile's
+    # newer ones, which is what a token-replay takeover looks like to the
+    # platform. Safe on a dead session: `refresh_cookies` refuses a jar that
+    # is missing a required cookie.
+    if session_id and hasattr(scraper, "on_cookies"):
+        scraper.on_cookies = cookie_saver(platform_id, session_id)
     try:
         await scraper.start()
     except Exception as e:

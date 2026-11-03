@@ -18,6 +18,7 @@
 import { describe, expect, it } from "vitest";
 import type { KeywordGroup } from "../api/types";
 import {
+  cleanKeyword,
   mergeGeneratedChildren,
   parseBulkKeywordGroups,
   mergeBulkKeywordGroups,
@@ -211,3 +212,33 @@ describe("mergeBulkKeywordGroups", () => {
   });
 });
 
+describe("keyword entry reads the way the backend reads it", () => {
+  it("keeps a hyphen in the parent name", () => {
+    expect(parseBulkKeywordGroups("Coca-Cola: coke, cocacola")).toEqual([
+      { parent: "Coca-Cola", children: ["coke", "cocacola"] },
+    ]);
+  });
+
+  it("splits on the first separator whichever arrow is used", () => {
+    expect(parseBulkKeywordGroups("Gautam Adani -> gautamadani")).toEqual([
+      { parent: "Gautam Adani", children: ["gautamadani"] },
+    ]);
+    expect(parseBulkKeywordGroups("Gautam Adani => gautamadani")).toEqual([
+      { parent: "Gautam Adani", children: ["gautamadani"] },
+    ]);
+  });
+
+  it("collapses internal whitespace so a double space is the same keyword", () => {
+    expect(cleanKeyword("  Gautam   Adani ")).toBe("Gautam Adani");
+    const parsed = parseBulkKeywordGroups("Gautam  Adani: x, y");
+    expect(parsed[0].parent).toBe("Gautam Adani");
+  });
+
+  it("merges a double-spaced duplicate into the existing parent instead of keeping a second group", () => {
+    const { next } = mergeBulkKeywordGroups(
+      [{ parent: "Gautam Adani", children: [] }],
+      parseBulkKeywordGroups("Gautam  Adani: x, y"),
+    );
+    expect(next).toEqual([{ parent: "Gautam Adani", children: ["x", "y"] }]);
+  });
+});

@@ -16,6 +16,19 @@
 
 import type { KeywordGroup } from "../api/types";
 
+/**
+ * A keyword the way the backend reads it: trimmed, with every internal run
+ * of whitespace collapsed to one space (backend/shared/keywords.py `_clean`).
+ *
+ * The screen deduped on lower-case alone, so "Gautam  Adani" (double space)
+ * showed as its own group next to "Gautam Adani" -- and on save the backend
+ * treated them as the same parent, kept the first, and silently dropped the
+ * second group's permutations. Cleaning here makes the two agree.
+ */
+export function cleanKeyword(value: string): string {
+  return (value ?? "").trim().replace(/\s+/g, " ");
+}
+
 /** Variations to attach, keyed by the parent they were generated from. */
 export type GeneratedByParent = Record<string, string[]>;
 
@@ -43,7 +56,7 @@ export function mergeGeneratedChildren(
     seen.add(g.parent.toLowerCase());
     const fresh: string[] = [];
     for (const raw of additions) {
-      const child = raw.trim();
+      const child = cleanKeyword(raw);
       if (!child) continue;
       const key = child.toLowerCase();
       if (seen.has(key)) continue;
@@ -59,7 +72,7 @@ export function mergeGeneratedChildren(
     const seen = new Set<string>([parent.toLowerCase()]);
     const fresh: string[] = [];
     for (const raw of children) {
-      const child = raw.trim();
+      const child = cleanKeyword(raw);
       if (!child) continue;
       const key = child.toLowerCase();
       if (seen.has(key)) continue;
@@ -82,14 +95,20 @@ export function parseBulkKeywordGroups(raw: string): KeywordGroup[] {
   const result: KeywordGroup[] = [];
 
   for (const line of lines) {
-    // Check if line contains parent -> children or parent: children
-    const sepMatch = line.match(/^([^:=>\-]+)(?::|->|=>)(.+)$/);
+    // Check if line contains parent -> children or parent: children.
+    //
+    // The parent runs up to the FIRST separator, and may contain a hyphen:
+    // the old pattern excluded "-" from the parent altogether, so
+    // "Coca-Cola: coke, cocacola" failed to match and was read as two
+    // separate parents, "Coca-Cola: coke" and "cocacola" -- the first of
+    // which was then searched literally, colon and all.
+    const sepMatch = line.match(/^(.+?)\s*(?::|->|=>)\s*(.+)$/);
     if (sepMatch) {
-      const parent = sepMatch[1].trim();
+      const parent = cleanKeyword(sepMatch[1]);
       const rawChildren = sepMatch[2];
       const children = rawChildren
         .split(/[,\n]/)
-        .map((s) => s.trim())
+        .map((s) => cleanKeyword(s))
         .filter(Boolean);
       if (parent) {
         result.push({ parent, children });
@@ -98,7 +117,7 @@ export function parseBulkKeywordGroups(raw: string): KeywordGroup[] {
       // If no separator, line might contain comma-separated parent names
       const items = line
         .split(/[,\n]/)
-        .map((s) => s.trim())
+        .map((s) => cleanKeyword(s))
         .filter(Boolean);
       for (const item of items) {
         if (item) {
@@ -126,7 +145,7 @@ export function mergeBulkKeywordGroups(
   let dupCount = 0;
 
   for (const item of incoming) {
-    const pTrimmed = item.parent.trim();
+    const pTrimmed = cleanKeyword(item.parent);
     if (!pTrimmed) continue;
 
     const existingIdx = updated.findIndex(
@@ -141,7 +160,7 @@ export function mergeBulkKeywordGroups(
         seen.add(currentGroup.parent.toLowerCase());
         const freshChildren: string[] = [];
         for (const raw of item.children) {
-          const ch = raw.trim();
+          const ch = cleanKeyword(raw);
           if (!ch) continue;
           const key = ch.toLowerCase();
           if (seen.has(key)) continue;
@@ -165,7 +184,7 @@ export function mergeBulkKeywordGroups(
       const seen = new Set<string>([pTrimmed.toLowerCase()]);
       const freshChildren: string[] = [];
       for (const raw of item.children) {
-        const ch = raw.trim();
+        const ch = cleanKeyword(raw);
         if (!ch) continue;
         const key = ch.toLowerCase();
         if (seen.has(key)) continue;

@@ -749,6 +749,23 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
   const [keywordMatchType, setKeywordMatchType] = useState<"" | "individual" | "domain">("");
   const [matchLevel, setMatchLevel] = useState<"" | "high" | "medium" | "low">("");
   const [entityType, setEntityType] = useState<"" | "profile" | "page" | "group">("");
+  // THE PEOPLE/PAGES/GROUPS FILTER ONLY EXISTS ON FACEBOOK, but its value was
+  // sent on every request whatever the platform. Pick "Groups Only" on
+  // Facebook, switch to Instagram or All, and the dropdown vanished while the
+  // filter stayed on: every Instagram row is a "profile", so the grid read
+  // "No profiles match these filters" with no visible filter to blame.
+  useEffect(() => {
+    if (platform !== "facebook") setEntityType("");
+  }, [platform]);
+  // A different client is a different keyword list: carrying the previous
+  // client's selected keyword over left client B filtered on a name it does
+  // not have, and the dropdown (which only lists B's keywords) showed
+  // "All Keywords" -- an empty grid that looked unfiltered.
+  useEffect(() => {
+    setKeywordFilter("");
+  }, [groupId]);
+  const [loadErrorPending, setLoadErrorPending] = useState("");
+  const [loadErrorValidated, setLoadErrorValidated] = useState("");
   const [searchInput, setSearchInput] = useState("");
   const [search, setSearch] = useState("");
   const [pageSize, setPageSize] = useState<number>(25);
@@ -928,8 +945,13 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
       setPendingItems(tab === "validated" ? [] : res.items);
       setAgeCounts({ new: res.counts?.ages?.new ?? 0, old: res.counts?.ages?.old ?? 0 });
       setKeywordCounts(res.counts?.keywords ?? {});
+      setLoadErrorPending("");
     } catch (e) {
       if (ticket !== pendingSeq.current) return;
+      // KEPT ON SCREEN, not just toasted. A toast is gone in seconds, and the
+      // list it failed to refresh stayed up -- stale cards from the previous
+      // filter or client, or an empty grid reading "No profiles match".
+      setLoadErrorPending((e as Error).message || "request failed");
       toast.error((e as Error).message);
     } finally {
       if (ticket === pendingSeq.current) setLoadingPending(false);
@@ -971,8 +993,10 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
         new: res.counts?.validated_ages?.new ?? 0,
         old: res.counts?.validated_ages?.old ?? 0,
       });
+      setLoadErrorValidated("");
     } catch (e) {
       if (ticket !== validatedSeq.current) return;
+      setLoadErrorValidated((e as Error).message || "request failed");
       toast.error((e as Error).message);
     } finally {
       if (ticket === validatedSeq.current) setLoadingValidated(false);
@@ -1056,7 +1080,15 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
   // already only an approximation and, now that every tab is server-paged,
   // would have been a tally of the 25 rows on screen -- a keyword that first
   // appears on page 2 would not have been offered at all.
-  const keywordOptions = Object.entries(keywordCounts).sort((a, b) => b[1] - a[1]);
+  const keywordOptions: [string, number][] = Object.entries(keywordCounts).sort((a, b) => b[1] - a[1]);
+  // THE SELECTED KEYWORD MUST BE AN OPTION. The list is built from the counts
+  // of the CURRENT tab, so a keyword with no rows there (New -> Old, or every
+  // profile validated) vanished from it; a <select> whose value matches no
+  // option shows its first entry, "All Keywords", while the filter stayed on.
+  if (keywordFilter && !keywordOptions.some(([kw]) => kw === keywordFilter)) {
+    keywordOptions.push([keywordFilter, 0]);
+  }
+  const loadError = tab === "validated" ? loadErrorValidated : loadErrorPending;
 
   const toggle = (id: string) =>
     setSelected((prev) => {
@@ -1782,8 +1814,14 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
         </div>
       )}
 
+      {!loading && loadError && (
+        <div role="alert" style={{ padding: "14px 18px", margin: "12px 0", borderRadius: "8px", border: "1px solid var(--danger, #ef4444)", color: "var(--danger, #ef4444)" }}>
+          Could not load these profiles: {loadError}. What is shown below may be out of date, or missing — this is a
+          failed request, not an empty result. Change a filter or reload to try again.
+        </div>
+      )}
       {loading && !displayed.length && <div style={{ padding: "40px", textAlign: "center", color: "var(--text-dim)" }}>Loading…</div>}
-      {!loading && !displayed.length && (
+      {!loading && !loadError && !displayed.length && (
         <div style={{ padding: "40px", textAlign: "center", color: "var(--text-dim)" }}>
           No {tab === "new" ? "new" : tab === "old" ? "old" : "validated"} profiles match these filters.
           {/* Named explicitly because the date window is the one filter that

@@ -22,6 +22,8 @@ interface Props {
   clientName: string;
   platforms: PlatformState[];
   job: DiscoveryJobState | null;
+  /** Why the sweep can no longer be followed ("" when it can). */
+  lost?: string;
   running: boolean;
   cancelling: boolean;
   onCancel: () => void;
@@ -187,11 +189,13 @@ function PlatformInFlightItem({
 
 function DiscoveryBannerBox({
   job,
+  lost,
   running,
   cancelling,
   onCancel,
 }: {
   job: DiscoveryJobState;
+  lost?: string;
   running: boolean;
   cancelling: boolean;
   onCancel: () => void;
@@ -227,7 +231,18 @@ function DiscoveryBannerBox({
               RUNNING
             </span>
           ) : (
-            <span className="rail-pill" style={{ background: "rgba(54,181,160,0.2)", color: "var(--success)", fontWeight: 700 }}>
+            // COLOURED BY WHAT HAPPENED. This pill was always green, so a
+            // FAILED or CANCELLED sweep read as a success.
+            <span
+              className="rail-pill"
+              style={{
+                background: job.status === "done" ? "rgba(54,181,160,0.2)"
+                  : job.status === "failed" ? "rgba(239,68,68,0.2)" : "rgba(234,179,8,0.2)",
+                color: job.status === "done" ? "var(--success)"
+                  : job.status === "failed" ? "var(--danger)" : "var(--warn-yellow)",
+                fontWeight: 700,
+              }}
+            >
               {job.status.toUpperCase()}
             </span>
           )}
@@ -322,6 +337,25 @@ function DiscoveryBannerBox({
       {job.message && (
         <div style={{ fontSize: "12px", color: "var(--text-dim)", marginBottom: "10px" }}>
           {job.message}
+        </div>
+      )}
+
+      {lost && (
+        <div role="alert" style={{ fontSize: "12px", color: "var(--danger)", marginBottom: "10px" }}>
+          {lost}
+        </div>
+      )}
+
+      {/* PLATFORMS THAT DID NOT FULLY RUN, named. A skipped platform has no
+          keywords counted, so it drops out of the progress maths and the bar
+          can read 100% for a sweep that never touched it. */}
+      {!running && job.platforms.some((p) => p.status === "skipped" || p.status === "failed" || p.status === "partial") && (
+        <div role="alert" style={{ fontSize: "12px", color: "var(--warn-yellow)", marginBottom: "10px" }}>
+          Not fully searched:{" "}
+          {job.platforms
+            .filter((p) => p.status === "skipped" || p.status === "failed" || p.status === "partial")
+            .map((p) => `${p.display_name} (${p.status}${p.note ? ` — ${p.note}` : ""})`)
+            .join("; ")}
         </div>
       )}
 
@@ -438,11 +472,14 @@ function TileProgressRow({ p }: { p: PlatformSweepState }) {
 }
 
 export function LiveResultsView({
-  clientId, clientName, platforms, job, running, cancelling, onCancel, onAnalyseStarted, refreshKey, liveKey, resumeAnalysisJobId,
+  clientId, clientName, platforms, job, lost, running, cancelling, onCancel, onAnalyseStarted, refreshKey, liveKey, resumeAnalysisJobId,
 }: Props) {
   const [phase, setPhase] = useState<Phase>("discovery");
   const [platform, setPlatform] = useState<string>("");
-  const [counts, setCounts] = useState<Record<string, number>>({});
+  // null = the count could not be read. A failed read used to be turned into
+  // 0, so a platform with results showed "0 results" -- the one number on this
+  // page that must never say "nothing" when the truth is "unknown".
+  const [counts, setCounts] = useState<Record<string, number | null>>({});
 
   // A new analysis job id arriving (from this page's own "Analyse
   // Validated"/"Analyse Selected", or from Home's "Analyse" action)
@@ -467,7 +504,7 @@ export function LiveResultsView({
         discoveryApi
           .listProfiles({ group_id: clientId, platform: p.platform, limit: 1 })
           .then((res) => [p.platform, res.total] as const)
-          .catch(() => [p.platform, 0] as const),
+          .catch(() => [p.platform, null] as const),
       ),
     ).then((pairs) => {
       if (!cancelled) setCounts(Object.fromEntries(pairs));
@@ -508,7 +545,9 @@ export function LiveResultsView({
       {clientId && (
         <div className="platform-rail-grid">
           {platforms.map((p) => {
-            const count = counts[p.platform] || 0;
+            const rawCount = counts[p.platform];
+            const countUnknown = rawCount === null;
+            const count = rawCount || 0;
             const sweep = jobPlatformById.get(p.platform);
             return (
               <div
@@ -526,7 +565,7 @@ export function LiveResultsView({
                   {p.session_state}
                 </span>
                 <span className="rail-pill" style={{ color: count > 0 ? "var(--text-main)" : "var(--text-dim)", fontWeight: count > 0 ? 700 : 400 }}>
-                  {count} {count === 1 ? "result" : "results"}
+                  {countUnknown ? "? results" : `${count} ${count === 1 ? "result" : "results"}`}
                 </span>
               </div>
               {sweep && sweep.status !== "pending" && <TileProgressRow p={sweep} />}
@@ -540,6 +579,7 @@ export function LiveResultsView({
       {job && (
         <DiscoveryBannerBox
           job={job}
+          lost={lost}
           running={running}
           cancelling={cancelling}
           onCancel={onCancel}

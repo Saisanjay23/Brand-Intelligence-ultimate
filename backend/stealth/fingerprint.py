@@ -252,9 +252,15 @@ def _detect_chrome_version(binary_path: str | None) -> tuple[str, str]:
 
 CHROME_MAJOR_VERSION, CHROME_FULL_VERSION = _detect_chrome_version(chrome_binary())
 
+# THE MAJOR VERSION ONLY, with the three reduced fields real Chrome sends.
+# Since Chrome 110 the User-Agent header is "reduced": `Chrome/156.0.0.0`,
+# never the build number -- the full version lives in the client-hints list
+# (`chrome_full` below), which is where it is kept. A UA carrying
+# `Chrome/156.0.8078.80` is a string no real Chrome sends, so it marked every
+# request this tool made as an override.
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    f"(KHTML, like Gecko) Chrome/{CHROME_FULL_VERSION} Safari/537.36"
+    f"(KHTML, like Gecko) Chrome/{CHROME_MAJOR_VERSION}.0.0.0 Safari/537.36"
 )
 
 # A 100-session pool that all present the exact same viewport is itself a

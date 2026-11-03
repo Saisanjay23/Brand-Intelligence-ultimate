@@ -1235,6 +1235,9 @@ class Discovery:
         # before every keyword would add exactly the load this is meant to
         # reduce.
         self._warmed = False
+        # The login/checkpoint wall a profile VISIT ran into, if any -- see
+        # `_resolve_missing`. Read by `sweep` once the visits are done.
+        self._resolve_wall = ""
 
     async def _self_avatar_assets(self) -> set[str]:
         """Every stable asset id (see _photo_asset_id) findable for the
@@ -1363,7 +1366,24 @@ class Discovery:
                         body_text = await page.inner_text("body")
                     except Exception:
                         body_text = ""
-                    if RE_LOGIN.search(body_text) or RE_CHECKPOINT.search(body_text) or RE_GONE.search(body_text):
+                    # A WALL BY URL IS THE SESSION'S, NOT THE PROFILE'S. It used
+                    # to blank this one candidate's name and be forgotten, so an
+                    # account challenged halfway through ~100 profile visits
+                    # finished the sweep `exhausted` -- complete, satisfied --
+                    # with blank cards and no session verdict. Remembered here
+                    # and handed to the sweep, which ends as that wall.
+                    try:
+                        _visit_url = page.url or ""
+                    except Exception:
+                        _visit_url = ""
+                    _url_wall = (
+                        "checkpoint" if is_wall_url(_visit_url, ("checkpoint",))
+                        else "login" if is_wall_url(_visit_url, ("login", "login.php"))
+                        else "")
+                    if _url_wall:
+                        self._resolve_wall = self._resolve_wall or _url_wall
+                    if (_url_wall or RE_LOGIN.search(body_text)
+                            or RE_CHECKPOINT.search(body_text) or RE_GONE.search(body_text)):
                         blocked = True
                     else:
                         # Wait for the profile's own data to actually be
@@ -2056,12 +2076,20 @@ class Discovery:
                 to_resolve = []
             if to_resolve:
                 _resolve_started = time.time()
+                self._resolve_wall = ""
                 try:
                     resolved = await self._resolve_missing(to_resolve, kind)
                 except Exception:
                     resolved = {}
                 finally:
                     out.resolve_seconds = round(time.time() - _resolve_started, 1)
+                if self._resolve_wall and out.stopped in ("", "exhausted", "end-of-serp", "no-results"):
+                    # The search itself worked and its rows stand, but the
+                    # account was walled while its profiles were visited --
+                    # the session verdict the runner needs to replay this
+                    # keyword elsewhere and stop spending the account.
+                    out.stopped, out.complete = self._resolve_wall, False
+                    out.error = f"facebook profile visits hit a {self._resolve_wall} wall"
 
             for eid in sorted(unresolved_in_by_id):
                 if r := resolved.get(eid):

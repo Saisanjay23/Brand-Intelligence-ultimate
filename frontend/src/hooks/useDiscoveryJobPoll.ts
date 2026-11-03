@@ -25,6 +25,10 @@ const RETRY_MS = 2000;
 // -- the behaviour this replaced, which is the right thing to degrade to.
 const FALLBACK_POLL_MS = 1000;
 
+// Consecutive failed requests before the sweep is reported as "cannot be
+// reached" rather than quietly retried for ever.
+const LOST_AFTER_FAILURES = 5;
+
 function notifyFinished(job: DiscoveryJobState): void {
   const message = `Discovery sweep ${
     job.status === "done" ? "finished" : job.status === "failed" ? "failed" : "was cancelled"
@@ -73,6 +77,11 @@ export function useDiscoveryJobPoll(onFinish?: () => void, onProgress?: () => vo
   // facet aggregates for rows that cannot have changed.
   const lastCounts = useRef("");
   const [cancelling, setCancelling] = useState(false);
+  // WHY THE SWEEP CAN NO LONGER BE FOLLOWED, or "". Every error used to be
+  // retried every two seconds for ever -- including a 404 after a backend
+  // restart -- so the banner sat frozen on RUNNING, `busy` kept blocking new
+  // sweeps, and nothing ever said the job was gone.
+  const [lostState, setLost] = useState<{ message: string; gone: boolean } | null>(null);
 
   const stop = useCallback(() => {
     if (timer.current) clearTimeout(timer.current);
@@ -83,6 +92,8 @@ export function useDiscoveryJobPoll(onFinish?: () => void, onProgress?: () => vo
 
   const watch = useCallback((jobId: string) => {
     stop();
+    setLost(null);
+    let failures = 0;
     const myEpoch = (epoch.current += 1);
     lastCounts.current = "";
     const stale = () => !mounted.current || epoch.current !== myEpoch;
@@ -105,6 +116,8 @@ export function useDiscoveryJobPoll(onFinish?: () => void, onProgress?: () => vo
           rev, wait: WAIT_S, signal: ac.signal,
         });
         if (stale()) return;
+        failures = 0;
+        setLost(null);
         rev = updated.rev || "";
         setJob(updated);
         // Counts moved -> new rows are already saved and readable. A landed
@@ -135,11 +148,31 @@ export function useDiscoveryJobPoll(onFinish?: () => void, onProgress?: () => vo
         // Straight back out: the server does the waiting.
         void poll();
         return;
-      } catch {
+      } catch (e) {
         // An abort is this hook being torn down, not a failure -- `stale()`
         // covers it below. Anything else is a transient fetch failure, and
         // backing off briefly is what stops a restarting backend being
         // hammered by a loop with no delay in it.
+        if (!stale()) {
+          if ((e as { notFound?: boolean }).notFound) {
+            setLost({
+              gone: true,
+              message: "The server no longer knows this sweep (it may have restarted). "
+                + "Whatever it found before then is saved -- start it again to continue.",
+            });
+            timer.current = null;
+            finish.current?.();
+            return;
+          }
+          failures += 1;
+          if (failures === LOST_AFTER_FAILURES) {
+            setLost({
+              gone: false,
+              message: "Cannot reach the server to follow this sweep. It may still be running -- "
+                + "retrying; this message clears when it answers.",
+            });
+          }
+        }
       }
       if (stale()) return;
       timer.current = setTimeout(poll, RETRY_MS);
@@ -155,7 +188,7 @@ export function useDiscoveryJobPoll(onFinish?: () => void, onProgress?: () => vo
     };
   }, [stop]);
 
-  const running = !!job && !TERMINAL.has(job.status);
+  const running = !!job && !TERMINAL.has(job.status) && !lostState?.gone;
 
   useEffect(() => {
     if (!running) setCancelling(false);
@@ -173,5 +206,5 @@ export function useDiscoveryJobPoll(onFinish?: () => void, onProgress?: () => vo
     }
   };
 
-  return { job, watch, running, cancelling, cancel };
+  return { job, watch, running, cancelling, cancel, lost: lostState?.message ?? "" };
 }

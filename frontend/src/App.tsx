@@ -236,8 +236,13 @@ export default function App() {
           clientId={clientId}
           clientName={clientName}
           platforms={platforms}
-          job={discoveryPoll.job}
-          running={discoveryPoll.running}
+          // ONLY THIS CLIENT'S SWEEP. The poller follows one job for the whole
+          // app, so another client's running sweep used to paint its banner,
+          // found counts and per-platform progress onto whichever client the
+          // analyst switched to.
+          job={discoveryPoll.job && discoveryPoll.job.group_id === clientId ? discoveryPoll.job : null}
+          lost={discoveryPoll.job && discoveryPoll.job.group_id === clientId ? discoveryPoll.lost : ""}
+          running={discoveryPoll.running && discoveryPoll.job?.group_id === clientId}
           cancelling={discoveryPoll.cancelling}
           onCancel={discoveryPoll.cancel}
           refreshKey={refreshKey}

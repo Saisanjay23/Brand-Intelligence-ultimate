@@ -4,6 +4,7 @@ import { toast } from "react-hot-toast";
 import { discoveryApi } from "../api/discoveryApi";
 import type { Client, ClientConfig, KeywordGroup, PlatformState } from "../api/types";
 import {
+  cleanKeyword,
   mergeGeneratedChildren,
   parseBulkKeywordGroups,
   mergeBulkKeywordGroups,
@@ -901,7 +902,7 @@ function KeywordGroupEditor({
   };
 
   const handleAddRow = () => {
-    const pTrimmed = parentInput.trim().replace(/^,+|,+$/g, "");
+    const pTrimmed = cleanKeyword(parentInput.replace(/^\s*,+|,+\s*$/g, ""));
     const cTrimmed = childInput.trim();
 
     if (!pTrimmed && !cTrimmed) return;
@@ -921,7 +922,7 @@ function KeywordGroupEditor({
 
     // Parse children from childInput (comma-separated or semicolon-separated)
     const newChildren = cTrimmed
-      ? cTrimmed.split(/[,;\n]+/).map((s) => s.trim()).filter(Boolean)
+      ? cTrimmed.split(/[,;\n]+/).map((s) => cleanKeyword(s)).filter(Boolean)
       : [];
 
     // Check if parent already exists (case-insensitive)
@@ -960,9 +961,14 @@ function KeywordGroupEditor({
   const setChildren = (idx: number, children: string[]) =>
     onChange(groups.map((g, i) => (i === idx ? { ...g, children } : g)));
 
-  const totalSearchTerms = groups.reduce(
-    (n, g) => n + (g.children.length ? g.children.length + 1 : 1), 0,
-  );
+  // THE NUMBER THE BACKEND ACTUALLY RUNS: every parent and every permutation,
+  // each distinct search once (case- and spacing-insensitive, as
+  // backend/shared/keywords.py `build_plans` dedupes). A permutation listed
+  // under two parents is one search there, but was counted twice here, so
+  // the screen promised more searches than ran.
+  const totalSearchTerms = new Set(
+    groups.flatMap((g) => [g.parent, ...g.children].map((t) => cleanKeyword(t).toLowerCase()).filter(Boolean)),
+  ).size;
 
   return (
     <div>

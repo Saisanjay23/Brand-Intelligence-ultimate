@@ -369,7 +369,13 @@ export const discoveryApi = {
     if (watch?.wait) p.set("wait", String(watch.wait));
     const q = p.toString();
     return fetch(url(`/discovery/jobs/${jobId}${q ? `?${q}` : ""}`), { signal: watch?.signal })
-      .then(json<DiscoveryJobState>);
+      .then((res) => {
+        // A 404 is the server saying it does not know this job -- it was
+        // evicted, or the backend restarted and the in-memory job went with
+        // it. Retrying will never change that, so it is marked.
+        if (res.status === 404) throw Object.assign(new Error("job not found"), { notFound: true });
+        return json<DiscoveryJobState>(res);
+      });
   },
 
   cancelJob: (jobId: string) =>

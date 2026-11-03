@@ -16,6 +16,21 @@ SAMESITE = {
 }
 
 
+def _default_domain(wanted: list[str]) -> str:
+    """The domain for a cookie that arrived without one (a pasted `Cookie:`
+    header carries names and values only).
+
+    A stem with a dot in it ("x.com") IS a host and is used as given; a bare
+    stem gets ".com". X lists "twitter x.com", and taking the first entry
+    blindly stored every such cookie under `.twitter.com`, which the browser
+    never sends to x.com -- so a good paste failed its own check and the
+    account was marked expired."""
+    if not wanted:
+        return ""
+    dotted = next((w for w in wanted if "." in w), "")
+    return f".{dotted}" if dotted else f".{wanted[0]}.com"
+
+
 def normalize_cookies(items: list[dict], domain: str = "") -> list[dict]:
     """Normalise a cookie export into Playwright's shape.
 
@@ -29,7 +44,7 @@ def normalize_cookies(items: list[dict], domain: str = "") -> list[dict]:
     for c in items:
         if not isinstance(c, dict) or "name" not in c:
             continue
-        dom = c.get("domain") or (f".{wanted[0]}.com" if wanted else "")
+        dom = c.get("domain") or _default_domain(wanted)
         if wanted and not any(w in dom for w in wanted):
             continue
         item = {

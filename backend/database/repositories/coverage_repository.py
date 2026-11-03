@@ -291,6 +291,56 @@ async def owed(
         raise
 
 
+async def unplanned(
+    group_id: str, platforms: Iterable[str], plans: Iterable[Any],
+) -> list[dict]:
+    """Keywords the client is CONFIGURED with that have no cell at all on a
+    platform that has been swept.
+
+    `owed()` can only name cells that exist. A keyword added after a
+    platform's last sweep has no cell there yet, so a report built from the
+    ledger alone said `owed: 0` -- a clean bill of health for the one
+    keyword nobody had ever searched. Comparing the ledger with the
+    client's current plan is what closes that.
+
+    Tab-agnostic (`tab` is "" in what comes back): the question here is
+    whether the term has ever been planned on the platform, and which tabs
+    a sweep will cover is the sweep's own business.
+    """
+    wanted = [p for p in platforms]
+    plans = list(plans)
+    if not wanted or not plans:
+        return []
+    have: set[tuple[str, str, str]] = set()
+    try:
+        cursor = db()[COVERAGE].find(
+            {"group_id": group_id, "platform": {"$in": wanted}},
+            {"platform": 1, "kw_type": 1, "search": 1},
+        )
+        async for doc in cursor:
+            have.add((doc.get("platform", ""), doc.get("kw_type", ""),
+                      (doc.get("search") or "").strip().lower()))
+    except Exception as e:
+        # Same rule as `owed`: an unreadable ledger is an error, never "nothing".
+        log.error(f"coverage read failed for {group_id}: {type(e).__name__}: {e}")
+        raise
+    out: list[dict] = []
+    for pid in sorted(wanted):
+        for p in plans:
+            search = (getattr(p, "search", "") or "").strip()
+            kw_type = getattr(p, "kw_type", "") or ""
+            if (pid, kw_type, search.lower()) in have:
+                continue
+            out.append({
+                "platform": pid, "tab": "", "kw_type": kw_type, "search": search,
+                "parent": getattr(p, "parent", "") or search,
+                "outcome": NEVER,
+                "reason": "added since this platform was last swept -- never searched here",
+                "attempts": 0, "attempted_at": None, "covered_at": None,
+            })
+    return out
+
+
 async def summary(group_id: str) -> dict:
     """Counts by outcome for one client, for a badge or a health check."""
     try:
