@@ -416,6 +416,15 @@ class Settings(BaseSettings):
     # 02:00:00 every night is a pattern; a start that wanders is not.
     # Manual runs are never delayed. 0 disables it.
     scheduler_start_jitter_minutes: float = 15.0
+    # Rest between one client's sweep and the next in a Scheduler run, in
+    # seconds. Every client in the queue is swept through the SAME pooled
+    # accounts, so back-to-back sweeps are the pattern that reads most clearly
+    # as automation (and Threads shares Instagram's account, so a flag on one
+    # is a flag on both). The actual rest is this number times a random 0.7 to
+    # 1.6, never the same twice. Owed only after a client that really searched:
+    # a client skipped for want of keywords or a session touched no account and
+    # costs no rest. 0 turns the rest off. Was a fixed 60 before it was a setting.
+    scheduler_client_gap_seconds: float = 180.0
     # Let an analysis batch ask the platform whether a profile URL still
     # exists before a browser worker is given it. Only a 404/410 from a
     # platform that reliably serves one settles the row; every other answer

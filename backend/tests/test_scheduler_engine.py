@@ -337,6 +337,102 @@ class TestInterClientGap:
         assert rig.slept == []
 
 
+class TestTheGapIsASettingAndNeverMissing:
+    """The rest between clients is `settings.scheduler_client_gap_seconds`,
+    varied every time, and owed at EVERY seam in the queue.
+
+    It used to be a hardcoded 60, and it had two holes: the last client of the
+    first pass ran straight into the gap-closing lap with no pause at all, and
+    the lap's own gaps were a fixed 60 where the first pass's were varied."""
+
+    def _live(self, monkeypatch, seconds):
+        monkeypatch.setattr(scheduler_service, "_CLIENT_GAP_S", None)
+        monkeypatch.setattr(scheduler_service.settings if hasattr(scheduler_service, "settings")
+                            else __import__("backend.config.settings", fromlist=["settings"]).settings,
+                            "scheduler_client_gap_seconds", seconds)
+
+    def test_the_default_is_three_minutes(self):
+        from backend.config.settings import Settings
+
+        assert Settings(_env_file=None).scheduler_client_gap_seconds == 180.0
+
+    def test_the_gap_follows_the_setting_and_is_never_the_same_twice(self, monkeypatch):
+        self._live(monkeypatch, 180.0)
+        gaps = [scheduler_service._client_gap_s() for _ in range(300)]
+        assert all(0.7 * 180 <= g <= 1.6 * 180 for g in gaps)
+        assert len({round(g, 3) for g in gaps}) > 250        # varied, not a fixed number
+        assert min(gaps) < 160 and max(gaps) > 250           # and genuinely spread out
+
+    def test_zero_turns_the_rest_off(self, monkeypatch):
+        self._live(monkeypatch, 0.0)
+        assert scheduler_service._client_gap_s() == 0.0
+
+    def test_a_negative_setting_cannot_make_a_negative_rest(self, monkeypatch):
+        self._live(monkeypatch, -30.0)
+        assert scheduler_service._client_gap_s() == 0.0
+
+    def test_an_unreadable_setting_falls_back_to_a_real_rest_not_none(self, monkeypatch):
+        self._live(monkeypatch, "not a number")
+        g = scheduler_service._client_gap_s()
+        d = scheduler_service._DEFAULT_CLIENT_GAP_S
+        assert 0.7 * d <= g <= 1.6 * d                        # too long is a slow night; none is a ban
+
+    def test_a_module_override_beats_the_setting(self, monkeypatch):
+        self._live(monkeypatch, 180.0)
+        monkeypatch.setattr(scheduler_service, "_CLIENT_GAP_S", 10.0)
+        assert 7.0 <= scheduler_service._client_gap_s() <= 16.0
+
+    async def test_the_last_client_of_the_pass_rests_before_the_lap(self, rig):
+        """THE HOLE. One client, still owing: its sweep used to be followed by
+        the re-search of its owed keywords with no pause whatever."""
+        rig.store.state["queue"] = ["c1"]
+        rig.clients.docs = {"c1": client("c1")}
+        rig.owed["value"] = 4
+        await rig.engine.fire(trigger="manual")
+        await rig.drive()
+        assert len(rig.runner.calls) == 2                    # the sweep, then the lap
+        assert len(rig.slept) == 1                           # ...with a rest between them
+
+    async def test_every_seam_gets_a_rest_and_every_one_is_varied(self, monkeypatch, rig):
+        monkeypatch.setattr(scheduler_service, "_CLIENT_GAP_S", 100.0)
+        rig.store.state["queue"] = ["c1", "c2"]
+        rig.clients.docs = {c: client(c) for c in ("c1", "c2")}
+        rig.owed["value"] = 4
+        await rig.engine.fire(trigger="manual")
+        await rig.drive()
+        # c1 -> c2, last client -> lap, lap c1 -> lap c2
+        assert len(rig.slept) == 3
+        assert all(70.0 <= s <= 160.0 for s in rig.slept)
+        assert 100.0 not in rig.slept                        # the lap's gap used to be exactly this
+
+    async def test_no_lap_means_no_extra_rest(self, rig):
+        rig.store.state["queue"] = ["c1", "c2"]
+        rig.clients.docs = {c: client(c) for c in ("c1", "c2")}
+        rig.owed["value"] = 0
+        await rig.engine.fire(trigger="manual")
+        await rig.drive()
+        assert len(rig.slept) == 1                           # only c1 -> c2
+
+    async def test_a_last_client_that_searched_nothing_adds_no_rest_before_the_lap(self, rig):
+        """It touched no account, and the client before it already rested."""
+        rig.store.state["queue"] = ["c1", "c2"]
+        rig.clients.docs = {c: client(c) for c in ("c1", "c2")}
+        rig.runner.skipped_for = {"c2": {"facebook": "session expired"}}
+        rig.owed["value"] = 4
+        await rig.engine.fire(trigger="manual")
+        await rig.drive()
+        # Only c1 -> c2. c2 searched nothing, so it owes nothing and is not in
+        # the lap; the lap covers c1 alone (no neighbour to rest before) and
+        # NO rest is added before it begins, because c2 touched no account.
+        assert len(rig.slept) == 1
+
+    async def test_a_stop_ends_a_rest_at_once(self, monkeypatch):
+        monkeypatch.setattr(scheduler_service, "_CLIENT_GAP_S", 3600.0)
+        engine = SchedulerEngine()
+        engine._stopping = True
+        await asyncio.wait_for(engine._rest_between_clients(), timeout=2.0)
+
+
 # -------------------------------------------------------- one at a time
 
 class TestSequencing:

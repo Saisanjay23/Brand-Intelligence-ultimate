@@ -35,7 +35,8 @@ WHAT IS GUARANTEED, AND WHAT IS NOT
   happen and nothing says so.
 
 SEQUENCING IS STRICT. One client's discovery job at a time, top to bottom,
-with a real gap between them (`_CLIENT_GAP_S`). Every client in the queue
+with a real gap between them (`settings.scheduler_client_gap_seconds`, varied
+every time, and taken before the gap-closing lap as well). Every client in the queue
 is swept through the same pooled platform accounts, so back-to-back sweeps
 on one account is the single pattern that reads most clearly as automation.
 The per-KEYWORD gap is the other half of this and lives in
@@ -69,9 +70,33 @@ _TICK_S = 20.0
 # Breathing room between clients. Inherited from the browser runner, and
 # the reasoning is unchanged: every client in the queue is swept through
 # the SAME pooled accounts, so a four-client queue without this is four
-# sweeps of one Facebook login inside a couple of minutes. A minute is
+# sweeps of one Facebook login inside a couple of minutes. A few minutes is
 # invisible next to a sweep that already takes minutes.
-_CLIENT_GAP_S = 60.0
+#
+# The number lives in `settings.scheduler_client_gap_seconds` (read live, so
+# an operator can change it). This module value is only an OVERRIDE: None
+# means "use the setting"; a number wins over it, which is how the tests take
+# the waiting out. `_DEFAULT_CLIENT_GAP_S` is the answer if settings cannot be
+# read -- a rest that is too long is a slow night, one that vanishes is a ban.
+_CLIENT_GAP_S: Optional[float] = None
+_DEFAULT_CLIENT_GAP_S = 180.0
+
+
+def _client_gap_s() -> float:
+    """One rest between two clients, in seconds: the configured gap times a
+    random 0.7 to 1.6, so no two are alike. IDENTICAL gaps between identical
+    bursts of activity are a rhythm, and a rhythm is what gets read as a
+    script. Used for EVERY gap the queue takes -- between clients on the first
+    pass, before the gap-closing lap, and between clients inside it -- so the
+    lap is no more regular than the pass."""
+    base = _CLIENT_GAP_S
+    if base is None:
+        try:
+            from backend.config.settings import settings
+            base = float(settings.scheduler_client_gap_seconds)
+        except Exception:                                  # noqa: BLE001
+            base = _DEFAULT_CLIENT_GAP_S
+    return max(0.0, base) * random.uniform(0.7, 1.6)
 
 # How late a fire can be and still be honoured. See
 # `schedule_math.catch_up_decision` for the reasoning.
@@ -488,10 +513,7 @@ class SchedulerEngine:
                     # Only between clients, never after the last one --
                     # and only after one that actually SWEPT.
                     if entry is not entries[-1] and _swept(entry):
-                        # Varied, not a fixed minute: identical gaps between
-                        # identical bursts of activity are a rhythm.
-                        await self._sleep_interruptible(
-                            _CLIENT_GAP_S * random.uniform(0.7, 1.6))
+                        await self._rest_between_clients()
 
                 if not self._stopping:
                     await self._close_gaps(entries)
@@ -768,6 +790,14 @@ class SchedulerEngine:
         if not owing:
             return
         log.info(f"scheduler: gap-closing lap over {len(owing)} client(s)")
+        # THE REST THE FIRST PASS COULD NOT TAKE. The loop above skips the gap
+        # after its LAST client because, then, nothing followed. The lap
+        # follows -- so without this, the last client's sweep ran straight into
+        # the first re-search with no pause at all, on the same accounts. Owed
+        # only if that last client really searched; an earlier one was already
+        # followed by its own rest.
+        if entries and _swept(entries[-1]):
+            await self._rest_between_clients()
         for entry in owing:
             if self._stopping:
                 break
@@ -796,7 +826,7 @@ class SchedulerEngine:
             if self._stopping:
                 break
             if entry is not owing[-1] and lap_swept:
-                await self._sleep_interruptible(_CLIENT_GAP_S)
+                await self._rest_between_clients()
 
     @staticmethod
     def _finish_lap(entry: dict, before: dict) -> bool:
@@ -952,6 +982,21 @@ class SchedulerEngine:
             "current_id": self._run.get("current_id", ""),
             "stopping": self._stopping,
         })
+
+    async def _rest_between_clients(self) -> None:
+        """Rest the pooled accounts before the next client's sweep begins.
+
+        One method for every gap the queue takes, so none of them can drift
+        from the others. Logged, because a run that goes quiet for a few
+        minutes between clients looks exactly like a run that has hung, and
+        the log is where someone checks. A Stop ends the rest at once."""
+        gap = _client_gap_s()
+        if gap > 0:
+            log.info(f"scheduler: resting {gap / 60:.1f} min before the next client "
+                     "(spaces out activity on the pooled accounts)")
+        # Always asked for, even at zero: that the queue ASKS to rest is what
+        # the tests watch, and a configured 0 is simply a rest of no length.
+        await self._sleep_interruptible(gap)
 
     async def _sleep_interruptible(self, seconds: float) -> None:
         """Sleep, but notice a Stop. A minute-long gap that ignores Stop is

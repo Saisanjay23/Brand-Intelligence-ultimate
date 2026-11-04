@@ -184,6 +184,10 @@ python run.py --port 9000
 
 Interactive OpenAPI documentation is available at `http://127.0.0.1:8000/docs`.
 
+### Scheduler pacing (keeping the accounts safe)
+
+The Scheduler sweeps one client at a time through the same pooled accounts, so it rests between clients rather than running them back to back. The rest is `SCHEDULER_CLIENT_GAP_SECONDS` (default **180**, so about 2 to 5 minutes), multiplied by a random 0.7 to 1.6 each time so it is never the same twice. It is taken after every client that really searched, **and once more before the gap-closing lap** (the one extra pass that re-searches whatever a first pass missed). A client skipped for lack of keywords or a session touched no account and costs no rest. Set it to `0` to turn it off; the Stop button ends a rest at once. A scheduled run also starts up to `SCHEDULER_START_JITTER_MINUTES` (default 15) late, so the accounts never begin at exactly the same minute every night. Threads shares Instagram's account, so one flag is a flag on both.
+
 ### Running on a smaller laptop
 
 The backend itself is small (about 135 MB). The memory is the browsers: one worker measured about 1.1 GB with a page open and about 1.6 GB with three tabs, and a job starts several at once. Two safeguards keep a 16 GB machine smooth. Neither changes what a run does or finds, only how many browsers run at once and whether a start pauses for free memory.
