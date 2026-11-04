@@ -45,6 +45,7 @@ import io
 import threading
 from typing import Optional
 
+from backend.config.settings import settings
 from backend.shared.logging import get_logger
 
 log = get_logger("imageembedding")
@@ -71,6 +72,11 @@ def _load() -> bool:
     and several hundred MB, and a process that never scores a logo (every
     process, until a client uploads a reference) must not pay either."""
     global _model, _processor, _dim, _load_failed
+    # SWITCHED OFF is not a failure and is not remembered as one: flipping the
+    # setting back on takes effect at the next call. Checked before anything
+    # heavy is imported, so an off tier costs nothing -- no torch, no weights.
+    if not settings.logo_embeddings_enabled:
+        return False
     if _model is not None:
         return True
     if _load_failed:

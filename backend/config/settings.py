@@ -291,6 +291,15 @@ class Settings(BaseSettings):
     browser_min_free_mb: int = 1800
     browser_start_wait_seconds: float = 45.0
 
+    # The CLIP embedding tier of logo matching (backend/shared/imageembedding.py):
+    # it catches a reference logo RE-PRESENTED on a new background, at the cost
+    # of torch + a ~600 MB model (~400 MB loaded, ~800 MB while scoring). OFF by
+    # default: logo matching then uses the perceptual-hash tier alone, which is
+    # exact and free, and nothing heavy is ever imported. Set
+    # LOGO_EMBEDDINGS_ENABLED=true to bring the tier back; it still needs torch
+    # and transformers installed, and degrades to the hash tier if they are not.
+    logo_embeddings_enabled: bool = False
+
     # Kill switch for backend/adaptive/'s last-resort schema healer. Off
     # returns analysis to exactly its pre-healer behaviour (standard tiers
     # only) with no code change or restart-time flag needed -- flip this the

@@ -183,6 +183,8 @@ The backend itself is small (about 135 MB). The memory is the browsers: one work
 - **Worker limits size themselves to the machine.** The default caps (`ANALYSIS_MAX_BROWSER_WORKERS`, `DISCOVERY_MAX_BROWSER_WORKERS`, `DISCOVERY_MAX_PARALLEL_SESSIONS`) are only ever *lowered* on a machine too small for them, never raised. Anything you set yourself in `.env` is left exactly as you set it. A 16 GB, 4-core/8-thread laptop keeps the defaults.
 - **A browser start waits for memory.** When free RAM is under `BROWSER_MIN_FREE_MB` (default 1800) a start waits up to `BROWSER_START_WAIT_SECONDS` (default 45) for room, then goes ahead anyway: it delays a start, it never refuses one. Set either to `0` to turn it off. A machine with plenty of free memory skips all of this.
 
+- **The CLIP logo-embedding tier is off by default.** It needs torch and a ~600 MB model (about 400 MB loaded, about 800 MB while scoring). Logo matching uses the exact perceptual-hash tier alone unless you set `LOGO_EMBEDDINGS_ENABLED=true` (which also needs `torch` and `transformers` installed). Nothing heavy is imported while it is off.
+
 `python run.py --check` prints a `resources` line showing your RAM, free RAM and the resulting browser limit. If runs feel slow or pages time out, close other heavy applications first (a browser with many tabs is the usual cause).
 
 MongoDB, if it runs on the same laptop, may grow its cache to about half of RAM as data accumulates. To cap it, set `storage.wiredTiger.engineConfig.cacheSizeGB: 1` in `mongod.cfg`.
