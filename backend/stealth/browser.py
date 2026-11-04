@@ -25,10 +25,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import random
 import shutil
 import sys
 import time
+import weakref
 from pathlib import Path
 
 # Patchright first, vanilla Playwright as the fallback.
@@ -66,6 +68,8 @@ except ImportError:
 
 from typing import Optional
 
+from backend.config import hardware
+from backend.config.settings import settings
 from backend.shared.logging import get_logger
 from backend.shared.tasks import spawn
 from backend.platforms.scan_options import DiscoveryOptions, cancelled
@@ -372,6 +376,66 @@ PERSISTENT_ARGS = [
     "--media-cache-size=16777216",
 ]
 
+# Below `browser_min_free_mb` times this, a browser start takes the careful
+# path (see Session.start); above it, none of that machinery runs at all.
+MEMORY_PRESSURE_FACTOR = 3
+# Seconds a freshly started Chrome is given to grow before the next start
+# measures free memory. A Chrome reaches most of its footprint within a few
+# seconds of its first page, so measuring sooner reads the machine as emptier
+# than it is.
+LAUNCH_SETTLE_S = 2.5
+
+# Keyed by running loop, not one module-level Lock: asyncio primitives bind to
+# the loop that first awaits them, and this process runs more than one (the
+# API's, and the one each test or job thread builds). Same pattern the runners
+# use for their worker semaphores.
+_launch_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _launch_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _launch_locks.get(loop)
+    if lock is None:
+        lock = _launch_locks[loop] = asyncio.Lock()
+    return lock
+
+
+@contextlib.asynccontextmanager
+async def launch_gate(label: str = "", stop=lambda: False):
+    """Wrap ANY browser launch: `async with launch_gate("tiktok"): ...`.
+
+    PLENTY OF ROOM: yields straight away, no lock and no wait -- a big
+    machine pays nothing. SHORT ON ROOM: waits (every waiter at once, never
+    queued behind another) for memory to free up, then lets one launch at a
+    time with a short settle, so the NEXT launch measures this Chrome after it
+    has grown rather than before. The wait is bounded and ends in "go ahead
+    anyway": it delays a start, it never refuses one and never changes what
+    the run does, and a machine that cannot be read counts as having room.
+
+    Lives here, not in Session, because TikTok's logged-out context launches
+    its own Chrome and has to pass the same door.
+    """
+    need = int(settings.browser_min_free_mb or 0)
+    wait = float(settings.browser_start_wait_seconds or 0)
+    avail = hardware.available_ram_mb() if need > 0 and wait > 0 else None
+    if avail is None or avail >= need * MEMORY_PRESSURE_FACTOR:
+        yield
+        return
+
+    enough, avail = await hardware.wait_for_headroom(need, wait, stop=stop)
+    if not enough:
+        log.warning(
+            f"{label or 'browser'}: only {avail} MB free (wanted {need}) after "
+            f"waiting up to {wait:.0f}s -- starting anyway; if runs are slow or "
+            "pages time out, close other applications or lower the browser "
+            "worker limits")
+    async with _launch_lock():
+        yield
+        await asyncio.sleep(LAUNCH_SETTLE_S)
+
+
 PLATFORM_HOME = {
     "facebook": "https://www.facebook.com/",
     "twitter": "https://x.com/home",
@@ -473,6 +537,28 @@ class Session:
         return self._platform
 
     async def start(self):
+        """Start this session's browser, politely when the machine is tight.
+
+        EVERY browser this tool opens comes through here (discovery, analysis,
+        login checks), which is why the memory guard lives here and nowhere
+        else. A worker is ~1.1 GB with a page and ~1.6 GB with three tabs
+        (backend/config/hardware.py has the measurements), and a job starts
+        several at once; on a 16 GB laptop that already runs the analyst's own
+        browser, piling on is how a machine starts swapping and a good
+        profile times out into PARTIAL.
+
+        PLENTY OF ROOM: straight to `_launch()`, no lock, no wait -- a big
+        machine pays nothing. SHORT ON ROOM: wait (all waiters at once, never
+        queued behind each other) for memory to free up, then launch one at a
+        time with a short settle so the NEXT launch measures this Chrome
+        after it has grown rather than before. The wait is bounded and ends
+        in "go ahead anyway": it delays a start, it never refuses one and
+        never changes what the run does, and an unreadable machine counts as
+        having room."""
+        async with launch_gate(self._platform, lambda: cancelled(self.o)):
+            return await self._launch()
+
+    async def _launch(self):
         self._pw = await async_playwright().start()
         opts = {
             "headless": not getattr(self.o, "headful", False),

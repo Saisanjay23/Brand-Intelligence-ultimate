@@ -879,7 +879,7 @@ async def anonymous_context():
     Serialised on `_profile_lock()`: the profile directory takes an
     exclusive OS lock, so two of these at once would collide.
     """
-    from backend.stealth.browser import STEALTH_DRIVER, async_playwright
+    from backend.stealth.browser import STEALTH_DRIVER, async_playwright, launch_gate
     from backend.stealth.fingerprint import LAUNCH_ARGS, chrome_binary, get_identity
     from backend.stealth.headers import build_extra_headers
     from backend.stealth.navigator_spoofing import build_init_js
@@ -934,7 +934,8 @@ async def anonymous_context():
         pw = ctx = None
         try:
             pw = await async_playwright().start()
-            ctx = await pw.chromium.launch_persistent_context(str(profile), **launch)
+            async with launch_gate("tiktok"):
+                ctx = await pw.chromium.launch_persistent_context(str(profile), **launch)
             # webdriver/visibilityState masking and native-code masking on the
             # overrides -- the same script every other platform gets.
             if init_js := build_init_js():

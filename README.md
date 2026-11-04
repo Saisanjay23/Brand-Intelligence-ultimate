@@ -176,6 +176,17 @@ python run.py --port 9000
 
 Interactive OpenAPI documentation is available at `http://127.0.0.1:8000/docs`.
 
+### Running on a smaller laptop
+
+The backend itself is small (about 135 MB). The memory is the browsers: one worker measured about 1.1 GB with a page open and about 1.6 GB with three tabs, and a job starts several at once. Two safeguards keep a 16 GB machine smooth. Neither changes what a run does or finds, only how many browsers run at once and whether a start pauses for free memory.
+
+- **Worker limits size themselves to the machine.** The default caps (`ANALYSIS_MAX_BROWSER_WORKERS`, `DISCOVERY_MAX_BROWSER_WORKERS`, `DISCOVERY_MAX_PARALLEL_SESSIONS`) are only ever *lowered* on a machine too small for them, never raised. Anything you set yourself in `.env` is left exactly as you set it. A 16 GB, 4-core/8-thread laptop keeps the defaults.
+- **A browser start waits for memory.** When free RAM is under `BROWSER_MIN_FREE_MB` (default 1800) a start waits up to `BROWSER_START_WAIT_SECONDS` (default 45) for room, then goes ahead anyway: it delays a start, it never refuses one. Set either to `0` to turn it off. A machine with plenty of free memory skips all of this.
+
+`python run.py --check` prints a `resources` line showing your RAM, free RAM and the resulting browser limit. If runs feel slow or pages time out, close other heavy applications first (a browser with many tabs is the usual cause).
+
+MongoDB, if it runs on the same laptop, may grow its cache to about half of RAM as data accumulates. To cap it, set `storage.wiredTiger.engineConfig.cacheSizeGB: 1` in `mongod.cfg`.
+
 ---
 
 ## Testing & Quality Assurance

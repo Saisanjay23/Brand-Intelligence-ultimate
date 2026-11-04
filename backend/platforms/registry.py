@@ -136,10 +136,10 @@ PLATFORMS: dict[str, Platform] = {
         discovery_path="backend.platforms.threads.discovery_engine:Discovery",
         session_path="backend.platforms.threads.discovery_engine:ThreadsSession",
         cookie_domain="threads",
-        # Assumed, not yet confirmed against a real export: Threads signs in
-        # with an Instagram account and its cookies are threads.com's own. A
-        # wrong name here shows up as an "incomplete" session, never a
-        # healthy one.
+        # Confirmed against a real pasted session (2026-11-04): Threads signs
+        # in with an Instagram account, its cookies are threads.com's own, and
+        # `sessionid` + `ds_user_id` are among them. A missing name shows up as
+        # an "incomplete" session, never a healthy one.
         required_cookies=("sessionid",),
         stability_note="Search needs a signed-in session on an Instagram account that has "
         "joined Threads, and the same account backs Instagram: a flag on one is a flag on "

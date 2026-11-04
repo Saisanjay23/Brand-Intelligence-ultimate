@@ -238,6 +238,27 @@ def check() -> bool:
     say(OK if good else BAD, "mongodb", detail)
     ok &= good
 
+    # Not a pass/fail: a small machine still runs everything, with fewer
+    # browsers open at once. The line says which, so a slow run is explained.
+    from backend.config import hardware
+    from backend.config.settings import settings
+
+    mem = hardware.memory_mb()
+    workers = min(settings.analysis_max_browser_workers, settings.discovery_max_browser_workers)
+    if mem is None:
+        say(OK, "resources", f"{hardware.logical_cores()} cores; memory not readable here")
+    else:
+        total, avail = mem
+        tight = avail < settings.browser_min_free_mb
+        say(
+            WARN if tight else OK,
+            "resources",
+            f"{total / 1024:.0f} GB RAM ({avail / 1024:.1f} GB free), "
+            f"{hardware.logical_cores()} cores -> up to {workers} browsers at once"
+            + (" -- memory is tight, starts will wait for room; close other apps"
+               if tight else ""),
+        )
+
     say(
         OK if DIST.is_dir() else WARN,
         "frontend build",

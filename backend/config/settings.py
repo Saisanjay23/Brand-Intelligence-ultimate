@@ -12,8 +12,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal, Optional
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+from backend.config import hardware
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -278,6 +280,17 @@ class Settings(BaseSettings):
     discovery_max_seconds: float = 900
     headless: bool = True
 
+    # --- memory headroom before a browser starts ---------------------------
+    # A browser worker is ~1.1 GB with a page open and ~1.6 GB with three tabs
+    # (measured, see backend/config/hardware.py), and a job starts several at
+    # once. When free memory is below browser_min_free_mb a launch WAITS up to
+    # browser_start_wait_seconds for it instead of piling onto a machine that
+    # is already full, then goes ahead anyway -- it delays a start, it never
+    # refuses one, so nothing a run does or finds changes. 0 on either turns
+    # the wait off. Kept well inside the runners' 120s start bound.
+    browser_min_free_mb: int = 1800
+    browser_start_wait_seconds: float = 45.0
+
     # Kill switch for backend/adaptive/'s last-resort schema healer. Off
     # returns analysis to exactly its pre-healer behaviour (standard tiers
     # only) with no code change or restart-time flag needed -- flip this the
@@ -455,6 +468,21 @@ class Settings(BaseSettings):
     # positive has a window to revert it before anyone downstream sees the
     # scored result
     publish_hold_minutes: float = 10.0
+
+    @model_validator(mode="after")
+    def _size_workers_to_this_machine(self):
+        """Lower the DEFAULT browser-worker caps on a machine too small for
+        them. Never raises a cap, and never touches one the operator set
+        (env var or .env) -- an explicit value is a decision, a default is a
+        guess made for a bigger machine. On a 16 GB / 4-core laptop the
+        answer is the default, so only weaker machines see any change, and
+        what changes is how many browsers run at once, never what they do."""
+        cap = hardware.recommended_workers()
+        for name in ("analysis_max_browser_workers", "discovery_max_browser_workers",
+                     "discovery_max_parallel_sessions"):
+            if name not in self.model_fields_set:
+                setattr(self, name, max(1, min(getattr(self, name), cap)))
+        return self
 
     @field_validator("alert_emails", "cors_allow_origins", mode="before")
     @classmethod
