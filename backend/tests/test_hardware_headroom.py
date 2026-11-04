@@ -55,6 +55,48 @@ class TestRecommendedWorkers:
         assert hardware.recommended_workers() >= 1
 
 
+class TestSyncedFolder:
+    """The session folder holds live Chrome profiles and cookie files; inside a
+    cloud-synced folder every write is uploaded. Detection reads the path only."""
+
+    @pytest.mark.parametrize("path,want", [
+        ("C:/Users/sai sanjay/OneDrive - CYFIRMA INDIA PRIVATE LIMITED/Automation/"
+         "Brand-Intelligence-ultimate/session", "OneDrive"),      # this very project
+        ("/home/a/OneDrive/work/session", "OneDrive"),
+        ("/home/a/Dropbox/work/session", "Dropbox"),
+        ("/home/a/Dropbox (Personal)/session", "Dropbox"),
+        ("/Users/a/iCloudDrive/session", "iCloud Drive"),
+        ("/Users/a/Google Drive/session", "Google Drive"),
+    ])
+    def test_a_synced_folder_is_named(self, path, want, monkeypatch):
+        for var in hardware._ONEDRIVE_ENV:
+            monkeypatch.delenv(var, raising=False)
+        assert hardware.synced_folder(path) == want
+
+    @pytest.mark.parametrize("path", [
+        "/srv/data/session",
+        "/home/a/onedrive-notes/session",          # contains the word, is not the folder
+        "/home/a/MyDropboxBackup/session",
+        "C:/Users/a/AppData/Local/BrandIntel/session",
+    ])
+    def test_an_ordinary_folder_is_not(self, path, monkeypatch):
+        for var in hardware._ONEDRIVE_ENV:
+            monkeypatch.delenv(var, raising=False)
+        assert hardware.synced_folder(path) == ""
+
+    def test_a_renamed_onedrive_root_is_found_by_the_environment(self, tmp_path, monkeypatch):
+        root = tmp_path / "Cloud Stuff"
+        monkeypatch.setenv("OneDrive", str(root))
+        assert hardware.synced_folder(root / "project" / "session") == "OneDrive"
+        assert hardware.synced_folder(tmp_path / "elsewhere" / "session") == ""
+
+    @pytest.mark.parametrize("odd", ["", "\0bad", "relative/path", "..", 12345])
+    def test_it_never_raises_on_an_odd_path(self, odd):
+        # A relative path resolves from the current folder, so WHICH service it
+        # names depends on where the tests run; what is promised is an answer.
+        assert isinstance(hardware.synced_folder(odd), str)
+
+
 class TestDefaultsOnlyEverGoDown:
     def _settings(self, monkeypatch, cap, **kw):
         monkeypatch.setattr(hardware, "recommended_workers", lambda *a, **k: cap)

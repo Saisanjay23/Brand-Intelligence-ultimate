@@ -185,6 +185,8 @@ The backend itself is small (about 135 MB). The memory is the browsers: one work
 
 - **The CLIP logo-embedding tier is off by default.** It needs torch and a ~600 MB model (about 400 MB loaded, about 800 MB while scoring). Logo matching uses the exact perceptual-hash tier alone unless you set `LOGO_EMBEDDINGS_ENABLED=true` (which also needs `torch` and `transformers` installed). Nothing heavy is imported while it is off.
 
+- **Keep the `session/` folder out of OneDrive, Dropbox, iCloud and Google Drive.** It holds live Chrome profiles (hundreds of MB each, rewritten constantly during a sweep) and cookie files. Inside a synced folder the sync client uploads every write, which costs CPU and disk and puts session cookies in the cloud. `python run.py --check` warns when it finds this. To move it, close the app, copy the `session/` folder to a local path (for example `%LOCALAPPDATA%\BrandIntel\session`) and set `SESSION_BLOB_PATH` to that path. Copy it rather than starting empty: the saved browser profiles belong to the accounts.
+
 `python run.py --check` prints a `resources` line showing your RAM, free RAM and the resulting browser limit. If runs feel slow or pages time out, close other heavy applications first (a browser with many tabs is the usual cause).
 
 MongoDB, if it runs on the same laptop, may grow its cache to about half of RAM as data accumulates. To cap it, set `storage.wiredTiger.engineConfig.cacheSizeGB: 1` in `mongod.cfg`.

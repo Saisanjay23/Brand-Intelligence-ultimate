@@ -259,6 +259,19 @@ def check() -> bool:
                if tight else ""),
         )
 
+    # A warning, never a failure: it runs fine there, only slower and with the
+    # session cookies synced to the cloud. Says exactly what to change.
+    if service := hardware.synced_folder(settings.session_blob_path):
+        say(
+            WARN,
+            "session folder",
+            f"{settings.session_blob_path} is inside {service}, which will sync live "
+            "browser profiles and cookies (slow, and cookies leave this machine). "
+            "Move it: copy the folder to a local path and set SESSION_BLOB_PATH to it",
+        )
+    else:
+        say(OK, "session folder", "not inside a cloud-synced folder")
+
     say(
         OK if DIST.is_dir() else WARN,
         "frontend build",

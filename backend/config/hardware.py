@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import os
+import re
 import subprocess
 import sys
 import time
@@ -123,6 +124,49 @@ def logical_cores() -> int:
         return max(1, len(os.sched_getaffinity(0)))  # type: ignore[attr-defined]
     except (AttributeError, OSError):
         return max(1, os.cpu_count() or 1)
+
+
+# Folder names a cloud-sync client gives its root, per service. Whole path
+# components only, so a folder that merely CONTAINS the word is not a match.
+_SYNC_NAMES = (
+    ("OneDrive", re.compile(r"^onedrive( - .+)?$", re.I)),
+    ("Dropbox", re.compile(r"^dropbox( \(.+\))?$", re.I)),
+    ("iCloud Drive", re.compile(r"^icloud ?drive$", re.I)),
+    ("Google Drive", re.compile(r"^google ?drive$", re.I)),
+)
+_ONEDRIVE_ENV = ("OneDrive", "OneDriveCommercial", "OneDriveConsumer")
+
+
+def synced_folder(path) -> str:
+    """The cloud-sync service whose folder `path` sits inside, or "".
+
+    WHY THIS IS A PERFORMANCE QUESTION. The session folder holds live Chrome
+    profiles -- hundreds of MB each and rewritten constantly while a sweep
+    runs -- plus cookie files. Inside a synced folder the sync client tries to
+    upload every one of those writes (measured 2026-11-04: 13,130 files, about
+    1.3 GB of profiles, under a running OneDrive), which costs CPU and disk on
+    exactly the laptops this is meant to run well on, and puts session
+    cookies in the cloud.
+
+    Reads the path only, never the disk, so it cannot be slow or fail. OneDrive
+    is also matched by the root folders Windows publishes in the environment,
+    which catches a renamed one.
+    """
+    try:
+        full = os.path.normcase(os.path.abspath(str(path)))
+    except (OSError, ValueError):
+        return ""
+    for var in _ONEDRIVE_ENV:
+        root = os.environ.get(var)
+        if root:
+            root = os.path.normcase(os.path.abspath(root))
+            if full == root or full.startswith(root.rstrip("\\/") + os.sep):
+                return "OneDrive"
+    for part in full.replace("\\", "/").split("/"):
+        for name, pattern in _SYNC_NAMES:
+            if pattern.match(part):
+                return name
+    return ""
 
 
 def recommended_workers(total_mb: Optional[int] = None, cores: Optional[int] = None) -> int:
