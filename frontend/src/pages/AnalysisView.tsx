@@ -640,6 +640,7 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
       else if (lower.includes("youtube.com") || lower.includes("youtu.be")) plat = "youtube";
       else if (lower.includes("t.me") || lower.includes("telegram.me")) plat = "telegram";
       else if (lower.includes("tiktok.com")) plat = "tiktok";
+      else if (lower.includes("threads.com") || lower.includes("threads.net")) plat = "threads";
 
       breakdown[plat] = (breakdown[plat] || 0) + 1;
       if (plat !== "other") validCount++;
@@ -1112,7 +1113,7 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
               </span>
             </div>
             <div style={{ fontSize: "12px", color: "var(--text-muted, #98a2b3)", marginTop: "3px" }}>
-              Paste direct URLs across Facebook, Instagram, Twitter/X, YouTube, Telegram &amp; TikTok. Data lives in temporary memory only and is completely cleared on page refresh.
+              Paste direct URLs across Facebook, Instagram, Twitter/X, YouTube, Telegram, TikTok &amp; Threads. Data lives in temporary memory only and is completely cleared on page refresh.
             </div>
           </div>
         </div>
@@ -1158,7 +1159,7 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
               <span style={{ color: "var(--primary-color, #8838DD)" }}>1.</span> Direct URLs to Analyze
             </div>
             <div style={{ fontSize: "12px", color: "var(--text-muted, #98a2b3)", marginTop: "2px" }}>
-              Enter or paste URLs (one per line). Supported: Facebook, Instagram, X/Twitter, YouTube, Telegram, TikTok.
+              Enter or paste URLs (one per line). Supported: Facebook, Instagram, X/Twitter, YouTube, Telegram, TikTok, Threads.
             </div>
           </div>
 
@@ -1208,7 +1209,7 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
         <textarea
           value={urlInput}
           onChange={(e) => setUrlInput(e.target.value)}
-          placeholder={`https://www.facebook.com/sample_account\nhttps://www.instagram.com/sample_profile\nhttps://x.com/sample_user\nhttps://www.youtube.com/@channel_name\nhttps://t.me/sample_channel\nhttps://www.tiktok.com/@sample_creator`}
+          placeholder={`https://www.facebook.com/sample_account\nhttps://www.instagram.com/sample_profile\nhttps://x.com/sample_user\nhttps://www.youtube.com/@channel_name\nhttps://t.me/sample_channel\nhttps://www.tiktok.com/@sample_creator\nhttps://www.threads.com/@sample_user`}
           rows={6}
           disabled={loading}
           style={{
@@ -1282,6 +1283,7 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
                 youtube: { bg: "rgba(255, 0, 0, 0.14)", border: "rgba(255, 0, 0, 0.35)", color: "#ff6b6b" },
                 telegram: { bg: "rgba(34, 158, 217, 0.14)", border: "rgba(34, 158, 217, 0.35)", color: "#5bc0eb" },
                 tiktok: { bg: "rgba(254, 44, 85, 0.14)", border: "rgba(37, 244, 238, 0.35)", color: "#25f4ee" },
+                threads: { bg: "rgba(255, 255, 255, 0.08)", border: "rgba(255, 255, 255, 0.22)", color: "#ffffff" },
               };
               const accent = platformAccents[plat] || {
                 bg: "rgba(136, 56, 221, 0.18)",
@@ -1693,6 +1695,7 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
               <option value="youtube">YouTube</option>
               <option value="telegram">Telegram</option>
               <option value="tiktok">TikTok</option>
+              <option value="threads">Threads</option>
             </select>
 
             {/* Risk Filter */}

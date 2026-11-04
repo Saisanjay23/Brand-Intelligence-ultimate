@@ -88,7 +88,7 @@ PLATFORMS_WITH_LOCATION = frozenset({"facebook", "twitter", "youtube", "instagra
 #
 # All 11 were status OK, permanently `analysis_complete: False`, and were
 # re-queued on every sweep to chase a capture that could never happen.
-PLATFORMS_WITH_SCREENSHOT = frozenset({"facebook", "instagram", "twitter", "tiktok"})
+PLATFORMS_WITH_SCREENSHOT = frozenset({"facebook", "instagram", "twitter", "tiktok", "threads"})
 
 # Statuses where re-reading cannot help: the profile is gone, so there is
 # nothing further to scrape and its blank fields are the honest answer.

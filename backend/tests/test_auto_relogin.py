@@ -744,6 +744,14 @@ KNOWN_UNAUTOMATED = {
               "is no login page here to automate OR to test a flow against. "
               "Routing TikTok through a proxy is the prerequisite, and it is "
               "the same prerequisite discovery already has.",
+    "threads": "threads.com/login takes an Instagram username and password "
+               "(or 'Continue with Instagram'), but its form selectors have "
+               "not been measured live, and an unmeasured flow is exactly how "
+               "Instagram's own login once got 'hardened' into one that never "
+               "worked. Until one is measured, a person pastes freshly "
+               "exported threads.com cookies in the Sessions panel; the "
+               "cookie is threads.com's own and the account is the one "
+               "Instagram already uses.",
 }
 
 

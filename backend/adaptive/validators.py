@@ -14,7 +14,7 @@ MAX_FUTURE_EPOCH_DELTA = 86400 * 2  # At most 2 days in the future (clock skew)
 
 GENERIC_NAMES = {
     "facebook", "login", "notifications", "home", "search",
-    "instagram", "twitter", "x", "telegram", "tiktok", "youtube",
+    "instagram", "twitter", "x", "telegram", "tiktok", "youtube", "threads",
     "profile", "feed", "user", "settings", "help", "about",
 }
 

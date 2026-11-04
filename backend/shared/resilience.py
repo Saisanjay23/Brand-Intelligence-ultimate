@@ -205,6 +205,9 @@ _SATISFIED_STOPS = frozenset({
 # the platform permanently `partial` for a search that worked.
 _TRUNCATED_STOPS = frozenset({
     "cap:seconds", "cap:pages", "cancelled", "mobile-api-failed-web-recovered",
+    # Threads' own Profiles list ended at its ceiling: more accounts may exist
+    # that no scroll can reach, so it is owed a say, not a silent "done".
+    "cap:platform",
 })
 
 
@@ -234,6 +237,7 @@ def sweep_outcome(stopped: str, complete: bool = False) -> str:
 _STOP_PHRASES = {
     "cap:seconds": "ran out of time budget",
     "cap:pages": "hit the page limit",
+    "cap:platform": "reached the platform's own results ceiling (more accounts may exist)",
     "cancelled": "were cancelled",
     "stalled": "stalled with no new results",
     "error": "errored",

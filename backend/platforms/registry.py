@@ -129,6 +129,22 @@ PLATFORMS: dict[str, Platform] = {
         stability_note="Falls back to reading the rendered page header when Instagram's "
         "GraphQL profile payload doesn't fire -- brittle to layout changes.",
     ),
+    "threads": Platform(
+        id="threads",
+        name="Threads",
+        analysis_path="backend.platforms.threads.analysis_engine:Scraper",
+        discovery_path="backend.platforms.threads.discovery_engine:Discovery",
+        session_path="backend.platforms.threads.discovery_engine:ThreadsSession",
+        cookie_domain="threads",
+        # Assumed, not yet confirmed against a real export: Threads signs in
+        # with an Instagram account and its cookies are threads.com's own. A
+        # wrong name here shows up as an "incomplete" session, never a
+        # healthy one.
+        required_cookies=("sessionid",),
+        stability_note="Search needs a signed-in session on an Instagram account that has "
+        "joined Threads, and the same account backs Instagram: a flag on one is a flag on "
+        "both. Threads' own Profiles list ends at about 50 accounts per keyword.",
+    ),
     "youtube": Platform(
         id="youtube",
         name="YouTube",

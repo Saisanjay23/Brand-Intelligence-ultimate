@@ -91,6 +91,8 @@ _PLATFORM_INTER_KEYWORD_DELAY: dict[str, float] = {
     "telegram": 0.0,
     "facebook": 12.0,
     "instagram": 8.0,
+    # The same Meta account as Instagram, so the same care.
+    "threads": 8.0,
 }
 _DEFAULT_INTER_KEYWORD_DELAY = 6.0
 
@@ -137,6 +139,7 @@ PLATFORM_TABS: dict[str, list[str]] = {
     "youtube": ["channels"],
     "telegram": ["all"],
     "tiktok": ["people"],
+    "threads": ["people"],
 }
 
 # ------------------------------------------------- parallel sessions, failover

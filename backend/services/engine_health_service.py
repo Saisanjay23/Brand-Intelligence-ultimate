@@ -398,6 +398,8 @@ _ATTR_HOMES = {
                  "for user fields, iter_mobile_search_users() for the container",
     "tiktok": "backend/platforms/tiktok/discovery_engine.py -- user_from_node() for "
               "user fields, iter_users() for the account/author walk",
+    "threads": "backend/platforms/threads/discovery_engine.py -- _JS_CARDS and "
+               "user_from_card() for the result cards, wall_kind() for walls",
     "youtube": "backend/platforms/youtube/discovery_engine.py -- sweep(), where the "
                "v3 search items are read",
     "telegram": "backend/platforms/telegram/discovery_engine.py -- entity_from(). "

@@ -424,6 +424,8 @@ class Settings(BaseSettings):
     # at either level (see backend/stealth/levels.py). A value other than
     # these two is rejected at startup rather than silently ignored.
     instagram_stealth: Literal["standard", "high"] = "high"
+    # Threads signs in with the same Instagram account, so it shares the posture.
+    threads_stealth: Literal["standard", "high"] = "high"
 
     # --- platform pushback: governor + circuit breaker -------------------
     # See shared/pushback.py. The governor is invisible while a platform is

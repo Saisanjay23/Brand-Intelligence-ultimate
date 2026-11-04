@@ -87,7 +87,7 @@ CHECK_JITTER = 0.2
 BATCH_SIZE = 5  # sessions live-checked per platform per monitor sweep
 # youtube included since 2026-08, previously excluded entirely (a dead API
 # key sat unnoticed until a real job hit it); see _verify_credential_item.
-MONITORED = ("facebook", "instagram", "twitter", "telegram", "tiktok", "youtube")
+MONITORED = ("facebook", "instagram", "twitter", "telegram", "tiktok", "youtube", "threads")
 
 # How long a dead (expired/checkpointed/unreadable) pool entry stays around,
 # visible and highlighted inactive so the user can delete or rewrite it,

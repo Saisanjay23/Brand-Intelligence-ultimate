@@ -101,6 +101,13 @@ export function PlatformIcon({ platform, size = 20, color }: Props) {
           />
         </svg>
       );
+    case "threads":
+      return (
+        <svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+          <rect width="24" height="24" rx="6" fill={color || "#000"} />
+          <text x="12" y="17.5" textAnchor="middle" fontSize="15" fontWeight="700" fill="#fff">@</text>
+        </svg>
+      );
     default:
       return (
         <svg width={size} height={size} viewBox="0 0 24 24" fill="none">

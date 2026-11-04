@@ -708,7 +708,7 @@ export function AlertsIncidentsPanel() {
               gap: "16px",
             }}
           >
-            {["facebook", "instagram", "twitter", "telegram", "tiktok", "youtube"].map((plat) => {
+            {["facebook", "instagram", "twitter", "telegram", "tiktok", "threads", "youtube"].map((plat) => {
               const info = canary?.platforms[plat];
               const warnings = info?.warnings || [];
               const status = info?.status || "healthy";

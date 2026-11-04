@@ -92,6 +92,7 @@ _PLATFORM_HOSTS: dict[str, str] = {
     "youtube.com": "youtube", "youtu.be": "youtube",
     "t.me": "telegram", "telegram.me": "telegram", "telegram.dog": "telegram",
     "tiktok.com": "tiktok",
+    "threads.com": "threads", "threads.net": "threads",
 }
 
 QUEUED, RUNNING, DONE, CANCELLED, FAILED = "queued", "running", "done", "cancelled", "failed"
@@ -137,6 +138,8 @@ _PLATFORM_CONCURRENCY: dict[str, int] = {
     # the longest inter-batch gap below. Facebook is NOT pinned there -- it
     # takes the browser default with the rest.
     "instagram": 1,
+    # Threads rides the SAME Meta account as Instagram: one profile at a time.
+    "threads": 1,
 }
 # Facebook, Twitter, TikTok -- og's ANALYSIS_CONCURRENT_TABS.
 _DEFAULT_CONCURRENCY = 3
@@ -150,6 +153,7 @@ _PLATFORM_INTER_BATCH_DELAY: dict[str, float] = {
     "youtube": 0.0,
     "telegram": 0.0,
     "instagram": 3.5,
+    "threads": 3.5,
 }
 _DEFAULT_INTER_BATCH_DELAY = 1.5
 
@@ -402,7 +406,7 @@ def parse_direct_url(raw: str) -> Optional[tuple[str, str, str]]:
 
     parts = [s for s in parsed.path.rstrip("/").split("/") if s]
     entity_id = parts[-1].lstrip("@") if parts else ""
-    if platform == "tiktok":
+    if platform in ("tiktok", "threads"):
         # The account is the "@handle" segment, not the last one: for
         # /@foo/video/123 the last segment is the video's id.
         entity_id = next((s[1:] for s in parts if s.startswith("@")), entity_id.lstrip("@"))
@@ -437,7 +441,7 @@ def _dedupe_key(platform: str, url: str, entity_id: str = "") -> str:
         return f"telegram:{low[2:] if low.startswith('/s/') else low}"
     if platform == "youtube":
         return f"youtube:{path.lower() if path.startswith('/@') else path}"
-    # twitter, instagram, tiktok: handles are case-insensitive
+    # twitter, instagram, tiktok, threads: handles are case-insensitive
     return f"{platform}:{path.lower()}"
 
 
@@ -1914,7 +1918,7 @@ class AnalysisRunner:
             except Exception:
                 pass
 
-        elif it.avatar_sha and it.platform in ("facebook", "instagram", "twitter", "youtube"):
+        elif it.avatar_sha and it.platform in ("facebook", "instagram", "twitter", "youtube", "threads"):
             # The picture is already in our store (discovery cached it), so
             # its pixel verdict costs one GridFS read -- and it is the verdict
             # a legacy document, written before `logo_strength` existed, may

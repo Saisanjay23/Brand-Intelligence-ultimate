@@ -161,6 +161,12 @@ _FIELD_READERS: dict[str, dict[str, str]] = {
         "last post date": r"    async def read_last_post_date\(",
         "screenshot": r"    async def screenshot\(",
     },
+    "threads": {
+        "display name": r"    def fill\(",
+        "followers": r"    def fill\(",
+        "last post date": r"    def fill\(",
+        "screenshot": r"    async def screenshot\(",
+    },
     "tiktok": {
         "display name": r"    def fill\(",
         "followers": r"    def fill\(",

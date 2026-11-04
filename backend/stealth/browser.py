@@ -377,6 +377,7 @@ PLATFORM_HOME = {
     "twitter": "https://x.com/home",
     "instagram": "https://www.instagram.com/",
     "tiktok": "https://www.tiktok.com/",
+    "threads": "https://www.threads.com/",
 }
 
 # When each profile last had its feed warmed. In-process only, so a restart

@@ -158,6 +158,11 @@ DEFAULT_AVATAR_FINGERPRINTS: dict[str, tuple[tuple[str, str, str], ...]] = {
         ("a082888228208222", "324c8e968ecc9623", "default-profile"),
     ),
 }
+# Threads serves its avatars from Instagram's CDN and shows an Instagram account's
+# own picture, so a picture-less account carries Instagram's stock avatar.
+# NOT yet confirmed against a live picture-less Threads profile.
+PLACEHOLDER_MARKERS["threads"] = PLACEHOLDER_MARKERS["instagram"]
+DEFAULT_AVATAR_FINGERPRINTS["threads"] = DEFAULT_AVATAR_FINGERPRINTS["instagram"]
 DEFAULT_AVATAR_MAX_DISTANCE = 6
 
 

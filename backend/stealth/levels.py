@@ -45,6 +45,12 @@ _TABLE: dict[str, dict[str, dict[str, Optional[float]]]] = {
         STANDARD: {"keyword_gap": 8.0, "page_gap": 2.5, "batch_gap": 3.5, "max_sessions": None},
         HIGH:     {"keyword_gap": 16.0, "page_gap": 6.0, "batch_gap": 9.0, "max_sessions": 1},
     },
+    # Threads signs in with the same Instagram account, so a flag on one is a
+    # flag on both: same numbers, same single session.
+    "threads": {
+        STANDARD: {"keyword_gap": 8.0, "page_gap": 2.5, "batch_gap": 3.5, "max_sessions": None},
+        HIGH:     {"keyword_gap": 16.0, "page_gap": 6.0, "batch_gap": 9.0, "max_sessions": 1},
+    },
 }
 
 

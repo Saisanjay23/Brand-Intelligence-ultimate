@@ -76,13 +76,14 @@ SEARCH_TERM_FIELDS = {
     "instagram": ("username", "display_name"),
     "twitter": ("username", "display_name"),
     "tiktok": ("username", "display_name"),
+    "threads": ("username", "display_name"),
     "youtube": ("display_name",),
 }
 
 # The tab each platform's people-search lives on.
 SEARCH_TAB = {
     "facebook": "people", "instagram": "people", "twitter": "people",
-    "tiktok": "people", "youtube": "channels",
+    "tiktok": "people", "youtube": "channels", "threads": "people",
 }
 
 # Results to take per search. Wider than the one profile being looked for,

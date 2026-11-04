@@ -25,6 +25,7 @@ CRITICAL_COOKIES: dict[str, tuple[str, ...]] = {
     "instagram": ("sessionid", "ds_user_id"),
     "twitter": ("auth_token", "ct0"),
     "tiktok": ("sessionid", "sessionid_ss", "sid_tt"),
+    "threads": ("sessionid",),
 }
 
 # Cache of recently alerted expirations (key -> epoch timestamp) to prevent spamming

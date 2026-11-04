@@ -75,6 +75,7 @@ class Platform(str, Enum):
     youtube = "youtube"
     telegram = "telegram"
     tiktok = "tiktok"
+    threads = "threads"
 
 
 class JobAccepted(BaseModel):
