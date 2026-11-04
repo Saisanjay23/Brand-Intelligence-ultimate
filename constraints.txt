@@ -1,0 +1,87 @@
+# Tested dependency set -- the exact versions behind "works the same on any laptop".
+#
+# Used by `python run.py --setup` as:  pip install -r requirements.txt -c constraints.txt
+# requirements.txt says what the tool needs (and stays loose, e.g. fastapi>=0.110);
+# this file says which versions of everything, including what those packages pull in,
+# were run through the whole test suite. A constraint only limits the version pip may
+# pick; it never installs anything extra.
+#
+# Generated 2026-11-04 from CLEAN installs of requirements.txt, each followed by the
+# full backend test suite (all green):
+#   Python 3.11.8   and   Python 3.14.3   (Windows, 64-bit)
+# 60 packages resolved identically on both and are pinned plainly. Four differ by
+# interpreter (numpy, pyee, PyWavelets, scipy) and carry a python_version marker.
+# Python 3.12 and 3.13 take the plain pins and leave those four to pip; Python 3.10
+# is untested.
+#
+# To refresh after a deliberate upgrade: make a clean venv, `pip install -r
+# requirements.txt` WITHOUT this file, run `python -m pytest backend/tests`, then
+# regenerate from `pip freeze` for each Python you support.
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.5
+aiosignal==1.4.0
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.16.0
+attrs==26.1.0
+certifi==2026.10.23
+cffi==2.1.1
+click==8.5.0
+colorama==0.4.6
+curl_cffi==0.17.0
+dnspython==2.9.2
+et_xmlfile==2.0.0
+fastapi==0.162.0
+frozenlist==1.8.0
+greenlet==3.5.6
+h11==0.16.0
+httpcore==1.0.9
+httptools==0.9.0
+httpx==0.28.1
+idna==3.20
+ImageHash==4.3.2
+iniconfig==2.3.1
+motor==3.7.1
+multidict==7.2.1
+numpy==2.4.6; python_version == "3.11"
+numpy==2.5.4; python_version == "3.14"
+openpyxl==3.1.5
+opentelemetry-api==1.45.2
+packaging==26.3
+patchright==1.64.4
+pillow==13.0.0
+playwright==1.64.1
+pluggy==1.7.0
+propcache==0.5.4
+pyaes==1.6.1
+pyasn1==0.6.5
+pycparser==3.12
+pydantic==2.14.2
+pydantic-settings==2.16.2
+pydantic_core==2.50.2
+pyee==13.0.1; python_version == "3.11"
+pyee==14.0.0; python_version == "3.14"
+pyflakes==4.1.0
+Pygments==2.21.0
+pymongo==4.19.0
+PyOTP==2.10.0
+pytest==9.2.0
+pytest-asyncio==1.4.1.post1
+python-dotenv==1.2.4
+python-multipart==0.0.33
+PyWavelets==1.9.0; python_version == "3.11"
+PyWavelets==1.10.0; python_version == "3.14"
+PyYAML==6.0.3
+RapidFuzz==3.14.6
+rsa==4.9.1
+scipy==1.17.1; python_version == "3.11"
+scipy==1.18.1; python_version == "3.14"
+starlette==1.10.0
+Telethon==1.45.0
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+tzdata==2026.6
+uvicorn==0.54.0
+watchfiles==1.3.0
+websockets==17.4
+yarl==1.25.1

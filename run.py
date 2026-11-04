@@ -47,16 +47,28 @@ FRONTEND = ROOT / "frontend"
 DIST = FRONTEND / "dist"
 
 # packages whose import name differs from the pip name
+#
+# KEEP THIS EQUAL TO WHAT requirements.txt INSTALLS AND THE CODE REQUIRES
+# (tests/test_fresh_clone_contract.py checks both directions). It used to
+# demand `apscheduler`, which the code dropped long ago and requirements.txt
+# never installed: on a clean laptop that package could never be satisfied, so
+# `--check` failed for ever and every `python run.py` re-ran the whole setup.
+# It only looked fine on a machine that happened to have it installed.
 IMPORT_NAMES = {
     "playwright": "playwright",
     "fastapi": "fastapi",
     "uvicorn": "uvicorn",
     "pydantic": "pydantic",
+    "pydantic-settings": "pydantic_settings",
+    "aiohttp": "aiohttp",
+    "httpx": "httpx",
+    "python-multipart": "multipart",
     "motor": "motor",
     "pymongo": "pymongo",
     "telethon": "telethon",
     "openpyxl": "openpyxl",
-    "apscheduler": "apscheduler",
+    "pillow": "PIL",
+    "imagehash": "imagehash",
     "pyotp": "pyotp",
     "curl_cffi": "curl_cffi",
 }
@@ -152,6 +164,10 @@ def mongo_ok() -> tuple[bool, str]:
 
         MongoClient(settings.mongo_uri, serverSelectionTimeoutMS=1500).server_info()
         return True, settings.mongo_uri
+    except ImportError as e:
+        # Before --setup there is no driver to ask with: say that, rather than
+        # sending someone to look for a mongod that may be running fine.
+        return False, f"cannot check yet ({e.name or 'a package'} is not installed) -- run --setup"
     except Exception as e:
         return False, f"{type(e).__name__} -- is mongod running?"
 
@@ -170,31 +186,65 @@ def run(cmd: list[str], cwd: Path | None = None, why: str = "") -> bool:
         return False
 
 
+def last_existing_path(stdout: str) -> str:
+    """The last line of `stdout` that is a file that exists, or "". The probe
+    below imports app code that logs to stdout, so the answer is not the only
+    line printed; taking the last real path is what makes that harmless."""
+    for line in reversed((stdout or "").splitlines()):
+        line = line.strip().strip('"')
+        if line and Path(line).is_file():
+            return line
+    return ""
+
+
+def chrome_on_this_machine() -> str:
+    """Path of the Chrome/Chromium sessions would launch here, or "".
+
+    Asked of the app's own resolver in a child process, so setup and the
+    sessions can never disagree about what counts as "Chrome is installed",
+    and so a half-installed environment cannot crash setup itself."""
+    try:
+        out = subprocess.run(
+            [sys.executable, "-c",
+             "from backend.stealth.fingerprint import chrome_binary; "
+             "print(chrome_binary() or '')"],
+            cwd=ROOT, capture_output=True, text=True, timeout=90,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return ""
+    return last_existing_path(out.stdout) if out.returncode == 0 else ""
+
+
 def setup(force: bool = False) -> bool:
     """Install everything needed, skipping whatever is already in place."""
     ok = True
 
     if force or missing_packages():
-        ok &= run(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "-r",
-                str(ROOT / "requirements.txt"),
-            ],
-            why="installing Python packages",
-        )
+        cmd = [sys.executable, "-m", "pip", "install", "-r", str(ROOT / "requirements.txt")]
+        # The versions that were run through the whole test suite, so every
+        # laptop installs the same thing and a new upstream release cannot
+        # change how the tool behaves under someone's feet. requirements.txt
+        # stays loose on purpose; this file only limits which version pip picks.
+        if (ROOT / "constraints.txt").is_file():
+            cmd += ["-c", str(ROOT / "constraints.txt")]
+        ok &= run(cmd, why="installing Python packages")
     else:
         say(OK, "python packages already installed")
 
-    # Chromium for Playwright: cheap to re-run, it no-ops when present
+    # Chromium for Playwright. Only a FALLBACK: every session launches the real
+    # Chrome this machine already has when there is one (see
+    # backend/stealth/fingerprint.py::chrome_binary) and passes its path
+    # explicitly, so the ~300 MB Chromium download is never used there. Skipped
+    # when Chrome is found; if Chrome is later missing, --check says so and a
+    # re-run of --setup downloads it then.
     if have("playwright"):
-        run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            why="installing the Chromium build for Playwright",
-        )
+        if found := chrome_on_this_machine():
+            say(OK, "chrome found", f"{found} -- skipping the Chromium download")
+        else:
+            run(
+                [sys.executable, "-m", "playwright", "install", "chromium"],
+                why="installing the Chromium build for Playwright",
+            )
 
     if FRONTEND.is_dir() and (shutil.which(npm()) or shutil.which("npm.cmd")):
         if force or not (FRONTEND / "node_modules").is_dir():
@@ -223,21 +273,9 @@ def setup(force: bool = False) -> bool:
 # ─────────────────────────────────── check ────────────────────────────────── #
 
 
-def check() -> bool:
-    ok = True
-    print("prerequisites:")
-    say(OK, "python", sys.version.split()[0])
-
-    if gone := missing_packages():
-        say(BAD, "python packages", f"missing {', '.join(gone)} -- run --setup")
-        ok = False
-    else:
-        say(OK, "python packages")
-
-    good, detail = mongo_ok()
-    say(OK if good else BAD, "mongodb", detail)
-    ok &= good
-
+def _report_machine() -> None:
+    """The checks that read the app's own settings, so they need the packages
+    installed. Warnings only: a smaller or synced setup still runs."""
     # Not a pass/fail: a small machine still runs everything, with fewer
     # browsers open at once. The line says which, so a slow run is explained.
     from backend.config import hardware
@@ -259,6 +297,18 @@ def check() -> bool:
                if tight else ""),
         )
 
+    # The README lists Chrome as a prerequisite and nothing checked it. Found
+    # the way sessions find it (CHROME_BINARY, PATH, the registry, known paths,
+    # then Playwright's own Chromium). A warning: setup can download Chromium.
+    from backend.stealth.fingerprint import chrome_binary
+
+    if binary := chrome_binary():
+        say(OK, "chrome", binary)
+    else:
+        say(WARN, "chrome",
+            "not found -- install Google Chrome, set CHROME_BINARY, or run --setup "
+            "to download Playwright's Chromium")
+
     # A warning, never a failure: it runs fine there, only slower and with the
     # session cookies synced to the cloud. Says exactly what to change.
     if service := hardware.synced_folder(settings.session_blob_path):
@@ -272,11 +322,40 @@ def check() -> bool:
     else:
         say(OK, "session folder", "not inside a cloud-synced folder")
 
+
+def check() -> bool:
+    ok = True
+    print("prerequisites:")
+    say(OK, "python", sys.version.split()[0])
+
+    if gone := missing_packages():
+        say(BAD, "python packages", f"missing {', '.join(gone)} -- run --setup")
+        ok = False
+    else:
+        say(OK, "python packages")
+
+    good, detail = mongo_ok()
+    say(OK if good else BAD, "mongodb", detail)
+    ok &= good
+
+    if gone:
+        # These read the app's own settings, which cannot load until the packages
+        # are installed. A clean laptop runs --check BEFORE --setup (the order the
+        # README gives), so this says what comes next instead of crashing.
+        say(WARN, "resources / chrome / session folder",
+            "checked after --setup (they need the installed packages)")
+    else:
+        _report_machine()
+
     say(
         OK if DIST.is_dir() else WARN,
         "frontend build",
         "" if DIST.is_dir() else "run --setup",
     )
+
+    if gone:
+        print("\nplatforms: listed after --setup")
+        return False
 
     try:
         from backend.platforms import registry

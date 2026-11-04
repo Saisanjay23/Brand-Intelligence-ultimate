@@ -140,10 +140,10 @@ To inspect authenticated search pages and profile telemetry without triggering p
 
 ### Prerequisites
 - **Operating System:** Windows 10/11, macOS, or Linux (Ubuntu 22.04+)
-- **Python:** 3.10 to 3.12
-- **Node.js:** 18+ LTS
-- **Database:** MongoDB 6.0+ listening on `mongodb://localhost:27017`
-- **Browser:** Google Chrome (Stable) installed on default system path
+- **Python:** 3.11 or newer. A clean clone, a clean install and the whole test suite were run on **3.11 and 3.14**; 3.12 and 3.13 use the same pinned set but were not run separately, and 3.10 is untested.
+- **Node.js:** 20 LTS or newer (the UI builds on 18, but its tests need 20+)
+- **Database:** MongoDB 6.0+ listening on `mongodb://localhost:27017`. Without it the app still starts and serves the UI, logs that Mongo is unreachable, retries every 15 seconds, and cannot store or read sessions or results until it is up.
+- **Browser:** Google Chrome (Stable). It is found through `CHROME_BINARY`, `PATH`, the Windows registry and the usual install folders; if none is found, `--setup` downloads Playwright's Chromium as a fallback.
 
 ### 1. Installation & Environment Check
 
@@ -152,12 +152,20 @@ To inspect authenticated search pages and profile telemetry without triggering p
 git clone https://github.com/Saisanjay23/Brand-Intelligence-ultimate.git
 cd Brand-Intelligence-ultimate
 
-# Verify system prerequisites (Python, Node, Mongo, Chrome, sessions)
+# Verify system prerequisites (Python, packages, Mongo, resources, Chrome, session folder, UI build).
+# Safe to run first, before anything is installed: it says what is missing instead of failing.
 python run.py --check
 
-# Automatic setup (installs Python dependencies, Playwright browsers, and builds UI)
+# Automatic setup (installs the pinned Python dependencies, builds the UI, and downloads
+# Playwright's Chromium only when no Chrome is found on the machine)
 python run.py --setup
 ```
+
+**What makes every laptop behave the same.** `requirements.txt` says what the tool needs; [`constraints.txt`](constraints.txt) pins the exact versions (including everything those packages pull in) that were run through the full test suite on a clean install, and `--setup` installs with it. `frontend/package-lock.json` does the same for the UI. Every uncommented value in `backend/.env.example` equals the code default, so copying it changes nothing and a laptop with no `.env` at all behaves identically. Nothing in the code depends on a path, user name or drive: the session, log and profile folders are relative to the project unless you set `SESSION_BLOB_PATH`.
+
+**What does not travel with the repo, on purpose:** sessions and cookies (they are private to the machine and the accounts), the saved Chrome profiles, the MongoDB data, and your `.env`. A new laptop starts empty and you add its sessions in the UI.
+
+To refresh the pins after a deliberate upgrade: make a clean virtual environment, `pip install -r requirements.txt` *without* `constraints.txt`, run `python -m pytest backend/tests`, then regenerate `constraints.txt` from `pip freeze` for each Python you support.
 
 ### 2. Launching the Service
 
@@ -195,7 +203,7 @@ MongoDB, if it runs on the same laptop, may grow its cache to about half of RAM 
 
 ## Testing & Quality Assurance
 
-The codebase includes an extensive suite of 271 unit tests that run entirely offline without requiring live platform accounts or active MongoDB connections:
+The codebase includes an extensive suite of about 1,900 tests that run entirely offline without requiring live platform accounts or active MongoDB connections:
 
 ```bash
 # Run backend test suite
