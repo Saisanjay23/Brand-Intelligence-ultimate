@@ -28,7 +28,9 @@ from backend.platforms.scan_options import cancelled
 from backend.shared import diagnostics
 from backend.shared.avatars import extract_instagram_hd_avatar, looks_like_placeholder
 from backend.shared.extraction import run_strategies
-from backend.shared.pushback import UNKNOWN, governor_for, note_response
+from backend.shared.pushback import (
+    CHALLENGED, STOP_CODE, THROTTLED, UNKNOWN, Signal, governor_for, note_response,
+)
 from backend.shared.resilience import classify_failure
 from backend.shared.schema_probe import SchemaProbe, probe_or_null
 from backend.shared.models.row import Row
@@ -899,6 +901,34 @@ async def _swap_to_app_ua(route) -> None:
             pass
 
 
+# WHEN INSTAGRAM SAYS "SLOW DOWN" OR "WE SUSPECT AUTOMATION", STOP ASKING.
+#
+# What the sweep used to do with a `feedback_required` / "please wait a few
+# minutes" / "we suspect automated behavior" answer: fire the web search on
+# the SAME account a moment later, clear the warning because the web leg
+# answered, report the keyword as covered, and move on to the next keyword
+# after the ordinary gap. So the one moment Instagram had just told this
+# account it was being watched, it got two more requests per keyword, for
+# every keyword left in the queue -- the textbook way a soft warning becomes
+# an "automated behaviour" flag on the account.
+#
+# Now a THROTTLED or CHALLENGED answer ends the sweep there: no web fallback,
+# and the stop code is the one `classify_failure` turns into a session verdict
+# (rate_limited -> graduated cooldown; checkpoint -> out of rotation until a
+# person looks). The runner then rests the account and re-owes the keyword,
+# so coverage is deferred, never silently traded for 5 shallow results.
+# EXPIRED (a bare 403, login_required) keeps the old path: that answer is
+# about the cookies, not the pace, and the web leg is what proves which.
+_STOP_ASKING = (THROTTLED, CHALLENGED)
+
+
+def _pushback_error(stop: str, status: int, sig: Signal) -> str:
+    """The sweep's error text for a pushback stop. Leads with the stop code
+    itself so `classify_failure` reads the verdict from our own vocabulary,
+    not from whichever phrase Instagram happened to use this time."""
+    return f"{stop}: instagram mobile search answered HTTP {status} with a {sig.kind} signal ({sig.reason})"
+
+
 @dataclass
 class Sweep:
     """One keyword's search sweep, and how it ended. LINKED TO: built and
@@ -1062,6 +1092,9 @@ class Discovery:
         # same insertion-ordered slicing X's `_emit` uses, so what streams is
         # always a prefix of what the finished sweep returns.
         notified = 0
+        # Set when Instagram told this account to slow down or that it looks
+        # automated -- see _STOP_ASKING. Ends the sweep with no fallback.
+        pushed_back = False
 
         async def _emit() -> None:
             """Hand the caller every user found since the last call.
@@ -1128,7 +1161,11 @@ class Discovery:
                     except Exception:
                         err_body = ""
                     sig = note_response("instagram", res.status, err_body)
-                    if sig.is_pushback or sig.kind == UNKNOWN:
+                    if sig.kind in _STOP_ASKING:
+                        pushed_back = True
+                        out.stopped = STOP_CODE[sig.kind]
+                        out.error = _pushback_error(out.stopped, res.status, sig)
+                    elif sig.is_pushback or sig.kind == UNKNOWN:
                         out.error = f"{sig.kind}: {sig.reason}"
                     break
 
@@ -1141,9 +1178,14 @@ class Discovery:
                 # satisfied, zero results -- for a keyword that was never
                 # really answered.
                 if isinstance(data, dict) and data.get("status") not in (None, "ok"):
-                    out.stopped = "http-200-status-" + str(data.get("status"))
-                    out.error = str(data.get("message") or data.get("status"))[:200]
-                    note_response("instagram", 200, text[:2000])
+                    sig = note_response("instagram", 200, text[:2000])
+                    if sig.kind in _STOP_ASKING:
+                        pushed_back = True
+                        out.stopped = STOP_CODE[sig.kind]
+                        out.error = _pushback_error(out.stopped, 200, sig)
+                    else:
+                        out.stopped = "http-200-status-" + str(data.get("status"))
+                        out.error = str(data.get("message") or data.get("status"))[:200]
                     break
 
                 new_users = 0
@@ -1225,7 +1267,19 @@ class Discovery:
                 out.stopped = "cap:pages"
                 out.complete = False
 
-            if not by_name and out.stopped == "exhausted":
+            if pushed_back:
+                # Keep what earlier pages already returned; ask nothing more
+                # of this account. `complete` stays False and the stop code
+                # makes the runner cool the session down and re-owe the
+                # keyword (see _STOP_ASKING).
+                out.users = list(by_name.values())
+                out.complete = False
+                from backend.shared.logging import get_logger as _gl
+                _gl("instagram").warning(
+                    f"instagram: search for {keyword!r} stopped -- {out.error}. No fallback "
+                    f"request sent; the account is handed back to rest "
+                    f"(governor: {governor_for('instagram').snapshot()})")
+            elif not by_name and out.stopped == "exhausted":
                 # The mobile API paged all the way to its own "no more
                 # results" signal and genuinely found nobody -- a common,
                 # valid outcome for a keyword with zero real Instagram

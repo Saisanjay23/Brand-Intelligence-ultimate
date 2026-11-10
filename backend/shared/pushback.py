@@ -86,6 +86,12 @@ _CHALLENGE_TOKENS = (
     "confirm your identity", "confirm it's you", "confirm it’s you",
     "suspicious activity", "account has been locked", "your account is locked",
     "/account/access", "arkose", "captcha",
+    # Instagram's "We suspect automated behavior on your account" warning. A
+    # challenge, not a throttle: the account needs a person to open it and
+    # acknowledge the warning, and every further automated request while it
+    # stands raises the risk of the account being disabled. Both spellings,
+    # since the app is localised.
+    "suspect automated", "automated behavior", "automated behaviour",
 )
 _THROTTLE_TOKENS = (
     "feedback_required", "rate limit", "rate-limit", "rate_limited",
@@ -93,6 +99,8 @@ _THROTTLE_TOKENS = (
     "temporarily blocked", "you're temporarily blocked", "we limit how often",
     "going too fast", "you can't use this feature right now",
     "overcapacity", "over capacity",
+    # Instagram's spam-block answer on its private API.
+    "sentry_block",
 )
 _EXPIRED_TOKENS = (
     "login_required", "not authenticated", "could not authenticate",

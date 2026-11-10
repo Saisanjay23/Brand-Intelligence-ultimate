@@ -49,7 +49,13 @@ from typing import Optional
 # codebase (analysis_service.py's inline `"rate limit" in err_str`, etc.)
 # already used this style, and every platform's own error text was written
 # to match it.
-_CHECKPOINT_TOKENS = ("checkpoint", "challenge", "verify your", "suspicious login")
+_CHECKPOINT_TOKENS = (
+    "checkpoint", "challenge", "verify your", "suspicious login",
+    # Instagram's "We suspect automated behavior on your account". The
+    # account needs a person to acknowledge it before it is used again --
+    # see shared/pushback.py, which files the same words as CHALLENGED.
+    "suspect automated", "automated behavio",
+)
 _AUTH_TOKENS = ("login", "not authenticated", "credential", "api key")
 # "rate_limited" is the stop CODE engines report (X's sweep, and this
 # module's own `classify_failure` return value); "rate limit" alone does not
@@ -59,6 +65,12 @@ _RATE_LIMIT_TOKENS = (
     "rate limit", "rate-limit", "rate_limited", "too many requests", "floodwait", "quota",
     # Instagram's wording for a throttle, carried in a 200's `message`
     "please wait a few minutes",
+    # shared/pushback.py already filed these as THROTTLED, but this list did
+    # not know them, so a sweep that stopped on one never cooled its session
+    # down -- the next keyword went out on the same account at full speed.
+    # "throttled" is pushback.py's own word, which the Facebook engine's
+    # pushback error carries ("answered with a throttled signal").
+    "feedback_required", "sentry_block", "throttled",
 )
 _TRANSIENT_TOKENS = (
     "timeout", "timed out", "navigation failed", "econnreset", "econnrefused",

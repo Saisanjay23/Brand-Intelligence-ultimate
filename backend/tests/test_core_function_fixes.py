@@ -187,11 +187,90 @@ class TestAnExpiredSessionIsNotLaunderedByTheWebFallback:
         assert classify_failure(sweep.error or sweep.stopped) == "checkpointed"
 
     @pytest.mark.asyncio
-    async def test_a_plain_throttle_is_still_cleared(self, monkeypatch):
-        """A throttle is the pacing governor's business, not a dead account."""
-        sweep = await self._run(monkeypatch, "Please wait a few minutes before you try again.")
-        assert sweep.error == ""
-        assert sweep_outcome(sweep.stopped, sweep.complete) == "truncated"
+    async def test_a_throttle_stops_the_account_instead_of_asking_again(self, monkeypatch):
+        """A throttle used to be answered with a web search on the same
+        account and then cleared, so the account kept working straight
+        through Instagram's warning. Now it ends the sweep, sends nothing
+        more, and reaches the runner as a (non-dead) rate limit."""
+        web_calls = []
+
+        async def web_spy(*a, **kw):
+            web_calls.append(a)
+            return []
+
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+        disc, ctx = _ig([{"status": "fail", "message": "Please wait a few minutes before you try again."}])
+        monkeypatch.setattr(
+            "backend.platforms.instagram.discovery_engine.web_search_users", web_spy)
+        sweep = await disc.sweep("x")
+        assert web_calls == [] and ctx.request.get.await_count == 1
+        assert sweep.stopped == "rate_limited" and not sweep.complete
+        assert classify_failure(sweep.error or sweep.stopped) == "rate_limited"
+        assert sweep_outcome(sweep.stopped, sweep.complete) == "broken"   # still owed
+
+
+class TestInstagramStopsWhenItIsWarned:
+    """The answers that mean "this account looks automated" or "slow down"
+    end the sweep with no further request, keep what was already found,
+    and carry a verdict the runner acts on."""
+
+    async def _run(self, monkeypatch, pages):
+        web_calls = []
+
+        async def web_spy(*a, **kw):
+            web_calls.append(a)
+            return []
+
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+        disc, ctx = _ig(pages)
+        monkeypatch.setattr(
+            "backend.platforms.instagram.discovery_engine.web_search_users", web_spy)
+        return await disc.sweep("x"), ctx, web_calls
+
+    @pytest.mark.asyncio
+    async def test_feedback_required_is_a_rate_limit(self, monkeypatch):
+        sweep, ctx, web = await self._run(
+            monkeypatch, [{"status": "fail", "message": "feedback_required"}])
+        assert web == [] and ctx.request.get.await_count == 1
+        assert classify_failure(sweep.error or sweep.stopped) == "rate_limited"
+
+    @pytest.mark.asyncio
+    async def test_suspected_automation_takes_the_account_out_of_rotation(self, monkeypatch):
+        sweep, _, web = await self._run(monkeypatch, [{
+            "status": "fail",
+            "message": "We suspect automated behavior on your account"}])
+        assert web == []
+        assert sweep.stopped == "checkpoint"
+        assert classify_failure(sweep.error or sweep.stopped) == "checkpointed"
+
+    @pytest.mark.asyncio
+    async def test_results_from_earlier_pages_are_kept(self, monkeypatch):
+        sweep, ctx, web = await self._run(monkeypatch, [
+            {"status": "ok", "users": _users("a", "b"), "has_more": True, "page_token": "p2"},
+            {"status": "fail", "message": "feedback_required"},
+        ])
+        assert web == [] and ctx.request.get.await_count == 2
+        assert [h.username for h in sweep.hits] == ["a", "b"]
+        assert sweep.stopped == "rate_limited" and not sweep.complete
+
+    @pytest.mark.asyncio
+    async def test_an_http_429_stops_too(self, monkeypatch):
+        r = MagicMock()
+        r.status = 429
+        r.text = AsyncMock(return_value="")
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+        disc, ctx = _ig([])
+        ctx.request.get = AsyncMock(return_value=r)
+        web_calls = []
+
+        async def web_spy(*a, **kw):
+            web_calls.append(a)
+            return []
+
+        monkeypatch.setattr(
+            "backend.platforms.instagram.discovery_engine.web_search_users", web_spy)
+        sweep = await disc.sweep("x")
+        assert web_calls == [] and sweep.stopped == "rate_limited"
 
 
 # ------------------------------------------------------- sessions & cookies
