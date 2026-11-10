@@ -497,3 +497,52 @@ class TestDiscoveryPacingAndTabs:
         await disc._get("https://www.instagram.com/x", {})
         tab.close.assert_awaited_once()
         assert disc._tab is None
+
+
+class TestAutomationWarningPopup:
+    """Instagram's "We suspect automated behavior on your account" is a popup
+    over a profile that usually still loads. The page-text checks only ran
+    when the header could NOT be read, so the batch carried on through it."""
+
+    @staticmethod
+    def _with_dialog(page, dialog_text):
+        from backend.platforms.instagram.analysis_engine import JS_DIALOG_TEXT
+
+        async def evaluate(script, *args):
+            return dialog_text if script == JS_DIALOG_TEXT else page._dom
+        page.evaluate = AsyncMock(side_effect=evaluate)
+        return page
+
+    @pytest.mark.asyncio
+    async def test_a_warning_over_a_readable_profile_stops_the_batch(self):
+        from backend.shared.resilience import classify_failure
+        page = _page("https://www.instagram.com/shop/", "Shop 10 posts")
+        page._dom = {"name": "Shop", "followers": "1,234 followers", "posts": "10 posts"}
+        self._with_dialog(page, "We suspect automated behavior on your account\nDismiss")
+        row = await _run("shop/", page)
+        assert row.status == "CHECKPOINT"
+        assert classify_failure(row.notes or "") == "checkpointed"
+
+    @pytest.mark.asyncio
+    async def test_a_bio_mentioning_automation_is_not_a_warning(self):
+        page = _page("https://www.instagram.com/bots/",
+                     "We suspect automated behavior is the future -- our bio")
+        page._dom = {"name": "Bots", "followers": "12 followers", "posts": "3 posts"}
+        self._with_dialog(page, "")
+        row = await _run("bots/", page)
+        assert row.status != "CHECKPOINT"
+
+    @pytest.mark.asyncio
+    async def test_the_warning_as_page_text_with_no_profile_is_caught(self):
+        page = _page("https://www.instagram.com/shop/",
+                     "We suspect automated behaviour on your account")
+        self._with_dialog(page, "")
+        row = await _run("shop/", page)
+        assert row.status == "CHECKPOINT"
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_dialog_is_not_a_warning(self):
+        from backend.platforms.instagram.analysis_engine import account_warning
+        page = MagicMock()
+        page.evaluate = AsyncMock(side_effect=RuntimeError("page closed"))
+        assert await account_warning(page) == ""

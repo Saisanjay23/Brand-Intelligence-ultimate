@@ -57,7 +57,11 @@ RE_LOGIN = re.compile(
 RE_CHECKPOINT = re.compile(
     r"(challenge_required|Suspicious Login|"
     r"We Detected An Unusual Login|confirm it.s you|"
-    r"Help Us Confirm)",
+    r"Help Us Confirm|"
+    # "We suspect automated behavior on your account" -- the warning that
+    # comes before a restriction. The account needs a person to open it and
+    # dismiss the warning; every automated visit after it raises the risk.
+    r"suspect\w*\s+automated|automated\s+behaviou?r)",
     re.I,
 )
 RE_GONE = re.compile(

@@ -148,7 +148,39 @@ NO_PAYLOAD_STREAK_LIMIT = 3
 # matches. This is a THROTTLE, not a verdict on the profile.
 _RE_THROTTLE_PAGE = re.compile(
     r"(something went wrong|try again later|please wait a few minutes|"
-    r"we limit how often)", re.I)
+    r"we limit how often|action blocked)", re.I)
+
+
+# THE WARNING THAT SITS ON TOP OF A PROFILE THAT LOADED FINE.
+#
+# Instagram's "We suspect automated behavior on your account" arrives as a
+# popup over the page, and the profile behind it usually still renders. So
+# the header read succeeded, the page-text checks further down (which only
+# run when the header could NOT be read) never ran, and the batch carried on
+# to every remaining profile on an account Instagram had just warned. The
+# popup is the one place this warning lives, so it is looked for there, on
+# every visit.
+#
+# Only the text INSIDE open dialogs is read, never the whole page: a bio or
+# caption can say anything, but a profile page has no dialog open of its own
+# when it first loads, so text in one is Instagram talking to the account.
+JS_DIALOG_TEXT = """
+() => Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"]'))
+  .map(d => d.innerText || "").join("\\n").slice(0, 4000)
+"""
+
+
+async def account_warning(page) -> str:
+    """The checkpoint / automation warning showing in an open dialog on
+    `page`, as the matched words -- or "" when there is none, or the page
+    could not be read (an unreadable page is not a warning; the existing
+    checks further down still get their turn)."""
+    try:
+        text = await page.evaluate(JS_DIALOG_TEXT) or ""
+    except Exception:
+        return ""
+    m = RE_CHECKPOINT.search(text) if isinstance(text, str) else None
+    return m.group(0) if m else ""
 
 
 def _jitter_ms(base_ms: float) -> int:
@@ -1084,6 +1116,21 @@ class Scraper:
                 body = await page.inner_text("body")
             except Exception:
                 pass
+
+            # Checked BEFORE the profile is read, and whether or not it can
+            # be: a warning over a perfectly readable profile is still a
+            # warning (see account_warning). CHECKPOINT stops this batch
+            # (run() / the analysis runner) and takes the account out of
+            # rotation until a person has looked at it.
+            if warned := await account_warning(page):
+                row.status = "CHECKPOINT"
+                row.note(f"instagram warned this account in a popup ({warned!r}) -- "
+                         f"batch stopped; open the account, dismiss the warning and "
+                         f"let it rest before using it again")
+                if not pushed:
+                    governor_for("instagram").record(Signal(
+                        CHALLENGED, f"warning popup: {warned}"))
+                return row
 
             private = False
             candidates = ([api_user] if api_user else []) + found
