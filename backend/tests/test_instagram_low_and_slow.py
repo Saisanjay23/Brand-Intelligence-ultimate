@@ -1,7 +1,6 @@
-"""Instagram low-and-slow: a natural search request, a shallow page cap, a
-rest between searching and visiting, and the "About this account" panel
-off unless asked for. Each guards a change made after the account was
-flagged for automated behaviour."""
+"""Instagram low-and-slow: a natural search request, a shallow page cap,
+and a rest between searching and visiting. Each guards a change made after
+the account was flagged for automated behaviour."""
 
 from __future__ import annotations
 
@@ -100,9 +99,3 @@ class TestRestBeforeAnalysis:
         import time
         await asyncio.wait_for(AR._rest_after_recent_use(
             "instagram", {"last_ok": time.time()}, job, "acct"), timeout=2)
-
-
-class TestAboutPanelIsOffByDefault:
-    def test_the_default_is_off(self):
-        from backend.config.settings import Settings
-        assert Settings.model_fields["instagram_about_panel_per_batch"].default == 0

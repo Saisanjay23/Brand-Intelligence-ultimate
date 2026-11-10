@@ -119,14 +119,6 @@ class Settings(BaseSettings):
     # pacing, the single most important knob for staying unremarkable
     request_timeout_sec: int = 45
     analysis_delay_sec: float = 2.5
-    # INSTAGRAM'S "ABOUT THIS ACCOUNT" PANEL: how many profiles per analysis
-    # batch may have it opened (menu -> About this account). It is the only
-    # source of the join date and the usual source of the country, but a
-    # person opens it on almost no profiles, and opening it on nearly every
-    # one is a pattern Instagram can score. 0 = never (the default); rows it
-    # is skipped on say so, so a blank join date is never mistaken for one
-    # Instagram did not have.
-    instagram_about_panel_per_batch: int = 0
     # Seconds an Instagram account rests between its last real use (a
     # discovery sweep, say) and the start of an analysis batch on it. With a
     # one-account pool, search and then fifty profile visits back to back is

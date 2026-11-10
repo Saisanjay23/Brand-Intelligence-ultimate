@@ -351,109 +351,29 @@ class TestPermalinkTier:
 
 
 @pytest.mark.usefixtures("fresh_governor")
-class TestAboutPanelReusesThePage:
+class TestNoAboutPanel:
+    """"About this account" was opened on nearly every profile -- a pattern
+    a person never makes. It is gone: no click, no menu, no join date."""
     GOOD = {"name": "Shop", "followers": "1,234 followers", "posts": "10 posts"}
 
-    @staticmethod
-    def _prep(monkeypatch, budget=5):
-        from backend.config.settings import settings
+    def test_the_panel_reader_no_longer_exists(self):
+        assert not hasattr(_ae.Scraper, "read_about_panel")
+
+    @pytest.mark.asyncio
+    async def test_a_profile_visit_never_opens_the_menu(self, monkeypatch):
         monkeypatch.setattr(_ae, "_TIMELINE_WAIT_S", 0.01)
-        # The panel is OFF by default now; these tests are about how it
-        # behaves when it is switched on.
-        monkeypatch.setattr(settings, "instagram_about_panel_per_batch", budget)
-
-    @pytest.mark.asyncio
-    async def test_off_by_default_and_said_so(self, monkeypatch):
-        self._prep(monkeypatch, budget=0)
         page = _page("https://www.instagram.com/shop/", "")
         page._dom = self.GOOD
+        page.locator = MagicMock()
+        page.get_by_text = MagicMock()
 
         def setup(s):
-            s.read_about_panel = AsyncMock(return_value={})
             s.read_last_post_date = AsyncMock(return_value="")
         row, s = await _run_s("shop/", page, setup)
-        s.read_about_panel.assert_not_awaited()
-        assert "About-this-account panel not opened" in row.notes
-
-    @pytest.mark.asyncio
-    async def test_the_budget_is_per_batch(self, monkeypatch):
-        self._prep(monkeypatch, budget=1)
-        page = _page("https://www.instagram.com/shop/", "")
-        page._dom = self.GOOD
-
-        def setup(sc):
-            sc.read_about_panel = AsyncMock(return_value={})
-            sc.read_last_post_date = AsyncMock(return_value="")
-        _, s = await _run_s("shop/", page, setup)
-        assert s.read_about_panel.await_count == 1
-        row = await s.process("https://www.instagram.com/shop/", "target", "feed", None)
-        assert s.read_about_panel.await_count == 1        # second profile: not opened
-        assert "About-this-account panel not opened" in row.notes
-
-    @pytest.mark.asyncio
-    async def test_no_second_tab_and_no_second_load_of_the_profile(self):
-        page = _page("https://www.instagram.com/shop/", "")
-        page.wait_for_selector = AsyncMock(side_effect=RuntimeError("no options button"))
-        page.keyboard = MagicMock()
-        page.keyboard.press = AsyncMock()
-        page.remove_listener = MagicMock()
-        s = _scraper(page)
-        assert await s.read_about_panel("shop", page) == {}
-        s.session.ctx.new_page.assert_not_awaited()
-        page.goto.assert_not_awaited()
-        page.close.assert_not_awaited()            # the caller's page lives on
-        page.remove_listener.assert_called_once()
-        page.keyboard.press.assert_awaited_once_with("Escape")
-
-    @pytest.mark.asyncio
-    async def test_process_passes_its_own_page_and_runs_it_before_the_date_tiers(self, monkeypatch):
-        self._prep(monkeypatch)
-        page = _page("https://www.instagram.com/shop/", "")
-        page._dom = self.GOOD
-        order = []
-
-        def setup(s):
-            async def about(username, pg=None):
-                order.append(("about", pg))
-                return {}
-
-            async def last(*a, **k):
-                order.append(("last", None))
-                return ""
-            s.read_about_panel = about
-            s.read_last_post_date = last
-        row, s = await _run_s("shop/", page, setup)
-        assert [o[0] for o in order] == ["about", "last"]
-        assert order[0][1] is page
-        assert s.session.ctx.new_page.await_count == 1
-
-    @pytest.mark.asyncio
-    async def test_skipped_while_throttled_and_said_so(self, monkeypatch):
-        self._prep(monkeypatch)
-        for _ in range(2):
-            _pb.note_response("instagram", 429)
-        page = _page("https://www.instagram.com/shop/", "")
-        page._dom = self.GOOD
-
-        def setup(s):
-            s.read_about_panel = AsyncMock(return_value={})
-            s.read_last_post_date = AsyncMock(return_value="")
-        row, s = await _run_s("shop/", page, setup)
-        s.read_about_panel.assert_not_awaited()
-        assert "About-this-account panel skipped" in row.notes
-
-    @pytest.mark.asyncio
-    async def test_skipped_once_cancelled(self, monkeypatch):
-        self._prep(monkeypatch)
-        page = _page("https://www.instagram.com/shop/", "")
-        page._dom = self.GOOD
-
-        def setup(s):
-            s.a.cancel = True
-            s.read_about_panel = AsyncMock(return_value={})
-            s.read_last_post_date = AsyncMock(return_value="")
-        row, s = await _run_s("shop/", page, setup)
-        s.read_about_panel.assert_not_awaited()
+        page.locator.assert_not_called()
+        page.get_by_text.assert_not_called()
+        assert not row.created_iso
+        assert "About-this-account" not in (row.notes or "")
 
 
 class TestDiscoveryLatestPostOwner:

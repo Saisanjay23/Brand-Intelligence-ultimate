@@ -608,38 +608,6 @@ def timeline_latest_post(blob: Any, username: str = "") -> str:
     return datetime.fromtimestamp(best, timezone.utc).date().isoformat()
 
 
-# Instagram's "About this account" panel.
-#
-# Reached by clicking (Options -> About this account); it is NOT directly
-# fetchable. Confirmed live 2026-08-22: the panel is served by a POST to
-# `/async/wbloks/fetch/?appid=com.bloks.www.ig.about_this_account` carrying
-# ~1.8KB of session-derived tokens (__bkv, __hs, __rev, __s, __hsi, __dyn),
-# and `/api/v1/users/<pk>/about_this_account/` answers 404 while
-# `/api/v1/users/<pk>/info/` answers 200 but carries no country at all.
-# Letting the page issue the request is what keeps those tokens correct
-# without this file having to harvest or forge any of them.
-#
-# The response is a Bloks payload -- a serialised UI tree, not a data
-# document -- so the country is read from its own NAMED state key rather
-# than by position in the component list. The label/value Text components
-# ("Account based in", then "India") are adjacent siblings whose order is a
-# layout decision; the named key is the closest thing to a stable contract
-# the payload offers.
-ABOUT_PANEL_APPID = "com.bloks.www.ig.about_this_account"
-_RE_ABOUT_COUNTRY = re.compile(
-    r'"key"\s*:\s*"IG_ABOUT_THIS_ACCOUNT:about_this_account_country"'
-    r'\s*,\s*"mode"\s*:\s*"[^"]*"\s*,\s*"initial"\s*:\s*"([^"]*)"'
-)
-
-
-def about_country(body: str) -> str:
-    """The country Instagram says an account is based in, out of the Bloks
-    payload behind "About this account". "" when the payload does not carry
-    one (the key is genuinely absent for some accounts)."""
-    m = _RE_ABOUT_COUNTRY.search(body or "")
-    return (m.group(1).strip() if m else "")
-
-
 def iter_mobile_search_users(blob: Any, probe: Any = None) -> Iterator[InstagramUser]:
     """Users from a mobile search payload (`api/v1/users/search/`)."""
     probe = probe_or_null(probe)

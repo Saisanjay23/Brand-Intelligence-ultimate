@@ -124,15 +124,13 @@ from backend.shared.text import (MONTHS, _letters_only, name_score,
                                    normalized_host, parse_count,
                                    parse_normalized_url)
 from backend.shared.avatars import hd_picture_url, looks_like_placeholder
-from backend.platforms.instagram.discovery_engine import (ABOUT_PANEL_APPID,
-                                                           MOBILE_UA,
+from backend.platforms.instagram.discovery_engine import (MOBILE_UA,
                                                            PROFILE_ENDPOINTS,
                                                            PROFILE_INFO_API,
                                                            RE_CHECKPOINT,
                                                            RE_GONE, RE_LOGIN,
                                                            InstagramSession,
                                                            InstagramUser,
-                                                           about_country,
                                                            parse_lines,
                                                            profile_from,
                                                            timeline_latest_post)
@@ -233,11 +231,6 @@ def register_no_payload(state, pushed: bool) -> str:
 # no date yet, and the cost of reading too early is a false "no posts",
 # which feeds the activity classification and the risk score.
 _TIMELINE_WAIT_S = 12.0
-
-# The About panel is two clicks and a Bloks round-trip. Short, explicit
-# budgets: it is a bonus field, and must never be what makes a profile slow.
-_ABOUT_CLICK_MS = 4000
-_ABOUT_RENDER_MS = 6000
 
 
 def normalize_url(url: str) -> str:
@@ -744,187 +737,6 @@ class Scraper:
                 continue
         return max(found) if found else ""
 
-    # ────────────────────── About this account ────────────────────────── #
-
-    # The panel renders each field as a label line followed by its value
-    # line: "Date joined" then "April 2025", "Account based in" then
-    # "India". Matching the label and taking the NEXT line is what survives
-    # Instagram restyling the panel, which it does often; the labels
-    # themselves are the stable part.
-    JS_ABOUT_PANEL = """
-    () => {
-      const lines = (document.body.innerText || "").split("\\n")
-        .map(s => s.trim()).filter(Boolean);
-      const after = (label) => {
-        const i = lines.findIndex(l => l.toLowerCase() === label.toLowerCase());
-        return i >= 0 && i + 1 < lines.length ? lines[i + 1] : "";
-      };
-      return {
-        joined: after("Date joined"),
-        based_in: after("Account based in"),
-        open: lines.some(l => /^about this account$/i.test(l)),
-      };
-    }
-    """
-
-    # "April 2025" -> "2025-04". MONTH precision, and deliberately not
-    # padded out to a day: the panel simply does not publish one, and
-    # writing "2025-04-01" would put a date in the record that Instagram
-    # never said.
-    _RE_MONTH_YEAR = re.compile(r"^([A-Za-z]+)\s+(\d{4})$")
-
-    @classmethod
-    def _parse_joined(cls, text: str) -> str:
-        """WHAT: the join date out of the About-this-account panel. HOW:
-        that panel renders a month and year ("April 2025") with no day, so
-        this returns MONTH precision (YYYY-MM) rather than inventing a
-        day-of-month that would read as a precise date nobody published.
-        LINKED TO: read_about_panel(); the value lands on
-        row.created_iso."""
-        m = cls._RE_MONTH_YEAR.match((text or "").strip())
-        if not m:
-            return ""
-        name, year = m.groups()
-        month = next((i for i, mon in enumerate(MONTHS, start=1)
-                      if mon.lower() == name.lower()), None)
-        if not month:
-            return ""
-        y = int(year)
-        if not (2010 <= y <= datetime.now(timezone.utc).year):
-            return ""  # Instagram launched in 2010
-        return f"{y:04d}-{month:02d}"
-
-    async def read_about_panel(self, username: str, page=None) -> dict:
-        """Instagram's "About this account" -> {country, joined}.
-
-        Two fields this engine could not otherwise report AT ALL: location
-        is blank on 100% of stored Instagram rows, and the creation date
-        has always been documented here as not exposed. The panel publishes
-        both.
-
-        It has to be CLICKED open -- it is not fetchable. Confirmed live
-        2026-08-22: `/api/v1/users/<pk>/about_this_account/` is a 404,
-        `/api/v1/users/<pk>/info/` answers 200 but carries no country, and
-        the panel itself is a POST to a Bloks endpoint carrying ~1.8KB of
-        session-derived tokens. Driving the page is what keeps those tokens
-        correct without this engine forging any of them.
-
-        WHEN `page` IS GIVEN it is the profile page the caller has already
-        loaded, and it is reused: no second tab, no second load of the same
-        profile URL (two loads of one profile seconds apart is a pattern no
-        person produces). The caller must have taken its evidence screenshot
-        first, because the panel is a modal over the profile; the modal is
-        dismissed before returning. Without `page`, the old behaviour: its
-        own tab, its own load.
-
-        Returns {} on anything short of a clean read -- never a guess.
-        """
-        reuse = page is not None
-        if not reuse:
-            page = await self.ctx.new_page()
-        bodies: list[str] = []
-
-        async def on_response(resp):
-            """Collects the About-this-account payload, which carries the
-            join date and country -- neither of which the profile header
-            itself renders."""
-            try:
-                if ABOUT_PANEL_APPID not in resp.url:
-                    return
-                bodies.append(await resp.text())
-            except Exception:
-                pass
-
-        listener = lambda r: spawn(on_response(r))  # noqa: E731
-        page.on("response", listener)
-        try:
-            if not reuse:
-                await page.goto(
-                    f"https://www.instagram.com/{quote(username)}/",
-                    wait_until="domcontentloaded", timeout=self.a.timeout * 1000,
-                )
-            await humanize_interaction(page, scroll=False, moves=1 if reuse else 2)
-            # The Options button is NOT on the page at domcontentloaded --
-            # measured live, it first exists somewhere between 0 and 3
-            # seconds in. Clicking without this wait is why the panel
-            # silently produced nothing on every profile: the locator
-            # matched zero elements, the loop fell through to `else` and
-            # returned {} without any error to explain it.
-            try:
-                await page.wait_for_selector(
-                    'svg[aria-label="Options"], svg[aria-label="More options"]',
-                    timeout=_ABOUT_RENDER_MS,
-                )
-            except Exception:
-                return {}
-            for selector in (
-                'svg[aria-label="Options"]',
-                'div[role="button"]:has(svg[aria-label="Options"])',
-                'svg[aria-label="More options"]',
-            ):
-                try:
-                    el = page.locator(selector).first
-                    if await el.count():
-                        await el.click(timeout=_ABOUT_CLICK_MS)
-                        break
-                except Exception:
-                    continue
-            else:
-                return {}
-            try:
-                await page.get_by_text("About this account", exact=False).first.click(
-                    timeout=_ABOUT_CLICK_MS)
-            except Exception:
-                return {}
-            # the panel paints from the Bloks response, so wait on the
-            # rendered label rather than a fixed sleep
-            try:
-                await page.wait_for_function(
-                    "() => /account based in|date joined/i.test(document.body.innerText)",
-                    timeout=_ABOUT_RENDER_MS,
-                )
-            except Exception:
-                pass
-
-            dom = {}
-            try:
-                dom = await page.evaluate(self.JS_ABOUT_PANEL) or {}
-            except Exception:
-                dom = {}
-
-            # The payload's own named state key first (a contract), the
-            # rendered label/value pair second (a layout decision).
-            country = ""
-            for body in bodies:
-                if country := about_country(body):
-                    break
-            if not country:
-                country = (dom.get("based_in") or "").strip()
-
-            return {
-                "country": country,
-                "joined": self._parse_joined(dom.get("joined") or ""),
-            }
-        except Exception:
-            return {}
-        finally:
-            if reuse:
-                # The caller's page lives on: stop listening and dismiss the
-                # modal so whatever it does next sees the profile, not a dialog.
-                try:
-                    page.remove_listener("response", listener)
-                except Exception:
-                    pass
-                try:
-                    await page.keyboard.press("Escape")
-                except Exception:
-                    pass
-            else:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
-
     # ───────────────────────────── per URL ────────────────────────────── #
 
     async def process(
@@ -935,16 +747,21 @@ class Scraper:
 
         `known`, when given (only a profile sent here via "Analyse
         Validated Profiles" carries one -- see analysis/runner.py's
-        `seed_by_url`), pre-fills `row.location`/`row.created_iso` before
-        step 6 below. Every OTHER field still comes from this visit's own
+        `seed_by_url`), pre-fills `row.location`/`row.created_iso`. Every
+        OTHER field still comes from this visit's own
         `fetch_via_api()`/interception/DOM chain regardless of what
         discovery had, since they all land in the SAME payload that a
         status/screenshot/last-post read needs this visit to make anyway
-        -- skipping them would save nothing. Location and join date are
-        different: both come only from the About-this-account panel, a
-        separate click-driven visit (step 6), so pre-filling them from
-        `known` lets that visit be skipped entirely when discovery already
-        has both.
+        -- skipping them would save nothing.
+
+        NO JOIN DATE. Instagram publishes an account's join date only in
+        the "About this account" panel, which has to be clicked open from
+        the profile's menu. A person opens it on almost no profiles; this
+        engine used to open it on nearly every one, a pattern Instagram can
+        score as automation. It was removed on purpose (2026-11-10): the
+        join date stays blank on Instagram rows unless discovery seeded
+        one, and location comes only from the profile payload's
+        `city_name`.
 
         WHAT IT RETURNS: a scored `Row`, status OK/PARTIAL/GONE/ERROR/
         CHECKPOINT/LOGIN_REQUIRED, every field tagged with `row.mark()`.
@@ -964,12 +781,9 @@ class Scraper:
              site for the live incident this ordering fixes).
           5. If no last-post date yet: try the already-intercepted
              timeline response first (`timeline_latest_post`, free).
-          6. If location or join date are still blank: `read_about_panel()`
-             on THIS page (the About-this-account panel, click-driven, no
-             second page load; skipped while throttled or cancelled).
-          7. If still no last-post date: `read_last_post_date()`'s grid-alt
+          6. If still no last-post date: `read_last_post_date()`'s grid-alt
              read, then up to three permalink visits (these navigate the
-             page away, which is why 6 runs first).
+             page away, which is why they run last).
 
         LINKED TO: called by `one()` below.
         """
@@ -1303,44 +1117,6 @@ class Scraper:
             # the handle from the URL (row.profile_id has been reassigned
             # to the numeric pk by fill() at this point, which is why the
             # pinned copy is used here too).
-            #
-            # "ABOUT THIS ACCOUNT" RUNS HERE, ON THIS SAME PAGE, before the
-            # last-post tiers below navigate it away. It used to open a new
-            # tab and load the same profile a second time and click through on
-            # nearly every row. The screenshot is already taken (the panel is
-            # a modal), the profile is still on screen, and the modal is
-            # dismissed afterwards. Skipped while Instagram is throttling us
-            # and once the job is cancelled -- it is a bonus field and never
-            # worth an extra interaction then.
-            if (not row.location or not row.created_iso) and (row.profile_name or row.profile_id):
-                from backend.config.settings import settings as _settings
-                about_budget = max(0, int(_settings.instagram_about_panel_per_batch or 0))
-                about_used = int(getattr(self, "_about_reads", 0) or 0)
-                if cancelled(self.a):
-                    pass
-                elif about_used >= about_budget:
-                    # Said on the row, so a blank join date reads as "not
-                    # asked", never as "Instagram had none".
-                    row.note("About-this-account panel not opened (per-batch limit "
-                             f"INSTAGRAM_ABOUT_PANEL_PER_BATCH={about_budget}) -- "
-                             "location / join date left blank")
-                elif not governor_for("instagram").healthy():
-                    row.note("About-this-account panel skipped: Instagram is "
-                             "throttling this session (location / join date left blank)")
-                else:
-                    self._about_reads = about_used + 1
-                    about = await self.read_about_panel(wanted, page)
-                    if about.get("country") and not row.location:
-                        row.location = about["country"]
-                        row.mark("location", "about-panel")
-                    if about.get("joined") and not row.created_iso:
-                        row.created_iso = about["joined"]
-                        row.mark("created", "about-panel")
-                        # Month precision, because that is all the panel
-                        # gives. Said out loud so a YYYY-MM here is never
-                        # mistaken for a truncated full date.
-                        row.note("join date is month-precision (Instagram publishes no day)")
-
             if not row.last_post_iso:
                 if row.posts_seen == "":
                     # SAID OUT LOUD, not skipped quietly. These tiers read
