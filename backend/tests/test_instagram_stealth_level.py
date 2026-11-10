@@ -51,13 +51,14 @@ def test_standard_reproduces_the_numbers_from_before_levels(level):
     level("standard")
     assert L.value("instagram", "keyword_gap", None) == DR._PLATFORM_INTER_KEYWORD_DELAY["instagram"]
     assert L.value("instagram", "batch_gap", None) == AR._PLATFORM_INTER_BATCH_DELAY["instagram"]
-    assert L.value("instagram", "page_gap", None) == 2.5          # the old fixed sleep
+    # Not the old fixed 2.5s any more: raised to reading pace on purpose.
+    assert L.value("instagram", "page_gap", None) == 4.5
     assert L.session_cap("instagram", 3) == 3                     # no cap of its own
 
 
 def test_high_is_slower_everywhere_and_one_account(level):
     level("high")
-    std = {"keyword_gap": 8.0, "batch_gap": 3.5, "page_gap": 2.5}
+    std = {"keyword_gap": 8.0, "batch_gap": 3.5, "page_gap": 4.5}
     for name, old in std.items():
         assert L.value("instagram", name, None) > old, name
     assert L.session_cap("instagram", 3) == 1

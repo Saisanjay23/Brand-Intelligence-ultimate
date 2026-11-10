@@ -41,15 +41,18 @@ LEVELS = (STANDARD, HIGH)
 # max_sessions accounts allowed to work this platform at once; None = no
 #              level-imposed cap (the runner's own default applies)
 _TABLE: dict[str, dict[str, dict[str, Optional[float]]]] = {
+    # page_gap is the median pause between two result pages of ONE search
+    # (jittered around it, see `jittered`). It was 2.5s, quicker than a
+    # person moves through a results list; 4.5s is about reading pace.
     "instagram": {
-        STANDARD: {"keyword_gap": 8.0, "page_gap": 2.5, "batch_gap": 3.5, "max_sessions": None},
-        HIGH:     {"keyword_gap": 16.0, "page_gap": 6.0, "batch_gap": 9.0, "max_sessions": 1},
+        STANDARD: {"keyword_gap": 8.0, "page_gap": 4.5, "batch_gap": 3.5, "max_sessions": None},
+        HIGH:     {"keyword_gap": 16.0, "page_gap": 7.0, "batch_gap": 9.0, "max_sessions": 1},
     },
     # Threads signs in with the same Instagram account, so a flag on one is a
     # flag on both: same numbers, same single session.
     "threads": {
-        STANDARD: {"keyword_gap": 8.0, "page_gap": 2.5, "batch_gap": 3.5, "max_sessions": None},
-        HIGH:     {"keyword_gap": 16.0, "page_gap": 6.0, "batch_gap": 9.0, "max_sessions": 1},
+        STANDARD: {"keyword_gap": 8.0, "page_gap": 4.5, "batch_gap": 3.5, "max_sessions": None},
+        HIGH:     {"keyword_gap": 16.0, "page_gap": 7.0, "batch_gap": 9.0, "max_sessions": 1},
     },
 }
 

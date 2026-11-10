@@ -686,7 +686,20 @@ def parse_lines(text: str) -> Iterator[Any]:
 
 # Crawling / pagination
 
-MOBILE_SEARCH_API = "https://i.instagram.com/api/v1/users/search/?q={q}&count={count}"
+# `search_surface` is the screen the app says the search came from; the app's
+# own people search sends `user_search_page`, and a request without it is one
+# no real client makes. Not yet re-verified live with the parameter added --
+# the sweep's own checks (non-200, `status: fail`, a missing `users` key) are
+# what would say so if Instagram answered it differently.
+MOBILE_SEARCH_API = (
+    "https://i.instagram.com/api/v1/users/search/"
+    "?q={q}&count={count}&search_surface=user_search_page"
+)
+# Results asked for per page. It was 100, a size no Instagram client asks for;
+# measured, the server never filled it anyway (30-37 users came back per
+# keyword), so the page size costs nothing in yield -- the rest still arrives
+# through `page_token`.
+SEARCH_PAGE_SIZE = 50
 # Same private mobile API, one profile by exact username, analysis_engine.py
 # uses this directly instead of waiting for the browser's own JS to fire it,
 # which it no longer does for a logged-in view of someone else's profile
@@ -731,7 +744,12 @@ MOBILE_UA = "Instagram 219.0.0.12.117 Android (29/10; 480dpi; 1080x2151; OnePlus
 # reads this cap from DiscoveryOptions rather than hardcoding it, and this
 # one now does too, so a client asking for more depth actually gets it
 # instead of being silently held at ten pages.
-DEFAULT_MAX_PAGES = 10
+#
+# Four, not ten: up to 200 candidates per keyword, and every search request
+# is one more against the same account's budget. A keyword that still has
+# results after four pages ends `cap:pages` -- reported as truncated, never
+# as "reached the end" -- so the cut is visible, not silent.
+DEFAULT_MAX_PAGES = 4
 
 
 # Secondary endpoint fallback
@@ -869,7 +887,7 @@ async def _page_gap(options) -> None:
     # the browser session (stealth/browser.py): 1.0 while the platform is
     # happy, up to 8x after it pushed back, so a throttled sweep slows down
     # instead of paging at full speed into the same refusal.
-    wait = stealth_levels.jittered(stealth_levels.value("instagram", "page_gap", 2.5))
+    wait = stealth_levels.jittered(stealth_levels.value("instagram", "page_gap", 4.5))
     wait *= max(1.0, governor_for("instagram").gap_multiplier())
     deadline = time.monotonic() + wait
     while True:
@@ -1134,7 +1152,7 @@ class Discovery:
                 if cancelled(self.a):
                     out.stopped = "cancelled"
                     break
-                url = MOBILE_SEARCH_API.format(q=quote(keyword), count=100)
+                url = MOBILE_SEARCH_API.format(q=quote(keyword), count=SEARCH_PAGE_SIZE)
                 # ENCODED: these are opaque base64-ish tokens, and a `+`, `/`
                 # or `=` left raw is rewritten in transit -- the next page
                 # then silently comes back wrong or empty.

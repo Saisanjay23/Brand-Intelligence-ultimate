@@ -355,8 +355,40 @@ class TestAboutPanelReusesThePage:
     GOOD = {"name": "Shop", "followers": "1,234 followers", "posts": "10 posts"}
 
     @staticmethod
-    def _prep(monkeypatch):
+    def _prep(monkeypatch, budget=5):
+        from backend.config.settings import settings
         monkeypatch.setattr(_ae, "_TIMELINE_WAIT_S", 0.01)
+        # The panel is OFF by default now; these tests are about how it
+        # behaves when it is switched on.
+        monkeypatch.setattr(settings, "instagram_about_panel_per_batch", budget)
+
+    @pytest.mark.asyncio
+    async def test_off_by_default_and_said_so(self, monkeypatch):
+        self._prep(monkeypatch, budget=0)
+        page = _page("https://www.instagram.com/shop/", "")
+        page._dom = self.GOOD
+
+        def setup(s):
+            s.read_about_panel = AsyncMock(return_value={})
+            s.read_last_post_date = AsyncMock(return_value="")
+        row, s = await _run_s("shop/", page, setup)
+        s.read_about_panel.assert_not_awaited()
+        assert "About-this-account panel not opened" in row.notes
+
+    @pytest.mark.asyncio
+    async def test_the_budget_is_per_batch(self, monkeypatch):
+        self._prep(monkeypatch, budget=1)
+        page = _page("https://www.instagram.com/shop/", "")
+        page._dom = self.GOOD
+
+        def setup(sc):
+            sc.read_about_panel = AsyncMock(return_value={})
+            sc.read_last_post_date = AsyncMock(return_value="")
+        _, s = await _run_s("shop/", page, setup)
+        assert s.read_about_panel.await_count == 1
+        row = await s.process("https://www.instagram.com/shop/", "target", "feed", None)
+        assert s.read_about_panel.await_count == 1        # second profile: not opened
+        assert "About-this-account panel not opened" in row.notes
 
     @pytest.mark.asyncio
     async def test_no_second_tab_and_no_second_load_of_the_profile(self):

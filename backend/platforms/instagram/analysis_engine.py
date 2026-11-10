@@ -1313,12 +1313,22 @@ class Scraper:
             # and once the job is cancelled -- it is a bonus field and never
             # worth an extra interaction then.
             if (not row.location or not row.created_iso) and (row.profile_name or row.profile_id):
+                from backend.config.settings import settings as _settings
+                about_budget = max(0, int(_settings.instagram_about_panel_per_batch or 0))
+                about_used = int(getattr(self, "_about_reads", 0) or 0)
                 if cancelled(self.a):
                     pass
+                elif about_used >= about_budget:
+                    # Said on the row, so a blank join date reads as "not
+                    # asked", never as "Instagram had none".
+                    row.note("About-this-account panel not opened (per-batch limit "
+                             f"INSTAGRAM_ABOUT_PANEL_PER_BATCH={about_budget}) -- "
+                             "location / join date left blank")
                 elif not governor_for("instagram").healthy():
                     row.note("About-this-account panel skipped: Instagram is "
                              "throttling this session (location / join date left blank)")
                 else:
+                    self._about_reads = about_used + 1
                     about = await self.read_about_panel(wanted, page)
                     if about.get("country") and not row.location:
                         row.location = about["country"]

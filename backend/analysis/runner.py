@@ -660,6 +660,35 @@ class _PlatformRun:
 _SESSION_BLOCKED_STATUSES = frozenset({"CHECKPOINT", "LOGIN_REQUIRED"})
 
 
+def rest_needed_s(platform_id: str, session_item: dict, now: float) -> float:
+    """Seconds this account should still rest before an analysis batch, from
+    when real work last used it (`last_ok`, which a discovery sweep sets).
+    Instagram only, and only for a real pooled account: an anonymous browser
+    or a never-used session has nothing to rest from."""
+    if platform_id != "instagram" or session_item.get("anonymous"):
+        return 0.0
+    rest = float(getattr(settings, "instagram_rest_before_analysis_sec", 0) or 0)
+    last = float(session_item.get("last_ok") or 0.0)
+    if rest <= 0 or last <= 0:
+        return 0.0
+    return max(0.0, min(rest, rest - (now - last)))
+
+
+async def _rest_after_recent_use(platform_id: str, session_item: dict, job, label: str) -> None:
+    """Wait out `rest_needed_s`, in short slices so a Stop lands quickly."""
+    wait = rest_needed_s(platform_id, session_item, time.time())
+    if wait <= 0:
+        return
+    log.info(f"[{platform_id}] {label}: resting {wait:.0f}s before analysis -- "
+             f"this account was in use moments ago")
+    deadline = time.monotonic() + wait
+    while not job.cancel.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        await asyncio.sleep(min(0.5, remaining))
+
+
 def _blocked_reason(platform_id: str, row: Row) -> str:
     """The `mark_session_failed` reason for a session-blocked row."""
     if platform_id == "telegram":
@@ -1352,6 +1381,13 @@ class AnalysisRunner:
         label = session_item.get("identifier") or session_id or "anonymous"
         scraper = None
         held: Optional[tuple[str, str]] = None
+
+        # A REST BETWEEN SEARCHING AND VISITING. With one Instagram account,
+        # a discovery sweep followed at once by a batch of profile visits is
+        # a single unbroken burst on that account. Waited out here, BEFORE a
+        # worker slot or a browser is taken, so nothing sits idle on
+        # instagram.com meanwhile; cut short by Stop.
+        await _rest_after_recent_use(platform_id, session_item, job, label)
 
         # Ceilinged process-wide, not per-platform -- see `_worker_semaphore`.
         try:
