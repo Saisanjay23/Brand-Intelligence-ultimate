@@ -44,6 +44,7 @@ from backend.platforms import registry
 from backend.services import avatar_cache
 from backend.platforms.scan_options import DiscoveryOptions
 from backend.sessions import manager as sessions_engine
+from backend.shared import account_budget
 from backend.shared import diagnostics
 from backend.shared import keywords as kw_groups
 from backend.shared import logo_verdict
@@ -2281,6 +2282,17 @@ class DiscoveryRunner:
                         # never has a keyword in its hands.
                         await _hold_for_breaker(platform_id, job, run, label)
                         if not run.queue or job.cancel.is_set() or run.hard_stop:
+                            break
+                        # THE ACCOUNT'S HOURLY CEILING, asked like the breaker
+                        # is: before a keyword leaves the queue, so a held
+                        # worker never has one in its hands (another account
+                        # may take it meanwhile). Free off Instagram/Threads.
+                        if not await account_budget.hold(
+                                platform_id, session_item, account_budget.SEARCH,
+                                lambda: job.cancel.is_set() or run.hard_stop,
+                                log=log, label=label):
+                            break
+                        if not run.queue:
                             break
                         item = run.queue.popleft()
                         item.attempts += 1

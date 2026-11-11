@@ -68,6 +68,25 @@ def _fresh_pushback_governors():
     pushback.reset_all()
 
 
+@pytest.fixture(autouse=True)
+def _fresh_account_budgets():
+    """Every test starts with an empty hourly count per account.
+
+    Process-wide like the governors above, and worse if leaked: the suite
+    runs far more fake Instagram searches than one hour's ceiling, so a
+    count carried between tests would make a late test WAIT for an hour.
+    Session claims are cleared for the same reason -- a linked-account
+    claim left behind would hold a later test's Threads session back."""
+    from backend.sessions import manager
+    from backend.shared import account_budget
+
+    account_budget.budget().reset()
+    manager._claim_accounts.clear()
+    yield
+    account_budget.budget().reset()
+    manager._claim_accounts.clear()
+
+
 # Every SMTP send the suite attempted, for tests that want to assert on it.
 SENT_EMAILS: list[dict] = []
 

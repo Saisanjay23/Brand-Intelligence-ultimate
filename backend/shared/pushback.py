@@ -294,10 +294,17 @@ class Governor:
 
 _governors: Dict[str, Governor] = {}
 
+# Platforms that pace as ONE. Threads signs in with Instagram accounts and is
+# the same company's infrastructure behind the same IP, so a throttle on
+# either must slow both -- see shared/meta_account.py. Threads therefore
+# reads and feeds Instagram's governor; it has none of its own.
+_SHARED_GOVERNOR = {"threads": "instagram"}
+
 
 def governor_for(platform: str) -> Governor:
     """The one governor for a platform, created on first use."""
     key = (platform or "").strip().lower() or "_default"
+    key = _SHARED_GOVERNOR.get(key, key)
     gov = _governors.get(key)
     if gov is None:
         gov = _governors[key] = Governor(key)

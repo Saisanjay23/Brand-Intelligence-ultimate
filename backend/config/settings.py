@@ -124,6 +124,23 @@ class Settings(BaseSettings):
     # one-account pool, search and then fifty profile visits back to back is
     # the burst; this puts a pause between them. 0 = no rest.
     instagram_rest_before_analysis_sec: float = 45.0
+    # HOURLY CEILINGS PER INSTAGRAM ACCOUNT (shared/account_budget.py).
+    # Counted over a rolling hour, per real account -- Instagram and Threads
+    # on the same account share one count. At the ceiling the work WAITS,
+    # it is never skipped. 0 = no ceiling. Guesses, kept well under what the
+    # tool used to do (~150 searches/hour at its slowest); move them once a
+    # real account shows where Instagram's own line is.
+    instagram_searches_per_hour: int = 40
+    instagram_profile_visits_per_hour: int = 60
+    # Instagram and Threads signed in as ONE account never work at the same
+    # time (shared/meta_account.py). How long a job waits for the other site
+    # to finish with that account before giving up and leaving its work owed.
+    meta_linked_wait_minutes: float = 120.0
+    # When one site CHALLENGES the account (e.g. "we suspect automated
+    # behaviour"), how long the same account rests on the other site at
+    # least. The warned session waits for a person; this keeps the other
+    # from carrying on meanwhile.
+    meta_linked_checkpoint_rest_hours: float = 24.0
     # HOW LONG ANALYSIS WAITS FOR A PROFILE'S DATA TO ARRIVE, in seconds. A
     # CEILING, not a delay: a fast laptop gets its answer in ~4s and never
     # touches it. It was a fixed 6s, which a slower laptop or connection

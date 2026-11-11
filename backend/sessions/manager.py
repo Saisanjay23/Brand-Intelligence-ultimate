@@ -22,7 +22,7 @@ from typing import Any, NamedTuple, Optional
 from backend.config.settings import settings
 from backend.database.repositories import session_repository as sessions_db
 from backend.sessions.cookies import load_cookies, normalize_cookies
-from backend.shared import fast_http
+from backend.shared import fast_http, meta_account
 from backend.shared.errors import ConflictError, NotFoundError, ValidationError
 from backend.shared.logging import get_logger
 
@@ -562,6 +562,29 @@ class _Claim(NamedTuple):
 
 _claims: dict[tuple[str, str], _Claim] = {}
 
+# Which real account each claimed session signs in as, for the platforms
+# where two pools can hold the same account (Instagram and Threads -- see
+# shared/meta_account.py). Written when a session is claimed, read to keep
+# the other pool's session for that account out of use meanwhile.
+_claim_accounts: dict[tuple[str, str], str] = {}
+
+
+def _linked_claimed(platform_id: str, cookies, now: float) -> bool:
+    """Is the SAME real account claimed right now on a linked platform?
+
+    Instagram and Threads can be one account in two pools. Running both at
+    once is one account active on two devices, from one IP, at the same
+    moment -- the pattern the claim exists to prevent, one level up. A
+    session whose account is not known (no `ds_user_id`) links to nothing."""
+    key = meta_account.account_key(platform_id, cookies)
+    if not key:
+        return False
+    others = meta_account.siblings(platform_id)
+    return any(
+        p in others and k == key and _is_claimed(p, sid, now)
+        for (p, sid), k in list(_claim_accounts.items())
+    )
+
 
 def _owner_ref() -> Optional["weakref.ReferenceType"]:
     """A weak handle on the task doing the claiming, or None if there isn't
@@ -639,7 +662,22 @@ async def _busy_only(platform_id: str) -> bool:
     items = await sessions_db.list_pool(platform_id)
     now = _now()
     return any(
-        _is_available(s, now) and _is_claimed(platform_id, s["id"], now)
+        _is_available(s, now) and (
+            _is_claimed(platform_id, s["id"], now)
+            or _linked_claimed(platform_id, s.get("cookies"), now))
+        for s in items
+    )
+
+
+async def _linked_only(platform_id: str) -> bool:
+    """Is an otherwise-free account held back ONLY because its linked
+    platform is using the same account? Such a wait ends when that job
+    does, which can be far longer than a busy pool's few minutes."""
+    items = await sessions_db.list_pool(platform_id)
+    now = _now()
+    return any(
+        _is_available(s, now) and not _is_claimed(platform_id, s["id"], now)
+        and _linked_claimed(platform_id, s.get("cookies"), now)
         for s in items
     )
 
@@ -654,11 +692,25 @@ async def get_healthy_session(
     an analysis batch both run against a single-account platform, one after
     the other, instead of whichever started second failing outright.
     """
-    deadline = _now() + max(0.0, wait_s)
+    started = _now()
+    deadline = started + max(0.0, wait_s)
+    told = False
     while True:
         item = await _claim_one(platform_id)
         if item is not None:
             return item
+        if wait_s > 0 and await _linked_only(platform_id):
+            # The same account is working on Instagram/Threads. That job
+            # holds it for its whole run, so the ordinary few-minute wait
+            # would give up on an account that is about to be free; this
+            # one waits for it, up to its own ceiling.
+            linked_s = max(0.0, float(getattr(settings, "meta_linked_wait_minutes", 0) or 0)) * 60
+            deadline = max(deadline, started + linked_s)
+            if not told:
+                told = True
+                log.info(f"{platform_id}: waiting -- the same account is in use on "
+                         f"{'/'.join(meta_account.siblings(platform_id))} (waits up to "
+                         f"{linked_s / 60:.0f}m)")
         if _now() >= deadline or not await _busy_only(platform_id):
             return None
         await asyncio.sleep(_SESSION_POLL_S)
@@ -673,11 +725,14 @@ async def _claim_one(platform_id: str) -> Optional[dict]:
             s for s in items
             if _is_available(s, claimed_at)
             and not _is_claimed(platform_id, s["id"], claimed_at)
+            and not _linked_claimed(platform_id, s.get("cookies"), claimed_at)
         ]
         chosen = _pick_least_recently_used(available)
         if chosen is None:
             return None
         _claims[(platform_id, chosen["id"])] = _Claim(_owner_ref(), claimed_at)
+        if key := meta_account.account_key(platform_id, chosen.get("cookies")):
+            _claim_accounts[(platform_id, chosen["id"])] = key
     now = _now()
     await sessions_db.update_item(platform_id, chosen["id"], status="ready", rate_limited_until=0.0, last_used=now)
     # a real, durable count of how many times this session has actually
@@ -713,7 +768,7 @@ async def unavailable_reason(platform_id: str) -> str:
         return "no accounts are saved for this platform yet"
 
     now = _now()
-    dead = busy = limited = pending = free = 0
+    dead = busy = limited = pending = free = linked = 0
     soonest_free = 0.0
     for s in items:
         if s["status"] in DEAD_STATES:
@@ -726,6 +781,8 @@ async def unavailable_reason(platform_id: str) -> str:
                 soonest_free = s["rate_limited_until"]
         elif _is_claimed(platform_id, s["id"], now):
             busy += 1
+        elif _linked_claimed(platform_id, s.get("cookies"), now):
+            linked += 1
         else:
             # Free RIGHT NOW -- so the pick that just failed lost a race
             # with something releasing, rather than finding nothing.
@@ -743,6 +800,10 @@ async def unavailable_reason(platform_id: str) -> str:
         if dead:
             why += f" (the other {dead} need re-authenticating)"
         return why
+    if linked:
+        return (f"{linked} of {total} account(s) are the same Instagram account a running "
+                f"{'/'.join(meta_account.siblings(platform_id))} job is using -- one account "
+                "never works on both at once; this runs when that job finishes")
     if limited:
         mins = max(1, int((soonest_free - now) // 60)) if soonest_free else 0
         return (f"{limited} of {total} account(s) are rate-limited"
@@ -799,6 +860,7 @@ def release_claim(platform_id: str, session_id: str) -> None:
     `release_session` convention so callers don't need an extra branch."""
     if session_id:
         _claims.pop((platform_id, session_id), None)
+        _claim_accounts.pop((platform_id, session_id), None)
 
 
 async def session_for_job(
@@ -978,6 +1040,49 @@ async def mark_session_failed(
                     detail=detail,
                 )
             )
+    if reason in _ACCOUNT_LEVEL_REASONS:
+        await _rest_linked(platform_id, session_id, item, reason,
+                           float(fields["rate_limited_until"]))
+
+
+# What a platform says about the ACCOUNT, as opposed to one set of cookies.
+# A throttle or a challenge on Instagram is a verdict on the Instagram
+# account, wherever else it is signed in; "expired" is only these cookies.
+_ACCOUNT_LEVEL_REASONS = ("rate_limited", "checkpointed")
+
+
+async def _rest_linked(platform_id: str, session_id: str, item: Optional[dict],
+                       reason: str, until: float) -> None:
+    """Rest the same account's session on Instagram/Threads too.
+
+    A throttle rests it for exactly as long as the warned one. A challenge
+    rests it for `meta_linked_checkpoint_rest_hours` at least: the warned
+    session waits for a person, and the account must not keep working on
+    the other site while that warning stands. NOT marked dead -- its own
+    cookies are fine, and it comes back by itself. Never raises: the
+    failure it follows has already been recorded."""
+    try:
+        key = meta_account.account_key(platform_id, (item or {}).get("cookies"))
+        if not key:
+            return
+        if reason == "checkpointed":
+            hours = max(0.0, float(getattr(settings, "meta_linked_checkpoint_rest_hours", 0) or 0))
+            until = max(until, _now() + hours * 3600)
+        for other in meta_account.siblings(platform_id):
+            for s in await sessions_db.list_pool(other):
+                if meta_account.account_key(other, s.get("cookies")) != key:
+                    continue
+                if s["status"] in DEAD_STATES or float(s.get("rate_limited_until") or 0) >= until:
+                    continue
+                if await sessions_db.update_item(other, s["id"], status="rate_limited",
+                                                 rate_limited_until=until):
+                    log.warning(
+                        f"{other} session {s['id']} resting ~{(until - _now()) / 60:.0f}m -- "
+                        f"it is the same Instagram account as {platform_id} session "
+                        f"{session_id}, which was {reason}")
+    except Exception as e:                       # noqa: BLE001
+        log.warning(f"{platform_id}: could not rest the linked account -- "
+                    f"{type(e).__name__}: {e}")
 
 
 
@@ -1899,6 +2004,9 @@ async def _pick_batch(platform_id: str, limit: int) -> list[tuple[str, str, list
         and s["status"] not in PENDING_STATES
         and s["rate_limited_until"] <= now
         and not _session_in_use(platform_id, s["id"])
+        # The same Instagram account busy on Threads (or the reverse) is as
+        # off limits as this session being busy itself.
+        and not _linked_claimed(platform_id, s.get("cookies"), now)
         # Recently proven by a real job, so a probe would only add another
         # authenticated hit to an account that has already demonstrated it
         # is fine. See PROVEN_FRESH_S.
@@ -1987,7 +2095,8 @@ async def check_item(platform_id: str, session_id: str) -> dict:
     item = await sessions_db.get_item(platform_id, session_id)
     if item is None:
         raise NotFoundError(f"{platform_id}: session {session_id!r} not in pool")
-    if _session_in_use(platform_id, session_id):
+    if (_session_in_use(platform_id, session_id)
+            or _linked_claimed(platform_id, item.get("cookies"), _now())):
         raise ConflictError(
             f"{item['identifier']} is being used by a running job right now -- "
             "checking it at the same time risks a checkpoint. Try again once the job finishes."

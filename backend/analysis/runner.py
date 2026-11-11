@@ -61,6 +61,7 @@ from backend.platforms.scan_options import ScanOptions
 from backend.sessions import manager as sessions_engine
 from backend.database.repositories import analysis_result_repository as results_db
 from backend.database.repositories import client_repository as clients_db
+from backend.shared import account_budget
 from backend.shared import completeness
 from backend.shared import diagnostics
 from backend.shared import fast_http
@@ -1468,8 +1469,23 @@ class AnalysisRunner:
                             log.error(f"[{platform_id}] {run.hard_stop}")
                         if run.hard_stop or not run.queue or job.cancel.is_set():
                             break
+                        # THE ACCOUNT'S HOURLY CEILING, one slot per profile in
+                        # the chunk, asked before any leaves the queue -- same
+                        # reasoning as the breaker above. Free off
+                        # Instagram/Threads (where a chunk is one profile).
+                        size = min(run.concurrency, len(run.queue))
+                        took = 0
+                        for _ in range(size):
+                            if not await account_budget.hold(
+                                    platform_id, session_item, account_budget.PROFILE,
+                                    lambda: job.cancel.is_set() or bool(run.hard_stop),
+                                    log=log, label=label):
+                                break
+                            took += 1
+                        if not took or not run.queue:
+                            break
                         chunk = [run.queue.popleft()
-                                 for _ in range(min(run.concurrency, len(run.queue)))]
+                                 for _ in range(min(took, len(run.queue)))]
                         fatal = await asyncio.gather(
                             *(self._scrape_one(job, it, scraper, platform_id, session_item,
                                                stagger=idx)
