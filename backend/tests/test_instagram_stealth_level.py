@@ -56,20 +56,22 @@ def test_standard_reproduces_the_numbers_from_before_levels(level):
     assert L.session_cap("instagram", 3) == 3                     # no cap of its own
 
 
-def test_high_is_slower_everywhere_and_one_account(level):
+def test_high_is_slower_everywhere_but_does_not_cap_accounts(level):
+    """HIGH slows each account down; it no longer limits how many work at
+    once -- every free Instagram account is used, each paced and capped on
+    its own."""
     level("high")
     std = {"keyword_gap": 8.0, "batch_gap": 3.5, "page_gap": 4.5}
     for name, old in std.items():
         assert L.value("instagram", name, None) > old, name
-    assert L.session_cap("instagram", 3) == 1
+    assert L.session_cap("instagram", 3) == 3
 
 
-def test_a_level_can_only_lower_parallelism(level):
-    level("high")
-    assert L.session_cap("instagram", 1) == 1
-    assert L.session_cap("instagram", 5) == 1
-    level("standard")
-    assert L.session_cap("instagram", 1) == 1                    # never raised to more
+def test_a_level_never_raises_parallelism(level):
+    for name in ("high", "standard"):
+        level(name)
+        assert L.session_cap("instagram", 1) == 1
+        assert L.session_cap("instagram", 5) == 5
 
 
 def test_other_platforms_are_untouched_at_every_level(level):
@@ -90,18 +92,24 @@ def test_a_typo_in_the_setting_is_rejected_not_ignored():
 
 # ---------------------------------------------------------------- the runners
 
-def test_discovery_claims_one_instagram_account_at_high_but_not_at_standard(level):
-    level("high")
-    assert DR._sessions_wanted("instagram", 10) == 1
-    level("standard")
-    assert DR._sessions_wanted("instagram", 10) > 1
+@pytest.mark.parametrize("platform", ["instagram", "threads"])
+def test_discovery_asks_for_every_account_there_is_work_for(level, platform):
+    """No number caps it: with ten keywords, up to ten free accounts are
+    claimed (the claim loop stops at the first one that is not free), and
+    never more accounts than keywords."""
+    for name in ("high", "standard"):
+        level(name)
+        assert DR._sessions_wanted(platform, 10) == 10
+        assert DR._sessions_wanted(platform, 2) == 2
+        assert DR._sessions_wanted(platform, 1) == 1
 
 
-def test_analysis_claims_one_instagram_account_at_high_but_not_at_standard(level):
-    level("high")
-    assert AR._sessions_wanted("instagram", 30, 1) == 1
-    level("standard")
-    assert AR._sessions_wanted("instagram", 30, 1) > 1
+@pytest.mark.parametrize("platform", ["instagram", "threads"])
+def test_analysis_asks_for_every_account_there_is_work_for(level, platform):
+    for name in ("high", "standard"):
+        level(name)
+        assert AR._sessions_wanted(platform, 30, 1) == 30
+        assert AR._sessions_wanted(platform, 1, 1) == 1
 
 
 def test_high_never_changes_facebook_or_twitter_parallelism(level):

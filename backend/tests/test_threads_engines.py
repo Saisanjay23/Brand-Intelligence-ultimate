@@ -445,12 +445,13 @@ class TestRegistration:
         assert p.scraper() is ae.Scraper
         assert p.session_cls() is de.ThreadsSession
 
-    def test_it_is_swept_on_one_tab_and_one_session(self):
+    def test_it_is_swept_on_one_tab_with_every_free_account(self):
         from backend.discovery import runner as dr
         from backend.stealth import levels
 
         assert dr.tabs_for("threads") == ["people"]
-        assert levels.session_cap("threads", 3) == 1
+        assert levels.session_cap("threads", 3) == 3          # no level cap
+        assert dr._sessions_wanted("threads", 5) == 5
 
     def test_a_threads_link_routes_to_the_threads_platform(self):
         from backend.analysis import runner as ar

@@ -9,8 +9,10 @@ time from one IP. A level moves them together, so "high" means one coherent
 posture and "standard" means exactly what the tool did before levels existed.
 
   standard  today's numbers, unchanged.
-  high      a person working one account, slowly: one account at a time, longer
-            gaps everywhere. Costs speed. A sweep takes roughly twice as long.
+  high      each account worked slowly, like a person: longer gaps everywhere.
+            Costs speed per account. Every free account still works at once
+            (see the note on max_sessions in _TABLE) -- each one is paced and
+            capped on its own.
 
 WHAT A LEVEL DOES NOT TOUCH: what is collected. No search, tab, field or
 keyword is dropped at any level -- only the time between them and how many
@@ -44,15 +46,25 @@ _TABLE: dict[str, dict[str, dict[str, Optional[float]]]] = {
     # page_gap is the median pause between two result pages of ONE search
     # (jittered around it, see `jittered`). It was 2.5s, quicker than a
     # person moves through a results list; 4.5s is about reading pace.
+    #
+    # max_sessions is None at BOTH levels: Instagram uses every free account
+    # in its pool at once (discovery/analysis runners, `_sessions_wanted`).
+    # HIGH used to pin it to one account, which left a second or third
+    # account idle as standby while the first worked through the whole
+    # queue alone. What keeps several accounts safe now is per ACCOUNT, not
+    # a cap on how many: each has its own hourly ceiling
+    # (shared/account_budget.py), they share one pacing governor, workers
+    # start staggered, and one account never runs on Instagram and Threads
+    # at once (shared/meta_account.py). HIGH still means slower gaps.
     "instagram": {
         STANDARD: {"keyword_gap": 8.0, "page_gap": 4.5, "batch_gap": 3.5, "max_sessions": None},
-        HIGH:     {"keyword_gap": 16.0, "page_gap": 7.0, "batch_gap": 9.0, "max_sessions": 1},
+        HIGH:     {"keyword_gap": 16.0, "page_gap": 7.0, "batch_gap": 9.0, "max_sessions": None},
     },
-    # Threads signs in with the same Instagram account, so a flag on one is a
-    # flag on both: same numbers, same single session.
+    # Threads signs in with Instagram accounts, so a flag on one is a flag on
+    # both: same numbers.
     "threads": {
         STANDARD: {"keyword_gap": 8.0, "page_gap": 4.5, "batch_gap": 3.5, "max_sessions": None},
-        HIGH:     {"keyword_gap": 16.0, "page_gap": 7.0, "batch_gap": 9.0, "max_sessions": 1},
+        HIGH:     {"keyword_gap": 16.0, "page_gap": 7.0, "batch_gap": 9.0, "max_sessions": None},
     },
 }
 

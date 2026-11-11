@@ -61,7 +61,7 @@ from backend.platforms.scan_options import ScanOptions
 from backend.sessions import manager as sessions_engine
 from backend.database.repositories import analysis_result_repository as results_db
 from backend.database.repositories import client_repository as clients_db
-from backend.shared import account_budget
+from backend.shared import account_budget, meta_account
 from backend.shared import completeness
 from backend.shared import diagnostics
 from backend.shared import fast_http
@@ -348,11 +348,15 @@ def _sessions_wanted(platform_id: str, item_count: int, concurrency: int) -> int
     """
     cap = _MAX_SESSIONS_PER_PLATFORM.get(
         platform_id, _DEFAULT_MAX_SESSIONS_PER_PLATFORM)
+    if meta_account.is_meta(platform_id):
+        # Every free account the pool has -- see discovery/runner.py's
+        # `_sessions_wanted` for why Instagram is not capped at a number.
+        cap = item_count
     plat = registry.PLATFORMS.get(platform_id)
     if plat is not None and (plat.uses_api_key or plat.env_keys):
         cap = 1
-    # The platform's stealth level may only LOWER this (Instagram "high" = one
-    # account at a time). See stealth/levels.py.
+    # A platform's stealth level may only LOWER this (no level caps
+    # Instagram any more). See stealth/levels.py.
     cap = stealth_levels.session_cap(platform_id, cap)
     chunks = -(-item_count // max(1, concurrency))
     return max(1, min(cap, item_count, chunks))

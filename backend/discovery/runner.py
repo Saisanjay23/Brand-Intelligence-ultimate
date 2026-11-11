@@ -44,7 +44,7 @@ from backend.platforms import registry
 from backend.services import avatar_cache
 from backend.platforms.scan_options import DiscoveryOptions
 from backend.sessions import manager as sessions_engine
-from backend.shared import account_budget
+from backend.shared import account_budget, meta_account
 from backend.shared import diagnostics
 from backend.shared import keywords as kw_groups
 from backend.shared import logo_verdict
@@ -323,11 +323,19 @@ def _sessions_wanted(platform_id: str, keyword_count: int) -> int:
         return 1
     cap = _MAX_SESSIONS_PER_PLATFORM.get(
         platform_id, settings.discovery_max_parallel_sessions)
+    if meta_account.is_meta(platform_id):
+        # EVERY FREE ACCOUNT, however many the pool has. Instagram's limits
+        # are per account (an hourly ceiling each, see account_budget), so
+        # each extra account is extra capacity at no extra risk to the
+        # others; leaving one idle as standby only made the busy one work
+        # longer. The claim loop stops at the first account that is not
+        # free, so this never waits for one.
+        cap = keyword_count
     plat = registry.PLATFORMS.get(platform_id)
     if plat is not None and (plat.uses_api_key or plat.env_keys or not plat.session_path):
         cap = 1
-    # The platform's stealth level may only LOWER this (Instagram "high" = one
-    # account at a time). See stealth/levels.py.
+    # A platform's stealth level may only LOWER this (no level caps
+    # Instagram any more). See stealth/levels.py.
     cap = stealth_levels.session_cap(platform_id, cap)
     return max(1, min(cap, keyword_count))
 
