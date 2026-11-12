@@ -715,7 +715,7 @@ MOBILE_UA = "Instagram 219.0.0.12.117 Android (29/10; 480dpi; 1080x2151; OnePlus
 #
 # Four, not ten: up to 200 candidates per keyword, and every search request
 # is one more against the same account's budget. A keyword that still has
-# results after four pages ends `cap:pages` -- reported as truncated, never
+# results after DEFAULT_MAX_PAGES pages ends `cap:pages` -- reported as truncated, never
 # as "reached the end" -- so the cut is visible, not silent.
 DEFAULT_MAX_PAGES = 6
 

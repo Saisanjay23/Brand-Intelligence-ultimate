@@ -53,13 +53,14 @@ class TestTheSearchRequest:
         assert "search_surface=user_search_page" in url
 
     @pytest.mark.asyncio
-    async def test_stops_at_four_pages_and_says_it_was_cut(self, monkeypatch):
+    async def test_stops_at_the_default_page_budget_and_says_it_was_cut(self, monkeypatch):
+        from backend.platforms.instagram.discovery_engine import DEFAULT_MAX_PAGES
         monkeypatch.setattr(asyncio, "sleep", AsyncMock())
         pages = [{"status": "ok", "users": _users(f"u{i}"), "has_more": True,
                   "page_token": f"p{i}"} for i in range(10)]
         disc, ctx = _disc(pages)
         sweep = await disc.sweep("brand")
-        assert ctx.request.get.await_count == 4
+        assert ctx.request.get.await_count == DEFAULT_MAX_PAGES
         assert sweep.stopped == "cap:pages" and not sweep.complete
 
     @pytest.mark.asyncio
@@ -67,9 +68,9 @@ class TestTheSearchRequest:
         monkeypatch.setattr(asyncio, "sleep", AsyncMock())
         pages = [{"status": "ok", "users": _users(f"u{i}"), "has_more": True,
                   "page_token": f"p{i}"} for i in range(10)]
-        disc, ctx = _disc(pages, max_pages=6)
+        disc, ctx = _disc(pages, max_pages=3)
         await disc.sweep("brand")
-        assert ctx.request.get.await_count == 6
+        assert ctx.request.get.await_count == 3
 
 
 class TestRestBeforeAnalysis:
