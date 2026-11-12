@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, Fragment } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, Fragment } from "react";
 import { toast } from "react-hot-toast";
 
 import { discoveryApi } from "../api/discoveryApi";
@@ -27,6 +27,18 @@ import {
   updateClient as updateDirectoryClient,
   useClientDirectory,
 } from "../services/clientDirectory";
+import {
+  clearDraft,
+  clearDraftTexts,
+  editKey,
+  isBlankDraft,
+  loadDraft,
+  loadUi,
+  saveDraft,
+  saveUi,
+  useDraftText,
+  type ClientFormDraft,
+} from "../services/clientDraft";
 import {
   DiscoverIcon,
   AnalyseIcon,
@@ -67,6 +79,17 @@ const FB_TAB_CHIPS: { id: FacebookTab; label: string; icon: string }[] = [
   { id: "groups", label: "Groups", icon: "\u{1F465}" },
 ];
 type FacebookTabLimits = Record<FacebookTab, { individual: string; domain: string }>;
+
+const WORKSPACE_TABS: WorkspaceTab[] = ["overview", "keywords", "limits", "settings"];
+
+// A stored draft's Facebook boxes -> all three tabs present, blanks filled.
+function fbTabLimitsOf(stored?: Record<string, { individual: string; domain: string }>): FacebookTabLimits {
+  const one = (t: FacebookTab) => ({
+    individual: stored?.[t]?.individual ?? "",
+    domain: stored?.[t]?.domain ?? "",
+  });
+  return { people: one("people"), pages: one("pages"), groups: one("groups") };
+}
 
 interface Props {
   clientId: string;
@@ -902,8 +925,10 @@ function KeywordGroupEditor({
   logos: ClientLogo[];
   onLogosChanged: () => void;
 }) {
-  const [parentInput, setParentInput] = useState("");
-  const [childInput, setChildInput] = useState("");
+  // Kept outside the component so a keyword typed but not yet added
+  // survives switching tabs (see services/clientDraft.ts).
+  const [parentInput, setParentInput] = useDraftText(`${clientId || "new"}.${kind}.parent`);
+  const [childInput, setChildInput] = useDraftText(`${clientId || "new"}.${kind}.child`);
 
   const applyBulkText = (raw: string) => {
     const parsed = parseBulkKeywordGroups(raw);
@@ -1418,7 +1443,14 @@ function PlatformLimitsEditor({
   onFacebookTabChange: (tab: FacebookTab, kwType: "individual" | "domain", value: string) => void;
   disabled?: boolean;
 }) {
-  const [fbExpanded, setFbExpanded] = useState(false);
+  // Open when any sub-tab cap is set: a collapsed row hid caps that were
+  // really in force, so the table read "Unlimited" for a capped Facebook.
+  const fbHasValues = Object.values(facebookTabLimits).some(
+    (t) => t.individual.trim() !== "" || t.domain.trim() !== "");
+  const [fbExpanded, setFbExpanded] = useState(fbHasValues);
+  useEffect(() => {
+    if (fbHasValues) setFbExpanded(true);
+  }, [fbHasValues]);
 
   return (
     <div className="platform-limits-table-card">
@@ -1639,36 +1671,48 @@ export function HomeView({
   // appear until something happened to remount the page.
   const { clients } = useClientDirectory();
   const [loadingClients, setLoadingClients] = useState(true);
-  const [mode, setMode] = useState<Mode>(clientId ? "select" : "create");
-  const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<WorkspaceTab>("overview");
+  // WHERE THE PAGE WAS LEFT. Switching to Live Results or Admin unmounts
+  // this page; without this an analyst half-way through a new client came
+  // back to a blank form (or to whichever client was last open). The mode,
+  // the workspace tab and the unsaved form itself are read back from
+  // services/clientDraft.ts, so coming back lands exactly where they left.
+  const [boot] = useState(() => {
+    const ui = loadUi();
+    const inCreate = ui?.mode === "create" || !clientId;
+    const tab = WORKSPACE_TABS.includes(ui?.workspaceTab as WorkspaceTab)
+      ? (ui!.workspaceTab as WorkspaceTab)
+      : "overview";
+    return { mode: (inCreate ? "create" : "select") as Mode, tab, draft: inCreate ? loadDraft("new") : null };
+  });
+  const [mode, setMode] = useState<Mode>(boot.mode);
+  const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<WorkspaceTab>(boot.tab);
   const [sidebarFilter, setSidebarFilter] = useState<"all" | "active" | "empty">("all");
   const [sidebarSearch, setSidebarSearch] = useState("");
 
   const [editing, setEditing] = useState(false);
   const [activeClient, setActiveClient] = useState<Client | null>(null);
 
-  const [idInput, setIdInput] = useState(EMPTY_FORM.id);
-  const [nameInput, setNameInput] = useState(EMPTY_FORM.name);
-  const [domainInput, setDomainInput] = useState(EMPTY_FORM.domain);
+  const [idInput, setIdInput] = useState(boot.draft?.id ?? EMPTY_FORM.id);
+  const [nameInput, setNameInput] = useState(boot.draft?.name ?? EMPTY_FORM.name);
+  const [domainInput, setDomainInput] = useState(boot.draft?.domain ?? EMPTY_FORM.domain);
 
   // Parent/child groups are the SOURCE OF TRUTH here; the flat parent
   // lists below are derived from them, never edited independently, so the
   // form physically cannot produce a client whose groups and flat keywords
   // disagree (the server re-derives them again on save for the same
   // reason). See backend/shared/keywords.py.
-  const [nameGroups, setNameGroups] = useState<KeywordGroup[]>([]);
-  const [domainGroups, setDomainGroups] = useState<KeywordGroup[]>([]);
+  const [nameGroups, setNameGroups] = useState<KeywordGroup[]>(boot.draft?.nameGroups ?? []);
+  const [domainGroups, setDomainGroups] = useState<KeywordGroup[]>(boot.draft?.domainGroups ?? []);
   const nameKeywords = useMemo(() => nameGroups.map((g) => g.parent), [nameGroups]);
   const domainKeywords = useMemo(() => domainGroups.map((g) => g.parent), [domainGroups]);
 
-  const [platformLimitsIndividual, setPlatformLimitsIndividual] = useState<Record<string, string>>({});
-  const [platformLimitsDomain, setPlatformLimitsDomain] = useState<Record<string, string>>({});
-  const [facebookTabLimits, setFacebookTabLimits] = useState<FacebookTabLimits>({
-    people: { individual: "", domain: "" },
-    pages: { individual: "", domain: "" },
-    groups: { individual: "", domain: "" },
-  });
-  const [cron, setCron] = useState(EMPTY_FORM.cron);
+  const [platformLimitsIndividual, setPlatformLimitsIndividual] = useState<Record<string, string>>(
+    boot.draft?.limitsIndividual ?? {});
+  const [platformLimitsDomain, setPlatformLimitsDomain] = useState<Record<string, string>>(
+    boot.draft?.limitsDomain ?? {});
+  const [facebookTabLimits, setFacebookTabLimits] = useState<FacebookTabLimits>(
+    () => fbTabLimitsOf(boot.draft?.fbTabLimits));
+  const [cron, setCron] = useState(boot.draft?.cron ?? EMPTY_FORM.cron);
   const [activeTab, setActiveTab] = useState<KeywordTab>("names");
 
   const [saving, setSaving] = useState(false);
@@ -1738,25 +1782,114 @@ export function HomeView({
     setCron(EMPTY_FORM.cron);
   };
 
-  useEffect(() => {
-    if (!clientId || activeClient || !clients.length) return;
-    const existing = clients.find((c) => c.client_id === clientId);
-    if (existing) {
-      setActiveClient(existing);
-      loadIntoForm(existing);
-      setMode("select");
-      setEditing(false);
-    }
-  }, [clientId, clients]);
+  const applyDraft = (d: ClientFormDraft) => {
+    setIdInput(d.id);
+    setNameInput(d.name);
+    setDomainInput(d.domain);
+    setNameGroups(d.nameGroups);
+    setDomainGroups(d.domainGroups);
+    setPlatformLimitsIndividual(d.limitsIndividual);
+    setPlatformLimitsDomain(d.limitsDomain);
+    setFacebookTabLimits(fbTabLimitsOf(d.fbTabLimits));
+    setCron(d.cron);
+  };
 
-  const switchToCreate = () => {
+  // What the form holds right now, in the shape a draft is stored in.
+  const formDraft = useMemo<ClientFormDraft>(
+    () => ({
+      id: idInput,
+      name: nameInput,
+      domain: domainInput,
+      nameGroups,
+      domainGroups,
+      limitsIndividual: platformLimitsIndividual,
+      limitsDomain: platformLimitsDomain,
+      fbTabLimits: facebookTabLimits,
+      cron,
+    }),
+    [idInput, nameInput, domainInput, nameGroups, domainGroups,
+      platformLimitsIndividual, platformLimitsDomain, facebookTabLimits, cron],
+  );
+
+  // Open a saved client, with any unsaved edits the analyst left on it.
+  const openClient = (c: Client) => {
+    setActiveClient(c);
+    loadIntoForm(c);
+    const d = loadDraft(editKey(c.client_id));
+    if (d && d.id === c.client_id) {
+      applyDraft(d);
+      toast(`Restored your unsaved changes to "${c.name || c.client_id}".`, { icon: "📝", id: "draft-restored" });
+    }
+    setMode("select");
+    setEditing(false);
+  };
+
+  // Which client id this page last acted on. Lets the effect below tell
+  // "the analyst picked another client" (header switcher, Ctrl+K) apart
+  // from "the client list was re-read in the background".
+  const seenClientIdRef = useRef<string | null>(boot.mode === "create" ? clientId : null);
+
+  useEffect(() => {
+    if (!clientId || activeClient?.client_id === clientId) {
+      seenClientIdRef.current = clientId;
+      return;
+    }
+    // THE BUG THIS GUARDS. The client list is re-read every time the
+    // browser tab regains focus. This effect used to then load the last
+    // selected client into the form whenever none was open -- and while
+    // creating a new client none is, so simply switching browser tabs
+    // replaced everything typed into Create New Client with an old client.
+    // In create mode only a real switch to a different client may take over.
+    if (mode === "create" && seenClientIdRef.current === clientId) return;
+    const existing = clients.find((c) => c.client_id === clientId);
+    if (!existing) return; // not loaded yet -- runs again when it arrives
+    seenClientIdRef.current = clientId;
+    openClient(existing);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clientId, clients, mode, activeClient]);
+
+  // Remember which mode and workspace tab the page is on.
+  useEffect(() => {
+    saveUi({ mode, workspaceTab: activeWorkspaceTab });
+  }, [mode, activeWorkspaceTab]);
+
+  const switchToCreate = (opts: { restore?: boolean } = {}) => {
     setMode("create");
     setActiveClient(null);
     setEditing(false);
-    clearForm();
+    // "+ New" brings back an unfinished new client rather than wiping it.
+    const d = opts.restore === false ? null : loadDraft("new");
+    if (d && !isBlankDraft(d)) {
+      applyDraft(d);
+      toast("Restored the new client you were setting up.", { icon: "📝", id: "draft-restored" });
+    } else {
+      clearForm();
+    }
     setSweepPlatforms(new Set());
     setAnalysisPlatforms(new Set());
     setActiveWorkspaceTab("overview");
+  };
+
+  const discardNewClient = async () => {
+    if (!isBlankDraft(formDraft) &&
+        !(await confirmAction("Discard this new client? Everything typed into the form will be lost."))) {
+      return false;
+    }
+    clearDraft("new");
+    clearDraftTexts("new.");
+    clearForm();
+    return true;
+  };
+
+  const cancelCreate = async () => {
+    if (!(await discardNewClient())) return;
+    // Back to the client that was open before, not just the first one.
+    const back = clients.find((c) => c.client_id === clientId) || clients[0];
+    if (back) {
+      selectSavedClient(back.client_id);
+    } else {
+      setMode("select");
+    }
   };
 
   const selectSavedClient = (id: string) => {
@@ -1771,27 +1904,45 @@ export function HomeView({
     }
     const c = clients.find((x) => x.client_id === id);
     if (!c) return;
-    setActiveClient(c);
-    loadIntoForm(c);
-    setMode("select");
-    setEditing(false);
+    seenClientIdRef.current = c.client_id;
+    openClient(c);
     onClient(c.client_id, c.name);
   };
 
   const startEditing = () => {
     if (!activeClient) return;
-    loadIntoForm(activeClient);
+    // Not reloaded from the saved client: that silently threw away any
+    // keyword or limit edits made on the other tabs.
     setEditing(true);
     setActiveWorkspaceTab("settings");
   };
 
-  const cancelEditing = () => {
-    if (activeClient) loadIntoForm(activeClient);
+  const discardChanges = async () => {
+    if (!activeClient) return;
+    if (!(await confirmAction(
+      `Discard your unsaved changes to "${activeClient.name || activeClient.client_id}"? The form goes back to what is saved.`,
+    ))) {
+      return;
+    }
+    loadIntoForm(activeClient);
+    clearDraft(editKey(activeClient.client_id));
+    clearDraftTexts(`${activeClient.client_id}.`);
     setEditing(false);
   };
 
-  const cloneClient = (c: Client) => {
-    switchToCreate();
+  const cancelEditing = () => {
+    void discardChanges();
+  };
+
+  const cloneClient = async (c: Client) => {
+    const pending = loadDraft("new");
+    if (pending && !isBlankDraft(pending) &&
+        !(await confirmAction(
+          `You have an unfinished new client "${pending.name || pending.id || "untitled"}". Replace it with a copy of "${c.name || c.client_id}"?`,
+        ))) {
+      return;
+    }
+    switchToCreate({ restore: false });
     setIdInput(`${c.client_id}-copy`);
     setNameInput(`${c.name || c.client_id} (Copy)`);
     setDomainInput(c.domain || "");
@@ -1907,11 +2058,18 @@ export function HomeView({
       const client = editingExisting
         ? await updateDirectoryClient(id, config)
         : await createDirectoryClient(upsertBody);
+      if (!editingExisting) {
+        // The new-client draft is now a real client.
+        clearDraft("new");
+        clearDraftTexts("new.");
+      }
+      seenClientIdRef.current = client.client_id;
       setActiveClient(client);
       // Show what the server actually stored (it collapses spacing and drops
       // duplicates), so the form and the saved client agree and the
       // unsaved-changes check below has nothing to report.
       loadIntoForm(client);
+      clearDraft(editKey(client.client_id));
       setMode("select");
       setEditing(false);
       onClient(client.client_id, client.name);
@@ -1956,6 +2114,35 @@ export function HomeView({
     if (limitsChanged) out.push("scrape-limit");
     return out;
   };
+
+  // Name / domain / cron edits. Kept apart from unsavedChanges(): those do
+  // not change what a sweep searches, so they must not block Discover, but
+  // they are still unsaved work that has to survive a tab switch.
+  const detailsChanged = (): boolean => {
+    if (!activeClient) return false;
+    return (
+      (nameInput.trim() || activeClient.client_id) !== (activeClient.name || activeClient.client_id) ||
+      domainInput.trim() !== (activeClient.domain || "").trim() ||
+      cron.trim() !== (activeClient.cron || "").trim()
+    );
+  };
+
+  const pendingChanges = [...unsavedChanges(), ...(detailsChanged() ? ["client details"] : [])];
+
+  // EVERY CHANGE IS KEPT. The new-client form, or unsaved edits to an open
+  // client, are written to storage as they are typed, so leaving the page
+  // (another app tab, a reload) and coming back finds them where they were.
+  const hasPending = pendingChanges.length > 0;
+  useEffect(() => {
+    if (mode === "create") {
+      if (isBlankDraft(formDraft)) clearDraft("new");
+      else saveDraft("new", formDraft);
+      return;
+    }
+    if (!activeClient || formDraft.id !== activeClient.client_id) return;
+    if (hasPending) saveDraft(editKey(activeClient.client_id), formDraft);
+    else clearDraft(editKey(activeClient.client_id));
+  }, [mode, activeClient, formDraft, hasPending]);
 
   const handleSearch = async () => {
     if (!activeClient) return;
@@ -2090,7 +2277,16 @@ export function HomeView({
     // it just cost a 404 before doing the local delete anyway. Any
     // discovery profiles already stored server-side under this group_id are
     // untouched -- no route exposes deleting those.
-    await deleteDirectoryClient(deletedId);
+    try {
+      await deleteDirectoryClient(deletedId);
+    } catch (e) {
+      // Used to leave the button stuck on "Deleting…" with no message.
+      setDeleting(false);
+      onError((e as Error).message);
+      return;
+    }
+    clearDraft(editKey(deletedId));
+    clearDraftTexts(`${deletedId}.`);
     onForgetClient(deletedId);
     setActiveClient(null);
     setEditing(false);
@@ -2183,7 +2379,7 @@ export function HomeView({
           <button
             type="button"
             className="btn-new-client-pill"
-            onClick={switchToCreate}
+            onClick={() => switchToCreate()}
             title="Create a new client"
           >
             <PlusIcon size={13} style={{ marginRight: "3px" }} /> New
@@ -2284,16 +2480,16 @@ export function HomeView({
               <button
                 type="button"
                 className="text-link-btn"
-                onClick={() => {
-                  if (clients.length) {
-                    selectSavedClient(clients[0].client_id);
-                  } else {
-                    setMode("select");
-                  }
-                }}
+                onClick={() => void cancelCreate()}
+                title="Discard this new client"
               >
                 ✕ Cancel
               </button>
+            </div>
+
+            <div style={{ fontSize: "12px", color: "var(--text-dim)", marginBottom: "16px" }}>
+              Your progress is kept as you type — you can switch tabs or reload and
+              come back to it. Nothing is created until you press <strong>Save &amp; Create Client</strong>.
             </div>
 
             <div style={{ marginBottom: "20px" }}>
@@ -2333,7 +2529,6 @@ export function HomeView({
                   onNameGroups={setNameGroups}
                   onDomainGroups={setDomainGroups}
                   platforms={platforms}
-                  disabled={busy}
                   clientId={activeClient?.client_id || ""}
                 />
               </div>
@@ -2350,7 +2545,6 @@ export function HomeView({
                 onFacebookTabChange={(tab, kwType, value) =>
                   setFacebookTabLimits((prev) => ({ ...prev, [tab]: { ...prev[tab], [kwType]: value } }))
                 }
-                disabled={busy}
               />
             </div>
 
@@ -2392,7 +2586,7 @@ export function HomeView({
               type="button"
               className="btn-cyber-primary"
               style={{ width: "auto", padding: "10px 24px", marginTop: "12px", display: "inline-flex", alignItems: "center", gap: "8px" }}
-              onClick={switchToCreate}
+              onClick={() => switchToCreate()}
             >
               <PlusIcon size={14} /> Create New Client
             </button>
@@ -2435,7 +2629,7 @@ export function HomeView({
                 <button
                   type="button"
                   className="client-hero-btn"
-                  onClick={() => cloneClient(activeClient)}
+                  onClick={() => void cloneClient(activeClient)}
                   title="Duplicate configuration"
                   style={{ display: "inline-flex", alignItems: "center", gap: "5px" }}
                 >
@@ -2492,6 +2686,50 @@ export function HomeView({
                 <span>Client Settings</span>
               </button>
             </div>
+
+            {/* UNSAVED CHANGES -- shown on every tab, so edits made on one
+                tab are never forgotten from another. They are kept in
+                storage until saved or discarded. */}
+            {hasPending && (
+              <div
+                role="status"
+                style={{
+                  display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px",
+                  flexWrap: "wrap", padding: "10px 14px", marginBottom: "12px", borderRadius: "8px",
+                  background: "rgba(245, 158, 11, 0.10)", border: "1px solid rgba(245, 158, 11, 0.35)",
+                  fontSize: "12px", color: "var(--text-main)",
+                }}
+              >
+                <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
+                  <AlertTriangleIcon size={14} color="#F59E0B" />
+                  Unsaved {pendingChanges.join(", ")} changes. They are kept if you switch tabs,
+                  but Discover only searches what is saved.
+                </span>
+                <span style={{ display: "inline-flex", gap: "8px" }}>
+                  <button
+                    type="button"
+                    className="action-btn"
+                    onClick={() => void discardChanges()}
+                    disabled={saving}
+                    style={{
+                      background: "rgba(255, 255, 255, 0.06)", color: "var(--text-main)",
+                      border: "1px solid var(--border-subtle)", borderRadius: "6px", padding: "5px 12px",
+                    }}
+                  >
+                    Discard
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-cyber-primary"
+                    onClick={() => void saveConfig()}
+                    disabled={saving}
+                    style={{ width: "auto", padding: "5px 14px", margin: 0, display: "inline-flex", alignItems: "center", gap: "6px" }}
+                  >
+                    <SaveIcon size={13} /> {saving ? "Saving…" : "Save all"}
+                  </button>
+                </span>
+              </div>
+            )}
 
             {/* TAB CONTENT 1: RUN & OVERVIEW */}
             {activeWorkspaceTab === "overview" && (
@@ -2760,7 +2998,6 @@ export function HomeView({
                   onNameGroups={setNameGroups}
                   onDomainGroups={setDomainGroups}
                   platforms={platforms}
-                  disabled={busy}
                   clientId={activeClient?.client_id || ""}
                 />
 
@@ -2794,7 +3031,6 @@ export function HomeView({
                   onFacebookTabChange={(tab, kwType, value) =>
                     setFacebookTabLimits((prev) => ({ ...prev, [tab]: { ...prev[tab], [kwType]: value } }))
                   }
-                  disabled={busy}
                 />
 
                 <div style={{ display: "flex", justifyContent: "flex-end" }}>

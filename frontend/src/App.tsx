@@ -44,7 +44,12 @@ export default function App() {
   const [theme, setTheme] = useState<"light" | "dark">(
     () => (localStorage.getItem("theme") as "light" | "dark") || "dark"
   );
-  const [recentClients, setRecentClients] = useState<RecentClient[]>([]);
+  // Read synchronously, on the first render. This used to happen in an
+  // effect AFTER the first render, so the Clients page opened with no client
+  // and then had one arrive a moment later -- which it read as "the analyst
+  // switched client" and swapped an unsaved new-client form out for it.
+  const [initialRecents] = useState<RecentClient[]>(() => loadRecentClients());
+  const [recentClients, setRecentClients] = useState<RecentClient[]>(initialRecents);
   const [allClients, setAllClients] = useState<Client[]>([]);
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
 
@@ -58,8 +63,8 @@ export default function App() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
-  const [clientId, setClientId] = useState("");
-  const [clientName, setClientName] = useState("");
+  const [clientId, setClientId] = useState(initialRecents[0]?.client_id ?? "");
+  const [clientName, setClientName] = useState(initialRecents[0]?.name ?? "");
   const [error, setError] = useState("");
   // Bumped whenever a discovery job finishes, to force Live Results to
   // reload its cards.
@@ -129,15 +134,6 @@ export default function App() {
   useEffect(() => {
     if (directory.error) setError(`Clients database unreachable: ${directory.error}`);
   }, [directory.error]);
-
-  useEffect(() => {
-    const recents = loadRecentClients();
-    setRecentClients(recents);
-    if (recents.length) {
-      setClientId(recents[0].client_id);
-      setClientName(recents[0].name);
-    }
-  }, []);
 
   // Platform readiness and session pools, kept live by one poller and
   // refreshed the instant any panel changes a session, see the hook for
