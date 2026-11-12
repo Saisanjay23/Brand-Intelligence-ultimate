@@ -24,7 +24,9 @@ from backend.shared.avatars import looks_like_placeholder
 from backend.shared.models.row import Row
 from backend.shared.walls import is_wall_url
 from backend.platforms.scan_options import cancelled, captures_screenshot
-from backend.shared.pushback import CHALLENGED, EXPIRED, note_response
+from backend.shared.pushback import (CHALLENGED, EXPIRED, THROTTLED, governor_for,
+                                     note_response)
+from backend.shared.warning_dialog import dialog_warning
 from backend.shared.text import (MONTHS, epoch_to_dt, is_place, iter_dicts, iter_kv, name_score,
                                parse_count)
 from backend.platforms.facebook.discovery_engine import (RE_CHECKPOINT,
@@ -34,7 +36,35 @@ from backend.platforms.facebook.discovery_engine import (RE_CHECKPOINT,
                                                           FacebookSession,
                                                           hd_picture_url,
                                                           normalize_url,
-                                                          profile_id, tab_url)
+                                                          profile_id, record_wall,
+                                                          tab_url, text_wall,
+                                                          url_wall)
+
+# Row statuses that are a verdict on the SESSION, not the profile -- the
+# analysis runner (analysis/runner.py `_SESSION_BLOCKED_STATUSES`) stops the
+# worker and fails the account on these.
+_SESSION_STATUSES = ("CHECKPOINT", "LOGIN_REQUIRED")
+
+# The word every throttle note carries. "throttled" is what
+# shared/resilience.py's classify_failure maps to `rate_limited`, so a
+# throttled session is cooled down rather than quarantined as checkpointed
+# (the row status stays CHECKPOINT: it still stops the batch).
+_THROTTLED_WORD = "throttled"
+
+
+def _wall_code(status: str, note: str) -> str:
+    """The pushback stop code a session-blocked row stands for."""
+    if status == "LOGIN_REQUIRED":
+        return "login"
+    return "rate_limited" if _THROTTLED_WORD in (note or "") else "checkpoint"
+
+
+def _page_url(page) -> str:
+    try:
+        u = page.url
+    except Exception:
+        return ""
+    return u if isinstance(u, str) else ""
 
 # Field-reading constants
 # Keys and patterns used to read fields off a profile.
@@ -1415,6 +1445,9 @@ class Scraper:
         except Exception as e:
             first = (str(e).splitlines() or [""])[0][:200]
             h.nav_errors[tag] = f"{type(e).__name__}: {first}"
+            # A navigation that failed ON a wall (a redirect to /checkpoint/
+            # or /login/ that then timed out) is still the platform's answer.
+            self._note_url_wall(page, h, tag)
             return False
         h.http[tag] = status
         try:
@@ -1456,7 +1489,14 @@ class Scraper:
         # WHAT FACEBOOK ITSELF SAID about this navigation: its HTTP status, and
         # -- only when the page handed over no profile data and is small, so a
         # bio saying "try again later" can never trip it -- its body.
-        if status is not None:
+        #
+        # A REDIRECT TO A WALL IS NOT AN OK. A /checkpoint/ page answers 200
+        # with a long body, which note_response files as OK -- the governor
+        # was told the platform was healthy at the moment it challenged the
+        # account. The landed URL decides first.
+        if self._note_url_wall(page, h, tag):
+            pass
+        elif status is not None:
             txt = h.text.get(tag, "")
             body = txt if (len(txt) < 4000 and not self.has_profile_content(h, txt)) else None
             try:
@@ -1464,6 +1504,17 @@ class Scraper:
             except Exception:
                 pass
         return bool(h.html[tag])
+
+    @staticmethod
+    def _note_url_wall(page, h: "Harvest", tag: str) -> str:
+        """If `page` landed on a Facebook wall, record it on the governor
+        (once, here) and as this tab's signal; return the wall code."""
+        wall = url_wall(_page_url(page))
+        if wall:
+            sig = record_wall(wall, f"{tag} visit redirected to the {wall} page")
+            if sig is not None:
+                h.signals[tag] = sig
+        return wall
 
     # How long read_dom will wait for the photo-album anchors that
     # owner_id() reads, and ONLY on a vanity URL, where they are the
@@ -1646,12 +1697,19 @@ class Scraper:
         pid = row.profile_id if (row.profile_id or "").isdigit() else \
             cls.entity_id_for(h, page_url or row.url)
         walled = not cls.has_profile_content(h, txt, pid)
-        if is_wall_url(page_url, ("checkpoint",)) or (walled and RE_CHECKPOINT.search(txt)):
+        # URL first (incl. the /index.php?next= login redirect discovery
+        # already treats as a wall), then the text of a page with no data.
+        wall = url_wall(page_url)
+        text = text_wall(txt) if walled else ""
+        if wall == "checkpoint" or text == "checkpoint":
             row.status, msg = "CHECKPOINT", "session checkpointed"
-        elif is_wall_url(page_url, ("login", "login.php")) or (walled and RE_LOGIN.search(txt)):
+        elif wall == "login" or text == "login":
             row.status, msg = "LOGIN_REQUIRED", "cookies rejected/expired"
-        elif walled and RE_TRY_LATER.search(txt):
-            row.status, msg = "CHECKPOINT", "facebook is throttling this session (try again later)"
+        elif text == "rate_limited":
+            # "throttled", not "throttling": only the former is a rate-limit
+            # word to classify_failure, so the account is cooled down rather
+            # than quarantined as checkpointed.
+            row.status, msg = "CHECKPOINT", "facebook throttled this session (try again later)"
         # The content gate is what stops a live profile being written off as
         # taken down because one post in its timeline is restricted -- see
         # has_profile_content. Without it this returned GONE for 5 of the 8
@@ -1678,21 +1736,26 @@ class Scraper:
         from a long About page is its length. Deliberately does NOT use the
         GONE wording: the About refusal ("This content isn't available at
         the moment", see RE_CONTENT_UNAVAILABLE) is not a removed profile."""
-        if is_wall_url(page_url, ("checkpoint",)):
+        wall = url_wall(page_url)
+        if wall == "checkpoint":
             return "CHECKPOINT", "session checkpointed (About tab)"
-        if is_wall_url(page_url, ("login", "login.php")):
+        if wall == "login":
             return "LOGIN_REQUIRED", "cookies rejected/expired (About tab)"
         if sig is not None and getattr(sig, "is_pushback", False):
             st = "LOGIN_REQUIRED" if sig.kind == EXPIRED else "CHECKPOINT"
-            return st, f"facebook pushed back on the About tab ({sig.reason})"
+            # The KIND is in the note: "throttled" is what classify_failure
+            # reads as rate_limited; the bare reason ("body says 'try again
+            # later'") matched nothing and fell back to checkpointed.
+            return st, f"facebook pushed back on the About tab ({sig.kind}: {sig.reason})"
         t = txt or ""
         if len(t) < 2000:
-            if RE_CHECKPOINT.search(t):
+            text = text_wall(t)
+            if text == "checkpoint":
                 return "CHECKPOINT", "session checkpointed (About tab)"
-            if RE_LOGIN.search(t):
+            if text == "login":
                 return "LOGIN_REQUIRED", "cookies rejected/expired (About tab)"
-            if RE_TRY_LATER.search(t):
-                return "CHECKPOINT", "facebook is throttling this session (About tab)"
+            if text == "rate_limited":
+                return "CHECKPOINT", f"facebook {_THROTTLED_WORD} this session (About tab)"
         return None
 
     @staticmethod
@@ -1789,10 +1852,24 @@ class Scraper:
             if not await self.visit(
                 page, url, h, "main", scrolls=self.a.scrolls, needle=needle
             ):
+                why = h.nav_errors.get("main", "")
+                # A NAVIGATION THAT ENDED ON A WALL IS A SESSION VERDICT. Filed
+                # as ERROR it read as "this profile failed" and the batch
+                # carried on under a checkpointed / logged-out account. visit()
+                # has already told the governor (_note_url_wall).
+                wall = url_wall(_page_url(page))
+                if wall == "checkpoint":
+                    row.status = "CHECKPOINT"
+                    row.note(f"session checkpointed (main nav ended on the checkpoint page"
+                             f"{': ' + why if why else ''})")
+                    return row
+                if wall == "login":
+                    row.status = "LOGIN_REQUIRED"
+                    row.note("cookies rejected/expired (main nav ended on the login page)")
+                    return row
                 row.status = "ERROR"
                 # With the reason: the runner reads it to tell a dead
                 # browser or a blocked account from a slow page.
-                why = h.nav_errors.get("main", "")
                 row.note(f"main nav failed: {why}" if why else "main nav failed")
                 return row
 
@@ -1803,6 +1880,38 @@ class Scraper:
             # misread as "removed".
             sig = h.signals.get("main")
             pushed = sig is not None and sig.is_pushback
+
+            # THE WARNING POPUP OVER A PROFILE THAT LOADED. Meta's "we suspect
+            # automated behavior" / "you're temporarily blocked" arrives as a
+            # dialog over a page that still renders, so the content-gated
+            # checks below never see it. Checked BEFORE the profile is read,
+            # whether or not it can be; only the dialog's own text is read, so
+            # a bio quoting the words is never mistaken for it. One evaluate,
+            # no request; a healthy profile has no dialog open on load.
+            warn = await dialog_warning(page)
+            if warn is not None and warn.kind == CHALLENGED:
+                row.status = "CHECKPOINT"
+                row.note(f"facebook put a checkpoint warning on this account in a popup "
+                         f"({warn.reason}) -- batch stopped; open the account, dismiss "
+                         f"the warning and let it rest before using it again")
+                if not pushed:
+                    try:
+                        governor_for("facebook").record(warn)
+                    except Exception:
+                        pass
+                return row
+            if warn is not None and warn.kind == THROTTLED:
+                # A throttle slows the platform down (the governor) but the
+                # profile behind it is still read.
+                if not pushed:
+                    try:
+                        governor_for("facebook").record(warn)
+                    except Exception:
+                        pass
+                row.note(f"facebook {_THROTTLED_WORD} this account in a popup ({warn.reason})")
+            # Whether the governor has already heard about this visit.
+            told = pushed or (warn is not None and warn.is_pushback)
+
             if pushed and not self.has_profile_content(h, txt, row.profile_id):
                 row.status = "LOGIN_REQUIRED" if sig.kind == EXPIRED else "CHECKPOINT"
                 row.note(f"facebook pushed back ({sig.kind}: {sig.reason})")
@@ -1812,6 +1921,11 @@ class Scraper:
                     # a removed page's own entity does not exist: only its
                     # og:title/<title> can name it, never a stray payload
                     read_name(row, h, strict=True)
+                elif row.status in _SESSION_STATUSES and not told:
+                    # A wall read off the page's text never reached the
+                    # governor (a URL wall already did, in visit()).
+                    last = row.notes.rsplit("; ", 1)[-1]
+                    record_wall(_wall_code(row.status, last), f"main visit: {last}")
                 return row
             if pushed:
                 row.note(f"facebook pushed back on this visit but the profile loaded ({sig.reason})")
@@ -1950,10 +2064,15 @@ class Scraper:
                         tab_url_now = page.url or ""
                     except Exception:
                         tab_url_now = ""
-                    wall = self.tab_wall(tab_url_now, h.text.get(sk, ""), h.signals.get(sk))
+                    tab_sig = h.signals.get(sk)
+                    wall = self.tab_wall(tab_url_now, h.text.get(sk, ""), tab_sig)
                     if wall:
                         row.status = wall[0]
                         row.note(wall[1])
+                        # A wall read off the tab's TEXT never reached the
+                        # governor; a URL wall or a pushback response did.
+                        if not (tab_sig is not None and getattr(tab_sig, "is_pushback", False)):
+                            record_wall(_wall_code(wall[0], wall[1]), f"{sk} tab: {wall[1]}")
                         return row
                     if sk in h.nav_errors:
                         row.note(f"about tab nav failed ({sk}): {h.nav_errors[sk]}")
@@ -2023,8 +2142,10 @@ class Scraper:
             row = await self.one(u, tgt, feed)
             rows.append(row)
             self.report(i, len(jobs), u, row)
-            if row.status == "CHECKPOINT" and not self.a.keep_going:
-                _run_log.warning("CHECKPOINT -- aborting to avoid burning the session.")
+            # LOGIN_REQUIRED too: every visit after it on the same dead
+            # session is another wall, and another request on a flagged account.
+            if row.status in _SESSION_STATUSES and not getattr(self.a, "keep_going", False):
+                _run_log.warning(f"{row.status} -- aborting to avoid burning the session.")
                 break
             if i < len(jobs):
                 await self.pause()
@@ -2034,20 +2155,37 @@ class Scraper:
         """Several tabs at once, same session. Faster, and more conspicuous."""
         sem = asyncio.Semaphore(self.a.concurrency)
         done = 0
+        # Set by the first CHECKPOINT / LOGIN_REQUIRED row: every worker that
+        # has not started its visit yet skips it. Visits already in flight
+        # finish (their rows are kept); nothing new goes out on the account.
+        stopped = ""
+        keep_going = bool(getattr(self.a, "keep_going", False))
 
-        async def worker(idx: int, job: tuple[str, str, str]) -> tuple[int, Row]:
+        async def worker(idx: int, job: tuple[str, str, str]) -> "tuple[int, Row] | None":
             """One profile in its own tab, holding a concurrency slot.
             Starts staggered so several tabs do not hit Facebook in the
             same instant, and returns its index so the caller can restore
-            the caller's original job order."""
-            nonlocal done
+            the caller's original job order. None when skipped because the
+            session was already blocked."""
+            nonlocal done, stopped
             async with sem:
+                if stopped:
+                    return None
                 await asyncio.sleep(idx % self.a.concurrency * 1.5)  # stagger
+                if stopped:
+                    return None
                 row = await self.one(*job)
                 done += 1
                 self.report(done, len(jobs), job[0], row)
-                await self.pause(0.5)
+                if row.status in _SESSION_STATUSES and not keep_going and not stopped:
+                    stopped = row.status
+                    from backend.shared.logging import get_logger as _gl
+                    _gl("platforms.facebook.analysis").warning(
+                        f"{row.status} -- stopping the remaining visits to avoid "
+                        f"burning the session.")
+                if not stopped:
+                    await self.pause(0.5)
                 return idx, row
 
         pairs = await asyncio.gather(*(worker(i, j) for i, j in enumerate(jobs)))
-        return [r for _, r in sorted(pairs, key=lambda p: p[0])]
+        return [r for _, r in sorted((p for p in pairs if p is not None), key=lambda p: p[0])]

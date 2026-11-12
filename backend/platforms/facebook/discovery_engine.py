@@ -55,7 +55,10 @@ from urllib.parse import parse_qs, quote, urlparse
 from backend.platforms.scan_options import cancelled
 from backend.shared import diagnostics
 from backend.shared.tasks import spawn
-from backend.shared.pushback import STOP_CODE as _PUSHBACK_STOP, note_response
+from backend.shared.pushback import (CHALLENGED, EXPIRED, THROTTLED, Signal,
+                                     STOP_CODE as _PUSHBACK_STOP, governor_for,
+                                     note_response)
+from backend.shared.warning_dialog import dialog_warning
 from backend.shared.extraction import run_strategies
 from backend.shared.schema_probe import SchemaProbe, probe_or_null
 from backend.shared.avatars import looks_like_placeholder
@@ -96,19 +99,131 @@ RE_LOGIN = re.compile(r"(You must log in|Log in to Facebook|Log In or Sign Up)",
 # Blocked" / "You\u2019re ..."); apostrophes are written `.` because the page
 # serves a curly one. Like every pattern here it is trusted only OUTSIDE result
 # content (callers gate on chrome text / "no profile data came back").
+#
+# "suspect automated" / "automated behavio(u)r" is Meta's automation warning
+# ("We suspect automated behavior on your account"), the same words
+# shared/pushback.py files as CHALLENGED: the account needs a person before it
+# is used again, so it is a checkpoint, never a throttle.
 RE_CHECKPOINT = re.compile(
     r"(Confirm Your Identity|account has been locked|We.ve temporarily|"
+    r"Temporarily Blocked|suspect(?:s|ed)? automated|automated behaviou?r)",
+    re.I,
+)
+# The wording in RE_CHECKPOINT before the automation warning was added. Used
+# ONLY where a whole profile body is read with no content gate (the discovery
+# resolve visit blanks a candidate's name on a match): a cyber-security brand's
+# bio can say "automated behavior", and on a healthy platform that page must
+# keep resolving exactly as it did.
+_RE_PROFILE_WALL_TEXT = re.compile(
+    r"(Confirm Your Identity|account has been locked|We.ve temporarily|"
     r"Temporarily Blocked)",
+    re.I,
+)
+# The part of RE_CHECKPOINT that can only be a challenge (a person must act),
+# as opposed to Facebook's throttle heading. See `text_wall`.
+RE_CHALLENGE = re.compile(
+    r"(Confirm Your Identity|account has been locked|"
+    r"suspect(?:s|ed)? automated|automated behaviou?r)",
+    re.I,
+)
+# Facebook's THROTTLE wording: "You're Temporarily Blocked -- It looks like you
+# were misusing this feature by going too fast", "You can't use this feature
+# right now", "Action Blocked". Slow down; the account itself is fine.
+RE_THROTTLE_WALL = re.compile(
+    r"(Temporarily Blocked|going too fast|misusing this feature|"
+    r"can.t use this feature right now|Action Blocked)",
     re.I,
 )
 # Facebook's soft-throttle wording. Kept apart from RE_CHECKPOINT because
 # "try again later" is also ordinary prose: it is only ever searched on a page
 # that handed over no profile/results (analysis blocked_status, the search
 # page's `_session_blocked`), never on content.
-RE_TRY_LATER = re.compile(r"(Try again later|Please try again later)", re.I)
+RE_TRY_LATER = re.compile(
+    r"(Try again later|Please try again later|Temporarily Blocked|going too fast|"
+    r"misusing this feature|can.t use this feature right now|Action Blocked)",
+    re.I,
+)
 RE_GONE = re.compile(
     r"(isn't available|Page Not Found|content is currently unavailable)", re.I
 )
+
+
+# ------------------------------------------------------- pushback vocabulary
+#
+# A wall is a session verdict, and it has to reach two places: the stop code
+# (`classify_failure` cools or quarantines the account) and the platform's
+# pacing governor (shared/pushback.py), which only ever heard about pushback
+# that arrived as a search XHR. A wall found in the page's URL or text slowed
+# nothing down. These helpers are the one vocabulary for both engines.
+
+# Every stop code that means "the platform pushed back on this account".
+PUSHBACK_STOPS = frozenset(_PUSHBACK_STOP.values())
+# Stop code -> the governor's pushback kind ("checkpoint" -> CHALLENGED, ...).
+_STOP_KIND = {code: kind for kind, code in _PUSHBACK_STOP.items()}
+# Most severe first: a challenge needs a person, an expiry new cookies, a
+# throttle only time.
+_SEVERITY = {CHALLENGED: 3, EXPIRED: 2, THROTTLED: 1}
+
+
+def most_severe(signals) -> Optional[Signal]:
+    """The most severe pushback in `signals` (CHALLENGED > EXPIRED >
+    THROTTLED), the earliest on a tie; None when there is none."""
+    best = None
+    for s in signals or ():
+        if best is None or _SEVERITY.get(s.kind, 0) > _SEVERITY.get(best.kind, 0):
+            best = s
+    return best
+
+
+def record_wall(code: str, reason: str) -> Optional[Signal]:
+    """Tell Facebook's governor about a wall found in a page's URL or text
+    (stop code "checkpoint" / "login" / "rate_limited"). Returns the Signal
+    recorded, or None for a code that is not pushback. Never raises."""
+    kind = _STOP_KIND.get(code)
+    if kind is None:
+        return None
+    try:
+        return governor_for("facebook").record(Signal(kind, reason))
+    except Exception:
+        return None
+
+
+def url_wall(url: str) -> str:
+    """"checkpoint" / "login" when `url` is one of Facebook's walls, else "".
+    Judged by the path's first segment (shared/walls.py), plus the
+    /index.php?next=... redirect a dead session is sent to."""
+    if not isinstance(url, str) or not url:
+        return ""
+    if is_wall_url(url, ("checkpoint",)):
+        return "checkpoint"
+    if (is_wall_url(url, ("login", "login.php"))
+            or (url_path(url) == "/index.php" and "next=" in url)):
+        return "login"
+    return ""
+
+
+def text_wall(text: str) -> str:
+    """The wall a page's TEXT shows: "checkpoint" / "rate_limited" / "login",
+    or "". Only for text already known not to be result/profile content.
+
+    A throttle is "rate_limited", not "checkpoint": filing Facebook's "You're
+    Temporarily Blocked" or "try again later" as a checkpoint quarantined an
+    account that only needed to cool down. The order keeps every phrase's old
+    precedence over the login wording."""
+    t = text if isinstance(text, str) else ""
+    if not t:
+        return ""
+    if RE_CHALLENGE.search(t):
+        return "checkpoint"
+    if RE_THROTTLE_WALL.search(t):
+        return "rate_limited"
+    if RE_CHECKPOINT.search(t):
+        return "checkpoint"
+    if RE_LOGIN.search(t):
+        return "login"
+    if RE_TRY_LATER.search(t):
+        return "rate_limited"
+    return ""
 
 # real profile photos live on scontent*.fbcdn.net; rsrc.php / static.xx is
 # Facebook's own chrome, which is where the silhouette placeholder comes from.
@@ -486,7 +601,7 @@ async def _shows_no_results(page) -> bool:
 
 
 async def _session_blocked(page, have_results: bool = False) -> str:
-    """"checkpoint" / "login" when the search page is a wall instead of
+    """"checkpoint" / "login" / "rate_limited" when the search page is a wall instead of
     results, "" otherwise. URL first (unambiguous), then the page text
     against the same patterns the session check and analysis use.
 
@@ -502,22 +617,17 @@ async def _session_blocked(page, have_results: bool = False) -> str:
         url = page.url or ""
     except Exception:
         url = ""
-    if is_wall_url(url, ("checkpoint",)):
-        return "checkpoint"
-    if (is_wall_url(url, ("login", "login.php"))
-            or (url_path(url) == "/index.php" and "next=" in url)):
-        return "login"
+    if wall := url_wall(url):
+        return wall
     if have_results:
         return ""
     try:
         body = await page.inner_text("body")
     except Exception:
         return ""
-    if RE_CHECKPOINT.search(body) or RE_TRY_LATER.search(body):
-        return "checkpoint"
-    if RE_LOGIN.search(body):
-        return "login"
-    return ""
+    # A throttle ("try again later", "Temporarily Blocked") is "rate_limited"
+    # so the account is cooled down, not quarantined as checkpointed.
+    return text_wall(body)
 
 
 def page_state(blob: Any, probe: Any = None) -> Optional[PageState]:
@@ -1394,7 +1504,15 @@ class Discovery:
             detail to score, by visiting it directly. Holds a concurrency
             slot for the duration of the visit."""
             async with sem:
+                # ONE WALL ENDS THE VISITS. Once a visit has hit a wall the
+                # account is walled for every visit after it too; carrying on
+                # spends profile loads -- the most detectable thing this
+                # engine does -- on an account the platform has just stopped.
+                if self._resolve_wall:
+                    return
                 await asyncio.sleep(random.uniform(0.5, 1.2))
+                if self._resolve_wall:
+                    return
                 page = await self.ctx.new_page()
                 blobs: list[Any] = []
 
@@ -1448,14 +1566,29 @@ class Discovery:
                         _visit_url = page.url or ""
                     except Exception:
                         _visit_url = ""
-                    _url_wall = (
-                        "checkpoint" if is_wall_url(_visit_url, ("checkpoint",))
-                        else "login" if is_wall_url(_visit_url, ("login", "login.php"))
-                        else "")
-                    if _url_wall:
-                        self._resolve_wall = self._resolve_wall or _url_wall
+                    _url_wall = url_wall(_visit_url)
+                    # The warning popup Meta puts OVER a page that still
+                    # loads ("We suspect automated behavior", "You're
+                    # temporarily blocked"). Only dialog text is read, so a
+                    # bio quoting the words is never taken for it. One
+                    # evaluate, no request.
+                    if not _url_wall:
+                        _warn = await dialog_warning(page)
+                        if _warn is not None and _warn.is_pushback:
+                            _url_wall = _PUSHBACK_STOP[_warn.kind]
+                            if not self._resolve_wall:
+                                self._resolve_wall = _url_wall
+                                try:
+                                    governor_for("facebook").record(_warn)
+                                except Exception:
+                                    pass
+                    if _url_wall and not self._resolve_wall:
+                        self._resolve_wall = _url_wall
+                        # The governor never saw this: a profile visit is a
+                        # document load, not a search XHR. Once per wall.
+                        record_wall(_url_wall, f"profile visit landed on a {_url_wall} wall")
                     if (_url_wall or RE_LOGIN.search(body_text)
-                            or RE_CHECKPOINT.search(body_text) or RE_GONE.search(body_text)):
+                            or _RE_PROFILE_WALL_TEXT.search(body_text) or RE_GONE.search(body_text)):
                         blocked = True
                     else:
                         # Wait for the profile's own data to actually be
@@ -1783,10 +1916,21 @@ class Discovery:
             into the same wall. Everything already parsed is still returned."""
             if not pushed:
                 return False
-            sig = pushed[-1]
+            # The MOST SEVERE, not the latest: a challenge followed by a
+            # throttle on the next response is still a challenge, and filing
+            # it as a throttle would only cool an account that needs a person.
+            sig = most_severe(pushed)
             out.stopped = _PUSHBACK_STOP[sig.kind]
             out.error = f"facebook search answered with a {sig.kind} signal ({sig.reason})"
             return True
+
+        def _wall_stop(code: str, error: str) -> None:
+            """End the sweep on a wall found in the search page's URL or
+            text, and tell the governor -- unless a search response already
+            told it (`pushed`), so one event is counted once."""
+            out.stopped, out.error = code, error
+            if not pushed:
+                record_wall(code, error)
 
         page.on("response", lambda r: spawn(on_response(r)))
 
@@ -1804,8 +1948,7 @@ class Discovery:
             if nav_error is not None:
                 # 1. Did Facebook redirect to a login wall or checkpoint during navigation?
                 if blocked := await _session_blocked(page, have_results=bool(by_id)):
-                    out.stopped = blocked
-                    out.error = f"facebook search page shows a {blocked} wall"
+                    _wall_stop(blocked, f"facebook search page shows a {blocked} wall")
                     return out
 
                 # 2. Did the document actually commit and carry embedded results despite the timeout?
@@ -1837,8 +1980,7 @@ class Discovery:
                             absorb(blob)
                     except Exception as retry_err:
                         if blocked := await _session_blocked(page, have_results=bool(by_id)):
-                            out.stopped = blocked
-                            out.error = f"facebook search page shows a {blocked} wall"
+                            _wall_stop(blocked, f"facebook search page shows a {blocked} wall")
                             return out
                         if not by_id:
                             # Chained, so the retry's own reason survives
@@ -1886,7 +2028,12 @@ class Discovery:
                 # The panel is up by now: the wait_for_function above has
                 # already blocked until the body carried real text, which is
                 # the same paint that renders it.
-                if await _shows_no_results(page):
+                #
+                # NOT AFTER A PUSHBACK. A throttled first search response plus
+                # an empty panel is not "nothing matched"; `not pushed` lets
+                # the loop below reach `_pushback_stop` instead of reporting
+                # a clean, complete zero.
+                if not pushed and await _shows_no_results(page):
                     out.stopped, out.complete = "no-results", True
                 else:
                     # Waited in ONE-SECOND STEPS, re-reading the document
@@ -1906,7 +2053,7 @@ class Discovery:
                             pass
                         for blob in parse_embedded(await page.evaluate(JS_EMBEDDED), probe):
                             absorb(blob)
-                        if not by_id and await _shows_no_results(page):
+                        if not by_id and not pushed and await _shows_no_results(page):
                             out.stopped, out.complete = "no-results", True
                             break
 
@@ -1929,7 +2076,7 @@ class Discovery:
 
             # Nothing parsed and Facebook says why: stop now rather than
             # scrolling an empty page for `patience` rounds.
-            if not by_id and await _shows_no_results(page):
+            if not by_id and not pushed and await _shows_no_results(page):
                 out.stopped, out.complete = "no-results", True
             stalls = 0
             while not (out.stopped == "no-results"):
@@ -1997,10 +2144,27 @@ class Discovery:
                         )
                 else:
                     stalls += 1
+                    # A WARNING POPUP OVER THE RESULTS. Meta's "we suspect
+                    # automated behavior" / "you're temporarily blocked" sits
+                    # in a dialog over a page that may still show results, so
+                    # it is checked whatever has been parsed -- only the
+                    # dialog's own text is read, never the results. One
+                    # evaluate, no request; a healthy page has no dialog.
+                    warn = await dialog_warning(page)
+                    if warn is not None and warn.is_pushback:
+                        out.stopped = _PUSHBACK_STOP[warn.kind]
+                        out.error = (f"facebook showed a warning popup on the search "
+                                     f"page ({warn.kind}: {warn.reason})")
+                        if not pushed:
+                            try:
+                                governor_for("facebook").record(warn)
+                            except Exception:
+                                pass
+                        break
                     # Re-checked here too: the panel can render a moment after
                     # first paint, in which case the pre-loop check above ran
                     # too early. Still gated on having parsed nothing.
-                    if not by_id and await _shows_no_results(page):
+                    if not by_id and not pushed and await _shows_no_results(page):
                         out.stopped, out.complete = "no-results", True
                         break
                     # A SESSION THAT DIED MID-SWEEP. Facebook answers a dead
@@ -2014,8 +2178,7 @@ class Discovery:
                     # quarantines the account and the runner re-queues.
                     if stalls >= 2 and (blocked := await _session_blocked(
                             page, have_results=bool(by_id))):
-                        out.stopped = blocked
-                        out.error = f"facebook search page shows a {blocked} wall"
+                        _wall_stop(blocked, f"facebook search page shows a {blocked} wall")
                         break
                     if stalls >= self.a.patience:
                         out.stopped = "stalled"
@@ -2119,6 +2282,18 @@ class Discovery:
                 order=rendered_order)
             to_resolve = _in_platform_order(
                 missing_worth_visiting | unresolved_in_by_id, rendered_order)
+            # NO PROFILE VISITS ON AN ACCOUNT THE PLATFORM JUST PUSHED BACK ON.
+            # The sweep stopped because Facebook throttled, challenged or
+            # logged this account out; up to RESOLVE_TIME_BUDGET_SEC of
+            # profile loads on it is exactly the activity that turns a warning
+            # into a disabled account. The candidates keep their already-known
+            # (possibly blank) names, as on a cancel.
+            if to_resolve and out.stopped in PUSHBACK_STOPS:
+                from backend.shared.logging import get_logger as _gl
+                _gl("facebook").warning(
+                    f"[facebook] {keyword!r}/{tab}: skipping {len(to_resolve)} profile "
+                    f"visit(s) -- the sweep stopped on {out.stopped}")
+                to_resolve = []
             out.resolved_visits = len(to_resolve)
             # WHY a visit was needed, not just how many. The resolve phase is
             # ~80% of a sweep's wall clock (measured: 57.8s of 72.4s across
@@ -2163,11 +2338,15 @@ class Discovery:
                     resolved = {}
                 finally:
                     out.resolve_seconds = round(time.time() - _resolve_started, 1)
-                if self._resolve_wall and out.stopped in ("", "exhausted", "end-of-serp", "no-results"):
+                if (self._resolve_wall and out.stopped not in PUSHBACK_STOPS
+                        and out.stopped != "cancelled"):
                     # The search itself worked and its rows stand, but the
                     # account was walled while its profiles were visited --
                     # the session verdict the runner needs to replay this
-                    # keyword elsewhere and stop spending the account.
+                    # keyword elsewhere and stop spending the account. Over
+                    # EVERY non-session ending (a cap, a stall, a timeout,
+                    # an error too): a wall lost behind "cap:results" left
+                    # the walled account in rotation.
                     out.stopped, out.complete = self._resolve_wall, False
                     out.error = f"facebook profile visits hit a {self._resolve_wall} wall"
 
