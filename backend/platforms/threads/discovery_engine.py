@@ -58,9 +58,11 @@ from backend.platforms.scan_options import cancelled
 from backend.shared import diagnostics
 from backend.shared.avatars import looks_like_placeholder
 from backend.shared.models.row import Row
-from backend.shared.pushback import governor_for
+from backend.shared.pushback import (CHALLENGED, EXPIRED, STOP_CODE, THROTTLED,
+                                     Signal, governor_for, note_response)
 from backend.shared.text import parse_count
 from backend.shared.walls import url_path
+from backend.shared.warning_dialog import classify_dialog_text
 from backend.stealth import levels as stealth_levels
 from backend.stealth.browser import Session
 
@@ -85,7 +87,10 @@ RE_LOGIN = re.compile(
 )
 RE_CHECKPOINT = re.compile(
     r"(challenge_required|Suspicious Login|We Detected An Unusual Login|"
-    r"confirm it.s you|Help Us Confirm)",
+    r"confirm it.s you|Help Us Confirm|"
+    # The same "We suspect automated behavior on your account" warning
+    # Instagram shows -- Threads signs in with the same Meta account.
+    r"suspect\w*\s+automated|automated\s+behaviou?r)",
     re.I,
 )
 
@@ -299,7 +304,11 @@ _JS_CARDS = r"""
     found.push({u, lines: cl, img: img ? (img.src || '') : '',
                 ver: !!n.querySelector('svg[aria-label*="erified" i]')});
   }
-  return {url: location.href, lines: lines.slice(0, 400), cards: found};
+  // Text inside open dialogs only: a warning popup is the platform talking
+  // to the account, never a result card (see shared/warning_dialog.py).
+  const dialog = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"]'))
+    .map(d => d.innerText || '').join('\n').slice(0, 4000);
+  return {url: location.href, lines: lines.slice(0, 400), cards: found, dialog};
 }
 """
 
@@ -317,6 +326,42 @@ async def read_page(tab) -> dict:
     except Exception:
         return {"url": "", "lines": [], "cards": []}
     return snap if isinstance(snap, dict) else {"url": "", "lines": [], "cards": []}
+
+
+async def _refused_search(resp) -> "Optional[tuple[str, str]]":
+    """(stop code, error) when the search document itself was refused --
+    throttled, challenged or logged out -- else None. Feeds the governor
+    either way (a healthy answer only counts toward its total). The body is
+    read only on an error status, so result content is never classified.
+
+    The error leads with the stop code and carries no bare status number:
+    shared/resilience.py reads "403" as an expired login, which would turn a
+    throttle into a quarantine."""
+    st = getattr(resp, "status", None)
+    if not isinstance(st, int) or isinstance(st, bool):
+        return None
+    body = None
+    if st >= 400:
+        try:
+            body = (await resp.text())[:4000]
+        except Exception:
+            body = None
+    sig = note_response("threads", st, body)
+    if sig.kind not in (THROTTLED, CHALLENGED, EXPIRED):
+        return None
+    code = STOP_CODE[sig.kind]
+    why = sig.reason if not sig.reason.startswith("HTTP ") else "an error status"
+    return code, f"{code}: threads refused the search ({why})"
+
+
+def _finish(out, by_name: dict, keyword: str, options):
+    """Every user read so far onto `out` (capped), whatever ended the sweep."""
+    out.users = list(by_name.values())
+    out.hits = [user_to_row(u, keyword, source=out.source)
+                for u in out.users if u.url]
+    if options.max_results:
+        out.hits = out.hits[: options.max_results]
+    return out
 
 
 async def _page_gap(options) -> None:
@@ -469,11 +514,19 @@ class Discovery:
                 return out
 
             max_scrolls = int(getattr(self.a, "max_pages", 0) or 0) or DEFAULT_MAX_SCROLLS
-            await page.goto(SEARCH_URL.format(q=quote(keyword.strip(), safe="")),
-                            wait_until="domcontentloaded",
-                            timeout=self.a.timeout * 1000)
+            resp = await page.goto(SEARCH_URL.format(q=quote(keyword.strip(), safe="")),
+                                   wait_until="domcontentloaded",
+                                   timeout=self.a.timeout * 1000)
+            # THE SEARCH DOCUMENT'S OWN ANSWER. It used to be thrown away, so
+            # a refused search (429, a challenge body) scrolled on for several
+            # more rounds on the refused account and ended "empty-unconfirmed"
+            # with no verdict on the session. A healthy 200 is just counted.
+            if refused := await _refused_search(resp):
+                out.stopped, out.error = refused
+                return _finish(out, by_name, keyword, self.a)
 
             stable = 0
+            unreadable = 0
             snap: dict = {}
             for rnd in range(max_scrolls + 1):
                 if cancelled(self.a):
@@ -485,12 +538,56 @@ class Discovery:
                 snap = await read_page(page)
                 lines = snap.get("lines") or []
 
+                # AN UNREADABLE TAB IS NOT "THE LIST STOPPED GROWING". A dead
+                # or navigated-away tab reads as an empty snapshot; counted as
+                # a quiet round it ended a partial list "exhausted" (complete).
+                if not snap.get("url"):
+                    unreadable += 1
+                    if unreadable >= STALL_ROUNDS:
+                        out.stopped = "error"
+                        out.error = "the threads.com search tab could not be read"
+                        break
+                    await _page_gap(self.a)
+                    continue
+                unreadable = 0
+
+                # A WARNING POPUP, ON EVERY ROUND. Threads (the same Meta
+                # account as Instagram) can raise "we suspect automated
+                # behavior" or a "try again later" block over results that
+                # already loaded. Only text inside open dialogs is read, so a
+                # card's bio can never trip it. Results so far are kept.
+                if sig := classify_dialog_text(snap.get("dialog") or ""):
+                    governor_for("threads").record(sig)
+                    out.stopped = STOP_CODE[sig.kind]
+                    out.error = f"{out.stopped}: threads showed a warning popup ({sig.reason})"
+                    break
+                # A redirect to a wall mid-scroll, read by URL path only (the
+                # page's lines hold card bios once results are showing).
+                if by_name:
+                    wall = wall_kind(snap.get("url") or page.url, [])
+                    if wall:
+                        if wall == "checkpoint":
+                            governor_for("threads").record(
+                                Signal(CHALLENGED, "threads checkpoint wall"))
+                            out.stopped = "checkpoint"
+                            out.error = "checkpoint: Threads is challenging this session"
+                        else:
+                            out.stopped = "login"
+                            out.error = ("login required: threads.com is asking this "
+                                         "session to log in")
+                        break
+
                 if rnd == 0 or not by_name:
                     # A wall is decided BEFORE any card is trusted: a signed-out
                     # or never-joined session still renders post cards behind
                     # its dialog.
                     wall = wall_kind(snap.get("url") or page.url, lines)
                     if wall:
+                        if wall == "checkpoint":
+                            # Instagram's governor (shared with Threads) must
+                            # hear about it, or Instagram keeps full speed.
+                            governor_for("threads").record(
+                                Signal(CHALLENGED, "threads checkpoint wall"))
                         out.stopped = "checkpoint" if wall == "checkpoint" else "login"
                         out.error = {
                             "login": "login required: threads.com is asking this session "
@@ -552,11 +649,7 @@ class Discovery:
                     # clean zero this tool refuses.
                     out.stopped, out.complete = "empty-unconfirmed", False
 
-            out.users = list(by_name.values())
-            out.hits = [user_to_row(u, keyword, source=out.source)
-                        for u in out.users if u.url]
-            if self.a.max_results:
-                out.hits = out.hits[: self.a.max_results]
+            _finish(out, by_name, keyword, self.a)
         except Exception as e:
             out.stopped, out.error = "error", f"{type(e).__name__}: {e}"
             out.where = diagnostics.where(e)

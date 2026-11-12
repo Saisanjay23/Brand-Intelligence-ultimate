@@ -60,6 +60,7 @@ from backend.shared.pushback import (CHALLENGED, EXPIRED, THROTTLED, Signal,
                                      governor_for, note_response)
 from backend.shared.text import (iter_dicts, name_score, normalized_host,
                                  parse_normalized_url)
+from backend.shared.warning_dialog import dialog_warning
 
 # Consecutive profile visits that returned no record, with no explicit
 # pushback, before the governor is told Threads is probably soft-blocking.
@@ -69,6 +70,13 @@ NO_PAYLOAD_STREAK_LIMIT = 3
 # only after no profile record could be read, so a bio quoting it never
 # matches.
 _RE_GONE = re.compile(r"the link.s not working or the page is gone", re.I)
+
+# Threads' (Meta's) own "slow down" page copy, the same words Instagram
+# prints. Consulted only after no profile record could be read, like _RE_GONE.
+# A THROTTLE, not a verdict on the profile: it used to read as a plain
+# "profile record not seen", and the governor only heard after three in a row.
+_RE_THROTTLE_PAGE = re.compile(
+    r"(try again later|please wait a few minutes|we limit how often|action blocked)", re.I)
 
 def pushback_verdict(sig) -> Optional[tuple[str, str]]:
     """What Threads' own answer says about the ACCOUNT, as (row status, note),
@@ -340,6 +348,42 @@ class Scraper:
             landed = snap.get("url") or page.url
             user = profile_from(blobs_from_scripts(snap.get("texts") or []), wanted)
 
+            # THE WARNING OVER A PROFILE THAT LOADED FINE. Threads is the same
+            # Meta account as Instagram, and shows the same "we suspect
+            # automated behavior" popup over a page whose record still
+            # arrives -- so it is looked for on EVERY visit, before the record
+            # is trusted (Instagram's fix, 0e4af96). Only dialog text is read.
+            if warn := await dialog_warning(page):
+                if not any(p.kind == warn.kind for p in pushed):
+                    governor_for("threads").record(warn)
+                if warn.kind == CHALLENGED:
+                    row.status = "CHECKPOINT"
+                    row.note(f"threads warned this account in a popup ({warn.reason}) -- "
+                             "batch stopped; open the account, dismiss the warning and "
+                             "let it rest before using it again")
+                    return row
+                row.note(f"threads throttled this visit ({warn.reason}) -- pacing slowed")
+
+            # A challenge or a rejected login in the document's own answer is
+            # a verdict on the ACCOUNT whether or not a record came with it.
+            # It was only consulted when no record was read, so a challenged
+            # session that still got the embedded JSON filed an OK row and
+            # the batch carried on.
+            for sig in pushed:
+                if verdict := pushback_verdict(sig):
+                    row.status, note = verdict
+                    row.note(note)
+                    return row
+
+            if user is None and cancelled(self.a):
+                # STOPPED, NOT SOFT-BLOCKED. A Stop cuts the settle wait short,
+                # so the record is often not there yet; counting that toward
+                # the no-record streak told the governor (shared with
+                # Instagram) Threads was throttling when nobody was.
+                row.status = "PARTIAL"
+                row.note("cancelled before the profile record loaded")
+                return row
+
             if user is None:
                 wall = wall_kind(landed, lines)
                 if wall == "checkpoint":
@@ -352,12 +396,13 @@ class Scraper:
                              if wall == "not-joined" else "cookies rejected/expired")
                     return row
                 if pushed:
-                    sig = pushed[-1]
-                    if verdict := pushback_verdict(sig):
-                        row.status, note = verdict
-                        row.note(note)
-                        return row
-                    row.note(f"threads throttled this visit ({sig.reason})")
+                    # (A challenge/expiry already returned above.)
+                    row.note(f"threads throttled this visit ({pushed[-1].reason})")
+                elif m := _RE_THROTTLE_PAGE.search("\n".join(lines)):
+                    sig = Signal(THROTTLED, f"page says {m.group(0)!r}")
+                    governor_for("threads").record(sig)
+                    pushed.append(sig)
+                    row.note(f"threads throttled this visit ({sig.reason}) -- pacing slowed")
                 if _RE_GONE.search("\n".join(lines)):
                     row.status = "GONE"
                     row.note("removed or unavailable -- may already be down"

@@ -92,6 +92,10 @@ _CHALLENGE_TOKENS = (
     # stands raises the risk of the account being disabled. Both spellings,
     # since the app is localised.
     "suspect automated", "automated behavior", "automated behaviour",
+    # X's error 226 wording, and Google's "unusual traffic" / sorry page.
+    # Full phrases, so ordinary text cannot trip them.
+    "this request looks like it might be automated",
+    "detected unusual traffic", "google.com/sorry",
 )
 _THROTTLE_TOKENS = (
     "feedback_required", "rate limit", "rate-limit", "rate_limited",
@@ -110,8 +114,10 @@ _EXPIRED_TOKENS = (
 # id that merely contains the digits can never match.
 #   88  rate limit exceeded      326 account locked (challenge)
 #   32  could not authenticate   64  account suspended
-_X_CODE_RE = re.compile(r'"code"\s*:\s*(88|326|32|64)\b')
-_X_CODE_KIND = {"88": THROTTLED, "326": CHALLENGED, "32": EXPIRED, "64": EXPIRED}
+#   226 "this request looks like it might be automated" (challenge)
+_X_CODE_RE = re.compile(r'"code"\s*:\s*(88|326|226|32|64)\b')
+_X_CODE_KIND = {"88": THROTTLED, "326": CHALLENGED, "226": CHALLENGED,
+                "32": EXPIRED, "64": EXPIRED}
 
 
 def _first(text: str, tokens) -> Optional[str]:

@@ -52,8 +52,13 @@ from backend.shared import resilience
 from backend.shared.job_store import JobStore
 from backend.shared.logging import get_logger
 from backend.shared.models.row import Row
+from backend.shared.pushback import STOP_CODE as _PUSHBACK_STOP_CODE
 from backend.shared.pushback import wait_for_breaker
 from backend.shared.resilience import classify_failure
+
+# The stop codes an engine reports when the platform pushed back
+# (rate_limited / checkpoint / login) -- each one a verdict on the account.
+_PUSHBACK_STOPS = frozenset(_PUSHBACK_STOP_CODE.values())
 from backend.shared.tasks import spawn
 from backend.stealth import levels as stealth_levels
 from backend.shared.text import (contiguous_letters_match, handle_from_url,
@@ -2219,6 +2224,20 @@ class DiscoveryRunner:
                             stop_reason = "flood-wait"
                             if fatal_kind[0] != "session":
                                 fatal_kind[0] = "hard"
+                            # AND THE ACCOUNT RESTS FOR AS LONG AS TELEGRAM
+                            # SAID. The stop alone left the account "ok", so
+                            # the next run picked it straight back up -- on a
+                            # fresh client that no longer remembered the wait
+                            # -- and searched again inside it, deepening the
+                            # limit. mark_session_failed is a no-op for a
+                            # platform with no pool (empty session id).
+                            if session_id and not job.cancel.is_set():
+                                wait_s = float(getattr(sweep, "retry_after_s", 0) or 0)
+                                await sessions_engine.mark_session_failed(
+                                    platform_id, session_id, "rate_limited",
+                                    rate_limited_until=(time.time() + wait_s) if wait_s > 0 else 0,
+                                    detail=getattr(sweep, "error", "") or "telegram flood wait",
+                                )
                         else:
                             # A sweep that caught its own session-shaped problem
                             # (TikTok's CAPTCHA/checkpoint, an auth failure a
@@ -2231,6 +2250,14 @@ class DiscoveryRunner:
                             session_reason = classify_failure(
                                 getattr(sweep, "error", "") or getattr(sweep, "stopped", "")
                             )
+                            # THE STOP CODE IS THE ENGINE'S OWN VERDICT. Only
+                            # the error text was read whenever there was one,
+                            # so a sweep that stopped "rate_limited" or
+                            # "checkpoint" with a message in the platform's
+                            # own words ("slow down", "verify to continue")
+                            # left the account in rotation, still warned.
+                            if not session_reason and sweep_stopped in _PUSHBACK_STOPS:
+                                session_reason = classify_failure(sweep_stopped)
                             # Gated on the cancel for the same reason the raised-exception
                             # path above is: a sweep cut short by Stop reports an `error`
                             # shaped like the platform's, and quarantining on it costs a
