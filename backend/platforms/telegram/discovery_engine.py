@@ -42,6 +42,8 @@ from backend.shared import diagnostics
 from backend.shared.avatars import hd_picture_url
 from backend.shared.logging import get_logger
 from backend.shared.models.row import Row
+from backend.shared.pushback import (CHALLENGED, STOP_CODE, THROTTLED, Signal,
+                                     governor_for)
 from backend.shared.schema_probe import SchemaProbe, probe_or_null
 
 log = get_logger("telegram")
@@ -49,12 +51,14 @@ log = get_logger("telegram")
 try:
     from telethon import TelegramClient
     from telethon.errors import (AuthKeyUnregisteredError, ChannelPrivateError,
-                                 FloodWaitError, SessionRevokedError,
+                                 FloodError, FloodWaitError, PeerFloodError,
+                                 SessionRevokedError,
                                  UserDeactivatedBanError, UserDeactivatedError,
                                  UsernameInvalidError,
                                  UsernameNotOccupiedError)
     from telethon.tl.functions.channels import GetFullChannelRequest
     from telethon.tl.functions.contacts import SearchRequest
+    from telethon.tl.functions.updates import GetStateRequest
     from telethon.tl.functions.users import GetFullUserRequest
 
     HAVE_TELETHON = True
@@ -67,11 +71,22 @@ except ImportError:  # pragma: no cover
     # HAVE_TELETHON is what actually gates the platform being usable.
     HAVE_TELETHON = False
     TelegramClient = None  # type: ignore
+    GetStateRequest = None  # type: ignore
 
-    class FloodWaitError(Exception):  # type: ignore
+    class FloodError(Exception):  # type: ignore
         """Import-fallback stub, see the note above."""
 
         seconds = 0
+
+    class FloodWaitError(FloodError):  # type: ignore
+        """Import-fallback stub, see the note above."""
+
+        seconds = 0
+
+    class PeerFloodError(Exception):  # type: ignore
+        """Import-fallback stub, see the note above."""
+
+        pass
 
     class AuthKeyUnregisteredError(Exception):  # type: ignore
         """Import-fallback stub, see the note above."""
@@ -166,6 +181,57 @@ class FloodWait(RuntimeError):
         self.seconds = seconds
 
 
+class AccountLimited(RuntimeError):
+    """PEER_FLOOD: Telegram has limited the account itself (spam-reported),
+    account-wide and with no stated end. Not a wait to sit out -- a person
+    has to look at it (@SpamBot) -- so it stops like a checkpoint. The
+    message says "checkpoint" on purpose: shared/resilience.py's
+    classify_failure reads that word as `checkpointed`."""
+
+    def __init__(self, detail: str = ""):
+        super().__init__(
+            "telegram checkpoint -- the account is limited (PEER_FLOOD); "
+            "check it with @SpamBot" + (f" ({detail})" if detail else ""))
+
+
+# Telegram's own word that THIS SESSION no longer works. None of these names
+# carries a classify_failure token, so they are re-raised as NotAuthorised
+# with "not authenticated" in the text -- otherwise a session revoked
+# mid-run read as one failed profile and the dead account kept going.
+_SESSION_DEAD = (AuthKeyUnregisteredError, SessionRevokedError,
+                 UserDeactivatedError, UserDeactivatedBanError)
+
+
+def _flood_seconds(e: BaseException) -> int:
+    """The wait a Telethon FloodError asked for (FloodWait, FloodPremiumWait,
+    SlowModeWait all carry `.seconds`); 0 when it does not say."""
+    return int(getattr(e, "seconds", 0) or 0)
+
+
+def _translate(e: BaseException) -> Optional[Exception]:
+    """A raw Telethon error -> this module's own pushback exception, or None
+    when it is not pushback (left for the caller's own handling)."""
+    if isinstance(e, FloodError):
+        return FloodWait(_flood_seconds(e))
+    if isinstance(e, _SESSION_DEAD):
+        return NotAuthorised(f"telegram session not authenticated -- {type(e).__name__}")
+    if isinstance(e, PeerFloodError):
+        return AccountLimited(type(e).__name__)
+    return None
+
+
+# Every raw Telethon error `_translate` maps.
+_TRANSLATED = (FloodError, PeerFloodError) + _SESSION_DEAD
+
+# On a row whose profile picture was not fetched because Telegram had put
+# photo downloads on a flood wait -- the picture exists, it was not read.
+PHOTO_FLOOD_NOTE = "profile picture not read (photo flood-wait)"
+
+# Errors that end a read early and must reach the caller, never be folded
+# into a "not read" note on an otherwise OK row.
+_PUSHBACK = (FloodWait, NotAuthorised, AccountLimited)
+
+
 @dataclass
 class TelegramEntity:
     """A user, channel or group, flattened to what the report needs."""
@@ -234,6 +300,10 @@ def entity_to_row(e: "TelegramEntity", keyword: str) -> Row:
         row.note("Telegram flags this account as restricted")
     if e.bot:
         row.note("bot account")
+    # Reading gaps (e.g. a photo skipped under a flood wait). Empty on a
+    # clean search, so a healthy sweep's rows are unchanged.
+    for n in e.notes:
+        row.note(n)
     return row
 
 
@@ -375,9 +445,15 @@ class Telegram:
             # connect(), never start(): start() prompts for a phone code on stdin
             await self.client.connect()
             authorised = await self.client.is_user_authorized()
-        except FloodWaitError as e:
+            if not authorised and (wait_s := self._auth_probe_flood_wait()):
+                # NOT A LOGOUT. is_user_authorized() swallows every RPC
+                # error, a flood wait included (any wait over Telethon's
+                # 60s sleep threshold), into False -- which read as a dead
+                # session and quarantined a healthy account as expired.
+                raise FloodWait(wait_s)
+        except FloodError as e:
             await self.stop()
-            raise FloodWait(int(getattr(e, "seconds", 0) or 0)) from e
+            raise FloodWait(_flood_seconds(e)) from e
         except BaseException:
             # CLOSE ON A FAILED START. Callers only call stop() after a
             # start() that returned, so a connect that raised (no network,
@@ -402,9 +478,31 @@ class Telegram:
         # without telling anyone, so the platform was never asked to back
         # off. Set AFTER the authorisation probe on purpose: Telethon's
         # is_user_authorized() swallows every RPC error as "not logged in",
-        # so a flood wait on that one call with threshold 0 would read as a
-        # dead session and quarantine a healthy account.
+        # so with threshold 0 even a short flood wait on that one call would
+        # come back False (_auth_probe_flood_wait catches the long ones).
         self.client.flood_sleep_threshold = 0
+
+    def _auth_probe_flood_wait(self) -> int:
+        """Seconds still owed on a flood wait Telegram put on the auth probe
+        (updates.GetStateRequest, the one request is_user_authorized()
+        sends), 0 when there is none.
+
+        Telethon records every FloodWait/FloodPremiumWait in
+        `_flood_waited_requests` BEFORE it re-raises (client/users.py), so
+        the wait survives is_user_authorized() swallowing the error. Read
+        only after the probe said "not authorised", so a healthy start
+        sends exactly the same single request it always did. An entry
+        already in the past is a wait Telethon slept through itself."""
+        if GetStateRequest is None:
+            return 0
+        waited = getattr(self.client, "_flood_waited_requests", None)
+        if not isinstance(waited, dict):
+            return 0
+        due = waited.get(GetStateRequest.CONSTRUCTOR_ID)
+        if not isinstance(due, (int, float)):
+            return 0
+        remaining = due - time.time()
+        return max(1, int(remaining + 0.999)) if remaining > 0 else 0
 
     async def stop(self) -> None:
         """Disconnects and releases the MTProto client, freeing the local
@@ -459,8 +557,10 @@ class Telegram:
         detail calls) `resolve()` below."""
         try:
             return await self.client(request)
-        except FloodWaitError as e:
-            raise FloodWait(int(getattr(e, "seconds", 0))) from e
+        except _TRANSLATED as e:
+            # FloodError, not just FloodWaitError: FloodPremiumWait and
+            # SlowModeWait are its siblings, not subclasses of FloodWait.
+            raise _translate(e) from e
 
     async def search(self, keyword: str, limit: int = 50,
                      probe: Any = None, max_results: int = 0) -> list[TelegramEntity]:
@@ -494,14 +594,22 @@ class Telegram:
 
         out: list[TelegramEntity] = []
         for obj, ent in found:
-            if ent.has_photo and time.time() >= self._photos_paused_until:
+            if ent.has_photo and time.time() < self._photos_paused_until:
+                # Skipped, not absent: say so on the row.
+                ent.notes.append(PHOTO_FLOOD_NOTE)
+            elif ent.has_photo:
                 try:
                     photo_bytes = await self.client.download_profile_photo(obj, file=bytes)
                     if photo_bytes:
                         ent.avatar = f"data:image/jpeg;base64,{base64.b64encode(photo_bytes).decode('utf-8')}"
-                except FloodWaitError as e:
-                    wait_s = int(getattr(e, "seconds", 0) or 0)
+                except FloodError as e:
+                    wait_s = _flood_seconds(e)
                     self._photos_paused_until = time.time() + max(wait_s, 1)
+                    ent.notes.append(PHOTO_FLOOD_NOTE)
+                    # The search survives, but Telegram did push back: the
+                    # platform's governor hears it like any other throttle.
+                    governor_for("telegram").record(
+                        Signal(THROTTLED, f"FloodWait {wait_s}s (profile photos)"))
                     log.warning(
                         f"telegram: photo downloads flood-waited for {wait_s}s -- "
                         f"results for {keyword!r} kept without pictures, and no "
@@ -545,8 +653,10 @@ class Telegram:
         except UsernameInvalidError as e:
             raise EntityInaccessible(
                 "invalid", f"{username!r} is not a valid Telegram username") from e
-        except FloodWaitError as e:
-            raise FloodWait(int(getattr(e, "seconds", 0))) from e
+        except _TRANSLATED as e:
+            # A flood wait, a revoked/dead session or a limited account --
+            # pushback, never a fact about `username`.
+            raise _translate(e) from e
         except ChannelPrivateError as e:
             raise EntityInaccessible(
                 "private", f"{username!r} is a private channel/group, or this "
@@ -560,22 +670,44 @@ class Telegram:
             # asking for them only adds failing requests.
             return ent
 
+        # WHAT WAS READ BEFORE A STOP IS KEPT. A flood wait (or a limited
+        # account) part-way through used to throw the half-read entity away
+        # with the exception. It now travels on the exception as `partial`,
+        # and `unread` names every detail the read never reached, so a gap
+        # is stated on the row rather than looking like an empty answer.
+        unread = ((["profile picture"] if ent.has_photo else [])
+                  + ["bio" if ent.kind == "profile" else "members/bio"]
+                  + (["last post"] if ent.kind != "profile" else []))
+        try:
+            await self._read_detail(obj, ent, username, unread)
+        except (FloodWait, AccountLimited) as e:
+            ent.notes.extend(f"{what} not read (stopped early)" for what in unread)
+            e.partial = ent
+            raise
+        return ent
+
+    async def _read_detail(self, obj: Any, ent: TelegramEntity,
+                           username: str | int, unread: list) -> None:
+        """resolve()'s second half: photo, full detail, last post -- in that
+        order, each removed from `unread` once it has been attempted."""
         if ent.has_photo:
             try:
                 photo_bytes = await self.client.download_profile_photo(obj, file=bytes)
                 if photo_bytes:
                     ent.avatar = f"data:image/jpeg;base64,{base64.b64encode(photo_bytes).decode('utf-8')}"
-            except FloodWaitError as e:
+            except _TRANSLATED as e:
                 # See search()'s identical fix -- this used to be silently
                 # swallowed by the generic except below, so a flood-wait
                 # hit here came back as an ordinary OK/PARTIAL row instead
                 # of CHECKPOINT, and Scraper.run() never stopped the batch,
                 # driving the account deeper into the limit on every
-                # subsequent resolve() call.
-                raise FloodWait(int(getattr(e, "seconds", 0))) from e
+                # subsequent resolve() call. A dead session is the same:
+                # it is not "profile picture not read".
+                raise _translate(e) from e
             except Exception as e:
                 log.debug(f"could not download photo for @{username}: {e}")
                 ent.notes.append("profile picture not read")
+            unread.remove("profile picture")
 
         try:
             if ent.kind == "profile":
@@ -587,7 +719,8 @@ class Telegram:
                 ent.about = (getattr(chat, "about", "") or "").strip()
                 if ent.members is None:
                     ent.members = getattr(chat, "participants_count", None)
-        except FloodWait:
+        except _PUSHBACK:
+            # A flood wait or a dead session is not "bio not read".
             raise
         except Exception as e:
             log.debug(f"no full detail for @{username}: {type(e).__name__}")
@@ -596,23 +729,25 @@ class Telegram:
             ent.notes.append(
                 "bio not read" if ent.kind == "profile"
                 else "members/bio not read")
+        unread.remove("bio" if ent.kind == "profile" else "members/bio")
 
         # `get_messages(user, limit=1)` on a USER returns the DM history with
         # the session's own account, so its own sent message became that
         # person's "last post". Only channels and groups have a feed.
         if ent.kind != "profile":
             ent.last_post_iso = await self.last_post(obj, ent.notes)
-        return ent
+            unread.remove("last post")
 
     async def last_post(self, entity: Any, notes: Optional[list] = None) -> str:
         """Newest real post date of a channel/group, "" when none could be
         read. Service messages (joins, pins, title changes) are not posts and
         are skipped. A failed read is appended to `notes` when given;
-        FloodWait always propagates."""
+        pushback (FloodWait, a dead session, a limited account) always
+        propagates."""
         try:
             msgs = await self.client.get_messages(entity, limit=5)
-        except FloodWaitError as e:
-            raise FloodWait(int(getattr(e, "seconds", 0))) from e
+        except _TRANSLATED as e:
+            raise _translate(e) from e
         except Exception as e:
             log.debug(f"last post not read: {type(e).__name__}: {e}")
             if notes is not None:
@@ -645,7 +780,8 @@ class Sweep:
     browser platforms' Sweep: Telegram's global search returns a single
     capped page with no cursor (see this module's own top docstring), so
     there is no pagination state to carry -- `stopped` is always
-    "exhausted" (a clean single-page result) or "flood-wait"/"error"."""
+    "exhausted" (a clean single-page result) or "flood-wait"/"error", or
+    "checkpoint" when Telegram has limited the account (PEER_FLOOD)."""
 
     keyword: str
     tab: str = "all"
@@ -655,6 +791,10 @@ class Sweep:
     complete: bool = False
     seconds: float = 0.0
     error: str = ""
+    # HOW LONG TELEGRAM SAID TO WAIT, on a "flood-wait" stop (0 otherwise).
+    # The runner rests the account for exactly this long rather than
+    # handing it straight back to the next run inside the same wait.
+    retry_after_s: float = 0.0
     # Where in OUR code the sweep failed, when it raised -- see
     # shared/diagnostics.py::where. Blank for a sweep that ended itself.
     where: str = ""
@@ -776,6 +916,15 @@ class Discovery:
             out.stopped, out.complete = "exhausted", True
         except FloodWait as e:
             out.stopped, out.error = "flood-wait", str(e)
+            out.retry_after_s = float(e.seconds)
+            governor_for("telegram").record(Signal(THROTTLED, f"FloodWait {e.seconds}s"))
+        except AccountLimited as e:
+            # A limited account, not a wait: a checkpoint-coded stop, so the
+            # runner quarantines this session (classify_failure reads the
+            # "checkpoint" in the message) and hands the keyword on.
+            out.stopped, out.error = STOP_CODE[CHALLENGED], str(e)
+            governor_for("telegram").record(Signal(CHALLENGED, "PEER_FLOOD (account limited)"))
+            log.error(f"[telegram] {keyword!r} sweep stopped: {out.error}")
         except Exception as e:
             out.stopped, out.error = "error", f"{type(e).__name__}: {e}"
             out.where = diagnostics.where(e)

@@ -24,9 +24,11 @@ from typing import Optional
 from backend.shared import diagnostics
 from backend.shared.avatars import hd_picture_url
 from backend.shared.models.row import Row
+from backend.shared.pushback import CHALLENGED, THROTTLED, Signal, governor_for
 from backend.shared.text import (name_score, normalized_host,
                                    parse_normalized_url)
-from backend.platforms.telegram.discovery_engine import (EntityInaccessible,
+from backend.platforms.telegram.discovery_engine import (AccountLimited,
+                                                          EntityInaccessible,
                                                           FloodWait,
                                                           NotAuthorised,
                                                           Telegram,
@@ -205,6 +207,14 @@ class Scraper:
 
         try:
             ent = await self.tg.resolve(ref)
+        except (FloodWait, AccountLimited) as e:
+            # KEEP WHAT WAS READ. resolve() hands back the half-read entity
+            # (with notes naming what it never reached); it rides on the
+            # exception to one(), which marks the row CHECKPOINT.
+            if (partial := getattr(e, "partial", None)) is not None:
+                self.fill(row, partial)
+            e.row = row
+            raise
         except EntityInaccessible as e:
             # NOT GONE: Telegram refused to show it, which says nothing
             # about whether it still exists. Only UsernameNotOccupied (a
@@ -310,11 +320,22 @@ class Scraper:
         unreachable channel cannot end a job."""
         try:
             return await self.process(u, tgt, feed, known)
-        except FloodWait as e:
-            row = Row(url=normalize_url(u), target=tgt, original_feed=feed)
-            row.profile_id = username_of(row.url)
+        except (FloodWait, AccountLimited) as e:
+            # process() attaches the row it had filled so far; a fresh one
+            # only when the stop came before it got that far.
+            row = getattr(e, "row", None)
+            if row is None:
+                row = Row(url=normalize_url(u), target=tgt, original_feed=feed)
+                # t.me/c/<id> links have no username -- the id is the
+                # profile, exactly as process() records it.
+                num = numeric_id_of(row.url)
+                row.profile_id = username_of(row.url) or (str(num) if num is not None else "")
             row.status = "CHECKPOINT"  # stop the run, same as a challenge
             row.note(str(e))
+            if isinstance(e, FloodWait):
+                governor_for("telegram").record(Signal(THROTTLED, f"FloodWait {e.seconds}s"))
+            else:
+                governor_for("telegram").record(Signal(CHALLENGED, "PEER_FLOOD (account limited)"))
             return row
         except Exception as e:
             row = Row(url=normalize_url(u), target=tgt, original_feed=feed)
