@@ -60,6 +60,8 @@ from backend.shared.avatars import hd_picture_url
 from backend.shared.logging import get_logger
 from backend.shared.models.hit import Hit, hit_to_row
 from backend.shared.models.row import Row
+from backend.shared.pushback import (CHALLENGED, STOP_CODE, THROTTLED, Signal,
+                                     classify_response, governor_for)
 
 log = get_logger("youtube.api")
 
@@ -108,6 +110,74 @@ class QuotaExceeded(RuntimeError):
     """The daily allowance is gone, retrying today will not help."""
 
 
+class YouTubeKeyInvalid(RuntimeError):
+    """Google rejected the API key itself. A human has to replace it, so
+    retrying the same call is pointless."""
+
+
+class YouTubePushback(RuntimeError):
+    """Google pushed back on US (the key or the IP), not on one channel: a
+    per-minute rate limit, a 429, or the "unusual traffic" check.
+
+    `stop_code` is shared/pushback.py's STOP_CODE for the kind, so a sweep
+    can report it as-is. The message never carries a status code or the
+    response body: shared/resilience.classify_failure reads it, and a stray
+    "403" in it would turn a throttle into a dead key.
+    """
+
+    def __init__(self, signal: Signal, endpoint: str = ""):
+        self.signal = signal
+        self.kind = signal.kind
+        self.stop_code = STOP_CODE[signal.kind]
+        what = "challenged" if signal.kind == CHALLENGED else "throttled"
+        where = f" {endpoint}" if endpoint else ""
+        super().__init__(f"{self.stop_code}: youtube{where} {what} ({_plain_reason(signal)})")
+
+
+def _plain_reason(signal: Signal) -> str:
+    """The signal's reason with no digits in it, so the message cannot match
+    resilience.py's status-code patterns (see YouTubePushback)."""
+    reason = signal.reason or ""
+    if reason.startswith("HTTP") or any(ch.isdigit() for ch in reason):
+        return ("Google showed its unusual-traffic check" if signal.kind == CHALLENGED
+                else "Google said too many requests")
+    return reason
+
+
+# Google's per-MINUTE limit. Its body can also say "quota" ("Quota exceeded
+# for quota metric 'Queries' and limit 'Queries per minute'"), which is why
+# this is checked before the daily-quota test: a minute's wait fixes it, a
+# day's stop does not need to be paid for it.
+_PER_MINUTE_MARKERS = ("per minute", "ratelimitexceeded", "userratelimitexceeded",
+                       "rate limit exceeded")
+# The key itself is rejected. Only Google's own markers: the old test matched
+# any body containing "key" or "invalid", which also caught unrelated 403s.
+_KEY_INVALID_MARKERS = ("keyinvalid", "api key not valid", "api_key_invalid",
+                        "api key expired")
+_SORRY_PAGE = "google.com/sorry"
+
+
+def _raise_pushback(signal: Signal, endpoint: str = ""):
+    """Feed YouTube's governor and raise. Only THROTTLED/CHALLENGED reach
+    here -- an EXPIRED 403 is about one channel or the key, not the pace."""
+    governor_for("youtube").record(signal)
+    raise YouTubePushback(signal, endpoint)
+
+
+class _Page(list):
+    """One search page's items, plus the `pageInfo.totalResults` the API
+    reported for it. A list, so every caller that unpacks
+    `items, token = ...` is unaffected."""
+
+    total_results: int = 0
+
+
+class _Handles(dict):
+    """`handles()`'s answer, plus the pushback that cut it short, if any."""
+
+    pushback: Optional["YouTubePushback"] = None
+
+
 class YouTubeAPI:
     """WHAT: the thin Data API v3 client both engines share. HOW: plain
     urllib in a worker thread -- no browser, no session, no dependency
@@ -140,14 +210,30 @@ class YouTubeAPI:
         url = f"{BASE}/{endpoint}?{q}"
         try:
             with urllib.request.urlopen(url, timeout=30) as r:
+                # Redirected onto Google's "unusual traffic" page: that is a
+                # challenge, not a response to parse.
+                if _SORRY_PAGE in str(getattr(r, "geturl", lambda: "")() or ""):
+                    _raise_pushback(Signal(CHALLENGED, "redirected to Google's sorry page"),
+                                    endpoint)
                 return json.load(r)
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", "replace")
             body_lower = body.lower()
+            final_url = str(getattr(e, "url", "") or "")
+            if e.code in (403, 429) and any(m in body_lower for m in _PER_MINUTE_MARKERS):
+                _raise_pushback(Signal(THROTTLED, "per-minute rate limit"), endpoint)
             if e.code in (403, 429) and ("quota" in body_lower or "quotaexceeded" in body_lower):
                 raise QuotaExceeded("YouTube daily quota exhausted") from e
-            if e.code == 403 and any(tok in body_lower for tok in ("key", "api key", "invalid", "badrequest")):
-                raise RuntimeError(f"youtube {endpoint} 403: API key invalid - {body[:200]}") from e
+            if e.code in (400, 403) and any(m in body_lower for m in _KEY_INVALID_MARKERS):
+                raise YouTubeKeyInvalid(
+                    f"youtube {endpoint} {e.code}: API key invalid - {body[:200]}") from e
+            if e.code in (403, 429):
+                # Only a throttle or a challenge slows the platform. A plain
+                # 403 (EXPIRED) is usually one forbidden channel or playlist
+                # and keeps today's behaviour below.
+                sig = classify_response("youtube", e.code, f"{body}\n{final_url}")
+                if sig.kind in (THROTTLED, CHALLENGED):
+                    _raise_pushback(sig, endpoint)
             raise RuntimeError(f"youtube {endpoint} {e.code}: {body[:200]}") from e
 
     async def get(self, endpoint: str, **params) -> dict:
@@ -191,7 +277,12 @@ class YouTubeAPI:
         for attempt in range(3):
             try:
                 data = await self.get("search", **params)
-                items = data.get("items", [])
+                items = _Page(data.get("items", []))
+                try:
+                    items.total_results = int(
+                        (data.get("pageInfo") or {}).get("totalResults") or 0)
+                except (TypeError, ValueError):
+                    items.total_results = 0
                 token = data.get("nextPageToken", "")
                 # YouTube occasionally returns an empty items list on
                 # transient hiccups even with a 200 status. Retry once
@@ -205,7 +296,10 @@ class YouTubeAPI:
                     await asyncio.sleep(1.5 * (attempt + 1))
                     continue
                 return items, token
-            except QuotaExceeded:
+            except (QuotaExceeded, YouTubePushback, YouTubeKeyInvalid):
+                # None of these is a transient: retrying a throttle hits
+                # Google again while it is asking us to stop, and a dead key
+                # stays dead.
                 raise
             except Exception as e:
                 last_exc = e
@@ -256,7 +350,7 @@ class YouTubeAPI:
         the id form per channel. Losing the readable URL must not be able
         to lose the sweep.
         """
-        out: dict[str, str] = {}
+        out = _Handles()
         if not ids:
             return out
         try:
@@ -265,6 +359,13 @@ class YouTubeAPI:
                 custom = str(((ch.get("snippet") or {}).get("customUrl")) or "").strip()
                 if cid and custom:
                     out[cid] = custom
+        except YouTubePushback as e:
+            # Still never raises -- the page that paid for these ids must
+            # not be lost -- but the pushback rides back on the answer so
+            # sweep() stops after keeping this page instead of asking for
+            # another one while Google is saying slow down.
+            log.warning(f"youtube: channel handles unresolved for {len(ids)} id(s) ({e})")
+            out.pushback = e
         except Exception as e:                        # noqa: BLE001 - see NEVER RAISES
             # Every exception, not just the API's own RuntimeError: a
             # network timeout or dropped connection surfaces from urllib as
@@ -397,7 +498,8 @@ K_YT_TITLE = "snippet.{channelTitle|title}"
 class Sweep:
     """WHAT: the result of sweeping one keyword -- the hits, plus WHY the
     sweep ended. HOW: `stopped` carries the reason as a short tag
-    (cap:results, cap:seconds, exhausted, quota, error) and `complete` is
+    (cap:results, cap:seconds, exhausted, quota, rate_limited, checkpoint,
+    empty-unconfirmed, error) and `complete` is
     True only for `exhausted`, so a caller can tell "there was no more to
     find" apart from "we stopped early". Returning a short list without
     that distinction would make a quota failure look like a clean result.
@@ -563,10 +665,34 @@ class Discovery:
                             [hit_to_row(h) for h in page_hits])
                         if asyncio.iscoroutine(res):
                             await res
-                    except Exception:
-                        pass
+                    except Exception as e:                # noqa: BLE001 - never ends the sweep
+                        # Kept non-fatal (the finished Sweep still carries
+                        # every hit), but named: a callback that keeps failing
+                        # means the live view is not filling in.
+                        log.warning(
+                            f"youtube {keyword!r}: progress callback failed on page "
+                            f"{out.pages} ({type(e).__name__}: {e})")
 
                 if out.stopped == "cap:results":
+                    break
+
+                # The handle lookup was throttled: this page is kept above,
+                # and no further page is asked for while Google says stop.
+                if (pb := getattr(handle_by_id, "pushback", None)) is not None:
+                    raise pb
+
+                if (out.pages == 1 and not items and not token
+                        and getattr(items, "total_results", 0) > 0):
+                    # The API says results exist and sent none, even after
+                    # search_channels' retries. That is not "no such
+                    # channel": report it as unconfirmed, not complete.
+                    log.warning(
+                        f"youtube {keyword!r}: first page empty although the API "
+                        f"reported {items.total_results} result(s) -- not marking "
+                        f"this keyword complete")
+                    out.stopped = "empty-unconfirmed"
+                    out.error = ("youtube reported results for this keyword but "
+                                 "the first page came back empty")
                     break
 
                 if not token:
@@ -575,6 +701,10 @@ class Discovery:
                     break
         except QuotaExceeded as e:
             out.stopped, out.error = "quota", str(e)
+        except YouTubePushback as e:
+            # The engine's own verdict, in the code the runner already turns
+            # into a cool-down. str(e) carries no status digits and no body.
+            out.stopped, out.error = e.stop_code, str(e)
         except Exception as e:
             out.stopped, out.error = "error", f"{type(e).__name__}: {e}"
             out.where = diagnostics.where(e)

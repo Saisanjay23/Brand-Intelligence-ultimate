@@ -15,6 +15,7 @@ no-ops kept only to satisfy the same interface as the browser platforms.
 from __future__ import annotations
 
 import asyncio
+import urllib.error
 import urllib.request
 from typing import Optional
 from urllib.parse import unquote, urlparse
@@ -29,7 +30,16 @@ from backend.shared.text import name_score, normalized_host, parse_normalized_ur
 from backend.platforms.youtube.discovery_engine import (RE_DEFAULT_PIC,
                                                          QuotaExceeded,
                                                          YouTubeAPI,
+                                                         YouTubePushback,
                                                          channel_url)
+from backend.shared.pushback import THROTTLED, Signal, governor_for
+
+_SORRY_PAGE = "google.com/sorry"
+
+
+class _AvatarThrottled(Exception):
+    """The avatar host answered with a throttle (429 or Google's sorry
+    page) instead of the image."""
 
 
 def normalize_url(url: str) -> str:
@@ -144,6 +154,13 @@ class Scraper:
         except QuotaExceeded as e:
             _log.info(f"SESSION: quota exhausted for today -- key itself still valid ({e})")
             return True
+        except YouTubePushback as e:
+            # A throttle or Google's unusual-traffic check is about our pace
+            # or our IP, not the key. Inconclusive: raised, so the caller
+            # leaves the key's status alone (a "checkpoint" message would
+            # otherwise classify as a rejected key below).
+            _log.warning(f"SESSION: check inconclusive -- {e}")
+            raise
         except Exception as e:
             reason = classify_failure(e)
             if reason in ("expired", "checkpointed"):
@@ -247,19 +264,38 @@ class Scraper:
 
         self.fill(row, ch)
         await self._confirm_avatar(row)
+        await self._read_last_upload(row, ch)
+
+        row.status = "OK" if row.profile_name else "PARTIAL"
+        return row
+
+    async def _read_last_upload(self, row: Row, ch: dict) -> None:
+        """The newest-upload date, after `fill()` has already read the
+        channel. Shared by process() and run().
+
+        A FAILURE HERE DOES NOT DISCARD THE CHANNEL. It used to re-raise any
+        non-404 error, which turned a channel already read (name,
+        subscribers, created date) into an ERROR row with none of it. Now an
+        ordinary failure is noted and `posts_seen` is left blank (unknown,
+        which completeness reports as unread). Quota and a throttle still
+        propagate: those stop the whole batch, not one field."""
         uploads = ((ch.get("contentDetails") or {}).get("relatedPlaylists") or {}).get(
             "uploads", ""
         )
-        if iso := await self.api.latest_upload(uploads):
+        try:
+            iso = await self.api.latest_upload(uploads)
+        except (QuotaExceeded, YouTubePushback):
+            raise
+        except Exception as e:                        # noqa: BLE001 - see docstring
+            row.note(f"latest upload unread ({type(e).__name__}: {e})")
+            return
+        if iso:
             row.last_post_iso = iso
             row.posts_seen = "yes"
             row.mark("last_post", "api")
         elif (ch.get("statistics") or {}).get("videoCount") == "0":
             row.posts_seen = "no"
             row.mark("last_post", "api-no-videos")
-
-        row.status = "OK" if row.profile_name else "PARTIAL"
-        return row
 
     @staticmethod
     def _seed_readable_url(row: Row, kind: str, ref: str, known: Optional[dict]) -> None:
@@ -377,8 +413,17 @@ class Scraper:
         platform's API client already does its I/O rather than pulling in an
         async HTTP client for one call."""
         req = urllib.request.Request(uri, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=cls._AVATAR_TIMEOUT) as resp:
-            return resp.read(cls._AVATAR_MAX_BYTES)
+        try:
+            with urllib.request.urlopen(req, timeout=cls._AVATAR_TIMEOUT) as resp:
+                # Redirected onto Google's "unusual traffic" page: whatever
+                # comes back is that page, not the avatar.
+                if _SORRY_PAGE in str(getattr(resp, "geturl", lambda: "")() or ""):
+                    raise _AvatarThrottled("avatar fetch redirected to Google's sorry page")
+                return resp.read(cls._AVATAR_MAX_BYTES)
+        except urllib.error.HTTPError as e:
+            if e.code == 429 or _SORRY_PAGE in str(getattr(e, "url", "") or ""):
+                raise _AvatarThrottled("avatar fetch answered too many requests") from e
+            raise
 
     async def _confirm_avatar(self, row: Row) -> None:
         """Settle has_custom_pic from the IMAGE, which for YouTube is the
@@ -396,15 +441,35 @@ class Scraper:
         two flat colours), which keeps this to a fraction of channels rather
         than one extra fetch each.
 
-        NON-FATAL by construction: on any failure the row keeps whatever
-        `fill()` decided. A missed placeholder is a far smaller error than a
-        broken analysis run.
+        NON-FATAL by construction: on an ordinary failure (timeout, 404) the
+        row keeps whatever `fill()` decided. A missed placeholder is a far
+        smaller error than a broken analysis run.
+
+        EXCEPT WHEN GOOGLE IS THROTTLING US (a 429 or its sorry page). That
+        is recorded on YouTube's governor, the rest of this batch stops
+        fetching avatars, and the row's logo goes back to UNKNOWN (None)
+        with "avatar check unavailable" noted. `fill()`'s True here is only
+        "a URL exists" (OBSERVED, the weakest evidence) on exactly the URLs
+        most likely to be generated letter tiles; None reads as "No" in the
+        export and never overrides stronger stored evidence (see
+        shared/logo_verdict.py), so the row claims nothing nobody checked.
         """
         uri = row.profile_pic_url
         if not uri or YOUTUBE_GENERATED_PREFIX not in uri:
             return
+        if getattr(self, "_avatar_throttled", False):
+            self._avatar_unchecked(row)
+            return
         try:
             data = await asyncio.to_thread(self._read_avatar, uri)
+        except _AvatarThrottled as e:
+            governor_for("youtube").record(Signal(THROTTLED, str(e)))
+            self._avatar_throttled = True
+            from backend.shared.logging import get_logger as _gl
+            _gl("platforms.youtube.analysis").warning(
+                f"{e} -- skipping the remaining avatar checks in this batch")
+            self._avatar_unchecked(row)
+            return
         except Exception:
             return
         if not data:
@@ -413,6 +478,14 @@ class Scraper:
         if generated is not None:
             row.has_custom_pic = not generated
             row.mark("logo", "api+image")
+
+    @staticmethod
+    def _avatar_unchecked(row: Row) -> None:
+        """The picture could not be looked at because Google was throttling:
+        unknown, not "has one"."""
+        row.has_custom_pic = None
+        row.mark("logo", "api-avatar-unchecked")
+        row.note("avatar check unavailable (youtube throttled the image host)")
 
     async def one(self, u: str, tgt: str, feed: str, known: Optional[dict] = None) -> Row:
         """WHAT: process() that never raises -- always a Row. HOW: quota
@@ -424,7 +497,7 @@ class Scraper:
         quota as a bad key -- see its docstring."""
         try:
             return await self.process(u, tgt, feed, known)
-        except QuotaExceeded as e:
+        except (QuotaExceeded, YouTubePushback) as e:
             row = Row(url=normalize_url(u), target=tgt, original_feed=feed)
             row.status = "CHECKPOINT"  # stops the run, same as a challenge
             row.note(str(e))
@@ -500,6 +573,9 @@ class Scraper:
         id_refs = list(dict.fromkeys(
             [ref for _, _, _, kind, ref in resolved if kind == "id" and ref]
             + [sid for sid in seed_ids if sid.startswith("UC")]))
+        # A fresh batch gets a fresh chance at the avatar host.
+        self._avatar_throttled = False
+        rows: list[Row] = rows_out if rows_out is not None else []
         by_id: dict[str, dict] = {}
         batch_failed = False
         if id_refs:
@@ -507,11 +583,18 @@ class Scraper:
                 by_id = {c.get("id"): c for c in await self.api.channels(id_refs) if c.get("id")}
             except QuotaExceeded as e:
                 log.warning(f"QUOTA EXHAUSTED before the batch channel lookup -- stopping. {e}")
-                return [
-                    Row(url=url, target=tgt, original_feed=feed, entity_type="channel",
-                        status="CHECKPOINT", notes=str(e))
-                    for url, tgt, feed, _, _ in resolved
-                ]
+                # INTO `rows` (the caller's `rows_out`), not just returned:
+                # the runner reads that list, so a stop returned only here
+                # was never seen, the key never cooled and the job said done.
+                rows.extend(self._stopped_rows(resolved, str(e), "youtube daily quota exhausted"))
+                return rows
+            except YouTubePushback as e:
+                # NOT the per-channel fallback below: one call per channel
+                # into an API that is telling us to slow down is the worst
+                # possible answer to it.
+                log.warning(f"YOUTUBE PUSHBACK before the batch channel lookup -- stopping. {e}")
+                rows.extend(self._stopped_rows(resolved, str(e), str(e)))
+                return rows
             except Exception as e:
                 # Anything else (a network blip, a 5xx) costs the batch
                 # shortcut, not the batch: each channel below is then looked
@@ -533,7 +616,6 @@ class Scraper:
                 by_id[cid] = found[0]
             return found[0] if found else None
 
-        rows: list[Row] = rows_out if rows_out is not None else []
         for i, (url, tgt, feed, kind, ref) in enumerate(resolved, 1):
             if cancelled(self.a):
                 log.info(f"cancelled -- stopping after {len(rows)} of {len(resolved)} channel(s)")
@@ -561,14 +643,7 @@ class Scraper:
                 else:
                     self.fill(row, ch)
                     await self._confirm_avatar(row)
-                    uploads = ((ch.get("contentDetails") or {}).get("relatedPlaylists") or {}).get("uploads", "")
-                    if iso := await self.api.latest_upload(uploads):
-                        row.last_post_iso = iso
-                        row.posts_seen = "yes"
-                        row.mark("last_post", "api")
-                    elif (ch.get("statistics") or {}).get("videoCount") == "0":
-                        row.posts_seen = "no"
-                        row.mark("last_post", "api-no-videos")
+                    await self._read_last_upload(row, ch)
                     row.status = "OK" if row.profile_name else "PARTIAL"
             except QuotaExceeded as e:
                 row.status = "CHECKPOINT"
@@ -577,6 +652,18 @@ class Scraper:
                 self.report(i, len(resolved), url, row)
                 log.warning("QUOTA EXHAUSTED -- stopping.")
                 break
+            except YouTubePushback as e:
+                # Same stop as quota: CHECKPOINT cools the key in the runner.
+                # Unlike quota, the channels after this one are written as
+                # "not attempted -- <the throttle>" here, so they are not
+                # reported under the runner's quota wording.
+                row.status = "CHECKPOINT"
+                row.note(str(e))
+                rows.append(row)
+                self.report(i, len(resolved), url, row)
+                log.warning(f"YOUTUBE PUSHBACK -- stopping. {e}")
+                rows.extend(self._not_attempted(resolved[i:], str(e)))
+                break
             except Exception as e:
                 row.status = "ERROR"
                 row.note(f"{type(e).__name__}: {e}")
@@ -584,3 +671,28 @@ class Scraper:
             rows.append(row)
             self.report(i, len(resolved), url, row)
         return rows
+
+    @staticmethod
+    def _not_attempted(resolved_tail: list, why: str) -> list[Row]:
+        """ERROR rows for jobs a batch-wide stop left unread, each saying
+        why. ERROR, not CHECKPOINT: the runner cools the key once per
+        CHECKPOINT row and its cool-down climbs with each one (15m, 1h, 6h,
+        24h), so N CHECKPOINT rows for one event would park the key for a
+        day over a per-minute throttle."""
+        return [
+            Row(url=url, target=tgt, original_feed=feed, entity_type="channel",
+                status="ERROR", notes=f"not attempted -- {why}")
+            for url, tgt, feed, _, _ in resolved_tail
+        ]
+
+    @classmethod
+    def _stopped_rows(cls, resolved: list, stop_note: str, why: str) -> list[Row]:
+        """A batch stopped before any channel was read: ONE CHECKPOINT row
+        (the runner's signal to cool the key and fail the job) and the rest
+        as not attempted."""
+        if not resolved:
+            return []
+        url, tgt, feed, _, _ = resolved[0]
+        first = Row(url=url, target=tgt, original_feed=feed, entity_type="channel",
+                    status="CHECKPOINT", notes=stop_note)
+        return [first, *cls._not_attempted(resolved[1:], why)]
