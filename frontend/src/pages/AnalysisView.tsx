@@ -39,6 +39,31 @@ function pageScroller(el: HTMLElement): HTMLElement {
     ?? document.documentElement;
 }
 
+export const CANONICAL_PLATFORM_ORDER = [
+  "facebook",
+  "instagram",
+  "twitter",
+  "youtube",
+  "telegram",
+  "tiktok",
+  "threads",
+];
+
+export const PLATFORM_NAMES: Record<string, string> = {
+  facebook: "Facebook",
+  instagram: "Instagram",
+  twitter: "Twitter",
+  youtube: "YouTube",
+  telegram: "Telegram",
+  tiktok: "TikTok",
+  threads: "Threads",
+};
+
+export const getPlatformDisplayName = (platform: string): string => {
+  const p = (platform || "").toLowerCase();
+  return PLATFORM_NAMES[p] || (p ? p.charAt(0).toUpperCase() + p.slice(1) : "");
+};
+
 const SAMPLE_URLS = [
   "https://www.facebook.com/zuck",
   "https://www.instagram.com/instagram",
@@ -720,17 +745,14 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
     if (box && box.getBoundingClientRect().top < 0) box.scrollIntoView({ block: "start" });
   }, [searchQuery, platformFilter, riskFilter]);
 
-  // Filtered rows for the table -- grouped one platform after another (in
-  // the same order the Platform Status Chips above the table show them),
-  // rather than interleaved in whatever order each platform's scrape
-  // happened to finish an item in. Array.prototype.sort is stable, so
-  // items within one platform keep their original relative order.
+  // Filtered rows for the table -- grouped one platform after another in
+  // canonical platform order (Facebook leading on row 1, then Instagram, etc.),
+  // with items within each platform keeping their original relative order.
   const filteredItems = useMemo(() => {
     if (!allItems.length) return [];
-    const platformOrder = Object.keys(jobData?.platform_progress || {});
     const orderIndex = (p: string) => {
-      const i = platformOrder.indexOf(p);
-      return i === -1 ? platformOrder.length : i;
+      const idx = CANONICAL_PLATFORM_ORDER.indexOf((p || "").toLowerCase());
+      return idx === -1 ? CANONICAL_PLATFORM_ORDER.length : idx;
     };
     const filtered = allItems.filter((it) => {
       // Platform filter
@@ -753,7 +775,7 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
       return true;
     });
     return filtered.sort((a, b) => orderIndex(a.platform) - orderIndex(b.platform));
-  }, [allItems, jobData?.platform_progress, platformFilter, riskFilter, searchQuery]);
+  }, [allItems, platformFilter, riskFilter, searchQuery]);
 
   // Draw the next step once the "scroll for more" marker comes within 600px
   // of the bottom of the window. Re-armed whenever a step lands, so a tall
@@ -953,6 +975,9 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
       if (formatMode === "legacy") {
         mergedRow["Risk Score"] = riskScore;
         if ("priority" in mergedRow) mergedRow["priority"] = priority;
+        if (!itemEdits["Original Name"]) {
+          mergedRow["Original Name"] = getPlatformDisplayName(it.platform) || mergedRow["Original Name"] || "";
+        }
       } else {
         mergedRow["RiskScore"] = riskScore;
       }
@@ -1849,6 +1874,9 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
                   filteredItems.slice(0, shownRows).map((it) => {
                     const originalRow = formatMode === "incident" ? it.incident_row : it.legacy_row;
                     const row = { ...originalRow, ...(edits[it.id] || {}) };
+                    if (formatMode === "legacy" && !(edits[it.id] && "Original Name" in edits[it.id])) {
+                      row["Original Name"] = getPlatformDisplayName(it.platform) || row["Original Name"] || "";
+                    }
                     // Addressed by result_id wherever there is one, so the
                     // thumbnail still resolves after the job that captured
                     // it has aged out. The job endpoint is the fallback for

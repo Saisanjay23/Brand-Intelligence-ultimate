@@ -77,6 +77,12 @@ from backend.stealth import levels as stealth_levels
 
 log = get_logger("analysis.runner")
 
+# Order in which platforms are grouped for display and export. Facebook leads
+# on row 1, followed by Instagram, Twitter, etc.
+CANONICAL_PLATFORM_ORDER = (
+    "facebook", "instagram", "twitter", "youtube", "telegram", "tiktok", "threads"
+)
+
 # Bounded so a process left running for weeks cannot accumulate jobs. Both
 # ceilings are deliberately generous -- this is an interactive tool, an
 # analyst is not going to have 200 live jobs -- and exist to stop unbounded
@@ -878,6 +884,14 @@ class AnalysisRunner:
                 platform=platform, entity_id=entity_id,
                 org_id=org_id,
             ))
+
+        def _platform_order(it: AnalysisItem) -> int:
+            try:
+                return CANONICAL_PLATFORM_ORDER.index(it.platform.lower())
+            except ValueError:
+                return len(CANONICAL_PLATFORM_ORDER)
+
+        items.sort(key=_platform_order)
 
         job = AnalysisJob(
             id=uuid.uuid4().hex[:12], target_name=target_name.strip(),
@@ -2081,13 +2095,12 @@ class AnalysisRunner:
         Score column carried no information and an analyst could not tell a
         real logo match from an assumed one. These come from the Row's own
         resolved values (see shared/models/row.py), which is the point of
-        scraping the profile at all. `Original Name` (legacy) and
-        `AssetName` (incident) both prefer `main_keyword` -- the PARENT
-        keyword this profile was found/validated under -- over whatever the
-        caller typed as `target_name`, which no current UI flow actually
-        collects ("Analyse Validated Profiles" doesn't send it, and the
-        paste-URLs form always sends an empty string), so `target_name`
-        alone left both columns permanently blank in practice.
+        scraping the profile at all. `AssetName` (incident) prefers
+        `main_keyword` -- the PARENT keyword this profile was found/validated
+        under -- over whatever the caller typed as `target_name`.
+        `Original Name` (legacy) carries `platform_name` (the display name of
+        the platform, e.g. "Facebook"), with Facebook on row 1 and all
+        Facebook URLs grouped together beside it.
         """
         platform_name = registry.display_name(it.platform)
         def yes_no(v):
@@ -2140,13 +2153,9 @@ class AnalysisRunner:
         # names and order are a fixed contract with what consumes the sheet
         # downstream -- a value can be blank, a column cannot go missing.
         it.legacy_row = {
-            # Same priority as AssetName below: the parent keyword this
-            # profile was found/validated under, before whatever the caller
-            # typed as target_name (see _build_rows' own docstring for why
-            # that alone was never enough). "Original feed" has no keyword
-            # equivalent -- a feed URL, not a name -- so it stays exactly
-            # what the caller typed, blank included.
-            "Original Name": it.main_keyword or job.target_name,
+            # "Original Name" carries the platform name (e.g. Facebook, Instagram),
+            # with Facebook on row 1 and all its URLs grouped together beside it.
+            "Original Name": platform_name,
             "Original feed": job.official_feed,
             "IMPERSONATED": it.url,
             "Profile name": it.profile_name,

@@ -1,12 +1,7 @@
-"""AssetName (Platform Format) and Original Name (Old Format) both name the
-PARENT keyword a profile was found/validated under, not whatever the caller
-typed as `target_name` -- because no current UI flow actually collects one.
-"Analyse Validated Profiles" never sends it (see discovery.py's
-`analyse_validated`) and the paste-URLs analysis form always sends an empty
-string (see analysisApi.ts/quickAnalysisApi.ts's callers), so a column
-sourced from `target_name` alone was permanently blank in practice.
-`main_keyword` -- seeded from the validated profile's own `keywords[0]`
-(see discovery.py's `_seed_from_doc`) -- is the thing that is actually known.
+"""AssetName (Platform Format) names the PARENT keyword a profile was
+found/validated under, while Original Name (Old Format) carries the platform
+name (e.g. "Facebook"), with Facebook on row 1 and all Facebook URLs grouped
+together beside it.
 
 Both export layouts share one row-builder (`AnalysisRunner._build_rows`), so
 proving this here covers the XLSX export and the Copy TSV button at once --
@@ -21,53 +16,62 @@ from backend.analysis.runner import AnalysisItem, AnalysisJob, AnalysisRunner
 from backend.shared.models.row import Row
 
 
-def _populate(*, job_kwargs: dict | None = None, known: dict | None = None,
-              row_kwargs: dict | None = None) -> AnalysisItem:
+def _populate(*, platform: str = "facebook", job_kwargs: dict | None = None,
+              known: dict | None = None, row_kwargs: dict | None = None) -> AnalysisItem:
     runner = AnalysisRunner()
-    item = AnalysisItem(id="i", raw_url="u", url="https://facebook.com/x",
-                        platform="facebook", entity_id="x")
-    row = Row(url="https://facebook.com/x", target="Gautam Adani", **(row_kwargs or {}))
+    item = AnalysisItem(id="i", raw_url="u", url=f"https://{platform}.com/x",
+                        platform=platform, entity_id="x")
+    row = Row(url=f"https://{platform}.com/x", target="Gautam Adani", **(row_kwargs or {}))
     asyncio.run(runner._populate(AnalysisJob(id="j", **(job_kwargs or {})), item, row, known))
     return item
 
 
-class TestAssetNameAndOriginalNamePreferTheParentKeyword:
-    def test_validated_profile_uses_its_seeded_parent_keyword(self):
-        """The ordinary "Analyse Validated Profiles" path: no target_name is
-        sent, but `known["main_keyword"]` is -- discovery already resolved
-        the parent this profile was found under."""
+class TestAssetNameUsesParentKeywordAndOriginalNameUsesPlatformName:
+    def test_validated_profile_uses_its_seeded_parent_keyword_for_asset_name(self):
+        """AssetName gets the parent keyword, while Original Name gets the
+        platform display name."""
         item = _populate(known={"main_keyword": "Gautam Adani"})
         assert item.incident_row["AssetName"] == "Gautam Adani"
-        assert item.legacy_row["Original Name"] == "Gautam Adani"
+        assert item.legacy_row["Original Name"] == "Facebook"
 
     def test_manually_typed_target_name_still_works_with_no_known_keyword(self):
         """A pasted-URL job with no discovery behind it, where a caller (the
         API directly, not today's UI) did supply target_name by hand."""
         item = _populate(job_kwargs={"target_name": "Adani Group"})
         assert item.incident_row["AssetName"] == "Adani Group"
-        assert item.legacy_row["Original Name"] == "Adani Group"
+        assert item.legacy_row["Original Name"] == "Facebook"
 
     def test_seeded_parent_keyword_wins_over_a_typed_target_name(self):
         """Both are present: the parent keyword is the more specific, more
         current fact about THIS profile, so it wins over a job-wide typed
-        name that may cover profiles found under several different parents."""
+        name for AssetName."""
         item = _populate(
             job_kwargs={"target_name": "Adani Group"},
             known={"main_keyword": "Gautam Adani"},
         )
         assert item.incident_row["AssetName"] == "Gautam Adani"
-        assert item.legacy_row["Original Name"] == "Gautam Adani"
+        assert item.legacy_row["Original Name"] == "Facebook"
 
-    def test_pasted_url_with_nothing_known_is_blank_not_the_handle(self):
-        """No client, no keyword, no typed name: BOTH columns stay blank.
-
-        AssetName used to fall back to `entity_id`, which wrote the raw
-        handle into a column an analyst reads as "the keyword this was
-        reported under". A handle is not a keyword, and a plausible wrong
-        value in a takedown report is worse than an empty cell."""
+    def test_pasted_url_with_nothing_known_is_blank_asset_name_and_platform_for_original_name(self):
+        """No client, no keyword, no typed name: AssetName stays blank,
+        while Original Name has the platform name."""
         item = _populate()
         assert item.incident_row["AssetName"] == ""
-        assert item.legacy_row["Original Name"] == ""
+        assert item.legacy_row["Original Name"] == "Facebook"
+
+    def test_different_platforms_output_their_platform_name_under_original_name(self):
+        """Every platform gets its human-readable platform name under Original Name."""
+        fb = _populate(platform="facebook")
+        assert fb.legacy_row["Original Name"] == "Facebook"
+
+        ig = _populate(platform="instagram")
+        assert ig.legacy_row["Original Name"] == "Instagram"
+
+        tw = _populate(platform="twitter")
+        assert tw.legacy_row["Original Name"] == "Twitter"
+
+        yt = _populate(platform="youtube")
+        assert yt.legacy_row["Original Name"] == "YouTube"
 
     def test_original_feed_is_untouched_by_this(self):
         """No keyword equivalent for a feed URL -- it stays exactly what the
@@ -76,3 +80,21 @@ class TestAssetNameAndOriginalNamePreferTheParentKeyword:
         assert item.legacy_row["Original feed"] == ""
         item = _populate(job_kwargs={"official_feed": "https://facebook.com/real"})
         assert item.legacy_row["Original feed"] == "https://facebook.com/real"
+
+    def test_start_orders_items_with_facebook_on_row_1(self):
+        """Urls entered in arbitrary/mixed platform order are sorted with
+        Facebook on row 1, followed by Instagram, Twitter, etc., grouping all
+        URLs for each platform together."""
+        runner = AnalysisRunner()
+        urls = [
+            "https://twitter.com/user1",
+            "https://www.instagram.com/user2",
+            "https://www.facebook.com/user3",
+            "https://www.facebook.com/user4",
+            "https://www.youtube.com/@channel5",
+        ]
+        job, skipped = asyncio.run(runner.start(urls))
+        platforms = [it.platform for it in job.items]
+        # Facebook items first (row 1 and 2), followed by Instagram, Twitter, YouTube
+        assert platforms == ["facebook", "facebook", "instagram", "twitter", "youtube"]
+
