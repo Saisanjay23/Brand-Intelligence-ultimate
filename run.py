@@ -417,11 +417,17 @@ def main() -> None:
     # first run, or a missing piece: install without being asked.
     # `--dev` serves the UI from Vite, so a stale dist doesn't matter there
     # and rebuilding it would just cost startup time for nothing.
+    had_missing = bool(missing_packages())
     needs_ui_build = FRONTEND.is_dir() and not a.dev and ui_is_stale()
-    if missing_packages() or needs_ui_build or a.build:
+    if had_missing or needs_ui_build or a.build:
         print("Brand Intelligence -- setup\n")
         setup(force=a.build)
         print()
+        if had_missing:
+            # Re-exec so newly installed or upgraded Python packages (like uvicorn, fastapi)
+            # are loaded fresh into sys.modules instead of colliding with
+            # partially-imported stale module objects from before pip install.
+            sys.exit(subprocess.call([sys.executable] + sys.argv))
 
     good, detail = mongo_ok()
     if not good:
