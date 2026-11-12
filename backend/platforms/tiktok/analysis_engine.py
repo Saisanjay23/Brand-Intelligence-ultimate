@@ -47,12 +47,14 @@ from backend.shared.models.row import Row
 from backend.platforms.scan_options import captures_screenshot
 from backend.shared.text import name_score, normalized_host, parse_count, parse_normalized_url
 from backend.shared.walls import chrome_text, is_wall_url
+from backend.shared.pushback import CHALLENGED, EXPIRED, Signal, THROTTLED, governor_for
 from backend.platforms.tiktok.discovery_engine import (RE_CHECKPOINT, RE_GEOBLOCK,
                                                         RE_GONE, RE_LOGIN,
                                                         TikTokSession, TikTokUser,
                                                         geoblock_redirect,
                                                         newest_post_iso,
                                                         newest_post_via_search,
+                                                        page_pushback,
                                                         profile_from, read_hydration,
                                                         search_users_in)
 
@@ -391,6 +393,14 @@ class Scraper:
                 # own @tiktok account included. That is a policy on the
                 # endpoint, not a problem with the profile.
                 status = nav["status"]
+                # A 429 IS "SLOW DOWN", NOT "TRY ANOTHER DOOR". The search
+                # fallback below is a whole extra search on the same browser
+                # -- the one request that must not go out right after a
+                # throttle. Told to the governor; the HTTP 429 in the note is
+                # what the runner classifies as rate_limited.
+                if status == 429:
+                    self._throttled_429(row, nav_err)
+                    return row
                 # REFUSED IS NOT THE END. The profile page is one source, not
                 # the only one: TikTok's user search answers 200 while
                 # /@handle answers 403, and its cards carry most of what this
@@ -425,21 +435,49 @@ class Scraper:
             hydration = await read_hydration(page)
             user = profile_from(hydration, row.profile_id) if hydration else None
 
+            # IS TIKTOK PUSHING BACK ON THIS VISIT? Read from the chrome (bio,
+            # title and grid removed) and from open dialogs only, on EVERY
+            # visit -- a challenge or a "slow down" popup sits over a profile
+            # that still loads, and checking only when the payload was missing
+            # is how the batch carried on under one.
+            if is_wall_url(page.url, ("captcha",)):
+                pushback = Signal(CHALLENGED, "redirected to a captcha page")
+            else:
+                pushback = await page_pushback(page, chrome)
+
             challenged = False
+            blocked_status = ""
             if user:
                 self.fill(row, user)
                 # A CAPTCHA / slide-verify OVERLAY can sit on top of a profile
-                # whose payload still loaded. The fields are real, but the
-                # session is being challenged and the page is not what an
-                # analyst would see, so the row is PARTIAL with the reason,
-                # never a clean OK, and no further request is spent on it.
-                challenged = bool(RE_CHECKPOINT.search(chrome)) or is_wall_url(
-                    page.url, ("captcha",))
-                if challenged:
-                    row.note(
-                        "a verification challenge was on screen over this profile -- "
-                        "the fields were read from the page payload but the visit may be incomplete"
-                    )
+                # whose payload still loaded. The fields are real and are
+                # kept, but the page is not what an analyst would see and no
+                # further request is spent on it. LOGGED IN, the row is
+                # CHECKPOINT (a throttle too, with a rate-limit note), which
+                # stops the batch and rests the account: PARTIAL let the batch
+                # carry on visiting profiles on a challenged session.
+                # ANONYMOUS, there is no session to stop -- PARTIAL, and the
+                # governor is told so its breaker can trip.
+                if pushback is not None:
+                    challenged = True
+                    governor_for("tiktok").record(pushback)
+                    if pushback.kind == CHALLENGED:
+                        row.note(
+                            "a verification challenge was on screen over this profile -- "
+                            "the fields were read from the page payload but the visit may be incomplete"
+                        )
+                        if not self.anonymous:
+                            blocked_status = "CHECKPOINT"
+                            row.note(f"session checkpointed ({pushback.reason}) -- batch stopped; "
+                                     f"open the account, clear the check and let it rest")
+                    else:
+                        row.note(
+                            f"TikTok told this browser to slow down ({pushback.reason}) -- the "
+                            f"fields were read from the page payload but the visit may be incomplete"
+                        )
+                        if not self.anonymous:
+                            blocked_status = "CHECKPOINT"
+                            row.note("rate_limited -- batch stopped so the account can rest")
                 if not row.last_post_iso:
                     iso = newest_post_iso(hydration, row.profile_id)
                     if iso:
@@ -447,7 +485,26 @@ class Scraper:
                         row.posts_seen = "yes"
                         row.mark("last_post", "hydration")
             else:
-                if RE_CHECKPOINT.search(chrome) or is_wall_url(page.url, ("captcha",)):
+                if pushback is not None:
+                    # Told to the governor in BOTH modes. Anonymous rows used
+                    # to be a bare ERROR the runner only logs, so nothing
+                    # ever slowed down and the breaker could never trip.
+                    governor_for("tiktok").record(pushback)
+                if pushback is not None and pushback.kind == THROTTLED:
+                    if self.anonymous:
+                        row.status = "ERROR"
+                        row.note(
+                            f"rate limited -- TikTok told this logged-out browser to slow "
+                            f"down ({pushback.reason}), so the profile was not read; try again later"
+                        )
+                    else:
+                        # CHECKPOINT so the batch stops; the note is what the
+                        # runner classifies, as rate_limited.
+                        row.status = "CHECKPOINT"
+                        row.note(f"rate_limited -- TikTok told this account to slow down "
+                                 f"({pushback.reason}); batch stopped so the account can rest")
+                    return row
+                if pushback is not None:
                     if self.anonymous:
                         # NO COOKIES, NOTHING TO CHECKPOINT. Saying "session
                         # checkpointed" about a browser with no session sends
@@ -472,6 +529,7 @@ class Scraper:
                     else:
                         row.status = "LOGIN_REQUIRED"
                         row.note("cookies rejected/expired")
+                        governor_for("tiktok").record(Signal(EXPIRED, "profile page shows the sign-in prompt"))
                     return row
                 if RE_GONE.search(chrome):
                     row.status = "GONE"
@@ -482,6 +540,10 @@ class Scraper:
                     return row
                 if http_status is not None and http_status >= 400:
                     # The page answered with an error and carried no profile.
+                    # A 429 is a throttle: no fallback search (see above).
+                    if http_status == 429:
+                        self._throttled_429(row, None)
+                        return row
                     if await self._recover_via_search(row, page, http_status):
                         return row
                     self._refused(row, http_status, None)
@@ -543,7 +605,10 @@ class Scraper:
             # True regardless of whether anything was actually read. A weak
             # read missing the name -- the one field this whole tool is about
             # -- must not be stamped "OK".
-            row.status = "OK" if row.profile_name and not challenged else "PARTIAL"
+            if blocked_status:
+                row.status = blocked_status
+            else:
+                row.status = "OK" if row.profile_name and not challenged else "PARTIAL"
             return row
         finally:
             try:
@@ -591,6 +656,13 @@ class Scraper:
             "TikTok is blocked for this IP (redirected to "
             f"{page_url}) -- route this platform through a proxy"
         )
+
+    def _throttled_429(self, row: Row, nav_err: Optional[BaseException]) -> None:
+        """HTTP 429 on the profile page: tell the governor, skip the search
+        fallback, and write the ERROR row whose "HTTP 429" the runner reads
+        as rate_limited (resilience.classify_failure)."""
+        governor_for("tiktok").record(Signal(THROTTLED, "HTTP 429 on a profile page"))
+        self._refused(row, 429, nav_err)
 
     def _refused(self, row: Row, status: Optional[int], nav_err: Optional[BaseException]) -> None:
         """An ERROR row for a profile page TikTok would not serve.

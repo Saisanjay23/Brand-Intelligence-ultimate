@@ -313,10 +313,16 @@ class TestTikTokLastPostAndOverlay:
         assert "lower bound" in row.notes
 
     @pytest.mark.asyncio
-    async def test_a_challenge_overlay_over_a_loaded_profile_is_partial(self, monkeypatch):
+    @pytest.mark.parametrize("anonymous,status", [(False, "CHECKPOINT"), (True, "PARTIAL")])
+    async def test_a_challenge_overlay_over_a_loaded_profile(self, monkeypatch, anonymous, status):
+        """Logged in, a verification challenge is a verdict on the ACCOUNT:
+        CHECKPOINT stops the batch and cools the session, where PARTIAL let
+        every remaining profile be visited under a live captcha. Anonymous
+        there is no session to fail, so the row stays PARTIAL. Either way the
+        payload fields are kept and no extra request is spent."""
         page = _Page(body="Adani Group\nDrag the slider to verify", chrome="Drag the slider to verify",
                      hydration=_hydration())
-        sc, _ = _scraper(monkeypatch, page)
+        sc, _ = _scraper(monkeypatch, page, anonymous=anonymous)
         called = []
 
         async def _search(*_a, **_kw):
@@ -325,7 +331,7 @@ class TestTikTokLastPostAndOverlay:
 
         monkeypatch.setattr(A, "newest_post_via_search", _search)
         row = await sc.process("https://www.tiktok.com/@adanigroup", "Adani", "")
-        assert row.status == "PARTIAL"
+        assert row.status == status
         assert "verification challenge" in row.notes
         assert row.followers == 120400            # the payload fields are still kept
         assert not called, "an extra request was spent on a challenged session"

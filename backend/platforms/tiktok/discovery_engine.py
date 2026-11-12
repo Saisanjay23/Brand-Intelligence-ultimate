@@ -72,7 +72,10 @@ from backend.shared.extraction import run_strategies
 from backend.shared.schema_probe import SchemaProbe, probe_or_null
 from backend.shared.logging import get_logger
 from backend.shared.models.row import Row
+from backend.shared.pushback import (CHALLENGED, EXPIRED, STOP_CODE, THROTTLED, UNKNOWN,
+                                     Signal, governor_for, note_response)
 from backend.shared.text import iter_dicts
+from backend.shared.warning_dialog import dialog_warning
 from backend.stealth.browser import Session
 
 log = get_logger("tiktok")
@@ -86,11 +89,31 @@ log = get_logger("tiktok")
 UPLOAD_PROBE = "https://www.tiktok.com/upload?lang=en"
 
 RE_LOGIN = re.compile(r"(Log in to TikTok|Sign up for TikTok|Use QR code to log in)", re.I)
+# `select.{0,40}shape` (singular, wider gap): TikTok's 3D puzzle reads
+# "Select 2 objects that are the same shape", which the old
+# `select.{0,20}shapes` could not match.
 RE_CHECKPOINT = re.compile(
-    r"(verify to continue|select.{0,20}shapes|drag the slider|slide to verify|"
+    r"(verify to continue|select.{0,40}shape|drag the slider|slide to verify|"
     r"unusual (login )?activity|security check|captcha)",
     re.I,
 )
+# TikTok TELLING US TO SLOW DOWN, in its own on-screen words. Before this
+# there was no throttle wording at all, so "Too many attempts" read as an
+# empty page and the sweep ended `stalled` -- a code with no session verdict.
+#
+# Bare "try again later" is deliberately NOT here: TikTok's generic error
+# copy ("Something went wrong ... Please try again later") also shows on
+# healthy pages (an empty video grid, a transient panel), and matching it on
+# the page would slow a healthy platform. It is still caught inside an open
+# dialog, where shared/warning_dialog.py reads it. Applied only to page
+# CHROME (result cards stripped -- see _search_chrome_text), never to
+# captions or bios.
+RE_THROTTLE = re.compile(
+    r"(too many attempts|maximum number of attempts|visiting too (fast|frequently|often)"
+    r"|too many requests|rate limit(ed)?\b)",
+    re.I,
+)
+RE_WENT_WRONG = re.compile(r"something went wrong", re.I)
 RE_GONE = re.compile(
     r"(couldn.t find this account|this account can.t be found|user doesn.t exist)", re.I,
 )
@@ -571,11 +594,21 @@ async def read_hydration(page) -> Any:
 # result IS regardless of anything else TikTok changes about the response
 # shape or the surrounding markup, the same reasoning Facebook's own DOM
 # fallback documents for anchoring on profile links there.
+#
+# THE VIEWER'S OWN SIDEBAR LINK IS NOT A RESULT. This fallback only runs when
+# the hydration payload was stripped, which is exactly when `viewer_username`
+# has nothing to read, so the sweep's viewer filter cannot catch it. Results
+# live inside `#grid-main` (see JS_SCROLL_RESULTS), so anchors are read from
+# there when it exists, and never from the navigation. NOT the Users-tab
+# rule (`lines.length < 2`): a Top-tab author or video link carries one line
+# of text, so that rule would drop most real results here.
 JS_DOM_SEARCH = """
 () => {
   const seen = new Set();
   const out = [];
-  for (const a of document.querySelectorAll('a[href^="/@"]')) {
+  const root = document.querySelector('#grid-main') || document;
+  for (const a of root.querySelectorAll('a[href^="/@"]')) {
+    if (a.closest('nav, [data-e2e^="nav-"]')) continue;
     const href = a.getAttribute('href') || '';
     const m = href.match(/^\\/@([^/?]+)/);
     if (!m) continue;
@@ -726,7 +759,11 @@ async def newest_post_via_search(ctx, username: str, timeout_s: float = 20.0) ->
         try:
             await page.wait_for_selector("#search-tabs button", timeout=int(timeout_s * 1000))
         except Exception:
-            pass
+            # Results never rendered. A CAPTCHA or a throttle here used to
+            # come back as "" -- the same as "no recent post found" -- and
+            # told the governor nothing. Name it; the return stays "".
+            if await name_blank_search(page, f"last-post lookup for @{username}"):
+                return ""
         await page.wait_for_timeout(4000)
 
         want = username.lower()
@@ -839,6 +876,117 @@ async def _body_text(page) -> str:
         return await page.inner_text("body")
     except Exception:
         return ""
+
+
+# What TIKTOK is saying on a search page, as opposed to what the RESULTS say.
+# A caption, a related search or a nickname can contain "captcha", "Government
+# of India" or "too many requests"; read over the whole body, any of those
+# quarantined a healthy session or stopped the sweep as geoblocked. Result
+# cards are cut out (line by line, so a short fragment cannot garble the rest),
+# then the text of every open dialog and CAPTCHA container is added back, so a
+# real challenge is never lost to the stripping. A page that cannot be read
+# this way falls back to the whole body -- exactly as loose as before, never
+# stricter. Mirrors analysis_engine.py's `_chrome_text`.
+_SEARCH_RESULT_SELECTORS = (
+    'a[href^="/@"]', 'a[href*="/video/"]', 'a[href*="/photo/"]',
+    'a[href*="/search"]', 'a[href*="/tag/"]', 'a[href*="/music/"]',
+    '[data-e2e*="search-card"]', '[data-e2e*="search_top-item"]',
+    '[data-e2e*="search_video-item"]', '[data-e2e*="search-user"]',
+    '[data-e2e*="caption"]', '[data-e2e*="desc"]', '[data-e2e*="related"]',
+)
+
+JS_SEARCH_CHROME = r"""
+(sels) => {
+  // tiktok-search-chrome
+  let t = document.body ? (document.body.innerText || '') : '';
+  for (const s of sels) {
+    document.querySelectorAll(s).forEach((n) => {
+      for (const line of (n.innerText || '').split('\n')) {
+        const x = line.trim();
+        if (x.length >= 4) t = t.split(x).join(' ');
+      }
+    });
+  }
+  const keep = Array.from(document.querySelectorAll(
+      '[role="dialog"], [role="alertdialog"], [id*="captcha" i], [class*="captcha" i]'))
+    .map((n) => n.innerText || '').join('\n');
+  return t + '\n' + keep;
+}
+"""
+
+
+async def _search_chrome_text(page) -> str:
+    """The search page's text with result cards removed (see above)."""
+    try:
+        text = await page.evaluate(JS_SEARCH_CHROME, list(_SEARCH_RESULT_SELECTORS))
+        if isinstance(text, str):
+            return text
+    except Exception:
+        pass
+    return await _body_text(page)
+
+
+async def page_pushback(page, chrome: str) -> Optional[Signal]:
+    """Is TikTok pushing back on this page? -> CHALLENGED / THROTTLED, or None.
+
+    Reads only `chrome` (TikTok's own text, results/bio removed) and open
+    dialogs -- never captions. A challenge beats a throttle: it is the
+    stronger verdict. Costs one `evaluate`, no request."""
+    chrome = chrome or ""
+    if m := RE_CHECKPOINT.search(chrome):
+        return Signal(CHALLENGED, f"page says {m.group(0)!r}")
+    url = getattr(page, "url", "") or ""
+    if isinstance(url, str) and "/captcha" in url:
+        return Signal(CHALLENGED, "redirected to a captcha page")
+    warn = await dialog_warning(page)
+    if warn is not None and warn.kind == CHALLENGED:
+        return warn
+    if m := RE_THROTTLE.search(chrome):
+        return Signal(THROTTLED, f"page says {m.group(0)!r}")
+    if warn is not None and warn.kind == THROTTLED:
+        return warn
+    return None
+
+
+async def name_blank_search(page, what: str) -> Optional[Signal]:
+    """A search page that rendered nothing: say WHY, by name, and tell the
+    governor. Returns the pushback Signal (already recorded), or None.
+
+    Without this a CAPTCHA, a throttle and TikTok's "Something went wrong"
+    soft-block all read as "nothing found". The return values of the callers
+    are unchanged; what changes is that the breaker can now open and the log
+    says what happened."""
+    chrome = await _search_chrome_text(page)
+    sig = await page_pushback(page, chrome)
+    if sig is not None:
+        governor_for("tiktok").record(sig)
+        log.warning(f"tiktok: {what}: TikTok pushed back ({sig.kind}: {sig.reason}) -- "
+                    f"nothing was read; this is not an empty result")
+        return sig
+    if RE_WENT_WRONG.search(chrome):
+        # Not proof of a block, never proof of health.
+        governor_for("tiktok").record(Signal(UNKNOWN, "'Something went wrong' panel"))
+        log.warning(f"tiktok: {what}: TikTok showed 'Something went wrong' -- nothing was "
+                    f"read; this is a refusal, not an empty result")
+    return None
+
+
+def _stop_on_pushback(out: "Sweep", sig: Signal, keyword: str, where: str) -> None:
+    """End a sweep on pushback: the shared stop code, and an error that LEADS
+    with it so resilience.classify_failure files the right session verdict.
+    Results already gathered stay on the sweep."""
+    code = STOP_CODE[sig.kind]
+    out.stopped, out.complete = code, False
+    if sig.kind == CHALLENGED:
+        out.error = (f"checkpoint: TikTok served a CAPTCHA/verification challenge {where} "
+                     f"({sig.reason}) -- this session is checkpointed.")
+    elif sig.kind == THROTTLED:
+        out.error = (f"rate_limited: TikTok told this browser to slow down {where} "
+                     f"({sig.reason}) -- sweep stopped so the account can rest.")
+    else:
+        out.error = (f"login: TikTok shows its sign-in prompt {where} ({sig.reason}) -- "
+                     f"this session's cookies no longer work.")
+    log.warning(f"tiktok/people {keyword!r}: {out.error}")
 
 
 def _profile_lock() -> asyncio.Lock:
@@ -1132,6 +1280,12 @@ async def _users_for(
             bodies.append(text)
 
     page.on("response", lambda r: spawn(on_response(r)))
+    # Ordered accumulator: DOM order IS TikTok's ranking, so keep first
+    # sight of each handle and let scrolling append. Bound BEFORE the `try`:
+    # the handler below reports `len(ordered)`, and a failure ahead of this
+    # line (a navigation timeout) used to raise UnboundLocalError there,
+    # hiding the real error behind one about our own variable.
+    ordered: dict[str, TikTokUser] = {}
     try:
         await page.goto(USER_SEARCH_URL.format(q=quote(keyword)),
                         wait_until="domcontentloaded", timeout=int(timeout_s * 1000))
@@ -1146,13 +1300,13 @@ async def _users_for(
                 break
             await page.wait_for_timeout(1000)
         else:
-            log.info(f"tiktok/users {keyword!r}: no result cards rendered")
+            # A CAPTCHA, a throttle or the "Something went wrong" panel
+            # used to read exactly like "no accounts matched". Named and
+            # told to the governor; the return is still [].
+            if not await name_blank_search(page, f"account search for {keyword!r}"):
+                log.info(f"tiktok/users {keyword!r}: no result cards rendered")
             return []
         await page.wait_for_timeout(1500)
-
-        # Ordered accumulator: DOM order IS TikTok's ranking, so keep first
-        # sight of each handle and let scrolling append.
-        ordered: dict[str, TikTokUser] = {}
 
         async def harvest() -> int:
             """Absorb whatever cards are currently rendered, keeping FIRST
@@ -1213,6 +1367,10 @@ async def _users_for(
             await page.close()
         except Exception:
             pass
+
+
+# Sweep endings after which the Users-tab pass is not run (see sweep()).
+_NO_MERGE_STOPS = frozenset({"cap:results", "cancelled", *STOP_CODE.values()})
 
 
 @dataclass
@@ -1314,18 +1472,51 @@ class Discovery:
         # Sweep, into the rolling telemetry, and is what lets an alert name
         # the exact renamed key instead of reporting a mystery drop.
         probe = SchemaProbe()
+        # The first THROTTLED/CHALLENGED answer TikTok's search API gave, set
+        # by on_response and acted on by the scroll loop (which stops).
+        pushed: dict[str, Optional[Signal]] = {"sig": None}
+        # Zero-byte answers: TikTok's soft-block shape. Not pages.
+        empty_bodies = 0
 
         async def on_response(resp):
             """Absorbs every search payload the page fires, keeping FIRST
             sight of each handle -- iter_users already yields name matches
             ahead of video authors, so setdefault preserves that
             precedence. Signals `arrived` so the sweep can stop waiting as
-            soon as real data lands instead of sleeping a fixed time."""
+            soon as real data lands instead of sleeping a fixed time.
+
+            THE STATUS IS READ NOW. It never was: a 429 or a verify-JSON
+            answer counted as a page of (zero) results and the sweep ended
+            `stalled`, which carries no session verdict. Only an error status
+            is classified -- a 2xx body can legitimately contain "captcha"
+            (a caption) and must never be read as a block. An EMPTY body is
+            not counted as a page either, so a run of soft-blocked answers
+            cannot meet `cap:pages` and look like success."""
+            nonlocal empty_bodies
             try:
                 if "/api/search/" not in resp.url:
                     return
-                text = await resp.text()
+                status = getattr(resp, "status", None)
+                if not isinstance(status, int) or isinstance(status, bool):
+                    status = None
+                try:
+                    text = await resp.text()
+                except Exception:
+                    if status is None or status < 400:
+                        return
+                    text = ""
             except Exception:
+                return
+            if status is not None and status >= 400:
+                sig = note_response("tiktok", status, (text or "")[:2000])
+                if sig.kind in (THROTTLED, CHALLENGED):
+                    if pushed["sig"] is None:
+                        pushed["sig"] = sig
+                    arrived.set()
+                    return
+            if not (text or "").strip():
+                empty_bodies += 1
+                arrived.set()
                 return
             for blob in parse_lines(text):
                 for u in iter_users(blob, probe):
@@ -1343,9 +1534,12 @@ class Discovery:
 
             # Blocked region? Stop here and NAME it. Everything below would
             # otherwise run its full time budget against a notice page and
-            # report a stall (see RE_GEOBLOCK).
-            body = await _body_text(page)
-            if geoblocked(page.url, body):
+            # report a stall (see RE_GEOBLOCK). The REDIRECT is the proof; the
+            # notice text is read only from TikTok's own chrome, never from
+            # result cards, so a caption saying "Government of India" is a
+            # result, not a block (see _search_chrome_text).
+            chrome = await _search_chrome_text(page)
+            if geoblock_redirect(page.url) or RE_GEOBLOCK.search(chrome):
                 out.stopped, out.complete = "geoblocked", False
                 out.error = (
                     "TikTok is blocked for this IP -- the request was redirected to "
@@ -1365,13 +1559,13 @@ class Discovery:
             # slow page and never tells `sessions/manager.py` the session
             # itself is the problem -- so the same checkpointed session
             # keeps getting handed out to the next job.
-            if RE_CHECKPOINT.search(body) or "/captcha" in page.url:
-                out.stopped, out.complete = "checkpoint", False
-                out.error = (
-                    "TikTok served a CAPTCHA/verification challenge instead of "
-                    "search results -- this session is checkpointed."
-                )
-                log.warning(f"tiktok/people {keyword!r}: {out.error}")
+            #
+            # Read from the chrome and open dialogs only (a caption that says
+            # "captcha" is a result), and now also TikTok's throttle wording,
+            # which stops as `rate_limited`. Either is told to the governor.
+            if sig := await page_pushback(page, chrome):
+                governor_for("tiktok").record(sig)
+                _stop_on_pushback(out, sig, keyword, "instead of search results")
                 out.seconds = time.time() - started
                 return out
 
@@ -1412,6 +1606,12 @@ class Discovery:
 
             stalls = 0
             while True:
+                # TikTok's search API answered with a throttle or a
+                # challenge (see on_response). Stop HERE, keep what was
+                # gathered, and fire nothing more on this browser.
+                if pushed["sig"] is not None:
+                    _stop_on_pushback(out, pushed["sig"], keyword, "mid-sweep")
+                    break
                 if cancelled(self.a):
                     out.stopped = "cancelled"
                     break
@@ -1441,6 +1641,8 @@ class Discovery:
                     await asyncio.wait_for(arrived.wait(), timeout=self.a.page_wait)
                 except asyncio.TimeoutError:
                     pass
+                if pushed["sig"] is not None:
+                    continue        # the top of the loop stops and names it
 
                 if len(by_username) > before:
                     stalls = 0
@@ -1457,16 +1659,30 @@ class Discovery:
                         # detection tripping after several requests), not
                         # just on the initial load -- check once more
                         # before writing this off as an ordinary stall.
-                        stall_body = await _body_text(page)
-                        if RE_CHECKPOINT.search(stall_body) or "/captcha" in page.url:
-                            out.stopped, out.complete = "checkpoint", False
-                            out.error = (
-                                "TikTok served a CAPTCHA/verification challenge mid-sweep -- "
-                                "this session is checkpointed."
-                            )
-                            log.warning(f"tiktok/people {keyword!r}: {out.error}")
+                        # Chrome and dialogs only, as on load; a throttle
+                        # stops `rate_limited`.
+                        stall_chrome = await _search_chrome_text(page)
+                        if sig := await page_pushback(page, stall_chrome):
+                            governor_for("tiktok").record(sig)
+                            _stop_on_pushback(out, sig, keyword, "mid-sweep")
+                        elif (not self.anonymous and _found() == 0
+                                and (m := RE_LOGIN.search(stall_chrome))):
+                            # A LOGGED-IN sweep that found nothing while
+                            # TikTok shows its sign-in prompt: the cookies
+                            # are gone. `stalled` would hand this dead
+                            # session to the next keyword. (Anonymous
+                            # sweeps always see that prompt -- not a verdict.)
+                            sig = Signal(EXPIRED, f"page says {m.group(0)!r}")
+                            governor_for("tiktok").record(sig)
+                            _stop_on_pushback(out, sig, keyword, "with no results")
                         else:
                             out.stopped, out.complete = "stalled", False
+                            if empty_bodies and not out.pages and not by_username:
+                                # NAMED, not reclassified: still a stall.
+                                out.error = (
+                                    f"TikTok answered {empty_bodies} search request(s) with an "
+                                    f"empty body and no results rendered -- a soft refusal, "
+                                    f"not a keyword that matched nothing")
                         break
                     await page.wait_for_timeout(600)
 
@@ -1520,7 +1736,15 @@ class Discovery:
             # and scrolling it up to 25 times (~55s) even when nothing more
             # was needed -- directly delaying every keyword behind it under
             # the default discovery_sequential_keywords=True.
-            if out.stopped != "cap:results":
+            #
+            # Skipped too when the sweep stopped on pushback or a cancel: the
+            # Users tab is another search, and firing it right after TikTok
+            # said "slow down" / "verify" (or after the analyst pressed Stop)
+            # is exactly the request that must not go out. NOT skipped on
+            # "error" (a failed scroll): that is our page, not TikTok pushing
+            # back, and the Users tab runs on its own page and can still add
+            # the name matches.
+            if out.stopped not in _NO_MERGE_STOPS:
                 await self._merge_user_accounts(out, probe)
 
             if self.a.max_results:
