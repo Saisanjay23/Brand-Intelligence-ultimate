@@ -32,7 +32,9 @@ from urllib.parse import quote, urlparse
 from backend.platforms.scan_options import cancelled
 from backend.shared import diagnostics
 from backend.shared.tasks import spawn
-from backend.shared.pushback import note_response
+from backend.shared.pushback import (
+    CHALLENGED, EXPIRED, STOP_CODE, THROTTLED, Signal, governor_for, note_response,
+)
 from backend.shared.extraction import run_strategies
 from backend.shared.schema_probe import SchemaProbe, probe_or_null
 from backend.shared.avatars import hd_picture_url, looks_like_placeholder
@@ -56,7 +58,11 @@ RE_LOGIN = re.compile(
 )
 RE_CHECKPOINT = re.compile(
     r"(Verify your identity|unusual login activity|"
-    r"Your account has been locked|Confirm your)",
+    r"Your account has been locked|Confirm your|"
+    # X's error 226 wording ("This request looks like it might be
+    # automated..."), shown as a full page or a panel. The whole phrase, so a
+    # post that merely says "might be automated" cannot match.
+    r"looks like it might be automated)",
     re.I,
 )
 RE_GONE = re.compile(
@@ -816,6 +822,26 @@ _X_CONTENT_SELECTORS = (
 )
 
 
+_JS_STRIPPED_CHROME = """(sels) => {
+    const c = document.body.cloneNode(true);
+    for (const s of sels) { c.querySelectorAll(s).forEach((n) => n.remove()); }
+    return c.textContent || "";
+}"""
+
+
+async def _stripped_chrome(page) -> Optional[str]:
+    """The page's text with the result cells PROVABLY cut out, or None when
+    the cut could not be made. `chrome_text` falls back to the whole body
+    when it cannot strip (which is the right default for a page with no
+    results), so it cannot say whether a bio is still in what it returned;
+    this can, and is what lets the login wording be trusted mid-sweep."""
+    try:
+        text = await page.evaluate(_JS_STRIPPED_CHROME, list(_X_CONTENT_SELECTORS))
+    except Exception:
+        return None
+    return text if isinstance(text, str) else None
+
+
 async def _x_session_blocked(page, *, have_results: bool) -> str:
     """"checkpoint" / "login" when the search page is a wall instead of
     results, "" otherwise -- the X counterpart of facebook/
@@ -827,9 +853,11 @@ async def _x_session_blocked(page, *, have_results: bool) -> str:
     The stop codes returned here are the ones classify_failure already
     reads ("login" -> expired, "checkpoint" -> checkpointed).
 
-    The login text is only trusted on a page with no results: it is the
-    logged-out sidebar's wording, and a bio in a real result could quote
-    it. The URL is unambiguous either way."""
+    The login text is the logged-out sidebar's wording, and a bio in a real
+    result could quote it. So once results exist it is only trusted when the
+    result cells were provably cut out of the text read (`_stripped_chrome`);
+    before, a session logged out MID-sweep was never named, and the sweep
+    scrolled on to `stalled`. The URL is unambiguous either way."""
     try:
         path = urlparse(page.url or "").path
     except Exception:
@@ -841,14 +869,64 @@ async def _x_session_blocked(page, *, have_results: bool) -> str:
     # The page's OWN interface, with the people it is showing cut out: a
     # bio or a post that says "Confirm your booking" is a result, not X
     # speaking, and used to read as a checkpoint and quarantine the account.
-    body = await chrome_text(page, _X_CONTENT_SELECTORS)
+    stripped = await _stripped_chrome(page)
+    body = stripped if stripped is not None else await chrome_text(page, _X_CONTENT_SELECTORS)
     if not body:
         return ""
     if RE_CHECKPOINT.search(body):
         return "checkpoint"
-    if not have_results and RE_LOGIN.search(body):
+    if RE_LOGIN.search(body) and (not have_results or stripped is not None):
         return "login"
     return ""
+
+
+# What each page wall tells the shared governor (see shared/pushback.py).
+_WALL_SIGNAL = {"checkpoint": CHALLENGED, "login": EXPIRED, "rate_limited": THROTTLED}
+
+
+def record_wall(stop: str, where: str) -> None:
+    """Tell X's governor about a wall read off a PAGE (no response carried
+    it, so `note_response` never saw it). Once per wall, by the caller."""
+    if kind := _WALL_SIGNAL.get(stop):
+        governor_for("twitter").record(Signal(kind, f"{where} shows a {stop} wall"))
+
+
+def x_error_text(text: str, *, allow_body: bool) -> Optional[str]:
+    """The part of an X API answer that is X talking about the REQUEST, for
+    `classify_response` -- never a payload of people or posts, whose bios and
+    tweets can say "rate limit exceeded" or "confirm your identity".
+
+      * a top-level GraphQL `errors` array: always (X's own words);
+      * a body that is not JSON at all (an HTML / plain-text error page):
+        always, it cannot be a payload;
+      * any other body: only when `allow_body` (the caller found no users in
+        it) and it is small, exactly the rule this engine already used;
+      * otherwise None, and the response is classified by status alone.
+
+    The old check looked for "Rate limit exceeded" / "OverCapacity" /
+    '"code":88' anywhere in the whole body, so one user's bio quoting those
+    words ended the sweep as a rate limit."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    blobs = list(parse_lines(text))
+    if not blobs:
+        return text[:4000]
+    errors = [b["errors"] for b in blobs if isinstance(b, dict) and b.get("errors")]
+    if errors:
+        try:
+            return json.dumps(errors)[:4000]
+        except Exception:
+            return None
+    if allow_body and len(text) < 4000:
+        return text
+    return None
+
+
+def _pushback_error(stop: str, status: Any, sig: Signal) -> str:
+    """The sweep's error text for a pushback stop. Leads with the shared stop
+    code so `classify_failure` reads the verdict from our own vocabulary --
+    the same shape instagram/discovery_engine.py::_pushback_error uses."""
+    return f"{stop}: x search answered HTTP {status} ({sig.reason})"
 
 
 @dataclass
@@ -963,7 +1041,31 @@ class Discovery:
         # and called a finished search "stalled".
         empty_answer_seen = False
         arrived = asyncio.Event()
+        # Set when X pushed back on a search response: a throttle (429, code
+        # 88), a challenge (code 326 locked / 226 "looks automated") or a
+        # rejected login (401/403, code 32/64). Any of them ends the sweep --
+        # the name is historical; `pushback` says which it was.
         rate_limited = False
+        # (signal, HTTP status) of the FIRST pushback answer this sweep saw.
+        pushback: Optional[tuple[Signal, Any]] = None
+
+        def _stop_for_pushback() -> None:
+            """End the sweep on the pushback X gave, with the shared stop code
+            (rate_limited / checkpoint / login) so the runner cools down or
+            quarantines the account and re-owes the keyword. Results already
+            gathered are kept (`out.users` is built after the loop)."""
+            if pushback is None:
+                out.stopped = "rate_limited"
+                return
+            sig, status = pushback
+            out.stopped = STOP_CODE[sig.kind]
+            out.error = _pushback_error(out.stopped, status, sig)
+            out.complete = False
+            from backend.shared.logging import get_logger as _gl
+            _gl("twitter").warning(
+                f"twitter: search for {keyword!r} stopped -- {out.error}. No further "
+                f"request sent; the account is handed back to rest "
+                f"(governor: {governor_for('twitter').snapshot()})")
 
         probe = SchemaProbe()
         # How many users have already been handed to `on_progress`. X's
@@ -1016,7 +1118,7 @@ class Discovery:
             cursor, which X carries in the response BODY rather than a
             header -- so the only way to page is to read it back out of
             what arrived."""
-            nonlocal cursor, rate_limited, empty_answer_seen
+            nonlocal cursor, rate_limited, empty_answer_seen, pushback
             try:
                 if SEARCH_QUERY not in resp.url:
                     return
@@ -1027,7 +1129,9 @@ class Discovery:
                     # throttled is evidence about every account behind this
                     # IP, and the pacing layer reads the governor, not this
                     # engine's local flag.
-                    note_response("twitter", status, None)
+                    sig = note_response("twitter", status, None)
+                    if pushback is None:
+                        pushback = (sig, status)
                     rate_limited = True
                     arrived.set()
                     return
@@ -1035,12 +1139,6 @@ class Discovery:
             except Exception:
                 return
 
-            # Detect Twitter-specific rate-limit and error indicators in payload
-            if "Rate limit exceeded" in text or '"code":88' in text or "OverCapacity" in text:
-                note_response("twitter", status, text[:2000])
-                rate_limited = True
-                arrived.set()
-                return
             users_in_payload = 0
             ids_before = len(by_id)
             for blob in parse_lines(text):
@@ -1054,16 +1152,28 @@ class Discovery:
                     by_id.setdefault(u.entity_id or u.handle, u)
                 if st.bottom_cursor:
                     cursor = st.bottom_cursor
-            empty_answer_seen = len(by_id) == ids_before
-            # 401/403 and challenge codes were invisible to pacing before
-            # (control flow is unchanged -- the stall branch below already
-            # reads the page for a wall). The body is passed only when it was
-            # small and carried no users, so a profile whose name contains a
-            # trigger word cannot raise an alarm.
-            note_response(
+            # WHAT X SAID ABOUT THE REQUEST, read only where X is the one
+            # talking (x_error_text): a top-level errors array, a non-JSON
+            # error page, or a small body that carried no users -- so a
+            # profile whose bio says "rate limit exceeded" can no longer end
+            # the sweep. Recorded once, here.
+            sig = note_response(
                 "twitter", status,
-                text if (users_in_payload == 0 and len(text) < 4000) else None,
-            )
+                x_error_text(text, allow_body=(users_in_payload == 0)))
+            if sig.is_pushback:
+                # THE ACCOUNT WAS TOLD NO. This result used to be discarded:
+                # a 403 / code 326 (locked) / 226 (looks automated) answer set
+                # `empty_answer_seen`, and a sweep with earlier results could
+                # then end `exhausted`, complete, on an account X had just
+                # locked. Now it stops the sweep (see _stop_for_pushback),
+                # keeps what earlier pages returned, and is never read as the
+                # end of the results.
+                if pushback is None:
+                    pushback = (sig, status)
+                rate_limited = True
+                arrived.set()
+                return
+            empty_answer_seen = len(by_id) == ids_before
             out.pages += 1
             arrived.set()
 
@@ -1117,7 +1227,8 @@ class Discovery:
             if not by_id and not rate_limited:
                 if blocked := await _x_session_blocked(page, have_results=False):
                     out.stopped = blocked
-                    out.error = f"x search page shows a {blocked} wall"
+                    out.error = f"{blocked}: x search page shows a {blocked} wall"
+                    record_wall(blocked, "x search page")
                 elif await _x_says_no_results(page):
                     out.stopped, out.complete = "no-results", True
 
@@ -1130,7 +1241,7 @@ class Discovery:
                     out.stopped = "cancelled"
                     break
                 if rate_limited:
-                    out.stopped = "rate_limited"
+                    _stop_for_pushback()
                     break
                 if self.a.max_results and len(by_id) >= self.a.max_results:
                     out.stopped = "cap:results"
@@ -1163,7 +1274,7 @@ class Discovery:
                     answered = False
 
                 if rate_limited:
-                    out.stopped = "rate_limited"
+                    _stop_for_pushback()
                     break
 
                 if len(by_id) > before:
@@ -1207,7 +1318,8 @@ class Discovery:
                     if stalls >= 2:
                         if blocked := await _x_session_blocked(page, have_results=bool(by_id)):
                             out.stopped = blocked
-                            out.error = f"x search page shows a {blocked} wall"
+                            out.error = f"{blocked}: x search page shows a {blocked} wall"
+                            record_wall(blocked, "x search page")
                             break
                         # The empty-results panel can render after the
                         # pre-loop check above ran; still gated on having
@@ -1223,9 +1335,18 @@ class Discovery:
                             body_text = (await chrome_text(page, _X_CONTENT_SELECTORS)).lower()
                             if "rate limit" in body_text or "something went wrong" in body_text:
                                 out.stopped = "rate_limited"
+                                out.error = ("rate_limited: x search page shows a "
+                                             "rate-limit / something-went-wrong notice")
+                                record_wall("rate_limited", "x search page")
                                 break
                         except Exception:
                             pass
+
+                    # A pushback answer can land during the awaits above;
+                    # it must never be read as the end of the results.
+                    if rate_limited:
+                        _stop_for_pushback()
+                        break
 
                     # the same bottom cursor twice with no new users is the end
                     if empty_answer_seen and cursor and cursor == last_cursor and stalls >= 2:
@@ -1247,6 +1368,11 @@ class Discovery:
                     # Progressive adaptive backoff with jitter rather than flat 600ms
                     await asyncio.sleep(random.uniform(1.5, 3.0) * min(stalls, 3))
                 last_cursor = cursor
+
+            # A sweep X pushed back on is never a finished one, whichever
+            # check happened to end the loop first.
+            if rate_limited and out.complete:
+                _stop_for_pushback()
 
             # Network payload first (richer), rendered DOM second. The DOM
             # pass only runs when the payload produced nothing at all, so a

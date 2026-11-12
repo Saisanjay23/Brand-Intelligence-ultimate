@@ -40,6 +40,10 @@ from backend.shared.text import (name_score, normalized_host, parse_count,
                                  parse_normalized_url)
 from backend.stealth.mouse_movement import humanize_interaction
 from backend.shared.walls import chrome_text, is_wall_url, url_path
+from backend.shared.pushback import (CHALLENGED, EXPIRED, THROTTLED, Signal,
+                                     classify_response, governor_for,
+                                     note_response)
+from backend.shared.warning_dialog import dialog_warning
 from backend.platforms.twitter.discovery_engine import (ABOUT_QUERY,
                                                          _X_CONTENT_SELECTORS,
                                                          REPOSTS_QUERY,
@@ -54,7 +58,8 @@ from backend.platforms.twitter.discovery_engine import (ABOUT_QUERY,
                                                          iter_users,
                                                          latest_post,
                                                          latest_repost,
-                                                         parse_lines)
+                                                         parse_lines,
+                                                         x_error_text)
 
 BAD_SEGMENTS = {
     "home",
@@ -75,6 +80,35 @@ def _on_login_page(url: str) -> bool:
     when this is asked), so a prefix test read it as a dead session and
     quarantined a healthy account."""
     return is_wall_url(url, ("login",)) or url_path(url).startswith("/i/flow/login")
+
+
+def _on_access_page(url: str) -> bool:
+    """Is this X's locked-account / "verify to continue" door
+    (`x.com/account/access`)? Discovery already treated it as a checkpoint;
+    analysis never looked, so a profile visit bounced there read as a
+    missing payload. Matched on the full two-segment path: a user called
+    @account has tabs like /account/with_replies, never /account/access."""
+    return url_path(url).startswith("/account/access")
+
+
+def pushback_verdict(sig: Signal) -> Optional[tuple[str, str]]:
+    """What X's own answer says about the ACCOUNT, as (row status, note) --
+    or None when it says nothing about the account. Mirrors instagram/
+    analysis_engine.py::pushback_verdict: a challenge or a rejected login is
+    an account verdict (the runner quarantines it and hands the rest of the
+    batch on); a throttle is a pacing matter for the governor and returns
+    None. The notes carry "checkpoint" / "login" so `classify_failure` reads
+    the same verdict off them."""
+    if sig.kind == CHALLENGED:
+        return "CHECKPOINT", f"x challenge -- account checkpointed ({sig.reason})"
+    if sig.kind == EXPIRED:
+        return "LOGIN_REQUIRED", f"x login rejected ({sig.reason})"
+    return None
+
+
+# What a helper-tab wall (Scraper._wall_on's text) means for the row.
+_TAB_WALL_SIGNAL = {"checkpoint": CHALLENGED, "login wall": EXPIRED,
+                    "rate limit": THROTTLED}
 
 
 def normalize_url(url: str) -> str:
@@ -535,7 +569,14 @@ class Scraper:
         posts: list[str] = []
         got = asyncio.Event()
         wanted = row.profile_id.lower()
+        # Set on a THROTTLE (429, code 88): no reload, no extra tabs.
         rate_limited = False
+        # Every pushback X gave during THIS visit, in arrival order -- see
+        # on_response. Until now only a 429 or literal rate-limit words were
+        # noticed; a locked account (code 326), an automation flag (226) or a
+        # rejected login (401/403 on UserByScreenName) looked like a profile
+        # that simply had no payload, and the batch carried on.
+        pushed: list[Signal] = []
 
         async def on_response(resp):
             """Captures the profile visit's GraphQL payloads. Watches BOTH
@@ -550,20 +591,23 @@ class Scraper:
                 is_tweets = any(q in resp.url for q in TWEETS_QUERIES)
                 if not (is_user or is_tweets):
                     return
-                if getattr(resp, "status", 200) == 429:
+                status = getattr(resp, "status", 200)
+                if status == 429:
                     rate_limited = True
+                    # Recorded once, here -- the governor reads this, not
+                    # the row (also covers a timeline 429 after a good
+                    # profile payload).
+                    pushed.append(note_response("twitter", 429, None))
                     return
                 text = await resp.text()
             except Exception:
                 return
 
-            if "Rate limit exceeded" in text or '"code":88' in text:
-                rate_limited = True
-                return
-
+            carried_users = False
             for blob in parse_lines(text):
                 if is_user:
                     for u in iter_users(blob):
+                        carried_users = True
                         # a profile page also loads other users (who to follow);
                         # only the one whose handle matches is this profile
                         if not wanted or u.handle.lower() == wanted:
@@ -575,6 +619,31 @@ class Scraper:
                         blob, wanted, ident.entity_id if ident else ""
                     ):
                         posts.append(iso)
+
+            # WHAT X SAID ABOUT THE REQUEST. Only X's own words are read
+            # (x_error_text): a top-level errors array, a non-JSON error
+            # page, or -- for the user query -- a small body that carried no
+            # user. A bio or a tweet saying "rate limit exceeded" used to
+            # mark the visit throttled; it no longer can.
+            #
+            # The user query is classified on its status too, like
+            # Instagram's handler (X serves UserByScreenName even to a
+            # guest, so a 401/403 there is about our cookies). The timeline
+            # queries only on X's error words: their bare status is not
+            # evidence about the account, and must not slow a healthy run.
+            err = x_error_text(text, allow_body=is_user and not carried_users)
+            if is_user:
+                sig = note_response("twitter", status, err)
+            elif err is not None:
+                sig = classify_response("twitter", 200, err)
+                if sig.is_pushback:
+                    governor_for("twitter").record(sig)
+            else:
+                return
+            if sig.is_pushback:
+                pushed.append(sig)
+                if sig.kind == THROTTLED:
+                    rate_limited = True
 
         page.on("response", lambda r: spawn(on_response(r)))
 
@@ -617,8 +686,10 @@ class Scraper:
             # way. One reload gives it a full second window before the row
             # is written off. Never retried on a rate limit, checkpoint,
             # login or suspended page: reloading those only adds a request
-            # to an account that is already in trouble.
-            if not found and not rate_limited and not self._is_wall(page, body):
+            # to an account that is already in trouble -- nor after X
+            # answered this visit with any pushback (see on_response).
+            if (not found and not rate_limited and not pushed
+                    and not self._is_wall(page, body)):
                 try:
                     await page.reload(
                         wait_until="domcontentloaded",
@@ -629,12 +700,33 @@ class Scraper:
                 body = await chrome_text(page, _X_CONTENT_SELECTORS) or body
 
             if not found:
-                if rate_limited or "rate limit" in body.lower():
+                # A warning popup over the page (X's "looks automated",
+                # account-locked or temporarily-blocked sheet) -- read from
+                # the dialog only, see shared/warning_dialog.py.
+                warned = await self._dialog_check(page, row, pushed)
+                if warned == CHALLENGED:
+                    return row
+                if warned == THROTTLED:
+                    rate_limited = True
+                challenged = next((s for s in pushed if s.kind == CHALLENGED), None)
+                expired = next((s for s in pushed if s.kind == EXPIRED), None)
+                if challenged is not None:
+                    row.status, note = pushback_verdict(challenged)
+                    row.note(note)
+                elif rate_limited or "rate limit" in body.lower():
                     row.status = "CHECKPOINT"
                     row.note("rate limited by X -- cooling down")
-                elif RE_CHECKPOINT.search(body):
+                    if not any(s.kind == THROTTLED for s in pushed):
+                        # Seen only on the page: no response carried it,
+                        # so the governor has not heard of it yet.
+                        governor_for("twitter").record(Signal(
+                            THROTTLED, "rate-limit notice on the profile page"))
+                elif _on_access_page(page.url) or RE_CHECKPOINT.search(body):
                     row.status = "CHECKPOINT"
                     row.note("session checkpointed")
+                elif expired is not None:
+                    row.status, note = pushback_verdict(expired)
+                    row.note(note)
                 elif (
                     _on_login_page(page.url)
                     or RE_LOGIN.search(body)
@@ -711,17 +803,41 @@ class Scraper:
                 row.note("logged out -- login wall over the profile "
                          "(cookies rejected/expired); payload not trusted")
                 return row
+            if _on_access_page(page.url):
+                row.status = "CHECKPOINT"
+                row.note("session checkpointed -- X sent the account to "
+                         "/account/access; payload not trusted")
+                return row
+            # A WARNING OVER A PROFILE THAT LOADED FINE. The payload arrived,
+            # so none of the page checks above fire on it -- the same gap
+            # Instagram had (0e4af96). Read from open dialogs only.
+            warned = await self._dialog_check(page, row, pushed)
+            if warned == CHALLENGED:
+                return row
+            if warned == THROTTLED:
+                rate_limited = True
+            # X answered a query on this visit with a challenge (code 326
+            # locked / 226 looks automated) even though the profile payload
+            # arrived: the account needs a person, so the batch stops here.
+            # The fields already read are kept on the row.
+            challenged = next((s for s in pushed if s.kind == CHALLENGED), None)
             self.fill(row, found[0])
+            if challenged is not None:
+                row.status, note = pushback_verdict(challenged)
+                row.note(note)
+                return row
             # The payload arrived but carried no counts (X moves these
             # fields between A/B variants): read them off the header.
+            # By the pinned HANDLE: fill() has just overwritten profile_id
+            # with the numeric id, which matches no link on the page.
             if row.followers is None or row.friends is None:
-                apply_dom_counts(row, await dom_counts(page, row.profile_id))
+                apply_dom_counts(row, await dom_counts(page, handle))
             # The payload arrived but carried no name -- a shape change that
             # moved the field again, or a node that only had counts on it.
             # Same reasoning as the no-payload path above: read it off the
             # page rather than let the mapping layer show the handle.
             if not row.profile_name:
-                if name := await dom_display_name(page, row.profile_id):
+                if name := await dom_display_name(page, handle):
                     row.profile_name = name
                     row.name_score = name_score(name, row.target)
                     row.mark("name", "dom")
@@ -760,6 +876,8 @@ class Scraper:
             # pays for it. Runs on its own page; `page` stays parked on the
             # profile for the screenshot below.
             tiers_open = not rate_limited
+            # The wall (if any) each helper tab landed on -- see _tab_wall.
+            walls: list[str] = []
             if (
                 tiers_open
                 and not row.last_post_iso
@@ -771,10 +889,14 @@ class Scraper:
                 await self._between_tiers()
                 iso = await self.replies_tab_last_post(
                     profile_url, wanted, found[0].entity_id if found else "",
-                    row=row)
+                    row=row, walls=walls)
                 if iso:
                     row.last_post_iso = iso
                     row.mark("last_post", "replies-tab")
+                if verdict := self._tab_wall(row, walls, "replies"):
+                    if verdict != THROTTLED:
+                        return row
+                    tiers_open = False
 
             # And the /reposts tab, for an account whose output is ONLY
             # reposts -- its Posts and Replies tabs are both empty while its
@@ -791,11 +913,15 @@ class Scraper:
                 await self._between_tiers()
                 iso = await self.reposts_tab_last_post(
                     profile_url, wanted, found[0].entity_id if found else "",
-                    row=row)
+                    row=row, walls=walls)
                 if iso:
                     row.last_post_iso = iso
                     row.mark("last_post", "reposts-tab")
                     row.note("last activity is a repost -- no original posts or replies visible")
+                if verdict := self._tab_wall(row, walls, "reposts"):
+                    if verdict != THROTTLED:
+                        return row
+                    tiers_open = False
 
             # The About panel. Visited when it can actually add something:
             # the profile carried no free-text location of its own (blank on
@@ -813,7 +939,11 @@ class Scraper:
                 if self._stopped(row):
                     return row
                 await self._between_tiers()
-                if about := await self.read_about_panel(profile_url, row=row):
+                about = await self.read_about_panel(profile_url, row=row, walls=walls)
+                if verdict := self._tab_wall(row, walls, "about"):
+                    if verdict != THROTTLED:
+                        return row
+                if about:
                     if about.account_based_in:
                         row.location = about.account_based_in
                         row.mark("location", "about-panel")
@@ -876,6 +1006,8 @@ class Scraper:
         try:
             if _on_login_page(page.url or ""):
                 return "login wall"
+            if _on_access_page(page.url or ""):
+                return "checkpoint"
             body = await chrome_text(page, _X_CONTENT_SELECTORS)
         except Exception:
             return ""
@@ -888,6 +1020,70 @@ class Scraper:
         return ""
 
     @staticmethod
+    def _tab_wall(row: Row, walls: list, tab: str) -> Optional[str]:
+        """Turn the wall a helper tab landed on into a verdict on the row.
+
+        The helper tabs (/with_replies, /reposts, /about) used to only NOTE a
+        wall and the row still ended OK -- so a session logged out or
+        checkpointed between the profile and its tabs was never quarantined,
+        and the batch carried on into the same wall on every later profile.
+
+        Returns the signal kind (and records it on X's governor, once):
+          CHALLENGED -> row CHECKPOINT, the caller returns (fields kept);
+          EXPIRED    -> row LOGIN_REQUIRED, the caller returns (fields kept);
+          THROTTLED  -> row kept, the caller reads no further tabs;
+          None       -> no wall. `walls` is emptied either way."""
+        if not walls:
+            return None
+        wall = walls[-1]
+        walls.clear()
+        kind = _TAB_WALL_SIGNAL.get(wall)
+        if kind is None:
+            return None
+        governor_for("twitter").record(Signal(kind, f"{wall} on the {tab} tab"))
+        if kind == CHALLENGED:
+            row.status = "CHECKPOINT"
+            row.note(f"x checkpoint on the {tab} tab -- account checkpointed; "
+                     f"fields read before it are kept")
+        elif kind == EXPIRED:
+            row.status = "LOGIN_REQUIRED"
+            row.note(f"x login wall on the {tab} tab -- cookies rejected/expired; "
+                     f"fields read before it are kept")
+        else:
+            row.note(f"x rate limit on the {tab} tab -- remaining tabs not read")
+        return kind
+
+    @staticmethod
+    async def _dialog_check(page, row: Row, pushed: list) -> Optional[str]:
+        """A warning X shows in an open dialog over this page (shared/
+        warning_dialog.py reads ONLY dialog text, so a bio quoting the words
+        is never mistaken for it).
+
+          CHALLENGED -> row CHECKPOINT with a note; the caller returns, which
+                        stops the batch (run() / the analysis runner) and
+                        takes the account out of rotation;
+          THROTTLED  -> noted; the caller keeps the row but reads no more tabs.
+
+        Recorded on the governor unless a response this visit already
+        reported the same kind (one event, one record). Returns the kind, or
+        None when there is no warning."""
+        sig = await dialog_warning(page)
+        if sig is None:
+            return None
+        if not any(s.kind == sig.kind for s in pushed):
+            governor_for("twitter").record(sig)
+        pushed.append(sig)
+        if sig.kind == CHALLENGED:
+            row.status = "CHECKPOINT"
+            row.note(f"x warned this account in a popup ({sig.reason}) -- account "
+                     f"checkpointed, batch stopped; open the account, clear the "
+                     f"warning and let it rest before using it again")
+            return CHALLENGED
+        row.note(f"x throttled this account in a popup ({sig.reason}) -- "
+                 f"pacing slowed, extra tabs not read")
+        return THROTTLED
+
+    @staticmethod
     def _is_wall(page, body: str) -> bool:
         """Is this X's own wall (rate limit, checkpoint, login, suspended)
         rather than a profile that is merely slow to deliver its data?"""
@@ -898,6 +1094,7 @@ class Scraper:
             or RE_LOGIN.search(body)
             or RE_GONE.search(body)
             or _on_login_page(url)
+            or _on_access_page(url)
         )
 
     @staticmethod
@@ -967,7 +1164,8 @@ class Scraper:
                 row.note(f"{u.posts:,} posts")
 
     async def read_about_panel(self, url: str,
-                               row: Optional[Row] = None) -> Optional[AboutAccount]:
+                               row: Optional[Row] = None,
+                               walls: Optional[list] = None) -> Optional[AboutAccount]:
         """X's "About this account" panel -> the country it believes the
         account operates from, plus how many times it has been renamed.
 
@@ -990,7 +1188,8 @@ class Scraper:
         `url` is the profile URL (`https://x.com/<handle>`). When `row` is
         given, a read that comes back empty leaves a note on it saying why
         (wall, timeout, error) -- None alone cannot tell "no panel" from "never
-        loaded".
+        loaded". When `walls` is given, the wall the tab landed on (if any)
+        is appended to it so process() can act on it (see _tab_wall).
         """
         page = await self.ctx.new_page()
         found: list[AboutAccount] = []
@@ -1028,6 +1227,8 @@ class Scraper:
                 timed_out = True
             if not found and row is not None:
                 wall = await self._wall_on(page)
+                if wall and walls is not None:
+                    walls.append(wall)
                 row.note(f"about tab not read -- {wall}" if wall else
                          "about tab not read -- timed out" if timed_out else
                          "about tab not read")
@@ -1043,7 +1244,8 @@ class Scraper:
                 pass
 
     async def replies_tab_last_post(self, url: str, wanted: str, entity_id: str,
-                                    row: Optional[Row] = None) -> str:
+                                    row: Optional[Row] = None,
+                                    walls: Optional[list] = None) -> str:
         """Newest post date off the /with_replies tab. "" when there is none.
 
         WHY THIS TIER EXISTS
@@ -1123,6 +1325,8 @@ class Scraper:
             iso = await dom_last_post(page, wanted)
             if not iso and row is not None:
                 wall = await self._wall_on(page)
+                if wall and walls is not None:
+                    walls.append(wall)
                 row.note(f"replies tab not read -- {wall}" if wall
                          else "replies tab showed no dated post")
             return iso
@@ -1137,7 +1341,8 @@ class Scraper:
                 pass
 
     async def reposts_tab_last_post(self, url: str, wanted: str, entity_id: str,
-                                    row: Optional[Row] = None) -> str:
+                                    row: Optional[Row] = None,
+                                    walls: Optional[list] = None) -> str:
         """Newest REPOST time off the /reposts tab. "" when there is none.
 
         Direct navigation to `/<handle>/reposts` lands on the tab and fires
@@ -1179,6 +1384,8 @@ class Scraper:
                 timed_out = True
             if not found and row is not None:
                 wall = await self._wall_on(page)
+                if wall and walls is not None:
+                    walls.append(wall)
                 if wall or timed_out:
                     row.note(f"reposts tab not read -- {wall or 'timed out'}")
             return max(found) if found else ""
