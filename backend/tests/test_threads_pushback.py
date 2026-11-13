@@ -156,6 +156,16 @@ class TestAnalysisWarnings:
         assert _gov().snapshot()["pushbacks"] == 1
 
     @pytest.mark.asyncio
+    async def test_a_throttle_popup_is_told_to_the_governor_only_once(self):
+        # No record AND a throttle popup AND the page's own "try again later"
+        # copy: one throttle, one governor entry.
+        s = _scraper(record=False, lines=["Please try again later"],
+                     dialog="Please wait a few minutes before you try again")
+        row = await s.process("https://www.threads.com/@nike", "Nike", "feed")
+        assert row.status == "PARTIAL"
+        assert _gov().snapshot()["pushbacks"] == 1
+
+    @pytest.mark.asyncio
     async def test_a_dialog_that_says_nothing_about_the_account_changes_nothing(self):
         s = _scraper(texts=GOOD, dialog="Say more with Threads")
         row = await s.process("https://www.threads.com/@nike", "Nike", "feed")

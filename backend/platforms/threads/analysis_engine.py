@@ -362,6 +362,11 @@ class Scraper:
                              "batch stopped; open the account, dismiss the warning and "
                              "let it rest before using it again")
                     return row
+                # Remembered as a pushback of this visit, so the checks below
+                # (page copy, no-record streak) do not tell the governor
+                # about the same throttle a second time.
+                if not any(p.kind == warn.kind for p in pushed):
+                    pushed.append(warn)
                 row.note(f"threads throttled this visit ({warn.reason}) -- pacing slowed")
 
             # A challenge or a rejected login in the document's own answer is
