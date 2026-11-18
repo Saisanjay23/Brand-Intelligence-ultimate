@@ -112,6 +112,19 @@ function selfHealingStory(ss: {
     : "Credentials are stored, so this account signs itself back in when it is found logged out.";
 }
 
+// The failure a 200 response is carrying, or "" when it reports success.
+// Covers the two shapes handleAction gets back: a check ({ok, detail}) and
+// an interactive login ({status, message}). Anything else (a pool after a
+// delete) has neither field and counts as success.
+export function actionFailure(res: unknown): string {
+  if (!res || typeof res !== "object") return "";
+  const r = res as { ok?: unknown; detail?: unknown; status?: unknown; message?: unknown };
+  if (r.ok === false) return String(r.detail || "check failed");
+  if (r.status === "timeout" || r.status === "failed") {
+    return String(r.message || `login ${r.status}`);
+  }
+  return "";
+}
 
 export function SessionPanel({ sessions, onChanged }: Props) {
   const [modal, setModal] = useState<ModalState>({ isOpen: false, mode: "create" });
@@ -122,7 +135,10 @@ export function SessionPanel({ sessions, onChanged }: Props) {
   // check said, kept per session id so checking one row doesn't grey out
   // the whole platform card the way a pool-wide action does
   const [checkingId, setCheckingId] = useState<string>("");
-  const [checkResult, setCheckResult] = useState<{ id: string; ok: boolean; detail: string } | null>(null);
+  // `inconclusive` = the check itself could not finish (network, timeout);
+  // the server left the account's status alone, so the row must not say
+  // "not usable" about an account nobody actually measured.
+  const [checkResult, setCheckResult] = useState<{ id: string; ok: boolean; detail: string; inconclusive?: boolean } | null>(null);
   // Same per-row treatment as the live check above: a re-login opens a real
   // browser and can take half a minute, so the row it belongs to says so
   // rather than the whole platform card greying out.
@@ -153,7 +169,12 @@ export function SessionPanel({ sessions, onChanged }: Props) {
     setGlobalError("");
     try {
       const res = await sessionsApi.checkSessionItem(platform, sessionId);
-      setCheckResult({ id: sessionId, ok: res.ok, detail: res.detail });
+      setCheckResult({
+        id: sessionId,
+        ok: res.ok,
+        detail: res.detail,
+        inconclusive: !res.ok && res.conclusive === false,
+      });
       onChanged();
     } catch (e) {
       setGlobalError((e as Error).message);
@@ -166,7 +187,13 @@ export function SessionPanel({ sessions, onChanged }: Props) {
     setBusyPlatform(platform);
     setGlobalError("");
     try {
-      await fn();
+      const res = await fn();
+      // Not every failure is an HTTP error: "Verify Sweep Now" answers
+      // 200 {ok:false, detail} and "Launch Login" answers 200 with status
+      // "timeout"/"failed". Discarding the body made both look like nothing
+      // happened, which an operator reads as "fine".
+      const failure = actionFailure(res);
+      if (failure) setGlobalError(`${platform}: ${failure}`);
       onChanged();
     } catch (e) {
       setGlobalError((e as Error).message);
@@ -251,6 +278,11 @@ export function SessionPanel({ sessions, onChanged }: Props) {
           const activeCount = s.sessions?.filter(isUsable).length || 0;
           const isAtMax = poolCount >= 20;
           const isBusy = busyPlatform === s.platform;
+          // The server sends a placeholder with state "unknown" when it could
+          // not read this platform's pool at all. Its empty `sessions` list
+          // means "couldn't look", not "no accounts", so it must not render
+          // as the empty-pool card.
+          const isUnknown = s.state === "unknown";
 
           return (
             <div
@@ -290,7 +322,7 @@ export function SessionPanel({ sessions, onChanged }: Props) {
                   <div style={{ fontSize: "11px", color: "var(--text-muted, #98a2b3)", display: "flex", alignItems: "center", gap: "5px", marginTop: "1px" }}>
                     <span>Type: <strong style={{ color: "var(--text-body, #f2f4f7)" }}>{s.kind.toUpperCase()}</strong></span>
                     <span>•</span>
-                    <span>Active: <strong style={{ color: "var(--text-body, #ffffff)" }}>{activeCount}</strong></span>
+                    <span>Active: <strong style={{ color: "var(--text-body, #ffffff)" }}>{isUnknown ? "?" : activeCount}</strong></span>
                   </div>
                 </div>
 
@@ -413,7 +445,24 @@ export function SessionPanel({ sessions, onChanged }: Props) {
 
                   {/* Sessions Scroll Area */}
                   <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: "8px", paddingRight: "2px" }}>
-                    {(!s.sessions || s.sessions.length === 0) ? (
+                    {isUnknown ? (
+                      <div style={{
+                        padding: "16px 12px",
+                        textAlign: "center",
+                        background: "rgba(253, 183, 27, 0.08)",
+                        borderRadius: "8px",
+                        border: "1px dashed rgba(253, 183, 27, 0.45)",
+                        margin: "auto 0"
+                      }}>
+                        <div style={{ display: "flex", justifyContent: "center", marginBottom: "6px" }}>
+                          <AlertTriangleIcon size={22} color="var(--warn-yellow, #FDB71B)" />
+                        </div>
+                        <div style={{ fontSize: "12px", fontWeight: 600, color: "var(--text-primary, #fff)" }}>Status unknown</div>
+                        <div style={{ fontSize: "11px", color: "var(--text-muted, #98a2b3)", margin: "3px auto 0 auto", wordBreak: "break-word" }}>
+                          {s.message || "Could not read this platform's sessions."} Treat it as not usable until it loads.
+                        </div>
+                      </div>
+                    ) : (!s.sessions || s.sessions.length === 0) ? (
                       <div style={{
                         padding: "24px 12px",
                         textAlign: "center",
@@ -452,11 +501,16 @@ export function SessionPanel({ sessions, onChanged }: Props) {
                               display: "flex",
                               justifyContent: "space-between",
                               alignItems: "center",
+                              // Wrap instead of squeezing: the status badge and the
+                              // action buttons never shrink, so in a three-column
+                              // grid they used to crush the details column down to
+                              // ~50px and cut the account name and its warnings off.
+                              flexWrap: "wrap",
                               gap: "8px",
                               flexShrink: 0
                             }}
                           >
-                            <div style={{ minWidth: 0, flex: 1 }}>
+                            <div style={{ minWidth: 0, flex: "1 1 180px" }}>
                               <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
                                 <span style={{
                                   fontSize: "10px",
@@ -569,13 +623,19 @@ export function SessionPanel({ sessions, onChanged }: Props) {
                                   style={{
                                     fontSize: "11px",
                                     fontWeight: 600,
-                                    color: checkResult.ok ? "var(--success, #12B76A)" : "var(--danger, #F04438)",
+                                    color: checkResult.ok
+                                      ? "var(--success, #12B76A)"
+                                      : checkResult.inconclusive
+                                        ? "var(--warning, #F79009)"
+                                        : "var(--danger, #F04438)",
                                     marginTop: "4px",
                                   }}
                                 >
                                   {checkResult.ok
                                     ? "✅ Checked just now — this account is logged in and working"
-                                    : `❌ Checked just now — ${checkResult.detail || "this account is not usable"}`}
+                                    : checkResult.inconclusive
+                                      ? `⚠️ Checked just now — couldn't tell (network?) — status unchanged${checkResult.detail ? `: ${checkResult.detail}` : ""}`
+                                      : `❌ Checked just now — ${checkResult.detail || "this account is not usable"}`}
                                 </div>
                               )}
 
@@ -631,7 +691,11 @@ export function SessionPanel({ sessions, onChanged }: Props) {
 
                               <button
                                 className="action-btn"
-                                disabled={!!busyPlatform || !!checkingId || !!ss.in_use}
+                                // Not while this account is being signed in (by the
+                                // button or the self-healer) or logging in: that is
+                                // a second browser on the same account.
+                                disabled={!!busyPlatform || !!checkingId || !!ss.in_use
+                                  || reloggingId === ss.id || !!ss.relogin_running || loggingIn}
                                 onClick={() => checkOneSession(s.platform, ss.id)}
                                 style={{
                                   padding: "4px 8px",
@@ -654,7 +718,8 @@ export function SessionPanel({ sessions, onChanged }: Props) {
                               {ss.can_relogin && (
                                 <button
                                   className="action-btn"
-                                  disabled={!!busyPlatform || !!reloggingId || !!ss.in_use || !!ss.relogin_running}
+                                  disabled={!!busyPlatform || !!reloggingId || !!ss.in_use || !!ss.relogin_running
+                                    || checkingId === ss.id}
                                   onClick={() => reloginOneSession(s.platform, ss.id)}
                                   style={{
                                     padding: "4px 8px",
@@ -899,15 +964,15 @@ const SessionEditModal: FC<{
           identifier: identifier.trim(),
           ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
           ...(cookieBlob.trim() ? { blob: cookieBlob.trim() } : {}),
-          // Sent only when this form is actually editing credentials.
-          // Omitting a field leaves the stored one alone, which is what
-          // keeps "rename this account" from wiping its password.
-          ...(authMode === "credentials"
-            ? {
-                username: username.trim(),
-                password,
-                two_factor_secret: twoFactorSecret.replace(/\s+/g, ""),
-              }
+          // Sent only when this form is actually editing credentials, and
+          // then only the boxes that were filled in. The server reads an
+          // explicit "" as "clear this field", so sending the blank ones
+          // meant setting just the 2FA secret wiped the stored username and
+          // password -- despite the "Leave blank to keep" placeholder.
+          ...(authMode === "credentials" && username.trim() ? { username: username.trim() } : {}),
+          ...(authMode === "credentials" && password ? { password } : {}),
+          ...(authMode === "credentials" && twoFactorSecret.replace(/\s+/g, "")
+            ? { two_factor_secret: twoFactorSecret.replace(/\s+/g, "") }
             : {}),
         });
       } else if (authMode === "credentials") {
@@ -1048,7 +1113,7 @@ const SessionEditModal: FC<{
                 <input
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
-                  placeholder="scraper.account@example.com"
+                  placeholder={isUpdate ? "Leave blank to keep the stored username" : "scraper.account@example.com"}
                   autoComplete="off"
                   style={modalInputStyle}
                   required={!isUpdate}

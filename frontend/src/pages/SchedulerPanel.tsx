@@ -143,7 +143,7 @@ export function SchedulerPanel({ platforms }: { platforms: PlatformState[] }) {
   const state = useSyncExternalStore(subscribe, getSnapshot);
   // Subscribed, not copied: a one-time copy taken on mount goes stale the
   // moment a client is created anywhere else, and never catches up.
-  const { clients } = useClientDirectory();
+  const { clients, loaded: directoryLoaded, error: directoryError } = useClientDirectory();
   const [filter, setFilter] = useState("");
   const [dragOverQueue, setDragOverQueue] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -500,6 +500,7 @@ export function SchedulerPanel({ platforms }: { platforms: PlatformState[] }) {
                   onDrop={onQueueDrop}
                   platforms={platforms}
                   client={clients.find((c) => c.client_id === entry.client_id)}
+                  directoryTrusted={directoryLoaded && !directoryError}
                 />
               ))}
             </div>
@@ -637,6 +638,7 @@ function QueueRow({
   onDrop,
   platforms,
   client,
+  directoryTrusted,
 }: {
   entry: ScheduleEntry;
   index: number;
@@ -648,8 +650,15 @@ function QueueRow({
   // undefined when the client was deleted from the directory after being
   // queued -- the row still renders, it just has no scope to configure.
   client?: Client;
+  // True once the directory has loaded without error. Only then does a
+  // missing `client` mean "deleted" rather than "not loaded yet".
+  directoryTrusted: boolean;
 }) {
   const [over, setOver] = useState(false);
+  // A deleted client used to render as an ordinary queued row reading
+  // "0 keywords" -- indistinguishable from a client with nothing saved yet.
+  // The engine skips it at run time; the queue should say so before then.
+  const deleted = directoryTrusted && !client && entry.status === "pending";
   // A cancel is only honoured BETWEEN sweeps server-side (see
   // backend/discovery/runner.py -- a sweep already in flight runs to
   // completion), so Stop can take a while to land on a slow platform.
@@ -761,7 +770,11 @@ function QueueRow({
 
       {/* ── SUBTITLE / PROGRESS MESSAGE ── */}
       <div style={{ fontSize: "11px", color: "var(--text-dim)", overflowWrap: "anywhere", wordBreak: "break-word", paddingLeft: "26px", lineHeight: 1.4, minWidth: 0, maxWidth: "100%" }}>
-        {pendingStop
+        {deleted ? (
+          <span style={{ color: "var(--danger, #e95053)", fontWeight: 600 }}>
+            This client no longer exists — it will be skipped. Remove it from the queue.
+          </span>
+        ) : pendingStop
           ? `${entry.message} — finishing the sweep in flight before stopping`
           : entry.message || `${entry.keywords.length} keyword${entry.keywords.length === 1 ? "" : "s"}`}
         {entry.status === "done" && entry.found > 0 && (

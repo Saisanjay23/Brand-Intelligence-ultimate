@@ -23,6 +23,7 @@ import { confirmAction } from "../utils/confirmAction";
 import {
   createClient as createDirectoryClient,
   deleteClient as deleteDirectoryClient,
+  findClient,
   refresh as refreshDirectory,
   updateClient as updateDirectoryClient,
   useClientDirectory,
@@ -113,6 +114,11 @@ interface Props {
   // this hands off to the Analysis tab to watch.
   onAnalyseStarted: (jobId: string) => void;
   onError: (m: string) => void;
+  // Whether `platforms` has ever loaded, and why it could not be read.
+  // Without these an empty list cannot tell "none registered" from "still
+  // loading" from "backend unreachable" -- and all three said "none".
+  platformsLoaded?: boolean;
+  platformsError?: string;
 }
 
 function splitKeywordList(raw: string): string[] {
@@ -951,6 +957,19 @@ function KeywordGroupEditor({
 
     // If input contains bulk separator or multiple lines, apply bulk parser
     if (/[,\n]/.test(pTrimmed) || /:(?!\/\/)|->|=>/.test(pTrimmed)) {
+      // NOT WITH PERMUTATIONS TYPED BELOW IT. The bulk parser only reads
+      // the main-keyword box, so anything in the permutations box was
+      // cleared below without ever being added -- typed keywords vanishing
+      // with no word said. Refuse and keep both boxes as they are instead.
+      if (cTrimmed) {
+        toast.error(
+          "The main keyword contains a list separator (, : -> =>), so it is read as a bulk list " +
+            "and the permutations box would be ignored. Put the permutations inside the main " +
+            'keyword box (e.g. "Name: perm1, perm2"), or remove the separator.',
+          { duration: 8000 },
+        );
+        return;
+      }
       applyBulkText(pTrimmed);
       setParentInput("");
       setChildInput("");
@@ -1322,14 +1341,30 @@ function KeywordTabs({
   // Loaded once per client and handed to every keyword row, so a grid with
   // 40 keywords makes ONE request rather than one per row.
   const [logos, setLogos] = useState<ClientLogo[]>([]);
+  // Why the logos could not be read, or "". A failed read used to become
+  // `setLogos([])` -- the same picture as a client that simply has no
+  // logos, so "unknown" looked like "none".
+  const [logosError, setLogosError] = useState("");
+  // The client the newest request was for. Switching client mid-load
+  // used to let the OLD client's answer land last and paint its logos
+  // onto the new client's keywords.
+  const logosFor = useRef(clientId);
   const reloadLogos = useCallback(() => {
+    logosFor.current = clientId;
+    setLogosError("");
     if (!clientId) { setLogos([]); return; }
     logosApi.list(clientId)
-      .then((r) => setLogos(r.items))
-      // A client with no logos, or a backend that predates them, is the
-      // normal case -- not something to put an error toast in front of an
-      // analyst who never asked for the feature.
-      .catch(() => setLogos([]));
+      .then((r) => {
+        if (logosFor.current === clientId) setLogos(r.items);
+      })
+      // Still no toast -- a client with no logos is the normal case and
+      // most analysts never use the feature -- but a quiet line under the
+      // tabs, so a failure is never mistaken for an empty list.
+      .catch((e) => {
+        if (logosFor.current !== clientId) return;
+        setLogos([]);
+        setLogosError((e as Error).message || "request failed");
+      });
   }, [clientId]);
   useEffect(() => { reloadLogos(); }, [reloadLogos]);
   const [genOpen, setGenOpen] = useState(false);
@@ -1372,6 +1407,30 @@ function KeywordTabs({
           <SparklesIcon size={14} /> Suggest Threat Keywords
         </button>
       </div>
+
+      {logosError && (
+        <div
+          role="status"
+          style={{
+            margin: "0 0 10px", fontSize: "11.5px",
+            color: "var(--warning, #F59E0B)",
+            display: "flex", alignItems: "center", gap: "8px",
+          }}
+        >
+          <AlertTriangleIcon size={12} />
+          Logos could not be loaded ({logosError}) -- the logo column below may be incomplete.
+          <button
+            type="button"
+            onClick={reloadLogos}
+            style={{
+              background: "transparent", border: "none", padding: 0,
+              color: "inherit", textDecoration: "underline", cursor: "pointer", fontSize: "inherit",
+            }}
+          >
+            Retry
+          </button>
+        </div>
+      )}
 
       <div style={{ display: activeTab === "names" ? "block" : "none" }}>
         <KeywordGroupEditor
@@ -1433,6 +1492,7 @@ function PlatformLimitsEditor({
   facebookTabLimits,
   onFacebookTabChange,
   disabled,
+  emptyText = "No platforms registered yet.",
 }: {
   platforms: PlatformState[];
   individualLimits: Record<string, string>;
@@ -1442,6 +1502,10 @@ function PlatformLimitsEditor({
   facebookTabLimits: FacebookTabLimits;
   onFacebookTabChange: (tab: FacebookTab, kwType: "individual" | "domain", value: string) => void;
   disabled?: boolean;
+  // What an EMPTY table says. Only "No platforms registered yet." once the
+  // list has actually loaded -- before then, or when it failed, an empty
+  // table means "not known", and saying "none" there is a clean zero.
+  emptyText?: string;
 }) {
   // Open when any sub-tab cap is set: a collapsed row hid caps that were
   // really in force, so the table read "Unlimited" for a capped Facebook.
@@ -1576,7 +1640,7 @@ function PlatformLimitsEditor({
           {!platforms.length && (
             <tr>
               <td colSpan={3} style={{ textAlign: "center", padding: "20px", color: "var(--text-dim)" }}>
-                No platforms registered yet.
+                {emptyText}
               </td>
             </tr>
           )}
@@ -1653,6 +1717,31 @@ function tabLimitsFormOf(c: Client): FacebookTabLimits {
   };
 }
 
+// Do two copies of ONE saved client hold the same setup -- everything a
+// sweep searches and everything the form edits? Used to notice that the
+// directory has a newer copy than the one this page opened (another
+// analyst saved in between). Order- and spacing-insensitive where the
+// helpers are, so two reads of an unchanged client always compare equal;
+// the flat keyword lists, which are exactly what Discover sends, are also
+// compared verbatim.
+function sameSavedClient(a: Client, b: Client): boolean {
+  const flat = (xs?: string[]) => JSON.stringify(xs || []);
+  return (
+    (a.name || "") === (b.name || "") &&
+    (a.domain || "") === (b.domain || "") &&
+    (a.cron || "") === (b.cron || "") &&
+    flat(a.name_keywords) === flat(b.name_keywords) &&
+    flat(a.domain_keywords) === flat(b.domain_keywords) &&
+    sameKeywordGroups(groupsOf(a, "individual", a.name_keywords || []),
+      groupsOf(b, "individual", b.name_keywords || [])) &&
+    sameKeywordGroups(groupsOf(a, "domain", a.domain_keywords || []),
+      groupsOf(b, "domain", b.domain_keywords || [])) &&
+    sameCaps(a.platform_limits_individual, b.platform_limits_individual) &&
+    sameCaps(a.platform_limits_domain, b.platform_limits_domain) &&
+    sameCaps(a.platform_tab_limits, b.platform_tab_limits)
+  );
+}
+
 export function HomeView({
   clientId,
   platforms,
@@ -1664,12 +1753,14 @@ export function HomeView({
   onDiscoveryStarted,
   onAnalyseStarted,
   onError,
+  platformsLoaded = true,
+  platformsError = "",
 }: Props) {
   // Subscribed to the directory rather than copied out of it: this used
   // to be a snapshot taken on mount, so a client that arrived afterwards
   // -- migrated from localStorage, created in another tab -- did not
   // appear until something happened to remount the page.
-  const { clients } = useClientDirectory();
+  const { clients, loaded: clientsLoaded, error: clientsError } = useClientDirectory();
   const [loadingClients, setLoadingClients] = useState(true);
   // WHERE THE PAGE WAS LEFT. Switching to Live Results or Admin unmounts
   // this page; without this an analyst half-way through a new client came
@@ -1718,6 +1809,24 @@ export function HomeView({
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  // A Discover / Analyse request on its way to the server. Without it a
+  // double-click (or an impatient second click while the request was slow)
+  // started TWO sweeps or two analysis jobs of the same thing. The ref is
+  // the real guard -- it is set synchronously, before the first await, so
+  // a second click in the same frame already sees it; the state only
+  // drives the disabled buttons.
+  const startingRef = useRef(false);
+  const [starting, setStarting] = useState<"" | "discover" | "analyse">("");
+  const beginStart = (what: "discover" | "analyse"): boolean => {
+    if (startingRef.current) return false;
+    startingRef.current = true;
+    setStarting(what);
+    return true;
+  };
+  const endStart = () => {
+    startingRef.current = false;
+    setStarting("");
+  };
 
   // A SET, not a single id: the Run hub lets an analyst pick any
   // combination of platforms. Empty means "every ready platform", which
@@ -1814,6 +1923,7 @@ export function HomeView({
   // Open a saved client, with any unsaved edits the analyst left on it.
   const openClient = (c: Client) => {
     setActiveClient(c);
+    dirCopyRef.current = c;
     loadIntoForm(c);
     const d = loadDraft(editKey(c.client_id));
     if (d && d.id === c.client_id) {
@@ -1828,9 +1938,41 @@ export function HomeView({
   // "the analyst picked another client" (header switcher, Ctrl+K) apart
   // from "the client list was re-read in the background".
   const seenClientIdRef = useRef<string | null>(boot.mode === "create" ? clientId : null);
+  // Mirrors `hasPending` (computed further down, after this effect is
+  // declared) so the effect below can read the CURRENT answer.
+  const hasPendingRef = useRef(false);
+  // The directory's own copy of the open client, as last seen -- see the
+  // effect below for why identity, not content, decides "newly delivered".
+  const dirCopyRef = useRef<Client | null>(null);
 
   useEffect(() => {
-    if (!clientId || activeClient?.client_id === clientId) {
+    if (clientId && activeClient?.client_id === clientId) {
+      seenClientIdRef.current = clientId;
+      // THE SAME CLIENT, RE-READ. This used to stop here, so once a client
+      // was open, `activeClient` and the form were never refreshed from the
+      // directory again: another analyst's saved keywords never reached
+      // this screen, and Save then wrote this screen's stale list over
+      // theirs. With nothing unsaved here, take the newer copy. With
+      // unsaved edits it is NOT swapped in (that would throw the edits
+      // away) -- saveConfig() checks for exactly this before writing.
+      //
+      // Only a copy the directory has NEWLY delivered counts (a different
+      // object from the last one seen). Content alone is not enough: right
+      // after a save, the directory can still hold the pre-save copy for a
+      // moment (a re-read that left before the save landed), and adopting
+      // that would put the analyst's just-saved edits back to the old ones.
+      const fresh = clients.find((c) => c.client_id === clientId);
+      if (fresh && fresh !== dirCopyRef.current) {
+        const seenBefore = dirCopyRef.current !== null;
+        dirCopyRef.current = fresh;
+        if (seenBefore && !sameSavedClient(fresh, activeClient) && !hasPendingRef.current) {
+          setActiveClient(fresh);
+          loadIntoForm(fresh);
+        }
+      }
+      return;
+    }
+    if (!clientId) {
       seenClientIdRef.current = clientId;
       return;
     }
@@ -1924,7 +2066,12 @@ export function HomeView({
     ))) {
       return;
     }
-    loadIntoForm(activeClient);
+    // Back to the NEWEST saved copy, which may be someone else's save
+    // that arrived while these edits were held.
+    const base = clients.find((c) => c.client_id === activeClient.client_id) ?? activeClient;
+    setActiveClient(base);
+    dirCopyRef.current = base;
+    loadIntoForm(base);
     clearDraft(editKey(activeClient.client_id));
     clearDraftTexts(`${activeClient.client_id}.`);
     setEditing(false);
@@ -2055,6 +2202,22 @@ export function HomeView({
       // free -- guessing is exactly what turned an accidental collision
       // into a silent overwrite.
       const { client_id: _omit, ...config } = upsertBody;
+      // SOMEONE ELSE SAVED THIS CLIENT SINCE IT WAS OPENED. An edit is a
+      // whole-record write, so saving now replaces their keywords and caps
+      // with this screen's -- silently, as it used to. Re-read first and,
+      // if the saved copy moved under us, ask before overwriting it.
+      if (editingExisting && activeClient) {
+        await refreshDirectory({ afterWrite: true });
+        const server = findClient(id);
+        if (server && !sameSavedClient(server, activeClient) &&
+            !(await confirmAction(
+              `"${server.name || id}" was changed by someone else since you opened it. Saving now ` +
+                "REPLACES their saved keywords, caps and details with what is on this screen. " +
+                "Save anyway? (Cancel, then Discard Changes, to load their version instead.)",
+            ))) {
+          return null;
+        }
+      }
       const client = editingExisting
         ? await updateDirectoryClient(id, config)
         : await createDirectoryClient(upsertBody);
@@ -2064,6 +2227,9 @@ export function HomeView({
         clearDraftTexts("new.");
       }
       seenClientIdRef.current = client.client_id;
+      // The directory's copy as of now is the baseline: only a copy it
+      // delivers AFTER this save may replace the form (see the effect).
+      dirCopyRef.current = findClient(client.client_id) ?? null;
       setActiveClient(client);
       // Show what the server actually stored (it collapses spacing and drops
       // duplicates), so the form and the saved client agree and the
@@ -2133,6 +2299,7 @@ export function HomeView({
   // client, are written to storage as they are typed, so leaving the page
   // (another app tab, a reload) and coming back finds them where they were.
   const hasPending = pendingChanges.length > 0;
+  hasPendingRef.current = hasPending;
   useEffect(() => {
     if (mode === "create") {
       if (isBlankDraft(formDraft)) clearDraft("new");
@@ -2146,7 +2313,28 @@ export function HomeView({
 
   const handleSearch = async () => {
     if (!activeClient) return;
-    if (!activeKeywordCount) {
+    if (!beginStart("discover")) return;
+    try {
+      await startSearch(activeClient);
+    } finally {
+      endStart();
+    }
+  };
+
+  const startSearch = async (opened: Client) => {
+    // THE FRESHEST SAVED COPY, NOT THE ONE OPENED. `activeClient` is
+    // whatever was loaded when the client was opened; if another analyst
+    // has saved new keywords since, sweeping it searched the OLD list and
+    // never the new keywords -- a missed keyword that looks exactly like a
+    // found-nothing one. Re-read the directory and sweep what is saved
+    // now. (A failed re-read leaves the cached copy, and the directory's
+    // own error banner says why.)
+    await refreshDirectory({ afterWrite: true });
+    const saved = findClient(opened.client_id) ?? opened;
+    const changedElsewhere = !sameSavedClient(saved, opened);
+    const individualCount = saved.name_keywords?.length || 0;
+    const domainCount = saved.domain_keywords?.length || 0;
+    if (!individualCount && !domainCount) {
       onError("This client has no keywords yet — head to the Keywords tab to add executive names or brand keywords.");
       return;
     }
@@ -2154,11 +2342,11 @@ export function HomeView({
     // one non-empty individual_keywords/domain_keywords entry rather than
     // sweeping nothing and reporting success), but catching it here means
     // the analyst finds out on click instead of via a failed job.
-    if (sweepKeywordScope === "individual" && !activeIndividualCount) {
+    if (sweepKeywordScope === "individual" && !individualCount) {
       onError("This client has no individual names configured — pick All Keywords or Domain, or add some in the Keywords tab.");
       return;
     }
-    if (sweepKeywordScope === "domain" && !activeDomainCount) {
+    if (sweepKeywordScope === "domain" && !domainCount) {
       onError("This client has no domain keywords configured — pick All Keywords or Individual, or add some in the Keywords tab.");
       return;
     }
@@ -2171,8 +2359,20 @@ export function HomeView({
     if (unsaved.length) {
       onError(
         `You have unsaved ${unsaved.join(" and ")} changes. Discover searches what is saved, ` +
-          "so save them first (Save Keyword Changes / Save Scrape Limits).");
+          "so save them first (Save Keyword Changes / Save Scrape Limits)." +
+          (changedElsewhere
+            ? " Note: this client was also changed by someone else since you opened it."
+            : ""));
       return;
+    }
+    if (changedElsewhere) {
+      // No unsaved edits, so the open-client effect reloads the form with
+      // this copy; say so, rather than sweep a list the screen did not show.
+      toast(
+        `"${saved.name || saved.client_id}" was updated by someone else since you opened it -- ` +
+          "this sweep uses the latest saved keywords and caps, now shown on screen.",
+        { icon: "🔄", duration: 8000 },
+      );
     }
     let maxSeconds: number | undefined;
     try {
@@ -2188,25 +2388,28 @@ export function HomeView({
       // fact, so the caps below (platform_limits_individual/_domain) only
       // ever apply to keywords that are genuinely part of this sweep.
       const res = await discoveryApi.startDiscovery({
-        group_id: activeClient.client_id,
+        group_id: saved.client_id,
         individual_keywords: sweepKeywordScope === "domain"
-          ? [] : dedupeKeywordsCaseInsensitive(activeClient.name_keywords || []),
+          ? [] : dedupeKeywordsCaseInsensitive(saved.name_keywords || []),
         domain_keywords: sweepKeywordScope === "individual"
-          ? [] : dedupeKeywordsCaseInsensitive(activeClient.domain_keywords || []),
+          ? [] : dedupeKeywordsCaseInsensitive(saved.domain_keywords || []),
         platforms: scope.platforms || (scope.platform ? [scope.platform] : undefined),
-        platform_limits_individual: activeClient.platform_limits_individual,
-        platform_limits_domain: activeClient.platform_limits_domain,
-        platform_tab_limits: activeClient.platform_tab_limits,
+        platform_limits_individual: saved.platform_limits_individual,
+        platform_limits_domain: saved.platform_limits_domain,
+        platform_tab_limits: saved.platform_tab_limits,
         // Empty = all three, exactly as an omitted `platforms` means every
         // platform. Sent unconditionally: the backend ignores it for every
         // platform that has only one tab.
         facebook_tabs: [...sweepFbTabs],
         max_seconds: maxSeconds,
       });
+      // Started FIRST, then the skipped list: onDiscoveryStarted clears the
+      // app's error banner, so reporting the skips before it (as this used
+      // to) had them wiped in the same render -- never seen.
+      onDiscoveryStarted(res.job_id);
       if (res.skipped.length) {
         onError(`Skipped: ${res.skipped.map((s) => `${s.value} (${s.reason})`).join(", ")}`);
       }
-      onDiscoveryStarted(res.job_id);
     } catch (e) {
       onError((e as Error).message);
     }
@@ -2214,6 +2417,15 @@ export function HomeView({
 
   const nameOf = (id: string) =>
     platforms.find((p) => p.platform === id)?.name || id;
+  // What the scrape-limits table says when it has no rows. "None
+  // registered" only once the platform list has really answered.
+  const platformsEmptyText = platforms.length
+    ? ""
+    : platformsError
+      ? `Platforms unavailable: ${platformsError}`
+      : !platformsLoaded
+        ? "Loading platforms…"
+        : "No platforms registered yet.";
   // "Facebook", "Facebook +2", or "" for all-platforms -- a button label
   // has to stay short, so past two the rest becomes a count.
   const scopeLabel = (sel: Set<string>) => {
@@ -2227,6 +2439,17 @@ export function HomeView({
 
   const handleRunAnalysis = async () => {
     if (!activeClient) return;
+    // Guarded from the first click, before the confirmation dialog: two
+    // quick clicks used to open two dialogs and start two identical jobs.
+    if (!beginStart("analyse")) return;
+    try {
+      await startAnalysis(activeClient);
+    } finally {
+      endStart();
+    }
+  };
+
+  const startAnalysis = async (activeClient: Client) => {
     const scope = analysisPlatformName ? `on ${analysisPlatformName}` : "across every platform";
     if (
       !(await confirmAction(
@@ -2255,6 +2478,20 @@ export function HomeView({
         domain: activeClient.domain,
       });
       onAnalyseStarted(res.job_id);
+      // WHAT WAS ACTUALLY STARTED, and what was not. This used to ignore
+      // both: profiles over the per-call ceiling, or URLs the analysis
+      // engine refused, were never mentioned, so an analyst read the job's
+      // results as covering every validated profile. After
+      // onAnalyseStarted, which clears the error banner.
+      toast.success(
+        `Analysis started for ${res.accepted} validated profile${res.accepted === 1 ? "" : "s"}.`,
+      );
+      if (res.skipped.length) {
+        onError(
+          `Analysis did not include ${res.skipped.length} item(s): ` +
+            res.skipped.map((s) => `${s.value} (${s.reason})`).join(", "),
+        );
+      }
     } catch (e) {
       onError((e as Error).message);
     }
@@ -2430,9 +2667,23 @@ export function HomeView({
         </div>
 
         <div className="client-directory-list">
-          {loadingClients ? (
+          {/* "No clients configured." ONLY when the directory really
+              answered with none. Before the first answer it is "loading",
+              and after a failed one it is an outage -- both used to read as
+              an empty directory, inviting the analyst to re-create clients
+              that exist. */}
+          {clientsError && clients.length > 0 && (
+            <div style={{ padding: "8px 12px", color: "var(--warning, #F59E0B)", fontSize: "11.5px" }}>
+              Could not refresh clients: {clientsError}. Showing the last list loaded.
+            </div>
+          )}
+          {!clientsLoaded || (loadingClients && !clients.length && !clientsError) ? (
             <div style={{ textAlign: "center", padding: "24px", color: "var(--text-dim)", fontSize: "12px" }}>
               Loading clients...
+            </div>
+          ) : clientsError && !clients.length ? (
+            <div style={{ textAlign: "center", padding: "24px", color: "var(--danger, #E95053)", fontSize: "12px" }}>
+              Could not load clients: {clientsError}
             </div>
           ) : !filteredClients.length ? (
             <div style={{ textAlign: "center", padding: "24px", color: "var(--text-dim)", fontSize: "12px" }}>
@@ -2537,6 +2788,7 @@ export function HomeView({
             <div style={{ marginBottom: "20px" }}>
               <PlatformLimitsEditor
                 platforms={platforms}
+                emptyText={platformsEmptyText}
                 individualLimits={platformLimitsIndividual}
                 domainLimits={platformLimitsDomain}
                 onIndividualChange={(platform, value) => setPlatformLimitsIndividual((prev) => ({ ...prev, [platform]: value }))}
@@ -2609,9 +2861,21 @@ export function HomeView({
                         <GlobeIcon size={12} /> {activeClient.domain}
                       </span>
                     )}
-                    <span className="status-dot-badge">
-                      <span className="status-dot" /> Active
-                    </span>
+                    {/* Not a blanket green "Active": a client with no
+                        keywords has nothing any sweep can search. */}
+                    {activeKeywordCount ? (
+                      <span className="status-dot-badge">
+                        <span className="status-dot" /> Configured
+                      </span>
+                    ) : (
+                      <span
+                        className="status-dot-badge"
+                        style={{ color: "var(--warning, #F59E0B)", borderColor: "rgba(245, 158, 11, 0.4)", background: "rgba(245, 158, 11, 0.1)" }}
+                        title="This client has no keywords yet -- add some on the Keywords tab"
+                      >
+                        <span className="status-dot" style={{ background: "var(--warning, #F59E0B)", boxShadow: "none" }} /> Needs setup
+                      </span>
+                    )}
                   </div>
                 </div>
               </div>
@@ -2889,8 +3153,8 @@ export function HomeView({
                       <button
                         type="button"
                         className="runner-btn-primary"
-                        disabled={!activeKeywordCount}
-                        onClick={handleSearch}
+                        disabled={!activeKeywordCount || !!starting}
+                        onClick={() => void handleSearch()}
                         title={
                           busy
                             ? "Queue another discovery sweep -- it starts when the running one finishes"
@@ -2905,6 +3169,7 @@ export function HomeView({
                               sweepKeywordScope === "individual" ? "Individual"
                                 : sweepKeywordScope === "domain" ? "Domain" : "",
                             ].filter(Boolean);
+                            if (starting === "discover") return "Starting…";
                             return bits.length ? `Discover (${bits.join(" · ")})` : "Discover";
                           })()}
                         </span>
@@ -2927,14 +3192,17 @@ export function HomeView({
                       <button
                         type="button"
                         className="runner-btn-secondary"
-                        onClick={handleRunAnalysis}
+                        disabled={!!starting}
+                        onClick={() => void handleRunAnalysis()}
                         title="Analyse this client's currently validated profiles now -- results are memory-only, shown on the Analysis tab"
                       >
                         <AnalyseIcon size={17} color="#9A50E9" />
                         <span>
-                          {analysisPlatformName
-                            ? `Analyse (${analysisPlatformName})`
-                            : "Analyse"}
+                          {starting === "analyse"
+                            ? "Starting…"
+                            : analysisPlatformName
+                              ? `Analyse (${analysisPlatformName})`
+                              : "Analyse"}
                         </span>
                       </button>
                     </div>
@@ -2974,12 +3242,31 @@ export function HomeView({
                     <span className="quick-stat-sub">Capped platforms</span>
                   </div>
 
+                  {/* FROM THE CLIENT'S OWN DATA. This was a hard-coded green
+                      "● Active / Continuous protection" on every client --
+                      including one with no keywords, which no sweep can
+                      search anything for. Nothing here knows whether a
+                      schedule is really running, so a set-up client says
+                      what is true (keywords saved), not "protected". */}
                   <div className="client-quick-stat-box">
                     <span className="quick-stat-label">Monitoring</span>
-                    <span className="quick-stat-value" style={{ fontSize: "15px", marginTop: "4px", color: "var(--success)" }}>
-                      ● Active
-                    </span>
-                    <span className="quick-stat-sub">Continuous protection</span>
+                    {activeKeywordCount ? (
+                      <>
+                        <span className="quick-stat-value" style={{ fontSize: "15px", marginTop: "4px", color: "var(--text-main)" }}>
+                          ● Configured
+                        </span>
+                        <span className="quick-stat-sub">
+                          {activeKeywordCount} keyword{activeKeywordCount === 1 ? "" : "s"} saved to search
+                        </span>
+                      </>
+                    ) : (
+                      <>
+                        <span className="quick-stat-value" style={{ fontSize: "15px", marginTop: "4px", color: "var(--warning, #F59E0B)" }}>
+                          ● Needs setup
+                        </span>
+                        <span className="quick-stat-sub">No keywords -- nothing can be searched</span>
+                      </>
+                    )}
                   </div>
                 </div>
               </div>
@@ -3023,6 +3310,7 @@ export function HomeView({
               <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
                 <PlatformLimitsEditor
                   platforms={platforms}
+                  emptyText={platformsEmptyText}
                   individualLimits={platformLimitsIndividual}
                   domainLimits={platformLimitsDomain}
                   onIndividualChange={(platform, value) => setPlatformLimitsIndividual((prev) => ({ ...prev, [platform]: value }))}
@@ -3123,7 +3411,13 @@ export function HomeView({
                     <span>Danger Zone</span>
                   </div>
                   <div style={{ fontSize: "12px", color: "var(--text-dim)", marginBottom: "12px" }}>
-                    Permanently delete this organization and cascade remove all associated discovery hits, validated profiles, and incident tickets.
+                    {/* Says what DELETE /clients/{id} actually does (backend/api/clients.py
+                        delete_client). This used to promise a cascade through discovery
+                        hits, validated profiles and incidents that nothing performs. */}
+                    Permanently delete this organization&rsquo;s saved setup -- its keywords, scrape
+                    caps, cron and reference logos -- for everyone. Discovery profiles already found
+                    under this org id are NOT deleted: they stay in the database and reappear if the
+                    client is re-created with the same org id.
                   </div>
                   <button
                     onClick={handleDelete}

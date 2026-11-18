@@ -43,7 +43,6 @@ export function Header({
   recentClients,
   allClients = [],
   onClient,
-  onForgetClient,
   activeJobsCount,
   readySessionsCount,
   platformCount,
@@ -307,7 +306,14 @@ export function Header({
                     }}
                     onClick={(e) => {
                       e.stopPropagation();
-                      onForgetClient(clientId);
+                      // CLEAR, not forget. This used to call onForgetClient,
+                      // whose job is "this client is gone" -- so it promptly
+                      // made ANOTHER client active, and the button labelled
+                      // "Clear Active" switched the analyst to a client they
+                      // never picked. Now it leaves no client selected.
+                      onClient("", "");
+                      setOpenDropdown(false);
+                      setSearchQuery("");
                     }}
                     title="Clear current active client"
                   >

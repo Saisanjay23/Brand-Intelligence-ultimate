@@ -88,11 +88,26 @@ export function keywordCategories(clientId: string): { individual: string[]; dom
 // ------------------------------------------------------------------ loading
 
 let inFlight: Promise<void> | null = null;
+let followUp: Promise<void> | null = null;
 
-export function refresh(): Promise<void> {
+// `afterWrite`: the caller has just changed a client and needs a read that
+// was SENT after that change. Joining a read already in flight is wrong
+// then -- it was sent before the write and resolves with the old list, so
+// a save would await, "succeed", and show the pre-save keywords. Such a
+// caller gets one fresh read queued behind the in-flight one instead.
+export function refresh(opts: { afterWrite?: boolean } = {}): Promise<void> {
   // Four components mount at once on a page load and all want the list.
   // One request, shared.
-  if (inFlight) return inFlight;
+  if (inFlight) {
+    if (!opts.afterWrite) return inFlight;
+    if (!followUp) {
+      followUp = inFlight.then(() => {
+        followUp = null;
+        return refresh();
+      });
+    }
+    return followUp;
+  }
   setState({ loading: true });
   inFlight = clientsApi
     .listClients()
@@ -114,19 +129,19 @@ export function refresh(): Promise<void> {
 
 export async function createClient(config: ClientConfig): Promise<Client> {
   const created = await clientsApi.createClient(config);
-  await refresh();
+  await refresh({ afterWrite: true });
   return created;
 }
 
 export async function updateClient(clientId: string, config: ClientEdit): Promise<Client> {
   const saved = await clientsApi.updateClient(clientId, config);
-  await refresh();
+  await refresh({ afterWrite: true });
   return saved;
 }
 
 export async function deleteClient(clientId: string): Promise<void> {
   await clientsApi.deleteClient(clientId);
-  await refresh();
+  await refresh({ afterWrite: true });
 }
 
 // ---------------------------------------------------------------- migration

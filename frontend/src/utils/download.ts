@@ -19,8 +19,27 @@ export function downloadBlob(filename: string, blob: Blob) {
   setTimeout(() => URL.revokeObjectURL(href), 1000);
 }
 
-// Flat records -> CSV text. Column order is the first row's own key order,
-// so callers control layout by controlling the row shape, not this function.
+// Every column any row has, in first-seen order -- the first row's own key
+// order first, then anything later rows add. Callers still control layout by
+// controlling the row shape.
+//
+// NOT `Object.keys(rows[0])`, which is what this used to be. An analysis
+// export taken while a job was still running could lead with a row whose
+// data had not arrived yet (an `{}` plus the one computed column), and the
+// whole file was then cut down to that one column: every other row's real
+// values silently dropped, with nothing in the file to say so.
+export function csvColumns(rows: Record<string, unknown>[]): string[] {
+  const seen = new Set<string>();
+  const cols: string[] = [];
+  for (const r of rows) {
+    for (const k of Object.keys(r)) {
+      if (!seen.has(k)) { seen.add(k); cols.push(k); }
+    }
+  }
+  return cols;
+}
+
+// Flat records -> CSV text. Columns: see csvColumns.
 //
 // Cell values here come from scraped, attacker-influenced social-media
 // profile content (an impersonator's own display name, bio, etc), and these
@@ -30,7 +49,7 @@ export function downloadBlob(filename: string, blob: Blob) {
 // without changing the visible text, same mitigation OWASP recommends.
 export function rowsToCsv(rows: Record<string, unknown>[]): string {
   if (!rows.length) return "";
-  const cols = Object.keys(rows[0]);
+  const cols = csvColumns(rows);
   const esc = (v: unknown) => {
     let s = v === null || v === undefined ? "" : String(v);
     if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
@@ -52,7 +71,7 @@ export function rowsToCsv(rows: Record<string, unknown>[]): string {
 // column/row pasting into Microsoft Excel and Google Sheets.
 export function rowsToTsv(rows: Record<string, unknown>[]): string {
   if (!rows.length) return "";
-  const cols = Object.keys(rows[0]);
+  const cols = csvColumns(rows);
   const esc = (v: unknown) => {
     let s = v === null || v === undefined ? "" : String(v);
     if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;

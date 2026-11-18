@@ -92,9 +92,31 @@ async def get_all_session_status() -> dict:
     for platform_id, result in zip(platform_ids, results):
         if isinstance(result, BaseException):
             log.warning(f"{platform_id}: session status unavailable -- {type(result).__name__}: {result}")
+            items.append(_unknown_pool(platform_id, result))
             continue
         items.append(result)
     return {"items": items}
+
+
+def _unknown_pool(platform_id: str, error: BaseException) -> dict:
+    """A stand-in row for a platform whose status could not be read.
+
+    Dropping it from the list instead made the platform vanish from the
+    Sessions page -- which reads as "nothing to see here", the silent clean
+    zero. "unknown" is never "ready": every gate that checks `state ==
+    "ready"` treats it as unusable, and the message says why.
+    """
+    from backend.platforms import registry
+
+    p = registry.PLATFORMS.get(platform_id)
+    return {
+        "platform": platform_id,
+        "name": p.name if p else platform_id,
+        "state": "unknown",
+        "kind": ("api-key" if p.uses_api_key else "mtproto" if p.env_keys else "cookies") if p else "cookies",
+        "can_login": False,
+        "message": f"Could not read this platform's session status -- {type(error).__name__}: {error}",
+    }
 
 
 @router.get("/{platform_id}", response_model=SessionPool)

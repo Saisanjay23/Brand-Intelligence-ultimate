@@ -87,6 +87,21 @@ def _fresh_account_budgets():
     manager._claim_accounts.clear()
 
 
+@pytest.fixture(autouse=True)
+def _no_real_egress_lookup(monkeypatch):
+    """The network-change guard (shared/egress.py) asks a public IP service
+    where this machine is. Off for every test, so none of them reaches the
+    network or is held by the machine they happen to run on; the tests that
+    are ABOUT the guard switch it on and feed it a fake lookup."""
+    from backend.config.settings import settings
+    from backend.shared import egress
+
+    monkeypatch.setattr(settings, "meta_egress_guard", False)
+    egress.reset()
+    yield
+    egress.reset()
+
+
 # Every SMTP send the suite attempted, for tests that want to assert on it.
 SENT_EMAILS: list[dict] = []
 

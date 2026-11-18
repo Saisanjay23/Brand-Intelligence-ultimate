@@ -339,6 +339,95 @@ def _worker_semaphore() -> asyncio.Semaphore:
     return sem
 
 
+# ----------------------------------------------- no login first (Instagram)
+#
+# READ THE PUBLIC PAGE FIRST, USE AN ACCOUNT ONLY WHEN THAT IS REFUSED.
+#
+# The pool's Instagram accounts kept being suspended, and a public Instagram
+# profile page still loads for a visitor who is not signed in. So with
+# `instagram_analysis_no_login` on, an Instagram batch starts with a NO-LOGIN
+# PHASE (`_no_login_phase`): one browser with no cookies in it reads each
+# profile's public page. No pooled session is claimed, no account is touched,
+# and every profile read there is finished there.
+#
+# The first profile Instagram REFUSES to a logged-out visitor (a login wall,
+# an HTTP 429, a page with the data withheld -- see the Instagram engine's
+# `process_logged_out`) ends that phase. It goes back on the queue untouched,
+# with everything still behind it, and the ACCOUNT PHASE -- the ordinary claim
+# rounds below, completely unchanged -- takes them. A refused read is never a
+# result: not GONE, not an empty profile, not a session failure (there is no
+# session to fail).
+#
+# THE PAUSE OUTLIVES THE BATCH. Instagram's logged-out limit is per IP address
+# and is reported to last for hours once hit, so the next batch a minute later
+# would only be refused again -- and every refused visit makes the refusal
+# last longer. A refusal of this machine therefore pauses the no-login phase
+# process-wide for `_NO_LOGIN_PAUSE_S`, and batches in that window go straight
+# to the account path, saying so. A page that simply did not load is handed
+# over too, but does not pause anything: it says nothing about the IP.
+#
+# ANALYSIS ONLY. Discovery's keyword search has no logged-out equivalent
+# (Instagram answers it with a login page), which is why this lives here and
+# NOT in registry.py's `anonymous_context_path` -- that flag would make
+# discovery treat Instagram as runnable without an account and produce
+# sweeps that find nothing, silently.
+
+# How long a refusal pauses the no-login phase, process-wide.
+_NO_LOGIN_PAUSE_S = 3600.0
+
+# Instagram's error page for ONE profile is not a refusal of this machine (a
+# removed profile shows it -- see the Instagram engine's NL_ERROR_PAGE), so
+# that profile is set aside for an account and the no-login phase carries on.
+# This many IN A ROW is treated as a refusal after all: a run of "every
+# profile is unavailable" is far likelier to be Instagram limiting us than a
+# batch of dead links, the same control `_preflight` applies.
+_NO_LOGIN_ERROR_PAGE_STREAK = 3
+
+# The session item a no-login read is made under. `anonymous` is the key the
+# rest of this module (and the Instagram Scraper, and account_budget) already
+# reads as "no account behind this".
+NO_LOGIN_SESSION_ITEM: dict = {"id": "", "identifier": "no-login", "anonymous": True}
+
+_no_login_pause: dict[str, Any] = {"until": 0.0, "reason": ""}
+
+
+def _no_login_wanted(platform_id: str) -> bool:
+    return (platform_id == "instagram"
+            and bool(getattr(settings, "instagram_analysis_no_login", False)))
+
+
+def no_login_paused(now: Optional[float] = None) -> str:
+    """Why the no-login phase is paused right now, or "" when it is not."""
+    t = time.time() if now is None else now
+    return _no_login_pause["reason"] if t < float(_no_login_pause["until"] or 0) else ""
+
+
+def pause_no_login(reason: str, now: Optional[float] = None) -> None:
+    t = time.time() if now is None else now
+    _no_login_pause["until"] = t + _NO_LOGIN_PAUSE_S
+    _no_login_pause["reason"] = reason
+
+
+def reset_no_login_pause() -> None:
+    """Forget a pause (tests, and an operator who knows the IP changed)."""
+    _no_login_pause["until"] = 0.0
+    _no_login_pause["reason"] = ""
+
+
+def _no_login_settles(row: Row) -> bool:
+    """Does a no-login reading FINISH this item, or must an account look?
+
+    Finished: the profile was read (OK), Instagram's own page said it is gone
+    (GONE -- the engine demands that page's own evidence, see
+    `process_logged_out`), or the URL is not a profile at all (ERROR with no
+    username, refused before any page load -- an account would refuse it the
+    same way). EVERYTHING ELSE goes to an account, including any status this
+    rule has never heard of: an unrecognised outcome is not a reading."""
+    if row.status in ("OK", "GONE"):
+        return True
+    return row.status == "ERROR" and not row.profile_id
+
+
 def _sessions_wanted(platform_id: str, item_count: int, concurrency: int) -> int:
     """How many sessions it is worth claiming for this platform.
 
@@ -661,6 +750,16 @@ class _PlatformRun:
     # past `pushback_max_wait_minutes`: the reason, which then becomes the
     # stated cause on every URL that was never analysed. Empty = not stopped.
     hard_stop: str = ""
+    # Why the no-login phase handed URLs to the account phase (Instagram
+    # only): a refusal, a paused no-login phase, a browser that would not
+    # start. Named on any of those URLs that no account then reached, so the
+    # row says both halves -- "could not be read without login, and no
+    # account was available" -- never just a generic session error.
+    no_login_handover: str = ""
+    # item id -> why THAT profile's own no-login read was not usable. More
+    # precise than `no_login_handover`, which also covers the URLs queued
+    # behind a refusal that were never tried without login at all.
+    no_login_why: dict[str, str] = field(default_factory=dict)
 
 
 # ROW STATUSES THAT ARE ABOUT THE ACCOUNT, NOT THE PROFILE. Every engine
@@ -990,6 +1089,13 @@ class AnalysisRunner:
                 errored = sum(1 for i in job.items if i.status == "error")
                 job.message = f"{job.total - errored}/{job.total} scraped" + (
                     f", {errored} failed" if errored else "")
+            # "Instagram: 9 read without login, 3 via account" -- see
+            # `_scrape_platform`. Only a platform that ran a no-login phase
+            # has one.
+            notes = [f"{p.get('display_name') or pid}: {p['note']}"
+                     for pid, p in job.platform_progress.items() if p.get("note")]
+            if notes:
+                job.message += " -- " + "; ".join(notes)
         except asyncio.CancelledError:
             # THE HARD-CANCEL BACKSTOP LANDING (see JobStore.cancel). The
             # cooperative flag did not reach a checkpoint inside the grace
@@ -1218,7 +1324,23 @@ class AnalysisRunner:
             progress=progress,
         )
 
-        want = _sessions_wanted(platform_id, len(items), concurrency)
+        # NO LOGIN FIRST (Instagram, while `instagram_analysis_no_login` is on).
+        # Whatever it reads is finished; whatever it leaves on `run.queue` is
+        # exactly what the account phase below would have been given, and that
+        # phase runs on it unchanged -- including claiming nothing at all when
+        # the queue is already empty.
+        no_login_ran = False
+        no_login_read = 0
+        if _no_login_wanted(platform_id) and run.queue and not job.cancel.is_set():
+            no_login_ran = True
+            no_login_read = await self._no_login_phase(job, run)
+        via_account = len(run.queue)
+
+        # Sized to what is LEFT, so a batch the no-login phase mostly read
+        # does not claim accounts for work that no longer exists. Without a
+        # no-login phase the queue is still the whole batch -- the same number
+        # this always was.
+        want = _sessions_wanted(platform_id, max(1, len(run.queue)), concurrency)
         progress["workers"] = 0
         setup_error = ""
         worker_error = ""
@@ -1293,7 +1415,21 @@ class AnalysisRunner:
                 "every available session for this platform failed or checkpointed -- "
                 "see the earlier failed item(s) on this platform for why")
             for it in stranded:
-                await self._fail_item(job, it, detail)
+                why_no_login = run.no_login_why.get(it.id) or run.no_login_handover
+                if why_no_login:
+                    # BOTH HALVES, SAID OUT LOUD. This URL was not read
+                    # without login AND no account could read it either.
+                    # Saying only the second half would hide that the
+                    # account path was a fallback; saying only the first
+                    # would read like a verdict. Neither is a finding about
+                    # the profile: it is owed.
+                    await self._fail_item(job, it, (
+                        f"not analysed -- could not be read without login "
+                        f"({why_no_login}), and no {registry.display_name(platform_id)} "
+                        f"account could take it over ({detail}). Owed: re-run it once "
+                        f"an account is available or the no-login pause has passed"))
+                else:
+                    await self._fail_item(job, it, detail)
                 job.completed += 1
                 progress["completed"] += 1
             progress["status"] = "failed"
@@ -1311,6 +1447,231 @@ class AnalysisRunner:
             # another one finished its URLs, and the analyst gets a complete
             # platform anyway.
             progress["status"] = "done"
+
+        if no_login_ran:
+            # WHERE EACH READING CAME FROM, on the batch itself. The rows say
+            # it one by one (their notes); this is the count an analyst reads
+            # at a glance, and `_run` carries it into the job's message.
+            progress["no_login_read"] = no_login_read
+            progress["via_account"] = via_account
+            progress["note"] = f"{no_login_read} read without login, {via_account} via account"
+            if run.no_login_handover:
+                progress["no_login_stopped"] = run.no_login_handover
+
+    async def _no_login_phase(self, job: AnalysisJob, run: _PlatformRun) -> int:
+        """Read as much of `run.queue` as possible with NO login. -> how many
+        items it finished. See the notes above `_no_login_wanted`.
+
+        One browser with no cookies in it (the platform Scraper with
+        `anonymous=True`), one profile at a time, under the same breaker,
+        the same pacing and a ceiling of its own (account_budget, keyed to
+        this machine rather than an account). No pooled session is claimed
+        and none is ever marked failed or ok: there is none.
+
+        STOPS AT THE FIRST PROFILE IT CANNOT READ. That profile goes back to
+        the FRONT of the queue, unread and uncounted -- its `attempts` are not
+        touched either, so the account phase gives it exactly the failover it
+        always did -- and everything behind it stays queued. A refusal of
+        this machine also pauses no-login process-wide (`pause_no_login`).
+        `run.no_login_why` / `run.no_login_handover` say why, for any of them
+        no account then reaches.
+
+        ONE EXCEPTION: Instagram's error page for a single profile (the
+        engine's NL_ERROR_PAGE) is not a refusal -- a removed profile shows
+        it. That profile is SET ASIDE for an account and the phase carries
+        on, unless it is the `_NO_LOGIN_ERROR_PAGE_STREAK`-th in a row.
+        """
+        from backend.platforms.instagram.analysis_engine import (
+            NL_ERROR_PAGE, NO_LOGIN_IP_BLOCKS)
+
+        platform_id = run.platform_id
+        progress = run.progress
+        if why := no_login_paused():
+            run.no_login_handover = f"no-login reading is paused: {why}"
+            log.info(f"[{platform_id}] no-login reading is paused ({why}) -- "
+                     f"{len(run.queue)} URL(s) go straight to the account path")
+            return 0
+
+        plat = registry.PLATFORMS.get(platform_id)
+        session_item = dict(NO_LOGIN_SESSION_ITEM)
+        label = str(session_item["identifier"])
+
+        def should_stop() -> bool:
+            return job.cancel.is_set() or bool(run.hard_stop)
+
+        read = 0
+        scraper = None
+        # Profiles handed to an account WITHOUT stopping the phase (error
+        # pages), returned to the front of the queue, in batch order, however
+        # the phase ends.
+        set_aside: list[AnalysisItem] = []
+        error_streak = 0
+        # One browser, counted against the process-wide ceiling like any
+        # other worker's -- see `_worker_semaphore`.
+        async with _worker_semaphore():
+            if not run.queue or job.cancel.is_set():
+                return 0
+            progress["workers"] = 1
+            progress["current_step"] = "Reading public profile pages (no login)..."
+            try:
+                try:
+                    scraper = plat.scraper()(run.options, [], anonymous=True)
+                    await _bounded(scraper.start(), f"{platform_id} no-login browser start")
+                except Exception as e:                  # noqa: BLE001 - handed over
+                    run.no_login_handover = (
+                        f"the no-login browser did not start ({type(e).__name__}: {e})")
+                    log.warning(f"[{platform_id}] {run.no_login_handover} -- every URL "
+                                f"goes to the account path")
+                    return 0
+
+                while run.queue and not job.cancel.is_set() and not run.hard_stop:
+                    # The breaker, exactly as an account worker asks it: a
+                    # platform pushing back is pushing back on this IP too.
+                    why = await wait_for_breaker(platform_id, should_stop, log=log, label=label)
+                    if why:
+                        run.hard_stop = (
+                            f"{platform_id} kept pushing back ({why}); not analysed "
+                            f"-- re-run these URLs later")
+                        log.error(f"[{platform_id}] {run.hard_stop}")
+                        break
+                    if not run.queue or job.cancel.is_set():
+                        break
+                    # This machine's no-login ceiling. Waits at the ceiling,
+                    # never skips -- the same rule as an account's.
+                    try:
+                        ok = await account_budget.hold(
+                            platform_id, session_item, account_budget.PROFILE,
+                            should_stop, log=log, label=label)
+                    except account_budget.DailyLimitReached as e:
+                        # Not expected (a no-login visit has no daily ceiling),
+                        # but if it ever comes the rest is an account's.
+                        run.no_login_handover = str(e)
+                        break
+                    if not ok:
+                        break
+                    it = run.queue.popleft()
+                    why, kind = await self._no_login_one(job, run, it, scraper)
+                    if not why:
+                        read += 1
+                        error_streak = 0
+                    elif (kind == NL_ERROR_PAGE
+                          and error_streak + 1 < _NO_LOGIN_ERROR_PAGE_STREAK):
+                        # One profile Instagram shows its error page for: an
+                        # account looks at it, no-login carries on.
+                        error_streak += 1
+                        run.no_login_why[it.id] = why
+                        set_aside.append(it)
+                        log.info(f"[{platform_id}] no-login: {it.url} showed Instagram's "
+                                 f"error page -- set aside for an account, carrying on")
+                    else:
+                        # A REFUSAL. This profile back to the front, and the
+                        # phase ends here; everything behind it is the
+                        # account phase's.
+                        run.no_login_why[it.id] = why
+                        run.queue.appendleft(it)
+                        refused_ip = (kind in NO_LOGIN_IP_BLOCKS or kind == NL_ERROR_PAGE)
+                        if refused_ip:
+                            pause_no_login(
+                                f"Instagram refused a logged-out visit ({kind}) at "
+                                f"{datetime.now(timezone.utc).strftime('%H:%M UTC')}")
+                        run.no_login_handover = (
+                            f"no-login reading stopped at an earlier profile it could "
+                            f"not read ({kind or 'unreadable'})")
+                        log.warning(
+                            f"[{platform_id}] no-login read of {it.url} not usable ({why}) "
+                            f"-- it and the {len(run.queue) - 1} URL(s) after it go to the "
+                            f"account path"
+                            + (f"; no-login paused for {_NO_LOGIN_PAUSE_S / 60:.0f} min"
+                               if refused_ip else ""))
+                        break
+                    if run.queue and run.inter_batch_delay > 0:
+                        # The same between-profile gap an account worker
+                        # takes (see `_platform_worker`).
+                        base = settings.analysis_delay_sec or 0
+                        mult = (run.inter_batch_delay / base) if base > 0 else 1.0
+                        try:
+                            await scraper.pause(mult)
+                        except Exception:               # noqa: BLE001
+                            pass
+            finally:
+                # Set-aside profiles back at the front, in batch order -- on
+                # every way out, a stop included, so none is ever lost.
+                run.queue.extendleft(reversed(set_aside))
+                progress["workers"] = 0
+                progress["current_url"] = ""
+                progress["current_step"] = ""
+                progress["item_started_at_ts"] = None
+                if scraper is not None:
+                    await _close_quietly(f"[{platform_id}] no-login browser", scraper.stop)
+        if read or run.queue:
+            log.info(f"[{platform_id}] no-login phase: {read} read without login, "
+                     f"{len(run.queue)} left for the account path")
+        return read
+
+    async def _no_login_one(
+        self, job: AnalysisJob, run: _PlatformRun, it: AnalysisItem, scraper: Any,
+    ) -> tuple[str, str]:
+        """One profile, read without login. -> ("", "") when it is FINISHED
+        (saved and counted, like any other result); otherwise (why, kind):
+        the reason it is not usable and the engine's refusal kind ("" when
+        there is none, e.g. a timeout). An unusable item is neither saved nor
+        counted and is reset to exactly what the account phase expects of a
+        queued item; WHERE it goes is the caller's decision."""
+        from backend.platforms.instagram.analysis_engine import (
+            REFUSED_NOTE_PREFIX, no_login_block_kind)
+
+        prog = run.progress
+        it.status = "running"
+        it.started_at_ts = time.time()
+        prog["current_url"] = it.url
+        prog["current_step"] = "Reading the public profile page (no login)..."
+        prog["item_started_at_ts"] = time.time()
+        known = job.seed_by_url.get(it.url)
+        t0 = time.time()
+        row: Optional[Row] = None
+        why = ""
+        try:
+            row = await asyncio.wait_for(
+                scraper.one(it.url, job.target_name, job.official_feed, known=known),
+                timeout=_step_timeout_s())
+        except asyncio.TimeoutError:
+            why = f"the page did not finish within {_step_timeout_s():.0f}s"
+        except asyncio.CancelledError:
+            # The hard stop landed mid-read: stated, not left "running".
+            _mark_not_analysed(it)
+            raise
+        except Exception as e:                          # noqa: BLE001 - handed over
+            why = f"{type(e).__name__}: {e}"
+
+        if row is not None and _no_login_settles(row):
+            it.duration_seconds = round(time.time() - t0, 2)
+            try:
+                await self._populate(job, it, row, known)
+                await self._settle(job, it, screenshot=row.screenshot_bytes)
+            except Exception as e:                      # noqa: BLE001
+                it.where = diagnostics.where(e)
+                await self._fail_item(job, it, f"{type(e).__name__}: {e}")
+            job.completed += 1
+            prog["completed"] = int(prog.get("completed") or 0) + 1
+            return "", ""
+
+        # NOT USABLE, UNREAD. Not saved (a refusal is not a result and must
+        # not overwrite a good saved reading of the same profile), not
+        # counted, attempts untouched -- the account phase sees a plain
+        # queued item.
+        kind = no_login_block_kind(row) if row is not None else ""
+        if row is not None:
+            # The engine's own words, without its "could not be read without
+            # login -- " opener: every sentence that repeats this reason
+            # already says that half.
+            why = (row.notes or row.status).replace(REFUSED_NOTE_PREFIX, "", 1)[:300]
+        it.status = "pending"
+        it.started_at_ts = None
+        it.error = ""
+        it.comments = ""
+        it.analysed_at = None
+        it.duration_seconds = None
+        return (why or "the no-login read was not usable"), kind
 
     async def _claim_sessions(
         self, platform_id: str, want: int,
@@ -1493,13 +1854,29 @@ class AnalysisRunner:
                         # Instagram/Threads (where a chunk is one profile).
                         size = min(run.concurrency, len(run.queue))
                         took = 0
+                        daily_spent = ""
                         for _ in range(size):
-                            if not await account_budget.hold(
+                            try:
+                                ok = await account_budget.hold(
                                     platform_id, session_item, account_budget.PROFILE,
                                     lambda: job.cancel.is_set() or bool(run.hard_stop),
-                                    log=log, label=label):
+                                    log=log, label=label)
+                            except account_budget.DailyLimitReached as e:
+                                daily_spent = str(e)
+                                break
+                            if not ok:
                                 break
                             took += 1
+                        if daily_spent and not took:
+                            # THIS ACCOUNT IS DONE FOR THE DAY, NOT BROKEN.
+                            # Rested until the reset; the URLs left are named
+                            # with this reason if no other account takes them.
+                            run.last_session_failure = f"{label}: {daily_spent}"
+                            log.warning(f"{label}: {daily_spent}")
+                            await sessions_engine.rest_session_until(
+                                platform_id, str(session_item.get("id") or ""),
+                                account_budget.next_reset(), daily_spent)
+                            break
                         if not took or not run.queue:
                             break
                         chunk = [run.queue.popleft()

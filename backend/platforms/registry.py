@@ -54,6 +54,36 @@ class Platform:
     # letting the platform sit dark because a cookie expired trades the
     # whole platform for one field.
     anonymous_context_path: str = ""
+    # "module:function" returning the NAME of a paid search vendor that is
+    # currently configured to answer this platform's DISCOVERY searches, or
+    # "" when none is. A function, not a flag, because it follows settings
+    # the operator can change (INSTAGRAM_SEARCH_PROVIDER + HIKERAPI_KEY) --
+    # the registry itself stays a static catalog.
+    #
+    # When it names a vendor, discovery/runner.py runs this platform the way
+    # it runs an API-key platform: NO pooled session is claimed, NO browser
+    # starts, the per-account ceilings and the account pacing are skipped,
+    # and a missing/dead session no longer marks the platform "skipped".
+    # Analysis is not affected -- it still needs `session_path`.
+    #
+    # Only Instagram sets this today (platforms/instagram/vendor_search.py).
+    discovery_vendor_path: str = ""
+
+    def discovery_vendor(self) -> str:
+        """The vendor serving this platform's discovery right now, or "".
+        Never raises: a hook that cannot be read leaves the platform on its
+        ordinary (session) path -- the behaviour before the hook existed --
+        and says so in the log rather than quietly."""
+        if not self.discovery_vendor_path:
+            return ""
+        try:
+            return str(_load(self.discovery_vendor_path)() or "")
+        except Exception as e:                       # noqa: BLE001 - see docstring
+            from backend.shared.logging import get_logger
+            get_logger("registry").warning(
+                f"{self.id}: could not read its discovery vendor setting "
+                f"({type(e).__name__}: {e}) -- discovery stays on pooled sessions")
+            return ""
 
     @property
     def can_discover(self) -> bool:
@@ -126,6 +156,9 @@ PLATFORMS: dict[str, Platform] = {
         session_path="backend.platforms.instagram.discovery_engine:InstagramSession",
         cookie_domain="instagram",
         required_cookies=("sessionid", "ds_user_id"),
+        # Optional: INSTAGRAM_SEARCH_PROVIDER=hikerapi + HIKERAPI_KEY moves
+        # discovery's keyword search off our accounts entirely.
+        discovery_vendor_path="backend.platforms.instagram.vendor_search:active_provider",
         stability_note="Falls back to reading the rendered page header when Instagram's "
         "GraphQL profile payload doesn't fire -- brittle to layout changes.",
     ),

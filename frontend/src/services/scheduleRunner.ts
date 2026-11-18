@@ -27,6 +27,8 @@
 // the last good queue as though it were current. A stale-but-happy queue
 // is the worst of the available lies: it is the one an analyst believes.
 
+import { toast } from "react-hot-toast";
+
 import type { Client } from "../api/types";
 import {
   browserTimezone,
@@ -249,7 +251,15 @@ function deriveEntries(
 // ------------------------------------------------------------- the polling
 
 let timer: ReturnType<typeof setTimeout> | null = null;
-let inFlight = false;
+// The read in flight, and at most one read queued behind it.
+let current: Promise<void> | null = null;
+let queued: Promise<void> | null = null;
+// Bumped by every write. A read that was SENT before a write and lands
+// after it carries the pre-write state; committing it would snap the
+// screen back (a removed row reappears, Run looks idle again so a second
+// press gets a 409). Such a read is dropped -- the follow-up read queued
+// by the write commits instead.
+let writeSeq = 0;
 
 function schedulePoll(delay: number): void {
   if (timer) clearTimeout(timer);
@@ -258,7 +268,7 @@ function schedulePoll(delay: number): void {
 }
 
 function startPolling(): void {
-  if (timer || inFlight) return;
+  if (timer || current) return;
   void poll();
 }
 
@@ -271,11 +281,29 @@ export async function refresh(): Promise<void> {
   await poll();
 }
 
-async function poll(): Promise<void> {
-  if (inFlight) return;
-  inFlight = true;
+// Never a no-op. This used to return at once when a read was already in
+// flight, so `await poll()` after a write resolved with the OLD read's
+// state still on screen. Now a caller arriving mid-read gets one fresh
+// read queued behind it, and waits for that.
+function poll(): Promise<void> {
+  if (!current) {
+    current = readOnce().finally(() => { current = null; });
+    return current;
+  }
+  if (!queued) {
+    queued = current.then(() => {
+      queued = null;
+      return poll();
+    });
+  }
+  return queued;
+}
+
+async function readOnce(): Promise<void> {
+  const seqAtSend = writeSeq;
   try {
     const s = await schedulerApi.getState();
+    if (seqAtSend !== writeSeq) return;   // stale: sent before a write
     // A write of ours has landed (the server's queue now matches what we
     // asked for), so stop preferring the local copy.
     if (optimisticQueue && sameOrder(optimisticQueue, s.queue)) optimisticQueue = null;
@@ -303,7 +331,6 @@ async function poll(): Promise<void> {
     // may be stale.
     commit({ ...state, error: (e as Error).message || "the backend is unreachable" });
   } finally {
-    inFlight = false;
     schedulePoll(state.running ? POLL_RUNNING_MS : POLL_IDLE_MS);
   }
 }
@@ -318,41 +345,63 @@ export function isQueued(clientId: string): boolean {
   return state.entries.some((e) => e.client_id === clientId);
 }
 
+// Writes are sent one after another, never overlapping. Each one is the
+// WHOLE list, so two in flight at once could land in either order and the
+// older list would win -- a client added a moment later silently gone.
+let writeChain: Promise<void> = Promise.resolve();
+
 // Applies the change locally first so dragging feels immediate, then
 // writes the whole list through. A failed write reverts to whatever the
-// server actually has on the next poll, and says why.
-async function writeQueue(ids: string[]): Promise<void> {
+// server actually has on the next poll, and says why -- in a toast, not
+// in `error`, which is the "cannot reach the backend" banner and is
+// cleared by the very next successful read.
+function writeQueue(ids: string[]): Promise<void> {
+  const mySeq = ++writeSeq;
   optimisticQueue = ids;
   commit({
     ...state,
     entries: deriveEntries(ids, Object.fromEntries(
       state.entries.map((e) => [e.client_id, e.name])), state.lastRun),
   });
-  try {
-    await schedulerApi.setQueue(ids);
-    optimisticQueue = null;
-  } catch (e) {
-    optimisticQueue = null;
-    commit({ ...state, error: (e as Error).message });
-  }
-  await poll();
+  writeChain = writeChain.then(async () => {
+    try {
+      await schedulerApi.setQueue(ids);
+      writeSeq++;   // and any read sent while it was on the wire is stale too
+    } catch (e) {
+      toast.error(`Queue not changed: ${(e as Error).message || "the write failed"}`);
+    }
+    // Only the newest write may let go of the local copy; an older one
+    // landing first must not expose a server list that lacks a newer edit.
+    if (mySeq === writeSeq) optimisticQueue = null;
+    await poll();
+  });
+  return writeChain;
+}
+
+// The server refuses any queue change while a run is going (409), so the
+// edit is refused here with the reason instead of being shown, sent and
+// then silently popped back.
+function refuseWhileRunning(): boolean {
+  if (!state.running) return false;
+  toast.error("The queue can't be changed while a run is going — stop it first.");
+  return true;
 }
 
 export function enqueue(client: Client): void {
-  if (isQueued(client.client_id)) return;
+  if (isQueued(client.client_id) || refuseWhileRunning()) return;
   void writeQueue([...state.entries.map((e) => e.client_id), client.client_id]);
 }
 
 // Removing the entry that is mid-sweep would leave its job running with
 // nothing tracking it, so that one is refused -- Stop first.
 export function dequeue(clientId: string): void {
-  if (state.currentId === clientId) return;
+  if (state.currentId === clientId || refuseWhileRunning()) return;
   void writeQueue(state.entries.map((e) => e.client_id).filter((id) => id !== clientId));
 }
 
 // Drag-to-reorder: moves `draggedId` to sit where `targetId` currently is.
 export function reorder(draggedId: string, targetId: string): void {
-  if (draggedId === targetId) return;
+  if (draggedId === targetId || refuseWhileRunning()) return;
   const ids = state.entries.map((e) => e.client_id);
   const from = ids.indexOf(draggedId);
   const to = ids.indexOf(targetId);
@@ -393,16 +442,20 @@ export function resetStatuses(): void {
 // press meant.
 export async function start(): Promise<void> {
   hiddenRunId = "";
+  writeSeq++;
   try {
     await schedulerApi.runNow();
+    writeSeq++;
   } finally {
     await poll();
   }
 }
 
 export async function stop(): Promise<void> {
+  writeSeq++;
   try {
     await schedulerApi.stop();
+    writeSeq++;
   } finally {
     await poll();
   }
@@ -415,8 +468,10 @@ export async function stop(): Promise<void> {
 // reason and is thrown on, because "saved" and "will never run" must not
 // look the same to whoever set it.
 export async function saveSchedule(schedule: Schedule): Promise<void> {
+  writeSeq++;
   try {
     await schedulerApi.setSchedule(schedule);
+    writeSeq++;
   } finally {
     await poll();
   }

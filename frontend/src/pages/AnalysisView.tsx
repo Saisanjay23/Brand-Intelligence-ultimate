@@ -23,12 +23,13 @@ import {
   mergedItems,
   getSnapshot,
   deleteSaved,
+  loadSaved,
   toggleSelected,
   setSelected,
   watchJob,
 } from "../services/analysisSession";
 import { confirmAction } from "../utils/confirmAction";
-import { download, downloadBlob, rowsToCsv, rowsToTsv } from "../utils/download";
+import { csvColumns, download, downloadBlob, rowsToCsv, rowsToTsv } from "../utils/download";
 import { formatElapsed, useLiveTimer } from "../utils/timeFormat";
 
 // What actually scrolls when the analyst scrolls this page: the app shell's
@@ -215,6 +216,61 @@ const getPriorityFromRisk = (score: number) => {
   if (score >= 5) return "High";
   return "Low";
 };
+
+// A row is SETTLED once its scrape has finished, one way or the other. Before
+// that its incident_row / legacy_row are still `{}`, and scoring an empty
+// row gives a confident-looking 3 ("Low") for a profile nobody has seen yet
+// -- an unknown dressed up as a verdict. Unsettled rows therefore show "—"
+// instead of a risk badge, match neither risk filter, and are left out of
+// exports (the toast says how many).
+export const isSettled = (it: { status: string }): boolean =>
+  it.status === "done" || it.status === "error";
+
+// The evidence thumbnail, with somewhere to go when the image will not load.
+//
+// The saved-store URL (by result_id) is tried first because it outlives the
+// job. But it only resolves once the row's save has LANDED -- mid-run, or if
+// the save failed, it 404s, and a bare <img> then showed a broken-image icon
+// for good. Each failure moves to the next candidate (the live job's own
+// copy, when the row belongs to the job on screen), and only when every
+// source has failed does it fall back to the same "No capture" box a row
+// without a screenshot gets.
+function EvidenceThumb({
+  urls,
+  profileName,
+  onPreview,
+}: {
+  urls: string[];
+  profileName: string;
+  onPreview: (p: { url: string; profileName: string } | null) => void;
+}) {
+  const [idx, setIdx] = useState(0);
+  const src = urls[idx];
+  if (!src) {
+    return (
+      <div style={{ width: "120px", height: "90px", display: "flex", alignItems: "center", justifyContent: "center", background: "var(--bg-surface, rgba(0,0,0,0.15))", borderRadius: "8px", border: "1px dashed var(--border-color, #344054)", margin: "0 auto" }}>
+        <span style={{ color: "var(--text-muted)", fontSize: "11px" }}>No capture</span>
+      </div>
+    );
+  }
+  return (
+    <img
+      src={src}
+      alt=""
+      onError={() => setIdx((i) => i + 1)}
+      onMouseEnter={() => onPreview({ url: src, profileName })}
+      onMouseLeave={() => onPreview(null)}
+      onClick={() => onPreview({ url: src, profileName })}
+      style={{
+        width: "120px", height: "90px", objectFit: "cover", objectPosition: "top",
+        borderRadius: "8px", cursor: "zoom-in", border: "1px solid var(--border-color, #344054)",
+        boxShadow: "0 2px 8px rgba(0,0,0,0.25)", transition: "transform 0.15s ease, box-shadow 0.15s ease",
+      }}
+      onMouseOver={(e) => { e.currentTarget.style.transform = "scale(1.04)"; e.currentTarget.style.boxShadow = "0 4px 16px rgba(154,80,233,0.3)"; }}
+      onMouseOut={(e) => { e.currentTarget.style.transform = "none"; e.currentTarget.style.boxShadow = "0 2px 8px rgba(0,0,0,0.25)"; }}
+    />
+  );
+}
 
 const ITEM_STATUS_LABEL: Record<AnalysisItemData["status"], string> = {
   pending: "waiting",
@@ -596,6 +652,7 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
   // before this page was loaded.
   const [saved] = useAnalysisField("saved");
   const [savedLoading] = useAnalysisField("savedLoading");
+  const [savedError] = useAnalysisField("savedError");
   const [retentionHours] = useAnalysisField("retentionHours");
   const [selected] = useAnalysisField("selected");
   const [deleting] = useAnalysisField("deleting");
@@ -758,9 +815,19 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
       // Platform filter
       if (platformFilter !== "all" && it.platform !== platformFilter) return false;
 
-      // Risk score filter
-      if (riskFilter === "high" && (it.risk_score || 0) < 5) return false;
-      if (riskFilter === "low" && (it.risk_score || 0) >= 5) return false;
+      // Risk score filter -- on the SAME number the badge shows and the
+      // export writes: computeDynamicRisk over the row with the analyst's
+      // edits laid on. It used to read the backend's `risk_score`, so a row
+      // whose Logo the analyst flipped to Yes showed "High (7)" yet was
+      // hidden by "High Risk" and listed under "Low Risk". A row that has
+      // not settled has no score at all and matches neither.
+      if (riskFilter !== "all") {
+        if (!isSettled(it)) return false;
+        const base = formatMode === "incident" ? it.incident_row : it.legacy_row;
+        const score = computeDynamicRisk({ ...base, ...(edits[it.id] || {}) }, formatMode);
+        if (riskFilter === "high" && score < 5) return false;
+        if (riskFilter === "low" && score >= 5) return false;
+      }
 
       // Text search
       if (searchQuery.trim()) {
@@ -775,7 +842,28 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
       return true;
     });
     return filtered.sort((a, b) => orderIndex(a.platform) - orderIndex(b.platform));
-  }, [allItems, platformFilter, riskFilter, searchQuery]);
+  }, [allItems, platformFilter, riskFilter, searchQuery, formatMode, edits]);
+
+  // THE SELECTION NEVER REACHES PAST WHAT IS SHOWN. Ticks used to survive a
+  // filter change, so an analyst who ticked rows, then searched or filtered
+  // them out of view, could press "Delete Selected" and permanently delete
+  // rows they could no longer see. Any tick whose row the current filters
+  // hide is dropped the moment it is hidden. Mid-job polls do not disturb
+  // this: a row being updated in place keeps its result_id and stays shown.
+  useEffect(() => {
+    const ticked = getSnapshot().selected;
+    if (!ticked.length) return;
+    const shown = new Set(filteredItems.map((it) => it.result_id).filter(Boolean));
+    const kept = ticked.filter((id) => shown.has(id));
+    if (kept.length !== ticked.length) setSelected(kept);
+  }, [filteredItems]);
+
+  // Item ids belonging to the job on screen -- the rows whose screenshot can
+  // still be fetched from the job itself when the saved copy is not there.
+  const jobItemIds = useMemo(
+    () => new Set((jobData?.items ?? []).map((i) => i.id)),
+    [jobData],
+  );
 
   // Draw the next step once the "scroll for more" marker comes within 600px
   // of the bottom of the window. Re-armed whenever a step lands, so a tall
@@ -955,7 +1043,23 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
       return;
     }
 
-    const rows = filteredItems.map((it) => {
+    // ONLY SETTLED ROWS GO INTO A FILE. A row still pending or running has
+    // an empty incident_row / legacy_row, which used to be exported as a
+    // blank line scored "3 / Low" -- an unscraped profile written down as a
+    // low-risk verdict in a takedown report. Left out instead, and the
+    // count left out is said out loud, so a partial file never passes for
+    // the whole batch.
+    const settled = filteredItems.filter(isSettled);
+    const leftOut = filteredItems.length - settled.length;
+    if (!settled.length) {
+      toast.error(`Nothing to export yet — all ${leftOut} shown row${leftOut === 1 ? " is" : "s are"} still being analysed`);
+      return;
+    }
+    const leftOutNote = leftOut
+      ? ` — ${leftOut} row${leftOut === 1 ? "" : "s"} still being analysed ${leftOut === 1 ? "was" : "were"} left out`
+      : "";
+
+    const rows = settled.map((it) => {
       const baseRow = formatMode === "incident" ? it.incident_row : it.legacy_row;
       const itemEdits = edits[it.id] || {};
 
@@ -991,19 +1095,24 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
       setExporting(true);
       if (fmt === "csv") {
         download(`${filenameStem}.csv`, rowsToCsv(rows), "text/csv");
-        toast.success(`Exported ${rows.length} rows to CSV`);
+        toast.success(`Exported ${rows.length} rows to CSV${leftOutNote}`);
       } else if (fmt === "json") {
         download(`${filenameStem}.json`, JSON.stringify(rows, null, 2), "application/json");
-        toast.success(`Exported ${rows.length} rows to JSON`);
+        toast.success(`Exported ${rows.length} rows to JSON${leftOutNote}`);
       } else if (fmt === "tsv") {
         const tsvText = rowsToTsv(rows);
         await navigator.clipboard.writeText(tsvText);
-        toast.success(`Copied ${rows.length} rows (TSV) to clipboard! Paste into Excel/Sheets.`);
+        toast.success(`Copied ${rows.length} rows (TSV) to clipboard! Paste into Excel/Sheets.${leftOutNote}`);
       } else if (fmt === "xlsx") {
         const filename = `${filenameStem}.xlsx`;
-        const blob = await analysisApi.exportXlsx(filename, rows);
+        // Every row carries every column before it leaves: the server's
+        // workbook takes its header from the FIRST row's keys alone, so a
+        // short first row would cut every other row's columns from the file.
+        const cols = csvColumns(rows);
+        const full = rows.map((r) => Object.fromEntries(cols.map((c) => [c, r[c] ?? ""])));
+        const blob = await analysisApi.exportXlsx(filename, full);
         downloadBlob(filename, blob);
-        toast.success(`Exported ${rows.length} rows to Excel (.xlsx)`);
+        toast.success(`Exported ${rows.length} rows to Excel (.xlsx)${leftOutNote}`);
       }
     } catch (e) {
       toast.error((e as Error).message || "Export failed");
@@ -1011,6 +1120,14 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
       setExporting(false);
     }
   };
+
+  // What the risk cell shows while a row is still pending or running: no
+  // score, because there is nothing scraped to score yet (see isSettled).
+  const pendingRisk = (
+    <span title="Still being analysed — no risk score yet" style={{ color: "var(--text-muted)", fontWeight: 700 }}>
+      —
+    </span>
+  );
 
   const getRiskBadge = (score: number) => {
     if (score >= 8) {
@@ -1410,6 +1527,41 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
           jobData={jobData}
           loading={loading}
         />
+      )}
+
+      {/* ─── Saved results could not be loaded ───
+          Outside the table's gate on purpose: a failed load leaves `saved`
+          empty, so the table (and anything inside it) is not drawn at all,
+          and an empty page reads exactly like "no results for this client".
+          This stays up until a load succeeds. */}
+      {savedError && (
+        <div
+          role="alert"
+          style={{
+            display: "flex", alignItems: "center", gap: "12px", flexWrap: "wrap",
+            marginBottom: "16px", padding: "12px 16px", borderRadius: "10px",
+            background: "rgba(233, 80, 83, 0.1)", border: "1px solid rgba(233, 80, 83, 0.45)",
+            color: "var(--danger, #E95053)", fontSize: "13px",
+          }}
+        >
+          <span style={{ fontWeight: 700 }}>Could not load saved results.</span>
+          <span style={{ color: "var(--text-dim, #98a2b3)" }}>
+            {savedError} — the table below may be missing this client's earlier results.
+          </span>
+          <button
+            type="button"
+            onClick={() => void loadSaved()}
+            disabled={savedLoading}
+            style={{
+              marginLeft: "auto", padding: "6px 14px", borderRadius: "8px", fontSize: "12px",
+              fontWeight: 700, cursor: savedLoading ? "wait" : "pointer",
+              border: "1px solid var(--danger, #E95053)", background: "transparent",
+              color: "var(--danger, #E95053)",
+            }}
+          >
+            {savedLoading ? "Retrying…" : "Retry"}
+          </button>
+        </div>
       )}
 
       {/* ─── Dual-Format Results & Export Section ─── */}
@@ -1879,12 +2031,14 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
                     }
                     // Addressed by result_id wherever there is one, so the
                     // thumbnail still resolves after the job that captured
-                    // it has aged out. The job endpoint is the fallback for
-                    // a row that is mid-run and not yet saved.
-                    const screenshotUrl = !it.has_screenshot ? null
-                      : it.result_id ? analysisApi.getSavedScreenshotUrl(it.result_id)
-                      : jobData ? analysisApi.getScreenshotUrl(jobData.job_id, it.id)
-                      : null;
+                    // it has aged out. The job's own copy comes next, for a
+                    // row of the job on screen whose save has not landed (or
+                    // failed) -- EvidenceThumb falls through them in order.
+                    const screenshotUrls: string[] = !it.has_screenshot ? [] : [
+                      ...(it.result_id ? [analysisApi.getSavedScreenshotUrl(it.result_id)] : []),
+                      ...(jobData && jobItemIds.has(it.id) ? [analysisApi.getScreenshotUrl(jobData.job_id, it.id)] : []),
+                    ];
+                    const rowSettled = isSettled(it);
                     return (
                       <tr
                         key={it.id}
@@ -1914,26 +2068,14 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
                             read at a glance, full-size preview on hover
                             (click also works, for touch devices). */}
                         <td className="sticky-col-1" style={{ padding: "10px", width: "140px", minWidth: "140px", maxWidth: "140px", textAlign: "center" }}>
-                          {screenshotUrl ? (
-                            <img
-                              src={screenshotUrl}
-                              alt=""
-                              onMouseEnter={() => setPreviewScreenshot({ url: screenshotUrl, profileName: it.profile_name || it.entity_id })}
-                              onMouseLeave={() => setPreviewScreenshot(null)}
-                              onClick={() => setPreviewScreenshot({ url: screenshotUrl, profileName: it.profile_name || it.entity_id })}
-                              style={{
-                                width: "120px", height: "90px", objectFit: "cover", objectPosition: "top",
-                                borderRadius: "8px", cursor: "zoom-in", border: "1px solid var(--border-color, #344054)",
-                                boxShadow: "0 2px 8px rgba(0,0,0,0.25)", transition: "transform 0.15s ease, box-shadow 0.15s ease",
-                              }}
-                              onMouseOver={(e) => { e.currentTarget.style.transform = "scale(1.04)"; e.currentTarget.style.boxShadow = "0 4px 16px rgba(154,80,233,0.3)"; }}
-                              onMouseOut={(e) => { e.currentTarget.style.transform = "none"; e.currentTarget.style.boxShadow = "0 2px 8px rgba(0,0,0,0.25)"; }}
-                            />
-                          ) : (
-                            <div style={{ width: "120px", height: "90px", display: "flex", alignItems: "center", justifyContent: "center", background: "var(--bg-surface, rgba(0,0,0,0.15))", borderRadius: "8px", border: "1px dashed var(--border-color, #344054)", margin: "0 auto" }}>
-                              <span style={{ color: "var(--text-muted)", fontSize: "11px" }}>No capture</span>
-                            </div>
-                          )}
+                          <EvidenceThumb
+                            // Keyed on the candidates, so a row that gains a
+                            // saved copy (or a new job) starts from the top.
+                            key={screenshotUrls.join("|")}
+                            urls={screenshotUrls}
+                            profileName={it.profile_name || it.entity_id}
+                            onPreview={setPreviewScreenshot}
+                          />
                         </td>
 
                         {/* Mode Specific Columns */}
@@ -2006,7 +2148,7 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
 
                             {/* Risk Rating */}
                             <td style={{ padding: "10px 14px", whiteSpace: "nowrap" }}>
-                              {getRiskBadge(computeDynamicRisk(row, formatMode))}
+                              {rowSettled ? getRiskBadge(computeDynamicRisk(row, formatMode)) : pendingRisk}
                             </td>
                             <td style={{ padding: "0" }}><EditableCell value={String(row["AssetName"] || "")} onChange={(v) => handleEdit(it.id, "AssetName", v)} /></td>
                             <td style={{ padding: "0", textAlign: "center" }}><ToggleCell value={String(row["Active (Yes/No)"] || "")} onChange={(v) => handleEdit(it.id, "Active (Yes/No)", v)} /></td>
@@ -2032,9 +2174,9 @@ export function AnalysisView({ resumeJobId, clientId = "" }: Props = {}) {
                             <td style={{ padding: "0" }}><EditableCell value={String(row["Location"] || "")} onChange={(v) => handleEdit(it.id, "Location", v)} /></td>
                             <td style={{ padding: "0" }}><EditableCell value={String(row["Last Post (DD-MM-YYYY) (Optional)"] || "")} onChange={(v) => handleEdit(it.id, "Last Post (DD-MM-YYYY) (Optional)", v)} /></td>
                             <td style={{ padding: "10px 14px", whiteSpace: "nowrap" }}>
-                              {getRiskBadge(computeDynamicRisk(row, formatMode))}
+                              {rowSettled ? getRiskBadge(computeDynamicRisk(row, formatMode)) : pendingRisk}
                             </td>
-                            <td style={{ padding: "0" }}><EditableCell value={getPriorityFromRisk(computeDynamicRisk(row, formatMode))} onChange={() => {}} readOnly={true} /></td>
+                            <td style={{ padding: "0" }}><EditableCell value={rowSettled ? getPriorityFromRisk(computeDynamicRisk(row, formatMode)) : ""} onChange={() => {}} readOnly={true} /></td>
                             <td style={{ padding: "0" }}><EditableCell value={String(row["Date"] || "")} onChange={(v) => handleEdit(it.id, "Date", v)} /></td>
                             <td style={{ padding: "0" }}><EditableCell value={String(row["Comments"] || "")} onChange={(v) => handleEdit(it.id, "Comments", v)} /></td>
                           </>

@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import toast from "react-hot-toast";
 import {
   alertsApi,
@@ -92,7 +92,30 @@ export function AlertsIncidentsPanel() {
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [counts, setCounts] = useState<Record<string, number>>({});
   const [canary, setCanary] = useState<CanaryReport | null>(null);
-  const [settings, setSettings] = useState<AlertSettings | null>(null);
+  const [settings, setSettingsRaw] = useState<AlertSettings | null>(null);
+  // Load failures, kept per source. One failed request used to leave
+  // `incidents` empty and render the "all operating normally" all-clear,
+  // which is the worst thing this page can say about a fault it never saw.
+  const [incidentsError, setIncidentsError] = useState<string>("");
+  const [canaryError, setCanaryError] = useState<string>("");
+
+  // Unsaved edits to recipients/SMTP. Every refresh (and every severity
+  // filter click) used to re-fetch settings and overwrite them. A ref, not
+  // state, so refreshAll can read it without re-running on each keystroke.
+  const settingsDirty = useRef(false);
+  // Every edit made through the form goes through here and marks the
+  // settings dirty; loads and saves use setSettingsRaw and clear it.
+  const setSettings: typeof setSettingsRaw = (update) => {
+    settingsDirty.current = true;
+    setSettingsRaw(update);
+  };
+  const loadedSettings = (s: AlertSettings) => {
+    settingsDirty.current = false;
+    setSettingsRaw(s);
+  };
+  // Only the newest refresh may write its results: a quick Critical -> All
+  // click could otherwise land the slower Critical response under "All".
+  const refreshSeq = useRef(0);
 
   const [loading, setLoading] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
@@ -105,22 +128,49 @@ export function AlertsIncidentsPanel() {
   const [activePreset, setActivePreset] = useState<(typeof SMTP_PRESETS)[0] | null>(null);
 
   const refreshAll = useCallback(async () => {
+    const seq = ++refreshSeq.current;
     setLoading(true);
-    try {
-      const [incRes, canaryRes, setRes] = await Promise.all([
-        alertsApi.getIncidents({ severity: severityFilter }),
-        alertsApi.getCanaryStatus(),
-        alertsApi.getSettings(),
-      ]);
-      setIncidents(incRes.incidents);
-      setCounts(incRes.counts);
-      setCanary(canaryRes);
-      setSettings(setRes);
-    } catch (err: any) {
-      toast.error(`Failed to load alert telemetry: ${err.message}`);
-    } finally {
-      setLoading(false);
+    // allSettled, not all: each source stands or falls on its own, so a
+    // failed canary read cannot also blank the incident list (or vice versa).
+    const [incRes, canaryRes, setRes] = await Promise.allSettled([
+      alertsApi.getIncidents({ severity: severityFilter }),
+      alertsApi.getCanaryStatus(),
+      // Skipped while there are unsaved edits -- see settingsDirty.
+      settingsDirty.current ? Promise.resolve(null) : alertsApi.getSettings(),
+    ]);
+    if (seq !== refreshSeq.current) return; // a newer refresh owns the screen
+    setLoading(false);
+
+    const failed: string[] = [];
+    if (incRes.status === "fulfilled") {
+      setIncidents(incRes.value.incidents);
+      setCounts(incRes.value.counts);
+      setIncidentsError("");
+    } else {
+      // Cleared rather than kept: the old list may be for another filter,
+      // and the error state below says plainly that nothing is known.
+      setIncidents([]);
+      setCounts({});
+      setIncidentsError(String(incRes.reason?.message || incRes.reason));
+      failed.push("incidents");
     }
+    if (canaryRes.status === "fulfilled") {
+      setCanary(canaryRes.value);
+      setCanaryError("");
+    } else {
+      // A stale report would keep showing its old verdicts as current.
+      setCanary(null);
+      setCanaryError(String(canaryRes.reason?.message || canaryRes.reason));
+      failed.push("canary status");
+    }
+    if (setRes.status === "fulfilled") {
+      // Re-checked here: the operator may have started editing while the
+      // request was in flight.
+      if (setRes.value && !settingsDirty.current) loadedSettings(setRes.value);
+    } else {
+      failed.push("settings");
+    }
+    if (failed.length) toast.error(`Failed to load alert ${failed.join(", ")}`);
   }, [severityFilter]);
 
   useEffect(() => {
@@ -194,7 +244,7 @@ export function AlertsIncidentsPanel() {
     setSavingSettings(true);
     try {
       const updated = await alertsApi.saveSettings(settings);
-      setSettings(updated);
+      loadedSettings(updated);
       toast.success("Alert settings saved and active in backend");
     } catch (err: any) {
       toast.error(`Failed to save settings: ${err.message}`);
@@ -224,7 +274,7 @@ export function AlertsIncidentsPanel() {
     try {
       // Auto-save settings first so that any newly entered credentials or presets are applied immediately
       const saved = await alertsApi.saveSettings(settings);
-      setSettings(saved);
+      loadedSettings(saved);
 
       const res = await alertsApi.sendTestEmail(targetEmail || undefined);
       setTestResult({ ok: true, message: res.detail || "Test email dispatched successfully!" });
@@ -306,13 +356,16 @@ export function AlertsIncidentsPanel() {
                     badge said ALL POOLS OPERATIONAL having checked nothing.
                     A green light for an unmeasured system is worse than no
                     light: it is the state an operator would act on. */}
-                {!canary?.last_run ? "NOT CHECKED YET"
+                {canaryError ? "STATUS UNKNOWN"
+                  : !canary?.last_run ? "NOT CHECKED YET"
                   : canary.overall_healthy ? "ALL POOLS OPERATIONAL" : "ACTION REQUIRED"}
               </span>
             </div>
 
             <div style={{ fontSize: "13px", color: "var(--text-muted, #98A2B3)", marginTop: "4px" }}>
-              {canary?.last_run
+              {canaryError
+                ? `Could not load the canary status (${canaryError}) -- pool health is unknown, not healthy.`
+                : canary?.last_run
                 ? `Proactive canary check ran at ${new Date(canary.last_run).toLocaleTimeString()} • ${
                     canary.warnings.length
                   } expiration warning(s) • ${settings?.alert_emails.length || 0} active email recipient(s)`
@@ -529,7 +582,25 @@ export function AlertsIncidentsPanel() {
 
           {/* Incidents Stream */}
           <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
-            {incidents.length === 0 ? (
+            {incidentsError ? (
+              <div
+                style={{
+                  textAlign: "center",
+                  padding: "60px 20px",
+                  border: "1px dashed rgba(221, 56, 59, 0.45)",
+                  borderRadius: "10px",
+                  background: "var(--background-color-dark, #101828)",
+                }}
+              >
+                <div style={{ fontSize: "32px", marginBottom: "8px" }}>⚠️</div>
+                <div style={{ fontSize: "15px", fontWeight: 700, color: "var(--alert-color, #DD383B)" }}>
+                  Could not load incidents
+                </div>
+                <div style={{ fontSize: "13px", color: "var(--text-muted, #98A2B3)", marginTop: "4px", maxWidth: "420px", margin: "4px auto 0", wordBreak: "break-word" }}>
+                  {incidentsError} — this is not an all-clear. Press Refresh to try again.
+                </div>
+              </div>
+            ) : incidents.length === 0 ? (
               <div
                 style={{
                   textAlign: "center",
@@ -711,11 +782,18 @@ export function AlertsIncidentsPanel() {
             {["facebook", "instagram", "twitter", "telegram", "tiktok", "threads", "youtube"].map((plat) => {
               const info = canary?.platforms[plat];
               const warnings = info?.warnings || [];
-              const status = info?.status || "healthy";
+              // No report for this platform (the canary request failed, or
+              // the report simply omits it) is UNKNOWN, not HEALTHY: a green
+              // badge for something nobody measured is the state an operator
+              // would act on. Only an explicit "healthy" earns green.
+              const status = info?.status || "unknown";
 
-              let statusColor = "#34C759";
-              let statusLabel = "HEALTHY";
-              if (status === "error") {
+              let statusColor = "#8E8E93";
+              let statusLabel = "UNKNOWN";
+              if (status === "healthy") {
+                statusColor = "#34C759";
+                statusLabel = "HEALTHY";
+              } else if (status === "error") {
                 statusColor = "#FF3B30";
                 statusLabel = "UNAVAILABLE";
               } else if (status === "warning") {
@@ -815,11 +893,17 @@ export function AlertsIncidentsPanel() {
                         </div>
                       ))}
                     </div>
-                  ) : (
+                  ) : !info ? (
+                    <div style={{ fontSize: "12px", color: "var(--text-muted)" }}>
+                      {canaryError
+                        ? `Canary status could not be loaded (${canaryError}), so this platform's health is unknown.`
+                        : "No canary report for this platform yet, so its health is unknown."}
+                    </div>
+                  ) : status === "healthy" ? (
                     <div style={{ fontSize: "12px", color: "var(--text-muted)" }}>
                       ✓ All session cookies and API tokens valid with no immediate expiration deadlines.
                     </div>
-                  )}
+                  ) : null /* an error/unconfigured card must not also say "all valid" */}
                 </div>
               );
             })}

@@ -2847,6 +2847,18 @@ a:hover {
   .brand-logo-sub {
     display: none;
   }
+  /* The header never wrapped, so on a phone the bell and the client
+     picker were pushed off the right edge -- no way to switch client.
+     Let the right-hand actions drop to their own line instead. */
+  .top-header {
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 10px 16px;
+  }
+  .header-right-actions {
+    margin-left: auto;
+    gap: 8px;
+  }
 }
 
 /* ── Discovery Sliding-Underline Tab Bar ─────────────────────────────── */

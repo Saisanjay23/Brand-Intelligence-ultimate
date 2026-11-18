@@ -130,8 +130,68 @@ class Settings(BaseSettings):
     # it is never skipped. 0 = no ceiling. Guesses, kept well under what the
     # tool used to do (~150 searches/hour at its slowest); move them once a
     # real account shows where Instagram's own line is.
-    instagram_searches_per_hour: int = 40
-    instagram_profile_visits_per_hour: int = 60
+    #
+    # Halved 2026-11-17 (40 -> 20, 60 -> 30) after the pool's only Instagram
+    # account was suspended: the old ceilings still allowed a full working
+    # day of nonstop activity on one account.
+    #
+    # Sized to the target of 15-20 keywords and 15-20 profiles an hour per
+    # account (tests/test_account_daily_budget.py proves that fits, on day
+    # one of a new account too).
+    #
+    # SEARCHES UNCAPPED (user decision, 2026-11-18): discovery search has no
+    # hourly or daily ceiling, so no warm-up or learned penalty applies to it
+    # either. Profile visits (analysis) keep theirs. Threads searches on the
+    # same account read these two numbers too. Set them above 0 to cap again.
+    instagram_searches_per_hour: int = 0
+    instagram_profile_visits_per_hour: int = 20
+    # DAILY CEILINGS PER INSTAGRAM ACCOUNT (UTC day, survives a restart).
+    # At the ceiling the account RESTS until 00:00 UTC -- another account in
+    # the pool carries on -- and anything not reached is recorded owed by
+    # name. Never skipped, never reported as searched. 0 = no daily ceiling.
+    instagram_searches_per_day: int = 0
+    instagram_profile_visits_per_day: int = 150
+    # Days a NEWLY ADDED account takes to reach the full daily ceilings: it
+    # starts at 25% and rises evenly. Accounts added before this existed are
+    # treated as established. 0 = no warm-up.
+    instagram_warmup_days: int = 14
+    # WHERE INSTAGRAM DISCOVERY'S KEYWORD SEARCH COMES FROM.
+    #   "account"   (default) a pooled, logged-in Instagram account searches
+    #               Instagram's own mobile endpoint -- exactly as before.
+    #   "hikerapi"  the paid vendor HikerAPI answers the search instead
+    #               (platforms/instagram/vendor_search.py). NO Instagram
+    #               account is claimed, no browser starts, and the per-account
+    #               ceilings above do not apply -- nothing of ours is at risk.
+    # "hikerapi" only takes effect while HIKERAPI_KEY is set; with no key the
+    # tool behaves exactly as "account" (and logs once that it is doing so).
+    # Discovery only. Instagram ANALYSIS has its own no-login path, below.
+    instagram_search_provider: Literal["account", "hikerapi"] = "account"
+    # INSTAGRAM ANALYSIS WITHOUT LOGGING IN FIRST (added 2026-11-17, after the
+    # pool's Instagram accounts kept being suspended).
+    #
+    # A public profile page still loads for a visitor who is not signed in,
+    # and Instagram puts the profile's own data inside that page: name, bio,
+    # followers, following, verified, private, picture and the newest posts.
+    # With this on, analysis reads each Instagram profile that way FIRST, in
+    # a browser that carries no cookies of ours, so no account is used and
+    # no account can be flagged for it. Only when Instagram refuses a
+    # logged-out visitor (a login wall, HTTP 429, a page with no profile data
+    # in it) does the batch fall back to the accounts, exactly as before --
+    # and a refused read is never filed as "not found".
+    #
+    # ANALYSIS ONLY. Searching for keywords (discovery) still needs an
+    # account or the vendor above: a logged-out search returns a login page.
+    instagram_analysis_no_login: bool = True
+    # The no-login visits allowed per rolling hour, for this whole machine.
+    # Not per account -- there is no account -- but per IP address, because
+    # that is what Instagram counts for a logged-out visitor (reported: about
+    # 200 an hour before it starts refusing for hours). Kept well under that.
+    # At the ceiling the visits WAIT, they are never skipped. These visits
+    # are never counted against any account's hourly or daily ceiling above.
+    instagram_no_login_profiles_per_hour: int = 60
+    # HikerAPI access key (hikerapi.com/tokens), sent as the `x-access-key`
+    # header. Billed per request; empty = the vendor is never called.
+    hikerapi_key: str = ""
     # Instagram and Threads signed in as ONE account never work at the same
     # time (shared/meta_account.py). How long a job waits for the other site
     # to finish with that account before giving up and leaving its work owed.
@@ -427,6 +487,21 @@ class Settings(BaseSettings):
     # session the moment they use it (their own login probe and
     # classify_failure), so this only governs the early-warning check.
     session_idle_recheck_hours: float = 8.0
+    # Instagram and Threads only: their login check is the account opening
+    # its own settings page. A job within `meta_proven_fresh_hours` of the
+    # account last working skips that check (the sweep's own answers still
+    # catch a dead login), and an idle account is checked at most every
+    # `meta_idle_recheck_hours`. Raised 2026-11-17 after a suspension.
+    meta_proven_fresh_hours: float = 6.0
+    meta_idle_recheck_hours: float = 24.0
+    # NETWORK-CHANGE GUARD (shared/egress.py). An Instagram/Threads account
+    # remembers the country this machine last used it from; if the machine
+    # is in a DIFFERENT country the account is held (re-checked every
+    # `meta_egress_hold_minutes`, so it resumes by itself when the network
+    # goes back). Cookie sessions with no proxy support get hijack-flagged
+    # when the VPN flips country. False turns the check off.
+    meta_egress_guard: bool = True
+    meta_egress_hold_minutes: float = 20.0
     # Local hours (default_timezone) during which the monitor touches no
     # account at all -- no browser check, no HTTP probe. start == end
     # disables the window. Default: midnight to 07:00.
@@ -476,7 +551,9 @@ class Settings(BaseSettings):
     # numbers the tool used before levels existed. Nothing collected changes
     # at either level (see backend/stealth/levels.py). A value other than
     # these two is rejected at startup rather than silently ignored.
-    instagram_stealth: Literal["standard", "high"] = "high"
+    # Instagram defaults to "standard" since 2026-11-18 (user decision: normal
+    # speed, every account at once). Set INSTAGRAM_STEALTH=high to slow it again.
+    instagram_stealth: Literal["standard", "high"] = "standard"
     # Threads signs in with the same Instagram account, so it shares the posture.
     threads_stealth: Literal["standard", "high"] = "high"
 

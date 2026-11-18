@@ -201,6 +201,11 @@ class TestQuietHoursAndIdleChecks:
     async def test_an_idle_account_checked_recently_is_left_alone(self, monkeypatch):
         from backend.sessions import manager
         monkeypatch.setattr(manager.settings, "session_idle_recheck_hours", 8.0)
+        # Instagram's own, longer idle window (meta_idle_recheck_hours, 24h
+        # since 2026-11-17) is tested in test_account_daily_budget.py; this
+        # test is about the shared mechanism, so it is held at the general one.
+        monkeypatch.setattr(manager.settings, "meta_idle_recheck_hours", 0.0)
+        monkeypatch.setattr(manager.settings, "meta_proven_fresh_hours", 0.0)
         pool = [
             {"id": "recent", "identifier": "r", "cookies": [], "status": "ready",
              "rate_limited_until": 0, "last_ok": 0.0},

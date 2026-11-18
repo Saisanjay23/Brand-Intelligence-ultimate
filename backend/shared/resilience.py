@@ -206,6 +206,10 @@ BROKEN = "broken"
 # extraction-fallback chain.
 _SATISFIED_STOPS = frozenset({
     "exhausted", "end-of-serp", "no-results", "cap:results",
+    # Instagram: a later result page added nobody new -- the end of what it
+    # will return, however many more tokens it offers. See
+    # instagram/discovery_engine.py's Discovery.sweep.
+    "no-new-results",
 })
 
 # `cancelled` sits here, not in broken: the analyst pressing Stop is a
@@ -221,6 +225,31 @@ _TRUNCATED_STOPS = frozenset({
     # that no scroll can reach, so it is owed a say, not a silent "done".
     "cap:platform",
 })
+
+# A PAID SEARCH VENDOR'S OWN FAILURES (Instagram via HikerAPI, see
+# platforms/instagram/vendor_search.py). Deliberately in NEITHER set above,
+# so both resolve to BROKEN: a key the vendor refused, or an answer that was
+# an error / not the shape we read, says nothing about whether the keyword
+# has matches, and filing it "no-results" would be the clean zero this module
+# exists to refuse. Named here rather than left to the unrecognised-is-broken
+# default so that the choice is visible and each has its own phrase below.
+#
+#   provider-auth   the vendor refused the key (HTTP 401/403, or none set)
+#   provider-error  anything else that is not a usable answer: a 5xx, an
+#                   unexpected status, malformed JSON, a body with no
+#                   `users` list, `status` other than ok, a network failure
+#
+# A vendor that is out of money reuses `quota`, and one that keeps answering
+# 429 reuses `rate_limited` -- same meaning, same phrase, nothing new to learn.
+PROVIDER_STOPS = frozenset({"provider-auth", "provider-error"})
+
+# The vendor stops that EVERY later keyword would hit identically -- one key,
+# one balance, one rate limit for the whole platform -- so the runner stops
+# the platform on the first one and records what is left as owed, rather than
+# spending the rest of the queue (and the vendor's patience) on the same
+# refusal. A `provider-error` is NOT here: a 5xx or one malformed body is
+# usually one bad answer, and the runner's ordinary one-retry handles it.
+PROVIDER_FATAL_STOPS = frozenset({"provider-auth", "quota", "rate_limited"})
 
 
 def sweep_outcome(stopped: str, complete: bool = False) -> str:
@@ -267,6 +296,9 @@ _STOP_PHRASES = {
     "mobile-api-failed-web-recovered": "fell back to the web API",
     "empty-unconfirmed": "came back empty without the platform confirming no results",
     "login": "hit a login wall",
+    # The paid search vendor (see PROVIDER_STOPS above).
+    "provider-auth": "were refused by the search vendor (API key rejected or missing)",
+    "provider-error": "got no usable answer from the search vendor",
 }
 
 _HTTP_RE = re.compile(r"^http-(\d{3})$")

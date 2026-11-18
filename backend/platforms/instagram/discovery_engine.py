@@ -15,6 +15,7 @@ fetch all available profiles for the keyword while respecting rate limits.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import random
 import re
@@ -65,7 +66,13 @@ RE_CHECKPOINT = re.compile(
     re.I,
 )
 RE_GONE = re.compile(
-    r"(Sorry, this page isn.t available|" r"user not found|page not found)", re.I
+    r"(Sorry, this page isn.t available|" r"user not found|page not found|"
+    # Instagram's current wording (seen 2026-11-18 on a missing handle):
+    # "Profile isn't available / The link may be broken, or the profile may
+    # have been removed." Without it a removed profile read as PARTIAL
+    # "profile payload not seen", which also counts towards the soft-block
+    # streak -- a deleted account could make the tool think it was blocked.
+    r"Profile isn.t available|the profile may have been removed)", re.I
 )
 
 
@@ -717,7 +724,13 @@ MOBILE_UA = "Instagram 219.0.0.12.117 Android (29/10; 480dpi; 1080x2151; OnePlus
 # is one more against the same account's budget. A keyword that still has
 # results after DEFAULT_MAX_PAGES pages ends `cap:pages` -- reported as truncated, never
 # as "reached the end" -- so the cut is visible, not silent.
-DEFAULT_MAX_PAGES = 6
+#
+# NO CAP (user decision, 2026-11-18): 0 = page each keyword until Instagram
+# has nothing more -- no next token (`exhausted`), a token that cannot
+# advance (`cap:pages`), or a later page that adds nobody (`no-new-results`).
+# Those three stops are what keep the loop finite now. A caller that sets
+# its own `max_pages` still gets exactly that many.
+DEFAULT_MAX_PAGES = 0
 
 
 # Secondary endpoint fallback
@@ -942,7 +955,9 @@ class Sweep:
     # shared/diagnostics.py::where. Blank for a sweep that ended itself.
     where: str = ""
     # "api" normally; "web-api" when the private mobile endpoint refused us
-    # or stopped being parseable and the web client's endpoint stood in
+    # or stopped being parseable and the web client's endpoint stood in;
+    # "hikerapi" when the paid vendor answered instead of an account
+    # (vendor_search.py) -- provenance, so logs and telemetry say which
     source: str = "api"
     # WHICH TARGETED ATTRIBUTES THE PLATFORM STILL SERVES: {key: [hits,
     # misses]}, from shared/schema_probe.py. Carried on the Sweep so the
@@ -966,16 +981,24 @@ class Discovery:
     backend/services/discovery_service.py is the actual caller.
     """
 
-    def __init__(self, args, ctx):
+    def __init__(self, args, ctx, *, vendor: Optional[bool] = None):
         """`args` is a DiscoveryOptions-shaped object (scan_options.py)
         carrying pacing/cap knobs; `ctx` is the already-started Playwright
         BrowserContext (stealth/browser.py::Session.start()) this class
-        issues raw API requests through via `ctx.request`."""
+        issues raw API requests through via `ctx.request`.
+
+        `vendor=True` sends every search to the paid vendor instead
+        (vendor_search.py) and `ctx` is then None -- the discovery runner
+        passes it when it started no browser because the vendor is
+        configured. None (every other caller) asks the settings, so a caller
+        that knows nothing about vendors gets whichever path is configured."""
         self.a = args
         self.ctx = ctx
         # One instagram.com tab per session, reused for every keyword --
         # see `_search_tab` and the note above `_JS_PAGE_GET`.
         self._tab = None
+        from backend.platforms.instagram import vendor_search
+        self.vendor = vendor_search.active() if vendor is None else bool(vendor)
 
     async def _search_tab(self):
         """The instagram.com tab the searches are made from, opened on first
@@ -1068,7 +1091,17 @@ class Discovery:
           3. Build `Hit`s from the winning user list.
 
         LINKED TO: called by `run()` below (one call per keyword).
+
+        NO ACCOUNT AT ALL when the vendor is on (`self.vendor`): the whole
+        keyword goes to vendor_search.sweep, which returns this same Sweep
+        shape with `source = "hikerapi"`. None of the steps above run --
+        no tab, no app user-agent, no pacing governor, no web fallback
+        (that fallback is a logged-in browser call too).
         """
+        if getattr(self, "vendor", False):
+            from backend.platforms.instagram import vendor_search
+            return await vendor_search.sweep(keyword, tab, self.a, on_progress)
+
         out = Sweep(keyword=keyword, tab=tab)
         # One tally per sweep of which targeted attributes Instagram still
         # serves -- see shared/schema_probe.py.
@@ -1116,7 +1149,7 @@ class Discovery:
 
         try:
             max_pages = int(getattr(self.a, "max_pages", 0) or 0) or DEFAULT_MAX_PAGES
-            for _ in range(max_pages):
+            for page_no in (range(max_pages) if max_pages > 0 else itertools.count()):
                 if cancelled(self.a):
                     out.stopped = "cancelled"
                     break
@@ -1232,6 +1265,23 @@ class Discovery:
                 if not page_token or (page_token, rank_token) == prev_cursor:
                     out.stopped = "cap:pages"
                     out.complete = False
+                    break
+
+                # A LATER PAGE THAT ADDS NOBODY IS THE END. Instagram keeps
+                # handing back `has_more` and a fresh token long after the
+                # results stop changing: measured 2026-11-12, "Gulf Cryo"
+                # took six requests for nine accounts, and "GulfCryo" six for
+                # three. Every one of those extra requests was one more
+                # search on the account for nothing -- and because the loop
+                # then ran out of pages it was filed `cap:pages`, TRUNCATED,
+                # which owed the keyword and sent it straight back to be
+                # searched again (three times in twelve minutes that day).
+                # Stopped here, as satisfied: the results are the results.
+                # The FIRST page is left alone -- an empty first page is
+                # `no-results` or a soft block, and both are decided above.
+                if page_no > 0 and new_users == 0:
+                    out.stopped = "no-new-results"
+                    out.complete = True
                     break
 
                 # Respect limits between pages. NOT a fixed number: the same

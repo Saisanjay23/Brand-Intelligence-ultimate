@@ -72,6 +72,35 @@ class JobStore(Generic[J]):
     def age_seconds(self, job: J) -> float:
         return time.time() - job.created_at
 
+    def _expired(self, job: J) -> bool:
+        """Whether the TTL has run out for this job -- which it only can
+        once the job has FINISHED.
+
+        THE BUG THIS GUARDS. The TTL used to be measured from `created_at`
+        with no regard for `status`, so a discovery sweep or analysis batch
+        that was still running six hours after it started simply vanished:
+        every poll got "job not found", Stop had nothing to cancel, the
+        table's reference to its task (the only strong one -- see
+        `_evict_locked`) was dropped, and for analysis the eviction hook
+        deleted the screenshots the still-running job was writing. A long
+        job is exactly the one an analyst is most likely to be watching.
+
+        So a job that is still going is never expired by age; the TTL
+        clock starts when the job reaches a terminal status (its
+        `finished_at_ts`, falling back to `created_at` for a job that
+        records none). A job whose task has already ended WITHOUT reaching
+        a terminal status (crashed past its own bookkeeping) is treated as
+        finished too, so it cannot sit in the table forever. Neither case
+        is unbounded either way: the `max_jobs` ceiling still applies."""
+        task = getattr(job, "task", None)
+        finished = job.status in self._terminal or (
+            task is not None and callable(getattr(task, "done", None)) and task.done()
+        )
+        if not finished:
+            return False
+        since = getattr(job, "finished_at_ts", None) or job.created_at
+        return time.time() - since >= self.ttl_seconds
+
     async def put(self, job: J) -> None:
         """Register a newly-created job, evicting first so the table never
         grows past `max_jobs` even under a burst of creations."""
@@ -80,14 +109,15 @@ class JobStore(Generic[J]):
             self._jobs[job.id] = job
 
     async def get(self, job_id: str) -> Optional[J]:
-        """None for an unknown id OR one that has aged past its TTL -- a
-        caller does not need to tell those apart, both mean "nothing here
-        for you to read"."""
+        """None for an unknown id OR a finished one that has aged past its
+        TTL -- a caller does not need to tell those apart, both mean
+        "nothing here for you to read". A still-running job never expires
+        here, however long it has been going (see `_expired`)."""
         async with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
                 return None
-            if self.age_seconds(job) >= self.ttl_seconds:
+            if self._expired(job):
                 self._drop_locked(job_id)
                 return None
             return job
@@ -201,7 +231,7 @@ class JobStore(Generic[J]):
         after this call -- without it, evicting down to exactly `max_jobs`
         and then inserting leaves the table at `max_jobs + 1` until the
         NEXT `put()`, one permanently-late eviction behind the ceiling."""
-        for jid in [j for j, job in self._jobs.items() if self.age_seconds(job) >= self.ttl_seconds]:
+        for jid in [j for j, job in self._jobs.items() if self._expired(job)]:
             self._drop_locked(jid)
         while len(self._jobs) > self.max_jobs - reserve:
             terminal = [j for j, job in self._jobs.items() if job.status in self._terminal]

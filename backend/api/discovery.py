@@ -314,6 +314,10 @@ class CoverageReport(BaseModel):
     cells: int = Field(..., description="Every (platform, tab, keyword) cell "
                                         "ever planned for this client.")
     owed: int = Field(..., description="Of those, how many still need searching.")
+    retired: int = Field(0, description="Cells the ledger still lists as owed for "
+                                        "keywords this client no longer has -- not "
+                                        "counted in `owed`, since no sweep will "
+                                        "ever search them again.")
     by_outcome: dict[str, int] = Field(default_factory=dict)
     by_platform: dict[str, dict[str, int]] = Field(default_factory=dict)
     items: list[OwedCell] = Field(
@@ -551,9 +555,14 @@ async def platforms() -> PlatformStateList:
 
     items = []
     for pid, plat in registry.PLATFORMS.items():
+        # "ready" for a platform whose searches a paid vendor answers
+        # (Instagram with HIKERAPI_KEY set): the runner will sweep it with no
+        # session at all, so reporting its dead pool here would contradict
+        # the "not ready means skipped" promise above.
+        state = "ready" if plat.discovery_vendor() else await registry.session_state(plat)
         items.append(PlatformState(
             platform=pid, name=plat.name, enabled=plat.enabled,
-            session_state=await registry.session_state(plat),
+            session_state=state,
             can_discover=plat.can_discover,
             stability_note=plat.stability_note,
         ))
@@ -627,9 +636,25 @@ async def coverage(
     # `owed: 0` for exactly the term nobody had searched. Compared against
     # the client's current plan here; a client that cannot be read leaves the
     # ledger's own answer standing rather than failing the report.
+    #
+    # AND KEYWORDS THE CLIENT NO LONGER HAS. The ledger never forgets a
+    # cell, so one left owed by a keyword or permutation the analyst has
+    # since removed (or by a tab its platform no longer has) stayed "owed"
+    # for ever -- no sweep would ever close it, because no current plan
+    # contains it. Those are dropped from the owed list and counted in
+    # `retired` instead, so they are visible but never alarming.
+    # Deliberately NOT narrowed to the Scheduler's saved platforms/Facebook
+    # tabs: a manual sweep picks its own tabs per run, and a gap it left on
+    # a tab the Scheduler skips is still real, closable work.
+    retired = 0
     try:
+        from backend.discovery.runner import tabs_for
         from backend.shared import keywords as kw_groups
         plans = kw_groups.build_plans(await clients_db.get(gid))
+        check = coverage_db.in_scope(plans, None, lambda pid: tabs_for(pid, None))
+        kept = [c for c in items if check(c)]
+        retired = len(items) - len(kept)
+        items = kept
         swept = [platform.value] if platform else list(report["by_platform"])
         items = items + await coverage_db.unplanned(gid, swept, plans)
     except Exception:                            # noqa: BLE001 - report still stands
@@ -640,6 +665,7 @@ async def coverage(
         # Recounted from the filtered list when a platform was named, so
         # the number and the list below it can never disagree.
         owed=len(items),
+        retired=retired,
         by_outcome=report["by_outcome"],
         by_platform=report["by_platform"],
         items=[OwedCell(**c) for c in items],
@@ -1076,6 +1102,29 @@ async def _validated_docs(
     return docs_out
 
 
+async def _validated_total(
+    group_id: str, platforms: Optional[list[str]] = None,
+) -> int:
+    """How many validated profiles the same scope as `_validated_docs`
+    holds IN ALL, ceiling ignored -- one cheap `limit=1` count per platform.
+
+    Only asked when that fetch came back AT the ceiling, so the overflow can
+    be named: the ceiling used to cut the batch to the first 500 with
+    `skipped=[]`, and an analyst with 800 validated profiles was told the
+    job had everything when 300 of them were never going to be looked at."""
+    # Deduplicated the same way `_validated_docs` treats a repeated pick.
+    wanted = list(dict.fromkeys(p for p in (platforms or []) if p)) or [None]
+    total = 0
+    for platform in wanted:
+        _, n, _ = await profiles_db.find(
+            group_id, platform=platform, status="approved",
+            phase=profiles_db.PHASE_DISCOVERY, limit=1, offset=0,
+            include_held=True, with_counts=False,
+        )
+        total += n
+    return total
+
+
 # Discovery-doc fields worth carrying into analysis as a starting point --
 # same names DISCOVERY_FIELDS writes them under (see profile_repository.py).
 # entity_type/discovery_source are deliberately left out: analysis has no
@@ -1176,6 +1225,19 @@ async def analyse_validated(body: AnalyseValidated) -> StartAnalysisAccepted:
         )
         eligible = await _validated_docs(body.group_id, selected)
         skipped = []
+        # THE SAME CEILING, NAMED HERE TOO. This path cut the batch at
+        # `_MAX_VALIDATED_PER_ANALYSE` and reported nothing skipped, so the
+        # profiles past it simply never appeared anywhere. Counted only when
+        # the fetch came back full, so the ordinary small call costs nothing.
+        if len(eligible) >= _MAX_VALIDATED_PER_ANALYSE:
+            left = await _validated_total(body.group_id, selected) - len(eligible)
+            if left > 0:
+                skipped.append(SkippedInput(
+                    value="(over limit)",
+                    reason=f"{left} more validated profile(s) over the "
+                           f"{_MAX_VALIDATED_PER_ANALYSE}-per-call limit were not started -- "
+                           f"this call always takes the first {_MAX_VALIDATED_PER_ANALYSE}, so "
+                           f"narrow the platforms or use Analyse Selected for the rest"))
 
     urls = [d["url"] for d in eligible]
     seed_by_url = {d["url"]: _seed_from_doc(d) for d in eligible}

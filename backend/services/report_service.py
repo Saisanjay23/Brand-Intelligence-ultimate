@@ -32,6 +32,7 @@ from typing import Any, Optional
 from backend.database.repositories import client_repository as clients_db
 from backend.database.repositories import profile_repository as profiles_db
 from backend.services import email_service
+from backend.shared.errors import NotFoundError
 from backend.shared.logging import get_logger
 
 log = get_logger("services.report")
@@ -50,13 +51,29 @@ async def _count(client_id: str, **extra: Any) -> int:
 
 
 async def build_client_report(client_id: str) -> dict:
-    """The numbers and sample rows for one client. Pure reads."""
+    """The numbers and sample rows for one client. Pure reads.
+
+    Raises `NotFoundError` (-> 404) for an id that is neither a client nor
+    the owner of any profiles."""
     try:
         client = await clients_db.get(client_id)
         name = client.get("name") or client_id
-    except Exception:
+    except NotFoundError:
         # A report for a client that has since been deleted is still worth
         # producing -- its profiles are what the analyst cares about.
+        #
+        # BUT ONLY IF IT HAS ANY. This used to swallow the not-found for
+        # every id, so `GET /reports/client/<typo>` answered 200 with an
+        # all-zeros report and `/send` mailed it: a clean zero for a client
+        # that does not exist, indistinguishable from a real client that
+        # genuinely found nothing. No client AND no profiles is a 404.
+        if not await _count(client_id):
+            raise
+        name = client_id
+    except Exception:                                # noqa: BLE001 - see below
+        # A client-directory read that FAILED (not "not found") costs the
+        # display name, never the report: the counts below are read
+        # independently and will raise on their own if Mongo is truly down.
         name = client_id
 
     # Independent reads, so they run together: a combined report builds
@@ -105,23 +122,51 @@ async def build_combined_report() -> dict:
     """One row per client. Clients are read in sequence rather than
     concurrently: a digest is not latency-sensitive, and a burst of parallel
     aggregations against Mongo while a sweep is writing to it is a cost with
-    no upside."""
+    no upside.
+
+    A CLIENT WHOSE REPORT FAILED IS NAMED, NEVER DROPPED. It used to be
+    logged at warning level and left out, so the digest's totals quietly
+    shrank and its client count read one lower -- a reader had no way to
+    tell "this client found nothing" from "this client could not be read".
+    Each one now lands in `failed` (id, name, why), `totals.failed` counts
+    them, and the HTML, text and email subject all say so."""
     clients = await clients_db.list_all()
     reports = []
+    failed: list[dict] = []
     for c in clients:
         try:
             reports.append(await build_client_report(c["client_id"]))
+        except NotFoundError:
+            # Deleted between the directory listing and this read, with no
+            # profiles left behind: there is genuinely nothing to report.
+            log.info(f"report for {c['client_id']!r} skipped: client deleted mid-digest")
         except Exception as e:                       # noqa: BLE001 - never fatal
             log.warning(f"report for {c['client_id']!r} failed: {type(e).__name__}: {e}")
+            failed.append({
+                "client_id": c["client_id"],
+                "name": c.get("name") or c["client_id"],
+                "error": f"{type(e).__name__}: {e}"[:200],
+            })
     totals = {
         "new": sum(r["validated"]["new"] for r in reports),
         "delta": sum(r["validated"]["delta"] for r in reports),
         "total": sum(r["validated"]["total"] for r in reports),
         "logo_matches": sum(r["logo_matches"] for r in reports),
         "pending": sum(r["pending"]["total"] for r in reports),
+        "failed": len(failed),
     }
     return {"generated_at": datetime.now(timezone.utc).isoformat(),
-            "clients": reports, "totals": totals}
+            "clients": reports, "failed": failed, "totals": totals}
+
+
+def _failed_note(rep: dict) -> str:
+    """'' when every client was read; otherwise the sentence every
+    rendering of the digest carries, so no reader can miss it."""
+    n = len(rep.get("failed") or [])
+    if not n:
+        return ""
+    return (f"{n} client{'s' if n != 1 else ''} could not be read -- "
+            f"{'their' if n != 1 else 'its'} numbers are NOT in these totals")
 
 
 # ------------------------------------------------------------------- HTML
@@ -226,13 +271,27 @@ def render_combined_html(rep: dict) -> str:
             f'color:#FDB71B;font-size:13px;">{r["logo_matches"]}</td>'
             f'<td align="right" style="padding:8px 10px;border-bottom:1px solid #1B2129;'
             f'color:#8A99AD;font-size:13px;">{r["pending"]["total"]}</td></tr>')
+    # A client that could not be read gets its own row saying so -- never
+    # a row of zeros, which would read as "found nothing".
+    for f in rep.get("failed") or []:
+        rows += (
+            f'<tr>'
+            f'<td style="padding:8px 10px;border-bottom:1px solid #1B2129;color:#F0F4F8;'
+            f'font-size:13px;">{_E(f["name"])[:36]}</td>'
+            f'<td colspan="5" style="padding:8px 10px;border-bottom:1px solid #1B2129;'
+            f'color:#FF6B6B;font-size:12px;">could not be read &mdash; '
+            f'{_E(f["error"])[:120]}</td></tr>')
+    note = _failed_note(rep)
+    warning = (f'<div style="color:#FF6B6B;font-size:13px;font-weight:700;margin:0 0 10px;">'
+               f'{_E(note)}</div>') if note else ""
     head = "".join(
         f'<th align="{a}" style="padding:8px 10px;color:#8A99AD;font-size:11px;'
         f'text-transform:uppercase;border-bottom:1px solid #242B35;">{h}</th>'
         for h, a in (("Client", "left"), ("New", "right"), ("Delta", "right"),
                      ("Total", "right"), ("Logo", "right"), ("Pending", "right")))
     inner = (
-        _cards(t["new"], t["delta"], t["total"])
+        warning
+        + _cards(t["new"], t["delta"], t["total"])
         + f'<div style="color:#8A99AD;font-size:13px;margin:16px 0 6px;">'
           f'Across <strong style="color:#F0F4F8;">{len(rep["clients"])}</strong> clients '
           f'&nbsp;&middot;&nbsp; {t["logo_matches"]} logo matches '
@@ -260,18 +319,29 @@ async def send_client_report(client_id: str, to_emails: Optional[list[str]] = No
     rep = await build_client_report(client_id)
     return await email_service.send_email(
         f'[Brand Intelligence] {rep["name"]} — {rep["validated"]["new"]} newly validated',
-        render_client_html(rep), render_text(rep), to_emails,
+        # A REPORT, not an alert: `report_emails` first, `alert_emails`
+        # when that is empty -- see `email_service.send_email`.
+        render_client_html(rep), render_text(rep), to_emails, report=True,
     )
 
 
 async def send_combined_report(to_emails: Optional[list[str]] = None) -> tuple[bool, str]:
     rep = await build_combined_report()
     t = rep["totals"]
+    note = _failed_note(rep)
+    subject = f'[Brand Intelligence] All clients — {t["new"]} newly validated'
+    text = f'All clients: new {t["new"]}, delta {t["delta"]}, total {t["total"]}\n'
+    if note:
+        # In the SUBJECT too: a digest that is missing clients must not
+        # look, from the inbox, exactly like one that is complete.
+        n = len(rep["failed"])
+        subject += f' — {n} client{"s" if n != 1 else ""} could not be read'
+        text = (f'WARNING: {note}\n'
+                + "".join(f'  {f["name"]}: could not be read ({f["error"]})\n'
+                          for f in rep["failed"])
+                + text)
     return await email_service.send_email(
-        f'[Brand Intelligence] All clients — {t["new"]} newly validated',
-        render_combined_html(rep),
-        f'All clients: new {t["new"]}, delta {t["delta"]}, total {t["total"]}\n',
-        to_emails,
+        subject, render_combined_html(rep), text, to_emails, report=True,
     )
 
 

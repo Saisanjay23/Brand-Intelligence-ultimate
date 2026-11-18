@@ -316,3 +316,57 @@ describe("the schedule", () => {
     expect(store.getSnapshot().nextRunAt).toBeNull();
   });
 });
+
+describe("reads and writes never overtake each other", () => {
+  it("a refresh during a read waits for a FRESH read, not the stale one", async () => {
+    // A read is on the wire with the old queue when the caller asks again.
+    let release!: (v: unknown) => void;
+    getState.mockImplementationOnce(() => new Promise((r) => { release = r; }));
+    const first = store.refresh();
+    getState.mockResolvedValue(serverState({ queue: ["c_new"] }));
+    const second = store.refresh();
+    release(serverState({ queue: [] }));
+    await first;
+    await second;
+    await settle();
+    expect(store.getSnapshot().entries.map((e) => e.client_id)).toEqual(["c_new"]);
+  });
+
+  it("refuses a queue edit while a run is going, instead of showing then reverting it", async () => {
+    getState.mockResolvedValue(serverState({ queue: ["c1"], running: true }));
+    await store.refresh();
+    await settle();
+    store.enqueue(client("c2"));
+    store.dequeue("c1");
+    await settle();
+    expect(setQueue).not.toHaveBeenCalled();
+    expect(store.getSnapshot().entries.map((e) => e.client_id)).toEqual(["c1"]);
+  });
+
+  it("a refused write does not masquerade as 'cannot reach the backend'", async () => {
+    setQueue.mockRejectedValueOnce(new Error("a run is in progress"));
+    store.enqueue(client("c1"));
+    for (let i = 0; i < 6; i += 1) await settle();
+    expect(store.getSnapshot().error).toBe("");
+  });
+
+  it("sends queue writes one at a time, in the order they were made", async () => {
+    const sent: string[][] = [];
+    let releaseFirst!: (v: unknown) => void;
+    setQueue.mockImplementationOnce((ids: string[]) => {
+      sent.push(ids);
+      return new Promise((r) => { releaseFirst = r; });
+    });
+    setQueue.mockImplementation((ids: string[]) => {
+      sent.push(ids);
+      return Promise.resolve(serverState({ queue: ids }));
+    });
+    store.enqueue(client("a"));
+    store.enqueue(client("b"));
+    await settle();
+    expect(sent).toEqual([["a"]]);            // the second waits its turn
+    releaseFirst(serverState({ queue: ["a"] }));
+    for (let i = 0; i < 6; i += 1) await settle();
+    expect(sent).toEqual([["a"], ["a", "b"]]);
+  });
+});

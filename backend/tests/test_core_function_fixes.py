@@ -152,6 +152,26 @@ class TestInstagramPaging:
         assert sweep.stopped == "cap:pages"
 
     @pytest.mark.asyncio
+    async def test_a_later_page_that_adds_nobody_ends_the_sweep_as_satisfied(self, monkeypatch):
+        """Measured 2026-11-12: Instagram kept offering fresh tokens long
+        after the results stopped changing -- six requests for nine
+        accounts -- and running out of pages filed the keyword truncated,
+        so it was owed and searched again. One request for nothing is
+        enough to know."""
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+        disc, ctx = _ig([
+            {"status": "ok", "users": _users("a", "b"), "has_more": True, "page_token": "p2"},
+            {"status": "ok", "users": _users("a", "b"), "has_more": True, "page_token": "p3"},
+            {"status": "ok", "users": _users("c"), "has_more": True, "page_token": "p4"},
+        ])
+        sweep = await disc.sweep("x")
+        assert ctx.request.get.await_count == 2
+        assert sweep.stopped == "no-new-results" and sweep.complete
+        assert [h.username for h in sweep.hits] == ["a", "b"]
+        from backend.shared.resilience import SATISFIED, sweep_outcome
+        assert sweep_outcome(sweep.stopped, sweep.complete) == SATISFIED
+
+    @pytest.mark.asyncio
     async def test_the_page_token_is_url_encoded(self, monkeypatch):
         monkeypatch.setattr(asyncio, "sleep", AsyncMock())
         disc, ctx = _ig([

@@ -37,6 +37,9 @@ interface PlatformStateResult {
   sessions: SessionInfo[];
   refresh: () => Promise<void>;
   error: string;
+  // false until the first fetch has answered. An empty list before then
+  // is "loading", not "nothing registered".
+  loaded: boolean;
 }
 
 // Replace state only when the payload actually differs. Every poll builds
@@ -51,16 +54,18 @@ export function usePlatformState(): PlatformStateResult {
   const [platforms, setPlatforms] = useState<PlatformState[]>([]);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [error, setError] = useState("");
+  // Has a fetch EVER answered? Until it has, an empty `platforms` means
+  // "not known yet", never "none registered" -- see `loaded` below.
+  const [loaded, setLoaded] = useState(false);
+  const everLoaded = useRef(false);
 
   const mounted = useRef(true);
-  const inFlight = useRef(false);
+  // The fetch currently running, and the ONE follow-up queued behind it.
+  const inFlight = useRef<Promise<void> | null>(null);
+  const queued = useRef<Promise<void> | null>(null);
   const failures = useRef(0);
 
-  const refresh = useCallback(async () => {
-    // A slow request must not stack up behind the poll timer, and a poll
-    // firing mid-refresh would only race itself for the same answer.
-    if (inFlight.current) return;
-    inFlight.current = true;
+  const fetchOnce = useCallback(async () => {
     try {
       const [health, pools] = await Promise.all([
         discoveryApi.platforms(),
@@ -71,18 +76,56 @@ export function usePlatformState(): PlatformStateResult {
       setPlatforms((prev) => keepIfUnchanged(prev, health.items));
       setSessions((prev) => keepIfUnchanged(prev, pools.items));
       setError("");
+      everLoaded.current = true;
+      setLoaded(true);
     } catch (e) {
       if (!mounted.current) return;
       failures.current += 1;
-      if (failures.current >= FAILURES_BEFORE_ERROR) setError((e as Error).message);
-    } finally {
-      inFlight.current = false;
+      // Before the FIRST answer there is no previous data on screen to
+      // keep showing, so the "one blip" grace above does not apply: an
+      // empty list there would read as "no platforms", not "unreachable".
+      if (failures.current >= FAILURES_BEFORE_ERROR || !everLoaded.current) {
+        setError((e as Error).message);
+      }
     }
   }, []);
 
+  // Start a fetch unless one is already running; either way, the promise
+  // of the fetch that is now running.
+  const start = useCallback((): Promise<void> => {
+    if (inFlight.current) return inFlight.current;
+    const p = fetchOnce().finally(() => {
+      if (inFlight.current === p) inFlight.current = null;
+    });
+    inFlight.current = p;
+    return p;
+  }, [fetchOnce]);
+
+  // The BACKGROUND poll (timer, focus): a slow request must not stack up
+  // behind the poll timer, and a poll firing mid-fetch would only race
+  // itself for the same answer -- so it just joins the running fetch.
+  const poll = useCallback(() => void start(), [start]);
+
+  // What a panel calls right after it MUTATED something. Joining the
+  // running fetch is wrong here: that request left before the mutation
+  // landed, so awaiting it hands the caller pre-mutation data and the
+  // screen keeps showing the old state as if the change had not taken.
+  // Instead ONE follow-up fetch is queued behind it (however many callers
+  // ask meanwhile) and the caller resolves only once that has answered.
+  const refresh = useCallback((): Promise<void> => {
+    if (!inFlight.current) return start();
+    if (!queued.current) {
+      queued.current = inFlight.current.then(() => {
+        queued.current = null;
+        return start();
+      });
+    }
+    return queued.current;
+  }, [start]);
+
   useEffect(() => {
     mounted.current = true;
-    void refresh();
+    poll();
 
     // Polling a tab nobody is looking at is wasted work, but only the
     // TIMER is gated on that. The events below are not: `focus` means the
@@ -91,10 +134,10 @@ export function usePlatformState(): PlatformStateResult {
     // window the user is actually reading (embedded webviews and some
     // remote-desktop setups do) never refreshes at all.
     const tick = setInterval(() => {
-      if (document.visibilityState !== "hidden") void refresh();
+      if (document.visibilityState !== "hidden") poll();
     }, POLL_MS);
 
-    const onBackInView = () => void refresh();
+    const onBackInView = () => poll();
     document.addEventListener("visibilitychange", onBackInView);
     window.addEventListener("focus", onBackInView);
 
@@ -104,7 +147,7 @@ export function usePlatformState(): PlatformStateResult {
       document.removeEventListener("visibilitychange", onBackInView);
       window.removeEventListener("focus", onBackInView);
     };
-  }, [refresh]);
+  }, [poll]);
 
-  return { platforms, sessions, refresh, error };
+  return { platforms, sessions, refresh, error, loaded };
 }

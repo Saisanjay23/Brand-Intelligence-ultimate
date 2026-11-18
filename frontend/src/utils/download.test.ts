@@ -14,7 +14,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { rowsToCsv } from "./download";
+import { rowsToCsv, rowsToTsv } from "./download";
 
 describe("rowsToCsv", () => {
   it("leads with a UTF-8 BOM so Excel reads it as UTF-8, not ANSI", () => {
@@ -37,5 +37,27 @@ describe("rowsToCsv", () => {
     const csv = rowsToCsv([{ a: 'has "quotes", and a comma' }]);
     const [, dataLine] = csv.split("\n");
     expect(dataLine).toBe(`"has ""quotes"", and a comma"`);
+  });
+});
+
+// An export taken mid-job could lead with a row that had no data yet. The
+// columns used to come from that first row alone, so the whole file was cut
+// to its one column and every real value after it vanished without a word.
+describe("columns come from every row, not the first", () => {
+  const rows = [
+    { RiskScore: 3 },
+    { AssetName: "acme_support", Location: "Pune", RiskScore: 7 },
+  ];
+
+  it("csv keeps a column the first row lacks", () => {
+    const [header, , second] = rowsToCsv(rows).replace(/^﻿/, "").split("\n");
+    expect(header).toBe("RiskScore,AssetName,Location");
+    expect(second).toBe("7,acme_support,Pune");
+  });
+
+  it("tsv keeps a column the first row lacks", () => {
+    const [header, first] = rowsToTsv(rows).split("\n");
+    expect(header).toBe("RiskScore\tAssetName\tLocation");
+    expect(first).toBe("3\t\t");
   });
 });

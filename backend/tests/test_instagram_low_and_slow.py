@@ -53,15 +53,27 @@ class TestTheSearchRequest:
         assert "search_surface=user_search_page" in url
 
     @pytest.mark.asyncio
-    async def test_stops_at_the_default_page_budget_and_says_it_was_cut(self, monkeypatch):
-        from backend.platforms.instagram.discovery_engine import DEFAULT_MAX_PAGES
+    async def test_no_default_page_cap_pages_until_instagram_runs_out(self, monkeypatch):
+        # No page cap by default (2026-11-18): twelve pages of new users, then
+        # the API says there is no more -- all twelve are fetched.
         monkeypatch.setattr(asyncio, "sleep", AsyncMock())
         pages = [{"status": "ok", "users": _users(f"u{i}"), "has_more": True,
-                  "page_token": f"p{i}"} for i in range(10)]
+                  "page_token": f"p{i}"} for i in range(11)]
+        pages.append({"status": "ok", "users": _users("last"), "has_more": False})
         disc, ctx = _disc(pages)
         sweep = await disc.sweep("brand")
-        assert ctx.request.get.await_count == DEFAULT_MAX_PAGES
-        assert sweep.stopped == "cap:pages" and not sweep.complete
+        assert ctx.request.get.await_count == 12
+        assert sweep.stopped == "exhausted" and sweep.complete
+
+    @pytest.mark.asyncio
+    async def test_no_default_page_cap_still_ends_when_pages_add_nobody(self, monkeypatch):
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+        pages = [{"status": "ok", "users": _users("a"), "has_more": True, "page_token": "p0"},
+                 {"status": "ok", "users": _users("a"), "has_more": True, "page_token": "p1"}]
+        disc, ctx = _disc(pages)
+        sweep = await disc.sweep("brand")
+        assert ctx.request.get.await_count == 2
+        assert sweep.stopped == "no-new-results" and sweep.complete
 
     @pytest.mark.asyncio
     async def test_a_configured_page_budget_still_wins(self, monkeypatch):

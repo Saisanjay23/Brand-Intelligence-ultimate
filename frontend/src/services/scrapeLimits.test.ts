@@ -71,10 +71,12 @@ describe("parseSweepSeconds", () => {
   it("is blank for the server default and minutes*60 otherwise", () => {
     expect(parseSweepSeconds("")).toBeUndefined();
     expect(parseSweepSeconds("15")).toBe(900);
-    expect(parseSweepSeconds("0.5")).toBe(30);
+    expect(parseSweepSeconds("1")).toBe(60);
+    expect(parseSweepSeconds("1440")).toBe(86400);
   });
 
-  it.each(["0", "-3", "abc", "100000"])("refuses %s", (bad) => {
+  // "0.5" is below the 1-1440 the message and the box both promise.
+  it.each(["0", "0.5", "-3", "abc", "1441", "100000"])("refuses %s", (bad) => {
     expect(() => parseSweepSeconds(bad)).toThrow(/Sweep time budget/);
   });
 });

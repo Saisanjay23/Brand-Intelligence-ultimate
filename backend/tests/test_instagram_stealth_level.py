@@ -34,7 +34,10 @@ from backend.stealth import levels as L
 @pytest.fixture
 def level(monkeypatch):
     def _set(name):
+        # Threads signs in with Instagram accounts and has its own level
+        # setting; the two move together in these tests.
         monkeypatch.setattr(L.settings, "instagram_stealth", name)
+        monkeypatch.setattr(L.settings, "threads_stealth", name)
     return _set
 
 
@@ -56,22 +59,30 @@ def test_standard_reproduces_the_numbers_from_before_levels(level):
     assert L.session_cap("instagram", 3) == 3                     # no cap of its own
 
 
-def test_high_is_slower_everywhere_but_does_not_cap_accounts(level):
-    """HIGH slows each account down; it no longer limits how many work at
-    once -- every free Instagram account is used, each paced and capped on
-    its own."""
+def test_high_is_slower_everywhere_and_uses_one_account_at_a_time(level):
+    """HIGH slows each account down AND works one account at a time (pinned
+    again 2026-11-17 after a suspension: several accounts active together
+    from one IP link them to each other). Failover to the next account is
+    the runner's claim rounds, not parallelism."""
     level("high")
     std = {"keyword_gap": 8.0, "batch_gap": 3.5, "page_gap": 4.5}
     for name, old in std.items():
         assert L.value("instagram", name, None) > old, name
+    assert L.session_cap("instagram", 3) == 1
+    assert L.session_cap("threads", 3) == 1
+
+
+def test_standard_still_uses_every_free_account(level):
+    level("standard")
     assert L.session_cap("instagram", 3) == 3
+    assert L.session_cap("threads", 3) == 3
 
 
 def test_a_level_never_raises_parallelism(level):
     for name in ("high", "standard"):
         level(name)
         assert L.session_cap("instagram", 1) == 1
-        assert L.session_cap("instagram", 5) == 5
+        assert L.session_cap("instagram", 5) <= 5
 
 
 def test_other_platforms_are_untouched_at_every_level(level):
@@ -93,23 +104,28 @@ def test_a_typo_in_the_setting_is_rejected_not_ignored():
 # ---------------------------------------------------------------- the runners
 
 @pytest.mark.parametrize("platform", ["instagram", "threads"])
-def test_discovery_asks_for_every_account_there_is_work_for(level, platform):
-    """No number caps it: with ten keywords, up to ten free accounts are
-    claimed (the claim loop stops at the first one that is not free), and
-    never more accounts than keywords."""
-    for name in ("high", "standard"):
-        level(name)
-        assert DR._sessions_wanted(platform, 10) == 10
-        assert DR._sessions_wanted(platform, 2) == 2
-        assert DR._sessions_wanted(platform, 1) == 1
+def test_discovery_account_count_follows_the_level(level, platform):
+    """STANDARD: with ten keywords, up to ten free accounts are claimed (the
+    claim loop stops at the first one that is not free), never more accounts
+    than keywords. HIGH (the default): one account at a time, and the next
+    one is claimed only when it rests or dies."""
+    level("standard")
+    assert DR._sessions_wanted(platform, 10) == 10
+    assert DR._sessions_wanted(platform, 2) == 2
+    assert DR._sessions_wanted(platform, 1) == 1
+    level("high")
+    assert DR._sessions_wanted(platform, 10) == 1
+    assert DR._sessions_wanted(platform, 1) == 1
 
 
 @pytest.mark.parametrize("platform", ["instagram", "threads"])
-def test_analysis_asks_for_every_account_there_is_work_for(level, platform):
-    for name in ("high", "standard"):
-        level(name)
-        assert AR._sessions_wanted(platform, 30, 1) == 30
-        assert AR._sessions_wanted(platform, 1, 1) == 1
+def test_analysis_account_count_follows_the_level(level, platform):
+    level("standard")
+    assert AR._sessions_wanted(platform, 30, 1) == 30
+    assert AR._sessions_wanted(platform, 1, 1) == 1
+    level("high")
+    assert AR._sessions_wanted(platform, 30, 1) == 1
+    assert AR._sessions_wanted(platform, 1, 1) == 1
 
 
 def test_high_never_changes_facebook_or_twitter_parallelism(level):

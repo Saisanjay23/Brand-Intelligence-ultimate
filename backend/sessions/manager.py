@@ -22,7 +22,7 @@ from typing import Any, NamedTuple, Optional
 from backend.config.settings import settings
 from backend.database.repositories import session_repository as sessions_db
 from backend.sessions.cookies import load_cookies, normalize_cookies
-from backend.shared import fast_http, meta_account
+from backend.shared import account_budget, egress, fast_http, meta_account
 from backend.shared.errors import ConflictError, NotFoundError, ValidationError
 from backend.shared.logging import get_logger
 
@@ -733,6 +733,18 @@ async def _claim_one(platform_id: str) -> Optional[dict]:
         _claims[(platform_id, chosen["id"])] = _Claim(_owner_ref(), claimed_at)
         if key := meta_account.account_key(platform_id, chosen.get("cookies")):
             _claim_accounts[(platform_id, chosen["id"])] = key
+    # THE NETWORK-CHANGE GUARD, before the account is handed to a job. A
+    # held account is given back (claim released) and rested briefly, so the
+    # next attempt re-checks and it resumes by itself once the network is
+    # back; the reason is on the account's row in the Sessions panel.
+    if meta_account.is_meta(platform_id) and getattr(settings, "meta_egress_guard", False):
+        why = await _egress_hold(platform_id, chosen)
+        if why:
+            _claims.pop((platform_id, chosen["id"]), None)
+            _claim_accounts.pop((platform_id, chosen["id"]), None)
+            minutes = max(1.0, float(getattr(settings, "meta_egress_hold_minutes", 20.0) or 20.0))
+            await rest_session_until(platform_id, chosen["id"], _now() + minutes * 60, why)
+            return None
     now = _now()
     await sessions_db.update_item(platform_id, chosen["id"], status="ready", rate_limited_until=0.0, last_used=now)
     # a real, durable count of how many times this session has actually
@@ -744,6 +756,31 @@ async def _claim_one(platform_id: str) -> Optional[dict]:
         "ready", 0.0, now, use_count,
     )
     return chosen
+
+
+async def _egress_hold(platform_id: str, chosen: dict) -> str:
+    """"" to let the account through, or why it is on hold. Also remembers
+    where the account worked from. Never raises: a guard that crashed a
+    claim would turn a safety check into an outage."""
+    try:
+        here = await egress.current()
+        remembered = chosen.get("egress") or {}
+        verdict, reason = egress.judge(remembered, here)
+        if verdict == egress.UNKNOWN:
+            egress.note_unknown(log)
+            return ""
+        if verdict == egress.CHANGED:
+            log.warning(f"{platform_id}/{chosen.get('identifier') or chosen['id']}: {reason}")
+            return reason
+        now = _now()
+        if here and egress.should_remember(remembered, here, now):
+            await sessions_db.update_item(
+                platform_id, chosen["id"],
+                egress={"country": here["country"], "org": here["org"], "at": now})
+        return ""
+    except Exception as e:                           # noqa: BLE001
+        log.warning(f"egress guard failed ({type(e).__name__}: {e}) -- letting the job through")
+        return ""
 
 
 async def unavailable_reason(platform_id: str) -> str:
@@ -838,7 +875,22 @@ def proven_fresh(session_item: dict) -> bool:
     seconds earlier, at the cost of a page load every time.
     """
     last_ok = float(session_item.get("last_ok") or 0.0)
-    return bool(last_ok) and (_now() - last_ok) < PROVEN_FRESH_S
+    return bool(last_ok) and (_now() - last_ok) < _proven_fresh_s(session_item.get("platform", ""))
+
+
+def _proven_fresh_s(platform_id: str) -> float:
+    """PROVEN_FRESH_S, longer for an account that signs in to Instagram.
+
+    The Instagram probe is the account opening its own settings page
+    (/accounts/edit/), which a person almost never does, and the pool's
+    only Instagram account was suspended on 2026-11-16 at exactly that
+    probe. For Instagram and Threads the window is
+    `meta_proven_fresh_hours` (default 6h): a job inside it skips the
+    probe and lets the sweep's own answers say if the login has died."""
+    if meta_account.is_meta(platform_id):
+        hours = float(getattr(settings, "meta_proven_fresh_hours", 0) or 0)
+        return max(PROVEN_FRESH_S, hours * 3600.0)
+    return PROVEN_FRESH_S
 
 
 def release_claim(platform_id: str, session_id: str) -> None:
@@ -996,6 +1048,15 @@ async def mark_session_failed(
         fields["rate_limited_until"] = _now() + minutes * 60
         fields["quarantine_minutes"] = minutes
 
+    # LIMITS THAT LEARN: a throttle or a challenge shrinks this account's
+    # hourly and daily limits, then they recover over days
+    # (shared/account_budget.py). Instagram/Threads accounts only.
+    if reason in _ACCOUNT_LEVEL_REASONS and meta_account.is_meta(platform_id):
+        fields.update(account_budget.next_penalty(item, reason, _now()))
+        log.warning(f"{platform_id} session {session_id}: warned ({reason}) -- its "
+                    f"hourly and daily limits drop to "
+                    f"{fields['budget_penalty_factor']:.0%} and recover over days")
+
     newly_dead = reason in DEAD_STATES and not was_dead
     if newly_dead:
         fields["dead_since"] = _now()
@@ -1084,6 +1145,39 @@ async def _rest_linked(platform_id: str, session_id: str, item: Optional[dict],
         log.warning(f"{platform_id}: could not rest the linked account -- "
                     f"{type(e).__name__}: {e}")
 
+
+
+async def rest_session_until(platform_id: str, session_id: str, until: float,
+                             why: str) -> None:
+    """Take a healthy account out of rotation until `until`, for a reason
+    that is about how much it has done, not about it being broken (its
+    daily ceiling, shared/account_budget.py). Unlike `mark_session_failed`
+    this adds no failure to its count and raises no incident: nothing is
+    wrong with it. It comes back by itself when `until` passes, through the
+    ordinary `rate_limited_until` check every claim already makes. The
+    same account on the sibling Meta site rests with it, since both count
+    against one daily budget. Never raises."""
+    if not session_id:
+        return
+    try:
+        await sessions_db.update_item(platform_id, session_id, status="rate_limited",
+                                      rate_limited_until=float(until), last_error=why)
+        log.warning(f"{platform_id} session {session_id} resting until "
+                    f"{datetime.fromtimestamp(until, timezone.utc):%Y-%m-%d %H:%M} UTC -- {why}")
+        item = await sessions_db.get_item(platform_id, session_id)
+        key = meta_account.account_key(platform_id, (item or {}).get("cookies"))
+        if key:
+            for other in meta_account.siblings(platform_id):
+                for s in await sessions_db.list_pool(other):
+                    if meta_account.account_key(other, s.get("cookies")) != key:
+                        continue
+                    if s["status"] in DEAD_STATES or float(s.get("rate_limited_until") or 0) >= until:
+                        continue
+                    await sessions_db.update_item(other, s["id"], status="rate_limited",
+                                                  rate_limited_until=float(until), last_error=why)
+    except Exception as e:                       # noqa: BLE001
+        log.warning(f"{platform_id}: could not rest session {session_id} -- "
+                    f"{type(e).__name__}: {e}")
 
 
 async def mark_session_ok(platform_id: str, session_id: str) -> None:
@@ -2010,7 +2104,7 @@ async def _pick_batch(platform_id: str, limit: int) -> list[tuple[str, str, list
         # Recently proven by a real job, so a probe would only add another
         # authenticated hit to an account that has already demonstrated it
         # is fine. See PROVEN_FRESH_S.
-        and (now - float(s.get("last_ok") or 0.0)) >= _idle_recheck_s()
+        and (now - float(s.get("last_ok") or 0.0)) >= _idle_recheck_s(platform_id)
     ]
     if not candidates:
         return []
@@ -2020,18 +2114,22 @@ async def _pick_batch(platform_id: str, limit: int) -> list[tuple[str, str, list
         # CHECKED RECENTLY IS AS GOOD AS USED RECENTLY. Without this an idle
         # account whose last check succeeded was re-checked on every sweep
         # once PROVEN_FRESH_S lapsed -- the 16-a-day settings-page visits.
-        if last is not None and _age_s(last) < _idle_recheck_s():
+        if last is not None and _age_s(last) < _idle_recheck_s(platform_id):
             continue
         stamped.append((last or datetime.min, s))
     stamped.sort(key=lambda t: t[0])
     return [(s["id"], s["identifier"], s["cookies"]) for _, s in stamped[:limit]]
 
 
-def _idle_recheck_s() -> float:
+def _idle_recheck_s(platform_id: str = "") -> float:
     """How long an account that was proved healthy (by a job or a check) is
-    left alone by the monitor. Never shorter than PROVEN_FRESH_S."""
+    left alone by the monitor. Never shorter than the platform's proven-
+    fresh window. Instagram/Threads use `meta_idle_recheck_hours` when it is
+    longer: their check is a settings-page visit (see _proven_fresh_s)."""
     hours = float(getattr(settings, "session_idle_recheck_hours", 0) or 0)
-    return max(PROVEN_FRESH_S, hours * 3600.0)
+    if meta_account.is_meta(platform_id):
+        hours = max(hours, float(getattr(settings, "meta_idle_recheck_hours", 0) or 0))
+    return max(_proven_fresh_s(platform_id), hours * 3600.0)
 
 
 def _age_s(when: Any) -> float:
@@ -2100,6 +2198,13 @@ async def check_item(platform_id: str, session_id: str) -> dict:
         raise ConflictError(
             f"{item['identifier']} is being used by a running job right now -- "
             "checking it at the same time risks a checkpoint. Try again once the job finishes."
+        )
+    # A re-login is a browser signed in as this account too; a check on top
+    # of it is the same two-browsers-one-account risk as the job case above.
+    if f"{platform_id}:{session_id}" in _relogin_running:
+        raise ConflictError(
+            f"{item['identifier']} is being signed back in right now -- "
+            "check it again once the re-login finishes."
         )
 
     if plat.uses_api_key or plat.env_keys:

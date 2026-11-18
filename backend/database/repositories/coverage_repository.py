@@ -56,7 +56,7 @@ careful with.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from pymongo import UpdateOne
 
@@ -341,8 +341,62 @@ async def unplanned(
     return out
 
 
+def in_scope(
+    plans: Iterable[Any],
+    platforms: Optional[Iterable[str]],
+    tabs_for: Callable[[str], Iterable[str]],
+) -> Callable[[dict], bool]:
+    """A test for "is this ledger cell still part of the client's CURRENT
+    plan" -- the same question the gap-closing lap answers before it
+    sweeps anything (`DiscoveryRunner._queue_for` keeps only cells whose
+    keyword is in `job.keyword_plan` and whose tab is one the job is
+    configured for).
+
+    THE BUG THIS GUARDS. The ledger never forgets a cell, which is right
+    for history but wrong for "what is still owed": a keyword, permutation,
+    platform or Facebook tab the analyst has since REMOVED left its last
+    owed cells behind, and the gap-closing lap -- correctly -- never swept
+    them, because they are no longer anything this client asks for. So
+    every count taken straight from the ledger said "still owing searches"
+    for ever, the nightly summary said so, and the alert email went out
+    about work nobody would ever do. A false alarm every night trains an
+    analyst to ignore the real one.
+
+    `plans` is the client's current keyword plan (`KeywordPlan`-shaped);
+    `platforms` the platforms in scope, None meaning every platform;
+    `tabs_for(pid)` the tabs in scope on one platform. Matching is keyed
+    exactly as `cell_id` keys it, so a casing change in the saved keywords
+    cannot make an in-plan cell look retired.
+
+    Pure, so both callers (the Scheduler's `_owed_for` and
+    `GET /discovery/coverage`) apply one rule and a test can pin it."""
+    keys = {
+        (getattr(p, "kw_type", "") or "", (getattr(p, "search", "") or "").strip().lower())
+        for p in plans
+    }
+    wanted = None if platforms is None else set(platforms)
+    tab_cache: dict[str, set[str]] = {}
+
+    def check(cell: dict) -> bool:
+        pid = cell.get("platform", "")
+        if wanted is not None and pid not in wanted:
+            return False
+        if (cell.get("kw_type", ""), (cell.get("search") or "").strip().lower()) not in keys:
+            return False
+        if pid not in tab_cache:
+            tab_cache[pid] = set(tabs_for(pid))
+        return cell.get("tab", "") in tab_cache[pid]
+
+    return check
+
+
 async def summary(group_id: str) -> dict:
-    """Counts by outcome for one client, for a badge or a health check."""
+    """Counts by outcome for one client, for a badge or a health check.
+
+    LEDGER-WIDE: every cell ever planned, including ones for keywords,
+    platforms or tabs the client no longer has. That is the right shape
+    for history; it is NOT the answer to "what does this client still
+    owe" -- for that, filter `owed()` through `in_scope()`."""
     try:
         cursor = db()[COVERAGE].aggregate([
             {"$match": {"group_id": group_id}},

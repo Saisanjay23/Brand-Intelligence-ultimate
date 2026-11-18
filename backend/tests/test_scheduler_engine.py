@@ -115,6 +115,11 @@ class FakeRunner:
             self.max_live = max(self.max_live, self.live)
         return job, skipped
 
+    def _plans_from(self, client, ind, dom):
+        # Read by `_owed_for` to build the client's current plan; the fake
+        # coverage's `in_scope` ignores it.
+        return []
+
     async def cancel(self, job_id):
         self.cancelled.append(job_id)
         job = self.jobs.get(job_id)
@@ -246,6 +251,19 @@ def rig(monkeypatch):
             if owed["raises"]:
                 raise RuntimeError("mongo is down")
             return {"owed": owed["value"]}
+
+        # `_owed_for` counts owed cells against the client's CURRENT plan
+        # (see test_coverage_current_plan.py for that filter itself). Here
+        # every fake cell is in plan, so `owed["value"]` is what it counts.
+        async def owed(self, group_id, platforms=None):
+            if owed["raises"]:
+                raise RuntimeError("mongo is down")
+            return [{"platform": "facebook", "tab": "people", "kw_type": "individual",
+                     "search": f"kw{i}"} for i in range(owed["value"])]
+
+        @staticmethod
+        def in_scope(plans, platforms, tabs_for):
+            return lambda cell: True
 
     monkeypatch.setattr(scheduler_service, "coverage_db", FakeCoverage())
 
@@ -791,8 +809,11 @@ class TestTick:
         indistinguishable from a schedule nobody ever set."""
         rig.store.state["queue"] = ["c1"]
         rig.clients.docs = {"c1": client("c1")}
+        # The daily time is pinned to 8h ago, so even the MOST RECENT
+        # occurrence is past the 6h window -- whatever time the suite runs.
+        at = (datetime.now(UTC) - timedelta(hours=8)).strftime("%H:%M")
         rig.store.state["schedule"] = {"enabled": True, "mode": "daily",
-                                       "at": "02:00", "on_date": "",
+                                       "at": at, "on_date": "",
                                        "weekdays": [], "tz": "UTC"}
         rig.store.state["next_run_at"] = datetime.now(UTC) - timedelta(days=2)
         await rig.engine._tick()
@@ -802,6 +823,50 @@ class TestTick:
         assert "NOT run" in missed[0]["message"]
         # ...and the schedule still moved on, so it is not stuck.
         assert rig.store.state["next_run_at"] > datetime.now(UTC)
+
+    async def test_after_a_long_outage_todays_run_still_runs(self, rig):
+        """Off from Friday night to Monday morning: the stored pointer is
+        Saturday's, days late. Judging that one alone marked it missed and
+        rolled to Tuesday -- Monday's run, an hour late and inside the
+        window, was never run and never recorded."""
+        rig.store.state["queue"] = ["c1"]
+        rig.clients.docs = {"c1": client("c1")}
+        due_today = (datetime.now(UTC) - timedelta(hours=1)).replace(second=0, microsecond=0)
+        rig.store.state["schedule"] = {"enabled": True, "mode": "daily",
+                                       "at": due_today.strftime("%H:%M"), "on_date": "",
+                                       "weekdays": [], "tz": "UTC"}
+        rig.store.state["next_run_at"] = due_today - timedelta(days=3)
+        await rig.engine._tick()
+        await rig.drive()
+        assert rig.runner.calls                      # today's run happened
+        ran = [r for r in rig.store.runs.values() if r["status"] != "missed"]
+        assert len(ran) == 1 and ran[0]["trigger"] == "catch_up"
+        assert ran[0]["due_at"] == due_today
+        # ...and the three that went by are said, not swallowed.
+        missed = [r for r in rig.store.runs.values() if r["status"] == "missed"]
+        assert len(missed) == 1
+        assert "3 earlier scheduled run(s)" in missed[0]["message"]
+        assert rig.store.state["next_run_at"] > datetime.now(UTC)
+
+    async def test_a_run_that_fails_to_start_leaves_a_record(self, rig):
+        """The pointer moves on before the fire, so a fire that raised used
+        to leave tonight's run with no history row and no alert."""
+        rig.store.state["queue"] = ["c1"]
+        rig.clients.docs = {"c1": client("c1")}
+        rig.store.state["schedule"] = {"enabled": True, "mode": "daily",
+                                       "at": "02:00", "on_date": "",
+                                       "weekdays": [], "tz": "UTC"}
+        rig.store.state["next_run_at"] = datetime.now(UTC) - timedelta(seconds=5)
+
+        async def broken_fire(**kw):
+            raise RuntimeError("mongo blip")
+
+        rig.engine.fire = broken_fire
+        await rig.engine._tick()                     # must not raise
+        missed = [r for r in rig.store.runs.values() if r["status"] == "missed"]
+        assert len(missed) == 1
+        assert "could not be started" in missed[0]["message"]
+        assert "mongo blip" in missed[0]["message"]
 
     async def test_the_tick_survives_a_bad_schedule(self, rig):
         """A scheduler that stops ticking because of one malformed field

@@ -19,12 +19,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const start = vi.fn();
 const getJob = vi.fn();
 const cancelJob = vi.fn();
+const listResults = vi.fn();
+const deleteResults = vi.fn();
 
 vi.mock("../api/analysisApi", () => ({
   analysisApi: {
     start: (...args: unknown[]) => start(...args),
     getJob: (...args: unknown[]) => getJob(...args),
     cancelJob: (...args: unknown[]) => cancelJob(...args),
+    listResults: (...args: unknown[]) => listResults(...args),
+    deleteResults: (...args: unknown[]) => deleteResults(...args),
   },
 }));
 
@@ -59,6 +63,9 @@ beforeEach(() => {
   start.mockReset();
   getJob.mockReset();
   cancelJob.mockReset();
+  listResults.mockReset();
+  listResults.mockResolvedValue({ items: [], total: 0, retention_hours: 24 });
+  deleteResults.mockReset();
 });
 
 afterEach(() => {
@@ -196,5 +203,137 @@ describe("clearing the workspace clears the work attached to it", () => {
     expect(store.getSnapshot().jobData).toBeNull();
     expect(store.getSnapshot().edits).toEqual({});
     expect(store.getSnapshot().urlInput).toBe("");
+  });
+});
+
+describe("a client switch takes the other client's job with it", () => {
+  it("drops client A's running job, and stops polling it, when B is opened", async () => {
+    const store = await loadStore();
+    await store.setOrg("client-a");
+    start.mockResolvedValue({ job_id: "job-a", skipped: [] });
+    getJob.mockResolvedValue(job({ job_id: "job-a", status: "running" }));
+    await store.startAnalysis(["https://instagram.com/x"]);
+    expect(store.getSnapshot().jobId).toBe("job-a");
+
+    await store.setOrg("client-b");
+    const callsAtSwitch = getJob.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(POLL_MS * 4);
+
+    expect(store.getSnapshot().jobId).toBeNull();
+    expect(store.getSnapshot().jobData).toBeNull();
+    expect(store.getSnapshot().loading).toBe(false);
+    expect(store.mergedItems(store.getSnapshot())).toHaveLength(0);
+    expect(getJob.mock.calls.length).toBe(callsAtSwitch);
+  });
+
+  it("does not let App's stale resume id re-attach A's job under B", async () => {
+    const store = await loadStore();
+    await store.setOrg("client-a");
+    getJob.mockResolvedValue(job({ job_id: "job-a", status: "done" }));
+    // Home's "Analyse" under client A hands the job over.
+    store.watchJob("job-a");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(store.getSnapshot().jobData?.job_id).toBe("job-a");
+
+    await store.setOrg("client-b");
+    // The view remounts under B and App still passes the same id.
+    store.watchJob("job-a");
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(store.getSnapshot().jobId).toBeNull();
+    expect(store.getSnapshot().jobData).toBeNull();
+  });
+
+  it("picks A's still-running job back up when A is opened again", async () => {
+    const store = await loadStore();
+    await store.setOrg("client-a");
+    start.mockResolvedValue({ job_id: "job-a", skipped: [] });
+    getJob.mockResolvedValue(job({ job_id: "job-a", status: "running" }));
+    await store.startAnalysis(["https://instagram.com/x"]);
+
+    await store.setOrg("client-b");
+    expect(store.getSnapshot().jobId).toBeNull();
+
+    await store.setOrg("client-a");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(store.getSnapshot().jobId).toBe("job-a");
+    expect(store.getSnapshot().jobData?.job_id).toBe("job-a");
+  });
+});
+
+describe("a deleted row stays deleted while its job is still running", () => {
+  const row = { id: "item-a", result_id: "r-a", url: "u", platform: "instagram", status: "done" };
+
+  it("filters the row out of every later poll of the same job", async () => {
+    const store = await loadStore();
+    start.mockResolvedValue({ job_id: "job-1", skipped: [] });
+    // The server's job memory keeps listing the row after it is deleted.
+    getJob.mockResolvedValue(job({ status: "running", items: [row] }));
+    deleteResults.mockResolvedValue({ deleted: 1 });
+
+    await store.startAnalysis(["https://instagram.com/x"]);
+    store.setSelected(["r-a"]);
+    await store.deleteSaved("selected");
+    expect(store.getSnapshot().jobData?.items).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(POLL_MS * 3);
+    expect(getJob.mock.calls.length).toBeGreaterThan(1);
+    expect(store.getSnapshot().jobData?.items).toHaveLength(0);
+  });
+
+  it("shows the same profile again when a NEW job re-analyses it", async () => {
+    const store = await loadStore();
+    start.mockResolvedValue({ job_id: "job-1", skipped: [] });
+    getJob.mockResolvedValue(job({ status: "done", items: [row] }));
+    deleteResults.mockResolvedValue({ deleted: 1 });
+
+    await store.startAnalysis(["https://instagram.com/x"]);
+    store.setSelected(["r-a"]);
+    await store.deleteSaved("selected");
+
+    start.mockResolvedValue({ job_id: "job-2", skipped: [] });
+    getJob.mockResolvedValue(job({ job_id: "job-2", status: "done", items: [{ ...row, id: "item-b" }] }));
+    await store.startAnalysis(["https://instagram.com/x"]);
+    expect(store.getSnapshot().jobData?.items).toHaveLength(1);
+  });
+});
+
+describe("edits on rows that stay on screen survive a new job", () => {
+  it("keeps edits on saved rows, drops edits on the replaced job's unsaved rows", async () => {
+    const store = await loadStore();
+    listResults.mockResolvedValue({
+      items: [{ id: "saved-1", result_id: "r-1", url: "u1", platform: "instagram", status: "done" }],
+      total: 1, retention_hours: 24,
+    });
+    await store.setOrg("client-a");
+    start.mockResolvedValue({ job_id: "job-1", skipped: [] });
+    getJob.mockResolvedValue(job({ status: "running", items: [{ id: "live-1", url: "u2", platform: "instagram", status: "running" }] }));
+    await store.startAnalysis(["https://instagram.com/x"]);
+
+    store.setSessionField("edits", {
+      "saved-1": { AssetName: "kept" },
+      "live-1": { AssetName: "goes" },
+    });
+
+    start.mockResolvedValue({ job_id: "job-2", skipped: [] });
+    getJob.mockResolvedValue(job({ job_id: "job-2", status: "done", items: [] }));
+    await store.startAnalysis(["https://instagram.com/y"]);
+
+    expect(store.getSnapshot().edits["saved-1"]?.AssetName).toBe("kept");
+    expect(store.getSnapshot().edits["live-1"]).toBeUndefined();
+  });
+});
+
+describe("a failed saved-results load is not an empty result", () => {
+  it("records the error so the view can say so, and clears it on success", async () => {
+    const store = await loadStore();
+    listResults.mockRejectedValue(new Error("backend down"));
+    await store.setOrg("client-a");
+    expect(store.getSnapshot().saved).toHaveLength(0);
+    expect(store.getSnapshot().savedError).toBe("backend down");
+
+    listResults.mockResolvedValue({ items: [], total: 0, retention_hours: 24 });
+    await store.loadSaved();
+    expect(store.getSnapshot().savedError).toBeNull();
   });
 });

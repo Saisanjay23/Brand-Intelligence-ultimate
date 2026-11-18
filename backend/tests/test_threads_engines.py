@@ -450,8 +450,10 @@ class TestRegistration:
         from backend.stealth import levels
 
         assert dr.tabs_for("threads") == ["people"]
-        assert levels.session_cap("threads", 3) == 3          # no level cap
-        assert dr._sessions_wanted("threads", 5) == 5
+        # One account at a time at the default (high) stealth level --
+        # see stealth/levels.py; STANDARD uses every free account.
+        assert levels.session_cap("threads", 3) == 1
+        assert dr._sessions_wanted("threads", 5) == 1
 
     def test_a_threads_link_routes_to_the_threads_platform(self):
         from backend.analysis import runner as ar

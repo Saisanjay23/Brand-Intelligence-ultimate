@@ -73,7 +73,20 @@ PROFILES = "profiles"
 # platform-based rule had written off as needing a login.
 #
 # Kept only as the list of platforms a re-visit is even possible for.
-REVISIT_PLATFORMS = ("facebook", "instagram")
+#
+# INSTAGRAM WAS TAKEN OFF IT (2026-11-17). Its re-visit was one call per
+# profile to the private `web_profile_info` endpoint, sent with a fake
+# Instagram-for-Android User-Agent through Playwright's own HTTP client --
+# not the browser -- on the pooled account's cookies. That is the pattern
+# of a stolen cookie replayed by a script, the endpoint answers 429 for
+# every username anyway (instagram/analysis_engine.py), and a backfill of
+# thousands of profiles would have sent thousands of them on one account.
+# An expired Instagram picture comes back by re-sweeping its client.
+REVISIT_PLATFORMS = ("facebook",)
+NOT_REVISITED = {
+    "instagram": ("not re-visited: Instagram picture recovery would put thousands of "
+                  "automated requests on one account -- re-sweep the client instead"),
+}
 
 # How many profiles one call pulls from Mongo at a time. Bounded so a
 # 10,000-row backfill never materialises as one list.
@@ -362,6 +375,10 @@ async def via_revisit(
     wanted = [p for p in (platforms or REVISIT_PLATFORMS) if p in REVISIT_PLATFORMS]
     started = time.time()
     result: dict[str, Any] = {"tier": "revisit", "platforms": {}, "recovered": 0, "failed": 0}
+    # Asked for by name and refused: said, not silently dropped.
+    for p in platforms or ():
+        if p in NOT_REVISITED:
+            result["platforms"][p] = {"error": NOT_REVISITED[p]}
 
     for platform in wanted:
         pending = await db()[PROFILES].count_documents(_blank_query(client_id, platform))
@@ -464,8 +481,7 @@ def _refresher_for(platform: str, plat_obj: Any, session: Any, options: Any):
     Each reuses the engine's own profile reader rather than re-implementing
     one: Facebook's `_resolve_missing` already visits a profile page and
     id-scopes what it reads (so it can never attach another account's
-    picture), and Instagram's profile-info endpoint is one authenticated
-    call. Writing new scraping here would be a second parser to keep
+    picture). Instagram has none, on purpose -- see REVISIT_PLATFORMS. Writing new scraping here would be a second parser to keep
     correct against the same platforms.
     """
     if platform == "facebook":
@@ -480,42 +496,5 @@ def _refresher_for(platform: str, plat_obj: Any, session: Any, options: Any):
                     for d in docs]
 
         return _facebook
-
-    if platform == "instagram":
-        from backend.platforms.instagram.discovery_engine import (
-            MOBILE_UA, PROFILE_INFO_API, parse_lines, profile_from)
-        from urllib.parse import quote
-
-        async def _instagram(docs: list[dict]) -> list[tuple[dict, str]]:
-            out: list[tuple[dict, str]] = []
-            for d in docs:
-                handle = (d.get("username") or "").strip()
-                if not handle:
-                    out.append((d, ""))
-                    continue
-                try:
-                    res = await session.ctx.request.get(
-                        PROFILE_INFO_API.format(u=quote(handle)),
-                        headers={"User-Agent": MOBILE_UA,
-                                 "x-ig-app-id": "936619743392459",
-                                 "accept": "application/json"},
-                        timeout=options.timeout * 1000,
-                    )
-                    text = await res.text() if res.status == 200 else ""
-                except Exception:                    # noqa: BLE001
-                    text = ""
-                avatar = ""
-                for blob in parse_lines(text):
-                    if user := profile_from(blob, handle):
-                        avatar = user.avatar or ""
-                        break
-                out.append((d, avatar))
-                # Paced: this is an authenticated API call per profile on a
-                # real account, and a few thousand of them back to back with
-                # no gap is the one pattern worth not having.
-                await asyncio.sleep(1.5)
-            return out
-
-        return _instagram
 
     raise ValueError(f"no avatar refresher for {platform!r}")

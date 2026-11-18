@@ -103,6 +103,22 @@ def _to_item(doc: dict) -> dict:
         # answers exactly one question: is a cached health result older than
         # the credentials it was measuring? See sessions/manager.py::status.
         "credentials_updated_at": float(doc.get("credentials_updated_at") or 0),
+        # Epoch seconds this ACCOUNT joined the pool (set once by add_item,
+        # never by a cookie re-paste). Drives the warm-up ramp in
+        # shared/account_budget.py: a new account starts on a fraction of
+        # the daily limits. 0 = added before this field existed -- treated
+        # as established, never as brand new.
+        "added_at": float(doc.get("added_at") or 0),
+        # Where this account last worked from ({"country", "org", "at"}),
+        # for the network-change guard (shared/egress.py). Cleared when
+        # fresh cookies are pasted.
+        "egress": doc.get("egress") or {},
+        # Limits that learn (shared/account_budget.py): the share of its
+        # limits this account may use after a warning, when that was set,
+        # and when it is fully recovered.
+        "budget_penalty_factor": float(doc.get("budget_penalty_factor") or 1.0),
+        "budget_penalty_at": float(doc.get("budget_penalty_at") or 0),
+        "budget_penalty_until": float(doc.get("budget_penalty_until") or 0),
         # Why this entry last stopped working, in words, kept ON the entry
         # rather than only in the logs, an auto-login that fails at 2am
         # otherwise leaves a row that just reads "checkpointed" with the
@@ -203,7 +219,7 @@ async def add_item(platform: str, cookies: list[dict], identifier: str) -> dict:
         "identifier": identifier, "status": "ready", "cookies": cookies,
         "rate_limited_until": 0.0, "last_used": _NEW_SESSION_LAST_USED(),
         "username": "", "password": "", "two_factor_secret": "",
-        "credentials_updated_at": _now(),
+        "credentials_updated_at": _now(), "added_at": _now(),
         "relogin_attempts": 0, "relogin_last_attempt": 0.0,
         "relogin_last_success": 0.0, "relogin_total_successes": 0,
     }
@@ -266,6 +282,9 @@ async def update_session_credentials(platform: str, session_id: str, **credentia
         # that was just replaced.
         "relogin_attempts": 0,
         "relogin_last_attempt": 0.0,
+        # A fresh login from THIS network is what makes this network
+        # legitimate, so the remembered place is dropped.
+        "egress": {},
     }
     for k in ("cookies", "api_key", "identifier", "api_id", "api_hash", "phone", "session_blob", "username", "password", "two_factor_secret", "storage_state"):
         if k in credentials and credentials[k] is not None:

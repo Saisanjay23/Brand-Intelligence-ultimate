@@ -123,30 +123,46 @@ export function SchedulerRunScope({ client, platforms, disabled }: Props) {
     forceRender((n) => n + 1);
 
     if (timer.current !== null) window.clearTimeout(timer.current);
-    timer.current = window.setTimeout(() => {
-      timer.current = null;
-      const send = intended.current;
-      if (!send) return;
-      setBusy(true);
-      clientsApi
-        .setSchedulerPrefs(client.client_id, {
-          platforms: send.platforms,
-          keyword_scope: send.scope,
-          facebook_tabs: send.facebook_tabs,
-          budget_minutes: send.budget_minutes,
-        })
-        .then(() => refreshDirectory())
-        .catch((e) => {
-          intended.current = null;
-          forceRender((n) => n + 1);
-          toast.error((e as Error).message || "Could not save the run scope");
-        })
-        .finally(() => setBusy(false));
-    }, 300);
+    timer.current = window.setTimeout(flush, 300);
   };
 
+  // Sends the pending choice. Kept in a ref so the unmount cleanup below
+  // calls the latest one.
+  const flush = () => {
+    timer.current = null;
+    const send = intended.current;
+    if (!send) return;
+    setBusy(true);
+    clientsApi
+      .setSchedulerPrefs(client.client_id, {
+        platforms: send.platforms,
+        keyword_scope: send.scope,
+        facebook_tabs: send.facebook_tabs,
+        budget_minutes: send.budget_minutes,
+      })
+      .then(() => refreshDirectory({ afterWrite: true }))
+      .catch((e) => {
+        intended.current = null;
+        forceRender((n) => n + 1);
+        // The shared directory was already patched with the unsaved
+        // choice, so without a re-read the chips kept showing it as if
+        // saved -- while the overnight run used the server's old values.
+        void refreshDirectory({ afterWrite: true });
+        toast.error((e as Error).message || "Could not save the run scope");
+      })
+      .finally(() => setBusy(false));
+  };
+  const flushRef = useRef(flush);
+  flushRef.current = flush;
+
+  // Leaving the tab within the 300ms debounce used to CANCEL the save
+  // while the local patch stayed -- a choice on screen that was never
+  // stored. Send it instead.
   useEffect(() => () => {
-    if (timer.current !== null) window.clearTimeout(timer.current);
+    if (timer.current !== null) {
+      window.clearTimeout(timer.current);
+      flushRef.current();
+    }
   }, []);
 
   // Platform selection toggling (exact selected only)

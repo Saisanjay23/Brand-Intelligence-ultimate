@@ -228,6 +228,11 @@ async def _bring_up_storage() -> None:
                 # remember to run.
                 await analysis_results_db.ensure_indexes()
                 await schedule_db.ensure_indexes()
+                # Instagram's daily account ceilings count in Mongo from
+                # here on, so a restart cannot hand a tired account a
+                # fresh day (shared/account_budget.py).
+                from backend.shared import account_budget
+                account_budget.use_persistent_store()
                 from backend.platforms import registry
                 for plat in registry.PLATFORMS.values():
                     await registry.session_state(plat)

@@ -47,24 +47,30 @@ _TABLE: dict[str, dict[str, dict[str, Optional[float]]]] = {
     # (jittered around it, see `jittered`). It was 2.5s, quicker than a
     # person moves through a results list; 4.5s is about reading pace.
     #
-    # max_sessions is None at BOTH levels: Instagram uses every free account
-    # in its pool at once (discovery/analysis runners, `_sessions_wanted`).
-    # HIGH used to pin it to one account, which left a second or third
-    # account idle as standby while the first worked through the whole
-    # queue alone. What keeps several accounts safe now is per ACCOUNT, not
-    # a cap on how many: each has its own hourly ceiling
-    # (shared/account_budget.py), they share one pacing governor, workers
-    # start staggered, and one account never runs on Instagram and Threads
-    # at once (shared/meta_account.py). HIGH still means slower gaps.
+    # max_sessions: STANDARD uses every free account in the pool at once
+    # (discovery/analysis runners, `_sessions_wanted`); HIGH -- the default --
+    # uses ONE at a time.
+    #
+    # HIGH WAS PINNED TO ONE, then released (a second and third account sat
+    # idle as standby while the first did all the work), and is pinned again
+    # as of 2026-11-17, after the pool's Instagram account was suspended.
+    # Every account in the pool leaves from this machine's one IP, and no
+    # per-account proxy exists, so several accounts working AT THE SAME TIME
+    # is the pattern that links them to each other -- one flag then takes
+    # the rest with it. One at a time loses nothing in coverage: when an
+    # account hits its daily ceiling (shared/account_budget.py) or dies, it
+    # rests and the next claim round takes the next account, so the queue
+    # still drains. It only costs speed, and speed is what this trades away.
+    # Set INSTAGRAM_STEALTH=standard to use every account at once again.
     "instagram": {
         STANDARD: {"keyword_gap": 8.0, "page_gap": 4.5, "batch_gap": 3.5, "max_sessions": None},
-        HIGH:     {"keyword_gap": 16.0, "page_gap": 7.0, "batch_gap": 9.0, "max_sessions": None},
+        HIGH:     {"keyword_gap": 16.0, "page_gap": 7.0, "batch_gap": 9.0, "max_sessions": 1},
     },
     # Threads signs in with Instagram accounts, so a flag on one is a flag on
     # both: same numbers.
     "threads": {
         STANDARD: {"keyword_gap": 8.0, "page_gap": 4.5, "batch_gap": 3.5, "max_sessions": None},
-        HIGH:     {"keyword_gap": 16.0, "page_gap": 7.0, "batch_gap": 9.0, "max_sessions": None},
+        HIGH:     {"keyword_gap": 16.0, "page_gap": 7.0, "batch_gap": 9.0, "max_sessions": 1},
     },
 }
 

@@ -457,7 +457,9 @@ export interface SessionInfo {
   // botched cookie export) because the fix differs: wait, or add another
   // account. This state used to be reported as "ready", so a fully dead
   // pool showed green while every job launched into it failed.
-  state: "ready" | "missing" | "incomplete" | "exhausted" | "unreadable" | "expired" | "checkpointed";
+  // "unknown": the server could not read this platform's status at all
+  // (see backend/api/sessions.py). Never to be shown as ready.
+  state: "ready" | "missing" | "incomplete" | "exhausted" | "unreadable" | "expired" | "checkpointed" | "unknown";
   kind: "cookies" | "api-key" | "mtproto";
   can_login: boolean;
   cookie_count: number;

@@ -29,13 +29,51 @@ const FALLBACK_POLL_MS = 1000;
 // reached" rather than quietly retried for ever.
 const LOST_AFTER_FAILURES = 5;
 
+// A PER-PLATFORM ending that means "not everything was searched".
+const UNHEALTHY_PLATFORM = new Set(["failed", "partial", "skipped"]);
+
 function notifyFinished(job: DiscoveryJobState): void {
-  const message = `Discovery sweep ${
-    job.status === "done" ? "finished" : job.status === "failed" ? "failed" : "was cancelled"
-  }: ${job.found} found${job.new ? ` (${job.new} new)` : ""}`;
-  if (job.status === "failed") toast.error(message);
-  else if (job.status === "cancelled") toast(message, { icon: "⚠️" });
-  else toast.success(message);
+  const counts = `${job.found} found${job.new ? ` (${job.new} new)` : ""}`;
+  if (job.status === "failed") {
+    toast.error(`Discovery sweep failed: ${counts}${job.message ? ` -- ${job.message}` : ""}`);
+    return;
+  }
+  if (job.status === "cancelled") {
+    toast(`Discovery sweep was cancelled: ${counts}`, { icon: "⚠️" });
+    return;
+  }
+  // THE JOB'S STATUS IS NOT THE VERDICT. The runner marks a job "done" once
+  // every platform has ENDED, however it ended -- so a sweep in which every
+  // platform failed, was skipped (no ready session) or stopped part-way used
+  // to toast a green "finished: 0 found". That is the silent clean zero
+  // this tool exists to avoid: an unsearched keyword reads exactly like a
+  // searched one that found nothing. The per-platform statuses decide.
+  const platforms = job.platforms || [];
+  const bad = platforms.filter((p) => UNHEALTHY_PLATFORM.has(p.status));
+  const anyDone = platforms.some((p) => p.status === "done");
+  const name = (p: { display_name: string; platform: string }) => p.display_name || p.platform;
+  const tail = job.message ? ` -- ${job.message}` : "";
+  if (bad.length && !anyDone) {
+    toast.error(
+      `Discovery sweep did not search: ${bad.map((p) => `${name(p)} ${p.status}`).join(", ")}. ` +
+        `${counts}${tail}`,
+      { duration: 12000 },
+    );
+  } else if (bad.length) {
+    toast(
+      `Discovery sweep finished with gaps -- ${bad.map((p) => `${name(p)} ${p.status}`).join(", ")}. ` +
+        `${counts}${tail}`,
+      { icon: "⚠️", duration: 12000 },
+    );
+  } else if (!anyDone && job.found === 0) {
+    // No platform reports a clean finish and nothing was found: whatever
+    // happened, it was not a completed search, so it must not be green.
+    toast(`Discovery sweep ended without any platform completing: ${counts}${tail}`, {
+      icon: "⚠️", duration: 12000,
+    });
+  } else {
+    toast.success(`Discovery sweep finished: ${counts}`);
+  }
 }
 
 // GET /discovery/jobs/{id} is a plain snapshot -- status, per-platform

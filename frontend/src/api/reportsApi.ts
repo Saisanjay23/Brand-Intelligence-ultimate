@@ -46,13 +46,18 @@ export interface SendResult {
   detail: string;
 }
 
-/** The rendered HTML, byte-identical to what the email carries. */
-export function clientReportHtmlUrl(clientId: string): string {
-  return url(`/reports/client/${encodeURIComponent(clientId)}/html`);
+/** The rendered HTML, byte-identical to what the email carries.
+ *
+ *  `inline` is for Preview. Without it the server answers with
+ *  `Content-Disposition: attachment`, so a "Preview" link opened in a new
+ *  tab just downloaded the file again -- same bytes, but rendered in the
+ *  tab instead of saved. */
+export function clientReportHtmlUrl(clientId: string, inline = false): string {
+  return url(`/reports/client/${encodeURIComponent(clientId)}/html${inline ? "?inline=true" : ""}`);
 }
 
-export function combinedReportHtmlUrl(): string {
-  return url("/reports/combined/html");
+export function combinedReportHtmlUrl(inline = false): string {
+  return url(`/reports/combined/html${inline ? "?inline=true" : ""}`);
 }
 
 export const reportsApi = {

@@ -146,6 +146,13 @@ function relativeLabel(isoString: string, now: number): string {
 // correctly in a log line and wrongly after a full stop -- "The last run
 // was interrupted. the backend restarted...". Capitalised at the point of
 // joining rather than at the source, so the log keeps its own voice.
+function sameSchedule(a: Schedule, b: Schedule): boolean {
+  return a.enabled === b.enabled && a.mode === b.mode && a.at === b.at
+    && (a.on_date || "") === (b.on_date || "") && (a.tz || "") === (b.tz || "")
+    && a.weekdays.length === b.weekdays.length
+    && a.weekdays.every((w, i) => w === b.weekdays[i]);
+}
+
 function sentence(text: string): string {
   const t = (text || "").trim();
   return t ? t.charAt(0).toUpperCase() + t.slice(1) : "";
@@ -205,9 +212,13 @@ export function SchedulerSchedule({
   const [detectedInfo, setDetectedInfo] = useState<string | null>(null);
 
   const tz = draft.tz || "Asia/Kolkata";
+  // Dirty means "differs from what is saved", not "was touched": ticking
+  // a box off and on again used to leave a standing "Unsaved" warning
+  // with nothing actually unsaved.
   const patch = (fields: Partial<Schedule>) => {
-    setDraft((d) => ({ ...d, ...fields }));
-    setDirty(true);
+    const next = { ...draft, ...fields };
+    setDraft(next);
+    setDirty(!sameSchedule(next, schedule));
   };
 
   const handleSmartDetect = async () => {
@@ -341,7 +352,8 @@ export function SchedulerSchedule({
             <AlertTriangleIcon size={14} color="var(--danger)" />
           </span>
           <span>
-            <strong>A scheduled run was missed.</strong> {sentence(missed.message)}
+            <strong>A scheduled run was missed{missed.due_at ? ` (due ${whenLabel(missed.due_at)})` : ""}.</strong>{" "}
+            {sentence(missed.message)}
           </span>
         </div>
       )}
@@ -581,6 +593,33 @@ export function SchedulerSchedule({
             </div>
           )}
         </>
+      )}
+
+      {/* Turning automatic runs OFF is an edit too, and has to be saved.
+          The Save button above lives inside the enabled-only form, so
+          unticking the box used to hide the only way to send it: the
+          header kept saying "Next run 02:00" and the run still fired. */}
+      {!draft.enabled && dirty && (
+        <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+          <span style={{ fontSize: "11.5px", color: "var(--warn-yellow, #fdb71b)", fontWeight: 600 }}>
+            Unsaved — automatic runs stay ON until you save.
+          </span>
+          <button
+            onClick={() => void save()}
+            disabled={disabled || saving}
+            style={{
+              padding: "6px 14px", borderRadius: "9px",
+              background: "rgba(124,92,255,0.14)",
+              border: "1px solid rgba(124,92,255,0.45)",
+              color: "var(--accent, #7c5cff)",
+              fontSize: "12.5px", fontWeight: 700,
+              cursor: disabled || saving ? "not-allowed" : "pointer",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {saving ? "Saving…" : "Save — turn off automatic runs"}
+          </button>
+        </div>
       )}
     </div>
   );

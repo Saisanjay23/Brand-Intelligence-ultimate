@@ -471,6 +471,10 @@ function TileProgressRow({ p }: { p: PlatformSweepState }) {
   );
 }
 
+// The analysis job id that last switched this page to its Analysis phase.
+// See the effect in LiveResultsView for why this outlives the component.
+let lastAnalysisSwitchedTo: string | null = null;
+
 export function LiveResultsView({
   clientId, clientName, platforms, job, lost, running, cancelling, onCancel, onAnalyseStarted, refreshKey, liveKey, resumeAnalysisJobId,
 }: Props) {
@@ -485,8 +489,20 @@ export function LiveResultsView({
   // Validated"/"Analyse Selected", or from Home's "Analyse" action)
   // switches straight to the Analysis toggle so the analyst doesn't have
   // to click it themselves.
+  //
+  // ONLY WHEN THE ID IS NEW. App never clears `resumeAnalysisJobId` (the
+  // analysis store relies on it staying set, see analysisSession.ts), and
+  // this page is remounted every time the analyst comes back to it -- so
+  // "an id is set" was true for the rest of the session after one analysis,
+  // and Live Results opened on Analysis even when the analyst had come to
+  // watch a discovery sweep they had just started. The last id acted on is
+  // kept at MODULE level, not in a ref, precisely because a ref dies with
+  // the remount that caused the bug.
   useEffect(() => {
-    if (resumeAnalysisJobId) setPhase("analysis");
+    if (resumeAnalysisJobId && resumeAnalysisJobId !== lastAnalysisSwitchedTo) {
+      lastAnalysisSwitchedTo = resumeAnalysisJobId;
+      setPhase("analysis");
+    }
   }, [resumeAnalysisJobId]);
 
   // KEYED ON `liveKey` TOO, NOT JUST `refreshKey`. `refreshKey` moves when
@@ -528,7 +544,17 @@ export function LiveResultsView({
       {/* Phase tabs -- Discovery / Analysis */}
       <div className="platform-rail-grid" style={{ gridTemplateColumns: "repeat(2, 1fr)", marginBottom: "16px" }}>
         {(["discovery", "analysis"] as const).map((ph) => (
-          <div key={ph} className={`platform-rail-item ${phase === ph ? "active" : ""}`} onClick={() => setPhase(ph)}>
+          // Reuses the count-card look but not its fixed 100px height --
+          // these tabs carry only a label, so at full height they read as
+          // two big empty boxes. A real button so the keyboard can reach it.
+          <button
+            type="button"
+            key={ph}
+            aria-pressed={phase === ph}
+            className={`platform-rail-item ${phase === ph ? "active" : ""}`}
+            style={{ height: "auto", textAlign: "left", font: "inherit", color: "inherit" }}
+            onClick={() => setPhase(ph)}
+          >
             <div className="rail-card-head">
               <span style={{ display: "flex", alignItems: "center" }}>
                 {ph === "discovery" ? <DiscoverIcon size={16} color="var(--purple, #9A50E9)" /> : <AnalyseIcon size={16} color="var(--purple, #9A50E9)" />}
@@ -537,7 +563,7 @@ export function LiveResultsView({
                 {ph === "discovery" ? "Discovery" : "Analysis"}
               </span>
             </div>
-          </div>
+          </button>
         ))}
       </div>
 

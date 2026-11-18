@@ -111,8 +111,12 @@ class TestJobStore:
     async def test_expired_job_reads_as_absent(self):
         store: JobStore[_Job] = JobStore(
             max_jobs=10, ttl_seconds=0.01, terminal_statuses=frozenset({"done"}))
-        await store.put(_job("x", age_seconds=5))
-        assert await store.get("x") is None, "a job past its TTL must read as gone"
+        # A FINISHED job -- only finished jobs age out; a running one never
+        # does (see test_job_store_eviction.py::TestRunningJobsNeverExpire).
+        job = _job("x", age_seconds=5)
+        job.status = "done"
+        await store.put(job)
+        assert await store.get("x") is None, "a finished job past its TTL must read as gone"
 
     @pytest.mark.asyncio
     async def test_cancel_is_idempotent_and_never_raises(self):

@@ -118,6 +118,44 @@ class TestTheBatchCeilingIsShared:
         assert len(await D._validated_docs("acme", [])) == 3
 
 
+class TestTheOverflowIsNamed:
+    """The "all validated" path used to cut at the ceiling and answer
+    `skipped=[]`, so the profiles past it vanished without a word."""
+
+    @staticmethod
+    def _runner(monkeypatch):
+        from unittest.mock import AsyncMock, MagicMock
+
+        job = MagicMock(id="j1", status="queued", total=3)
+        start = AsyncMock(return_value=(job, []))
+        monkeypatch.setattr(D.analysis_runner, "start", start)
+        return start
+
+    @pytest.mark.asyncio
+    async def test_profiles_left_over_the_ceiling_are_reported(self, pool, monkeypatch):
+        monkeypatch.setattr(D, "_MAX_VALIDATED_PER_ANALYSE", 3)
+        start = self._runner(monkeypatch)
+        res = await D.analyse_validated(D.AnalyseValidated(group_id="acme"))
+        assert len(start.await_args.args[0]) == 3
+        over = [s for s in res.skipped if s.value == "(over limit)"]
+        assert over and over[0].reason.startswith("3 more validated profile(s)")
+
+    @pytest.mark.asyncio
+    async def test_a_scoped_call_counts_only_its_platforms(self, pool, monkeypatch):
+        monkeypatch.setattr(D, "_MAX_VALIDATED_PER_ANALYSE", 3)
+        self._runner(monkeypatch)
+        res = await D.analyse_validated(D.AnalyseValidated(
+            group_id="acme", platforms=["facebook", "twitter"]))
+        over = [s for s in res.skipped if s.value == "(over limit)"]
+        assert over and over[0].reason.startswith("1 more validated profile(s)")
+
+    @pytest.mark.asyncio
+    async def test_a_batch_under_the_ceiling_reports_nothing(self, pool, monkeypatch):
+        self._runner(monkeypatch)
+        res = await D.analyse_validated(D.AnalyseValidated(group_id="acme"))
+        assert not any(s.value == "(over limit)" for s in res.skipped)
+
+
 class TestBothRequestShapesStillWork:
     """The Discovery grid sends singular `platform`; Run & Overview sends
     plural `platforms`. Neither may lose its scope."""

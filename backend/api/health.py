@@ -7,7 +7,10 @@ next to the thing it gates. One endpoint, one answer.
 
 from __future__ import annotations
 
+from typing import Optional
+
 from fastapi import APIRouter, Response
+from pydantic import BaseModel, Field
 
 from backend.api.models import Health
 from backend.database.connection import ping
@@ -15,13 +18,28 @@ from backend.database.connection import ping
 router = APIRouter(tags=["health"])
 
 
-@router.get("/health/live", response_model=Health,
+class LiveHealth(BaseModel):
+    """The liveness answer. Its own model because `Health.mongo` is a
+    required bool, and the liveness probe has no honest bool to give."""
+
+    status: str
+    mongo: Optional[bool] = Field(
+        None, description="Always null here: the liveness probe does not check "
+                          "Mongo. Use GET /health/ready for that.")
+
+
+@router.get("/health/live", response_model=LiveHealth,
             summary="Is the process up")
 async def live() -> dict:
     """Always 200 while the process is running. Use this for a liveness
     probe -- it deliberately does not touch Mongo, so a database outage
-    does not get the container killed and restarted pointlessly."""
-    return {"status": "ok", "mongo": True}
+    does not get the container killed and restarted pointlessly.
+
+    `mongo` IS NULL, NOT TRUE. It used to answer `"mongo": true` without
+    looking, so anything reading this endpoint was told the database was
+    up during an outage -- an unchecked "healthy". Null says what is
+    actually known: nothing; `/health/ready` is the probe that checks."""
+    return {"status": "ok", "mongo": None}
 
 
 @router.get("/health/ready", response_model=Health,

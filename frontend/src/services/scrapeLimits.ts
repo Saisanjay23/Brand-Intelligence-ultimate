@@ -77,7 +77,10 @@ export function parseSweepSeconds(raw: string): number | undefined {
   const text = (raw ?? "").trim();
   if (!text) return undefined;
   const minutes = Number(text);
-  if (!Number.isFinite(minutes) || minutes <= 0 || minutes > 24 * 60) {
+  // `< 1`, not `<= 0`: the message below and the box itself (min=1) both
+  // say 1 to 1440, so "0.5" must be refused here rather than quietly sent
+  // as a 30-second sweep that ends before it has searched anything.
+  if (!Number.isFinite(minutes) || minutes < 1 || minutes > 24 * 60) {
     throw new Error(
       `Sweep time budget: "${text}" is not valid. Enter minutes between 1 and 1440, ` +
         "or leave it empty for the default.",

@@ -83,6 +83,12 @@ export interface AnalysisSession {
   // batches from before this page was loaded.
   saved: AnalysisItemData[];
   savedLoading: boolean;
+  // Why the last saved-results load failed, or null. Kept in state rather
+  // than only toasted because a failed load leaves `saved` EMPTY, and an
+  // empty table with the toast already gone reads exactly like "this client
+  // has no results" -- a silent clean zero. The view shows a persistent
+  // banner with a Retry for as long as this is set.
+  savedError: string | null;
   retentionHours: number;
   // Which rows the analyst has ticked, by result_id. Lives here rather than
   // in the view for the same reason everything else does: a tab switch
@@ -114,6 +120,7 @@ function emptySession(): AnalysisSession {
     edits: {},
     saved: [],
     savedLoading: false,
+    savedError: null,
     retentionHours: 24,
     selected: [],
     deleting: false,
@@ -211,6 +218,48 @@ let generation = 0;
 // leak the scoping is here to close.
 let savedGeneration = 0;
 
+// WHICH CLIENT EACH JOB WAS STARTED FOR. The job payload does not carry its
+// org, so it is remembered here at the moment the job is first seen -- by
+// `startAnalysis`, or by the first `watchJob` (which App fires for a job it
+// just started under the client that is open). Needed because App never
+// clears `resumeAnalysisJobId`: every remount of the view re-offers the same
+// id, and after a client switch that would quietly re-attach client A's job
+// -- its rows, and with them its exports and deletes -- under client B.
+const jobOrg = new Map<string, string>();
+
+// A job that was still RUNNING when the analyst switched away from its
+// client, by org. Switching back re-attaches it so its progress is not lost;
+// a job that had already settled needs no parking, its rows are in `saved`.
+const parkedJob = new Map<string, string>();
+
+// Rows deleted while the CURRENT job is on screen, by result_id. The server
+// drops them from the 24h store, but the running job still holds them in
+// memory and lists them on every poll -- without this filter a deleted row
+// reappeared a second later, which reads as the delete having failed.
+// Scoped to one job on purpose: a later job that re-analyses the same URL
+// produces a new reading under the same result_id, and that must show.
+let deletedInJob = new Set<string>();
+
+function withoutDeleted(data: AnalysisJobResponse): AnalysisJobResponse {
+  if (!deletedInJob.size) return data;
+  return { ...data, items: data.items.filter((i) => !deletedInJob.has(i.result_id ?? "")) };
+}
+
+// The edits that survive replacing the current job. Edits are keyed by item
+// id, and a settled job row is saved under that SAME id -- so once a job's
+// rows are in `saved` they stay on screen after the job is replaced, and the
+// analyst's corrections on them must stay too. Only ids that are about to
+// leave the screen (rows of the old job with no saved copy) are dropped.
+function editsSurvivingJob(job: AnalysisJobResponse | null): AnalysisSession["edits"] {
+  if (!job || !job.items.length) return state.edits;
+  const onScreen = new Set(state.saved.map((r) => r.id));
+  const drop = job.items.map((i) => i.id).filter((id) => !onScreen.has(id) && id in state.edits);
+  if (!drop.length) return state.edits;
+  const next = { ...state.edits };
+  for (const id of drop) delete next[id];
+  return next;
+}
+
 export function stopPolling(): void {
   if (pollTimer !== null) {
     clearTimeout(pollTimer);
@@ -247,7 +296,7 @@ async function pollJob(
     // A poll that lands after the analyst started a different job (or hit
     // Clear) must not overwrite the current one with a stale payload.
     if (gen !== generation || state.jobId !== id) return { settled: true, rev: "" };
-    patch({ jobData: data });
+    patch({ jobData: withoutDeleted(data) });
     if (data.status === "done" || data.status === "cancelled" || data.status === "failed") {
       stopPolling();
       patch({ loading: false, cancelling: false });
@@ -338,11 +387,19 @@ function watch(id: string, gen: number, rev: string): void {
 // The `jobData === null && no poll` case is deliberately NOT skipped -- that
 // is a first watch whose poll failed, and it should be retried, not left
 // showing an empty table forever.
+//
+// A job that belongs to ANOTHER client is ignored outright -- see `jobOrg`.
+// A job seen for the first time is taken to belong to the client that is
+// open now, which is the one it was just started for.
 export function watchJob(id: string): void {
+  const owner = jobOrg.get(id);
+  if (owner !== undefined && owner !== state.orgId) return;
   if (state.jobId === id && (state.jobData !== null || pollActive)) return;
+  jobOrg.set(id, state.orgId);
   const gen = ++generation;
   stopPolling();
-  patch({ jobId: id, jobData: null, loading: true, edits: {} });
+  if (state.jobId !== id) deletedInJob = new Set();
+  patch({ jobId: id, jobData: null, loading: true, edits: editsSurvivingJob(state.jobData) });
   void (async () => {
     const first = await pollJob(id, gen);
     if (!first.settled) watch(id, gen, first.rev);
@@ -360,11 +417,36 @@ export function watchJob(id: string): void {
  *  `gen` guards against two client switches overlapping -- a slow response
  *  for client A must never repopulate a workspace that has since moved to
  *  client B.
+ *
+ *  A REAL SWITCH ALSO DROPS THE LIVE JOB. Clearing only `saved` used to
+ *  leave client A's running job attached -- still polled, its rows still
+ *  laid over B's table, and so inside B's exports and B's Delete All. Now
+ *  the poll is cut, the job and its edits go, and a job that was still
+ *  running is parked so that switching back to A picks it up again.
  */
 export async function setOrg(orgId: string): Promise<void> {
   const next = orgId || "";
   if (state.orgId === next && (state.saved.length > 0 || state.savedLoading)) return;
-  patch({ orgId: next, saved: [], selected: [] });
+  if (state.orgId !== next) {
+    const running = state.jobId !== null
+      && (state.loading || !state.jobData
+        || !["done", "cancelled", "failed"].includes(state.jobData.status));
+    if (running && state.jobId) parkedJob.set(state.orgId, state.jobId);
+    generation++;
+    stopPolling();
+    deletedInJob = new Set();
+    patch({
+      orgId: next, saved: [], selected: [], savedError: null,
+      jobId: null, jobData: null, edits: {}, loading: false, cancelling: false,
+    });
+    const back = parkedJob.get(next);
+    if (back) {
+      parkedJob.delete(next);
+      watchJob(back);
+    }
+  } else {
+    patch({ orgId: next, saved: [], selected: [], savedError: null });
+  }
   await loadSaved();
 }
 
@@ -379,9 +461,14 @@ export async function loadSaved(): Promise<void> {
     // flight -- these rows belong to a workspace that no longer exists.
     if (gen !== savedGeneration || state.orgId !== org) return;
     patch({
-      saved: res.items,
+      // A delete that landed while this load was in flight is filtered
+      // here too, or the stale list would put the row straight back.
+      saved: deletedInJob.size
+        ? res.items.filter((r) => !deletedInJob.has(r.result_id ?? ""))
+        : res.items,
       retentionHours: res.retention_hours,
       savedLoading: false,
+      savedError: null,
       // Drop ticks for rows that are no longer there (expired, or deleted
       // from another tab). A selection that outlives its rows would make
       // "Delete Selected (3)" act on one.
@@ -389,8 +476,9 @@ export async function loadSaved(): Promise<void> {
     });
   } catch (e) {
     if (gen !== savedGeneration) return;
-    patch({ savedLoading: false });
-    toast.error((e as Error).message || "Could not load saved results");
+    const msg = (e as Error).message || "Could not load saved results";
+    patch({ savedLoading: false, savedError: msg });
+    toast.error(msg);
   }
 }
 
@@ -438,18 +526,22 @@ export async function deleteSaved(mode: "selected" | "all"): Promise<number> {
       : await analysisApi.deleteResults(ids);
     const gone = new Set(mode === "all" ? [] : ids);
     const job = state.jobData;
+    // Remembered for the rest of this job -- see `deletedInJob`. "All"
+    // covers every saved row and every job row that had SETTLED (and so was
+    // saved); a row still running is not saved yet, will be written when it
+    // finishes, and is a genuinely new result when it then appears.
+    for (const id of gone) deletedInJob.add(id);
+    if (mode === "all") {
+      for (const r of state.saved) if (r.result_id) deletedInJob.add(r.result_id);
+      for (const i of job?.items ?? []) {
+        if (i.result_id && (i.status === "done" || i.status === "error")) deletedInJob.add(i.result_id);
+      }
+    }
     patch({
       deleting: false,
       selected: [],
       saved: mode === "all" ? [] : state.saved.filter((r) => !gone.has(r.result_id ?? "")),
-      jobData: job
-        ? {
-            ...job,
-            items: mode === "all"
-              ? []
-              : job.items.filter((i) => !gone.has(i.result_id ?? "")),
-          }
-        : job,
+      jobData: job ? withoutDeleted(job) : job,
     });
     return res.deleted;
   } catch (e) {
@@ -461,14 +553,17 @@ export async function deleteSaved(mode: "selected" | "all"): Promise<number> {
 
 export async function startAnalysis(urls: string[]): Promise<void> {
   const gen = ++generation;
+  const org = state.orgId;
   stopPolling();
-  patch({ loading: true, jobId: null, jobData: null, edits: {} });
+  deletedInJob = new Set();
+  patch({ loading: true, jobId: null, jobData: null, edits: editsSurvivingJob(state.jobData) });
   try {
-    const res = await analysisApi.start(urls, "", "", state.orgId);
-    // Clear, or a newer start, landed while this request was in flight.
-    // Installing this job now would attach it to a workspace the analyst
-    // has already moved on from.
+    const res = await analysisApi.start(urls, "", "", org);
+    // Clear, a newer start, or a client switch landed while this request
+    // was in flight. Installing this job now would attach it to a workspace
+    // the analyst has already moved on from.
     if (gen !== generation) return;
+    jobOrg.set(res.job_id, org);
     patch({ jobId: res.job_id });
 
     if (res.skipped && res.skipped.length > 0) {
@@ -500,7 +595,10 @@ export async function cancelAnalysis(): Promise<void> {
 // Clears the results AND the edits keyed to them. Edits used to be left
 // behind here, which was invisible while the whole component was thrown
 // away on every tab switch; now that the session persists, orphaned edits
-// would accumulate for the life of the page.
+// would accumulate for the life of the page. Only the edits of rows that
+// LEAVE the screen go, though: a job row that already settled is in `saved`
+// under the same id and stays visible, and wiping the analyst's corrections
+// on a row they can still see is losing their work, not tidying up.
 // Clears the WORKSPACE -- the URL box, the current job, the filters and the
 // edits keyed to them. It deliberately does NOT touch `saved`: those rows
 // are on the server for 24 hours and Clear is not a delete. An analyst who
@@ -510,12 +608,13 @@ export function clearSession(): void {
   // still in flight -- see `generation`.
   generation++;
   stopPolling();
+  deletedInJob = new Set();
   patch({
     urlInput: "",
     jobId: null,
     jobData: null,
     searchQuery: "",
-    edits: {},
+    edits: editsSurvivingJob(state.jobData),
     loading: false,
     cancelling: false,
   });

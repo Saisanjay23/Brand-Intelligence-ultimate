@@ -50,16 +50,30 @@ export function ReportPanel({ clientId }: Props) {
   const [report, setReport] = useState<ClientReport | CombinedReport | null>(null);
   const [loading, setLoading] = useState(false);
   const [sending, setSending] = useState(false);
+  // WHY A FAILED LOAD IS KEPT ON SCREEN, not only toasted. A toast is gone
+  // in a few seconds; what stays is the panel. On a first load that failed
+  // the panel used to be empty (no counts, no reason), and after a failed
+  // Refresh it kept the PREVIOUS counts with nothing to say they were now
+  // stale -- either way an old or missing number looked like a current one.
+  const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(() => {
     setLoading(true);
     const p = combined ? reportsApi.combined() : reportsApi.client(clientId!);
-    p.then(setReport)
-      .catch((e) => toast.error((e as Error).message || "Could not build the report"))
+    p.then((r) => { setReport(r); setError(null); })
+      .catch((e) => {
+        const msg = (e as Error).message || "Could not build the report";
+        setError(msg);
+        toast.error(msg);
+      })
       .finally(() => setLoading(false));
   }, [clientId, combined]);
 
   useEffect(() => {
+    // A different client: the previous client's counts (and its error) are
+    // not this one's, and must not sit on screen while this one loads.
+    setReport(null);
+    setError(null);
     if (combined || clientId) load();
   }, [load, combined, clientId]);
 
@@ -93,6 +107,10 @@ export function ReportPanel({ clientId }: Props) {
   };
 
   const href = combined ? combinedReportHtmlUrl() : clientReportHtmlUrl(clientId!);
+  // Same report, rendered in the tab rather than saved -- see the `inline`
+  // note in reportsApi.
+  const previewHref = combined ? combinedReportHtmlUrl(true) : clientReportHtmlUrl(clientId!, true);
+  const generatedAt = report?.generated_at ? new Date(report.generated_at) : null;
 
   return (
     <div style={{
@@ -122,6 +140,21 @@ export function ReportPanel({ clientId }: Props) {
         </button>
       </div>
 
+      {error && (
+        <div
+          role="alert"
+          style={{
+            fontSize: "11px", color: "var(--danger, #E95053)", marginTop: "10px",
+            padding: "8px 10px", borderRadius: "8px",
+            border: "1px solid rgba(233, 80, 83, 0.4)", background: "rgba(233, 80, 83, 0.08)",
+          }}
+        >
+          {report
+            ? `Could not refresh the report: ${error}. The numbers below are from the last successful load.`
+            : `Could not build the report: ${error}.`}
+        </div>
+      )}
+
       {counts && (
         <div style={{ display: "flex", gap: "8px", marginTop: "14px", flexWrap: "wrap" }}>
           <Card label="New" value={counts.new} colour="var(--success, #36B5A0)" />
@@ -139,6 +172,9 @@ export function ReportPanel({ clientId }: Props) {
             </span></>
           )}
           {combined && <> &middot; {(report as CombinedReport).clients.length} clients</>}
+          {generatedAt && !Number.isNaN(generatedAt.getTime()) && (
+            <> &middot; as of {generatedAt.toLocaleString()}</>
+          )}
         </div>
       )}
 
@@ -170,7 +206,7 @@ export function ReportPanel({ clientId }: Props) {
           ⬇ Download report
         </a>
         <a
-          href={href}
+          href={previewHref}
           target="_blank"
           rel="noreferrer"
           style={{

@@ -41,7 +41,7 @@ import { useRefreshOnFocus } from "../hooks/useRefreshOnFocus";
 import { findClient } from "../services/clientDirectory";
 
 import { confirmAction } from "../utils/confirmAction";
-import { download, downloadBlob, rowsToCsv } from "../utils/download";
+import { download, downloadBlob, rowsToCsv, rowsToTsv } from "../utils/download";
 import { AvatarImg } from "./AvatarImg";
 import { PlatformIcon } from "./PlatformIcon";
 import { CloneIcon, GlobeIcon, LayersIcon, TargetIcon, TrashIcon, VerifiedBadgeIcon, ZapIcon } from "./AppIcons";
@@ -738,6 +738,13 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
   const [loadingValidated, setLoadingValidated] = useState(false);
 
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  // The profile behind every ticked id, kept as it was last seen on screen.
+  // Selection survives paging (see the selection effect below), but the
+  // rows themselves do not -- `displayed` is only the current page -- so
+  // Copy/Export "Selected" used to filter the current page and quietly drop
+  // every tick made on another one while the badge still counted them all.
+  // Entries for un-ticked ids are harmless: readers walk `selected`, not this.
+  const selectedRows = useRef<Map<string, DiscoveredProfile>>(new Map());
   const [busyId, setBusyId] = useState<string | null>(null);
   const [bulkBusy, setBulkBusy] = useState(false);
   const [analysing, setAnalysing] = useState<"all" | "selected" | null>(null);
@@ -1048,10 +1055,19 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
   // switching tabs, or a fresh sweep landing (refreshKey). Deliberately
   // excludes `offset`/`pageSize`: paging forward/back is still the same
   // dataset, just a different slice of it.
+  //
+  // EVERY SERVER-SIDE FILTER belongs here, not just the obvious ones. The
+  // Validated sub-tab, logo/original toggles, match level, entity type and
+  // keyword match type all change which rows exist, and leaving them out
+  // kept the old ticks alive: tick 20 rows, switch to "High Match", and
+  // "Validate Selected (20)" validated rows that were no longer on screen --
+  // possibly ones the new filter had excluded on purpose.
   useEffect(() => {
     setSelected(new Set());
+    selectedRows.current.clear();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [groupId, platform, keywordFilter, search, tab, refreshKey, seenFrom]);
+  }, [groupId, platform, keywordFilter, search, tab, refreshKey, seenFrom,
+      validatedAge, logoOnly, originalFilter, matchLevel, entityType, keywordMatchType]);
 
   // match_level/entity_type/keyword_match_type (Individual/Domain) are all
   // sent as server params on both loads above (see loadPending/
@@ -1089,6 +1105,15 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
     keywordOptions.push([keywordFilter, 0]);
   }
   const loadError = tab === "validated" ? loadErrorValidated : loadErrorPending;
+
+  // Remember the row behind each tick while it is on screen. Re-run on every
+  // fresh page too, so a ticked row that was edited (marked original, say)
+  // and reloaded is exported as it is now, not as it was when ticked.
+  useEffect(() => {
+    for (const p of displayed) {
+      if (selected.has(p.id)) selectedRows.current.set(p.id, p);
+    }
+  }, [displayed, selected]);
 
   const toggle = (id: string) =>
     setSelected((prev) => {
@@ -1248,38 +1273,109 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
     }
   };
 
-  const scopedRows = () => (selected.size ? displayed.filter((p) => selected.has(p.id)) : displayed);
+  // EVERY ticked row, from every page it was ticked on -- see `selectedRows`.
+  // A tick whose row was never captured would be a silent drop, so a
+  // shortfall is named rather than exported as if it were the whole set.
+  const selectedProfiles = (): DiscoveredProfile[] => {
+    const rows = [...selected]
+      .map((id) => selectedRows.current.get(id))
+      .filter((p): p is DiscoveredProfile => !!p);
+    if (rows.length < selected.size) {
+      toast.error(`${selected.size - rows.length} selected row(s) could not be read -- re-tick them and try again`);
+    }
+    return rows;
+  };
 
-  const handleCopyUrls = () => {
-    const rows = scopedRows();
-    copyUrls(rows.map((p) => p.url), selected.size ? "selected" : "filtered");
-    setCopyMenuOpen(false);
+  // EVERY row matching the current tab and filters, read page by page from
+  // the server -- the same walk "Copy All" on the Validated tab has always
+  // done. "All Filtered" in the Copy/Export menus used to mean `displayed`,
+  // which is the current page only, so an analyst exporting 1,400 filtered
+  // profiles got 25 and a success toast.
+  const fetchAllFiltered = async (): Promise<{ rows: DiscoveredProfile[]; total: number }> => {
+    const rows: DiscoveredProfile[] = [];
+    let total = 0;
+    for (let offsetNow = 0; ; offsetNow += BULK_FETCH_CAP) {
+      const res = await discoveryApi.listProfiles({
+        group_id: groupId, platform: platform || undefined,
+        status: tab === "validated" ? "validated" : "pending",
+        keyword: keywordFilter || undefined, search: search || undefined,
+        match_level: matchLevel || undefined, entity_type: entityType || undefined,
+        keyword_match_type: keywordMatchType || undefined,
+        // "All" means everything matching the CURRENT filters, so the date
+        // window belongs here as much as the keyword does -- copying a wider
+        // set than the screen shows is the specific way this button betrays
+        // an analyst who thinks they scoped it.
+        first_seen_from: seenFrom,
+        logo_matched: logoOnly || undefined,
+        is_original: originalFilter ?? undefined,
+        ...(tab === "validated" ? { validated_age: validatedAge } : { age: tab }),
+        limit: BULK_FETCH_CAP,
+        offset: offsetNow,
+      });
+      total = res.total;
+      rows.push(...res.items);
+      if (!res.items.length || rows.length >= total) break;
+    }
+    return { rows, total };
+  };
+
+  // Selected rows if anything is ticked, otherwise every filtered row.
+  const scopedRows = async (): Promise<DiscoveredProfile[]> => {
+    if (selected.size) return selectedProfiles();
+    const { rows, total } = await fetchAllFiltered();
+    if (rows.length < total) {
+      toast.error(`Only ${rows.length} of ${total} filtered profiles could be read -- try again or narrow the filters`);
+    }
+    return rows;
+  };
+
+  const handleCopyUrls = async () => {
+    setCopyingAll(true);
+    try {
+      const rows = await scopedRows();
+      await copyUrls(rows.map((p) => p.url), selected.size ? "selected" : "filtered");
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setCopyingAll(false);
+      setCopyMenuOpen(false);
+    }
   };
 
   const handleCopyTable = async () => {
-    const rows = scopedRows();
-    if (!rows.length) {
-      toast.error("Nothing to copy");
-      setCopyMenuOpen(false);
-      return;
-    }
-    const tsv = rowsToCsv(rows.map(exportRow)).replace(/,/g, "\t");
+    setCopyingAll(true);
     try {
-      await navigator.clipboard.writeText(tsv);
-      toast.success(`Copied ${rows.length} row(s) as table data`);
-    } catch {
-      toast.error("Clipboard unavailable");
+      const rows = await scopedRows();
+      if (!rows.length) {
+        toast.error("Nothing to copy");
+        return;
+      }
+      // A real TSV, not the CSV with every comma swapped for a tab: that
+      // split any quoted value containing a comma ("Acme, Inc.") across two
+      // columns, and carried the CSV's Excel BOM into the clipboard as an
+      // invisible character at the start of the first header.
+      const tsv = rowsToTsv(rows.map(exportRow));
+      try {
+        await navigator.clipboard.writeText(tsv);
+        toast.success(`Copied ${rows.length} row(s) as table data`);
+      } catch {
+        toast.error("Clipboard unavailable");
+      }
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setCopyingAll(false);
+      setCopyMenuOpen(false);
     }
-    setCopyMenuOpen(false);
   };
 
   // Validated-tab-only pair, next to Analyse All Validated/Analyse
   // Selected -- same "all vs. selected" split, but for the clipboard
-  // instead of a job. "Selected" reuses what's already loaded (selection
-  // only ever covers rows on screen); "All" means every validated profile
+  // instead of a job. "Selected" reads every ticked row, on whatever page it
+  // was ticked (see `selectedRows`); "All" means every validated profile
   // matching the current filters, not just the current page, so it fetches
   // fresh rather than reusing `validatedPage` (which is paginated to
-  // `pageSize`) -- bounded by BULK_FETCH_CAP, the backend's own per-request
+  // `pageSize`) -- in pages of BULK_FETCH_CAP, the backend's own per-request
   // ceiling.
   const handleCopyAllValidated = async () => {
     setCopyingAll(true);
@@ -1288,30 +1384,11 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
       // match level, entity type and keyword match type (so "High Match Only"
       // copied the unfiltered set) and read a single page of BULK_FETCH_CAP,
       // so a client with more validated profiles than that copied the first
-      // thousand and reported success.
-      const urls: string[] = [];
-      let total = 0;
-      for (let offsetNow = 0; ; offsetNow += BULK_FETCH_CAP) {
-        const res = await discoveryApi.listProfiles({
-          group_id: groupId, platform: platform || undefined, status: "validated",
-          keyword: keywordFilter || undefined, search: search || undefined,
-          match_level: matchLevel || undefined, entity_type: entityType || undefined,
-          keyword_match_type: keywordMatchType || undefined,
-          // "All" means everything matching the CURRENT filters, so the date
-          // window belongs here as much as the keyword does -- copying a wider
-          // set than the screen shows is the specific way this button betrays
-          // an analyst who thinks they scoped it.
-          first_seen_from: seenFrom,
-          logo_matched: logoOnly || undefined,
-          is_original: originalFilter ?? undefined,
-          validated_age: validatedAge,
-          limit: BULK_FETCH_CAP,
-          offset: offsetNow,
-        });
-        total = res.total;
-        urls.push(...res.items.map((p) => p.url));
-        if (!res.items.length || urls.length >= total) break;
-      }
+      // thousand and reported success. The walk now lives in
+      // fetchAllFiltered, shared with the Copy/Export menus; this button only
+      // renders on the Validated tab, so it is the validated set.
+      const { rows, total } = await fetchAllFiltered();
+      const urls = rows.map((p) => p.url);
       if (urls.length < total) {
         toast.error(`Only ${urls.length} of ${total} validated profiles could be read -- copy again or narrow the filters`);
       }
@@ -1324,19 +1401,17 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
   };
 
   const handleCopySelectedValidated = () => {
-    const rows = (validatedPage?.items || []).filter((p) => selected.has(p.id));
-    copyUrls(rows.map((p) => p.url), "selected");
+    void copyUrls(selectedProfiles().map((p) => p.url), "selected");
   };
 
   const handleExport = async (fmt: "xlsx" | "csv" | "json") => {
-    const rows = scopedRows();
-    if (!rows.length) {
-      toast.error("Nothing to export");
-      setExportMenuOpen(false);
-      return;
-    }
     setExporting(true);
     try {
+      const rows = await scopedRows();
+      if (!rows.length) {
+        toast.error("Nothing to export");
+        return;
+      }
       const filename = `${groupId}-${tab}-${new Date().toISOString().slice(0, 10)}`;
       if (fmt === "xlsx") {
         const blob = await analysisApi.exportXlsx(filename, rows.map(exportRow));
@@ -1634,9 +1709,10 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
             className="btn-cyber-primary"
             style={{ padding: "7px 12px", fontSize: "11px", marginTop: 0, width: "auto", display: "inline-flex", alignItems: "center", gap: "5px" }}
             onClick={() => { setCopyMenuOpen(!copyMenuOpen); setExportMenuOpen(false); }}
+            disabled={copyingAll}
             title="Copy profile URLs or table data to clipboard"
           >
-            <CloneIcon size={12} /> {selected.size > 0 ? `Copy (${selected.size}) ▾` : "Copy ▾"}
+            <CloneIcon size={12} /> {copyingAll ? "Copying…" : selected.size > 0 ? `Copy (${selected.size}) ▾` : "Copy ▾"}
           </button>
           {copyMenuOpen && (
             <div className="action-dropdown-menu">
@@ -1649,7 +1725,9 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
               ) : (
                 <div className="action-dropdown-scope-badge" style={{ background: "rgba(148, 163, 184, 0.12)", color: "var(--text-dim)" }}>
                   <GlobeIcon size={12} color="var(--text-dim)" />
-                  <span>All Filtered ({displayed.length})</span>
+                  {/* `total`, the server's count for the whole filtered tab --
+                      which is what fetchAllFiltered copies -- not the page. */}
+                  <span>All Filtered ({total})</span>
                 </div>
               )}
               <button className="action-dropdown-item" onClick={handleCopyUrls}>
@@ -1689,7 +1767,7 @@ export function DiscoveryProfileGrid({ groupId, platform, refreshKey, liveKey = 
                 <div className="action-dropdown-scope-badge">🎯 Exporting {selected.size} Selected</div>
               ) : (
                 <div className="action-dropdown-scope-badge" style={{ background: "rgba(148, 163, 184, 0.12)", color: "var(--text-dim)" }}>
-                  🌐 Exporting All Filtered ({displayed.length})
+                  🌐 Exporting All Filtered ({total})
                 </div>
               )}
               <button className="action-dropdown-item" onClick={() => handleExport("xlsx")}>

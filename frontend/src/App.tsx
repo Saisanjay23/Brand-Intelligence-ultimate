@@ -131,9 +131,14 @@ export default function App() {
 
   // The database is the only store now, so a failure to reach it is a real
   // outage rather than something to fall back from silently.
-  useEffect(() => {
-    if (directory.error) setError(`Clients database unreachable: ${directory.error}`);
-  }, [directory.error]);
+  //
+  // DERIVED, NOT COPIED INTO `error`. An effect used to setError() this
+  // when the directory failed and nothing ever cleared it, so the banner
+  // went on saying "unreachable" after the database had answered again --
+  // and, sharing `error` with everything else, it could also overwrite (or
+  // be overwritten by) an unrelated message. Derived, it clears itself the
+  // moment directory.error does.
+  const directoryError = directory.error ? `Clients database unreachable: ${directory.error}` : "";
 
   // Platform readiness and session pools, kept live by one poller and
   // refreshed the instant any panel changes a session, see the hook for
@@ -143,6 +148,7 @@ export default function App() {
     sessions,
     refresh: refreshPlatformState,
     error: platformStateError,
+    loaded: platformStateLoaded,
   } = usePlatformState();
 
   const onClient = useCallback(
@@ -198,7 +204,7 @@ export default function App() {
       activeJobsCount={discoveryPoll.running ? 1 : 0}
       readySessionsCount={sessions.filter((s) => s.state === "ready").length}
       platformCount={platforms.length}
-      error={error || platformStateError}
+      error={error || directoryError || platformStateError}
       theme={theme}
       onThemeToggle={() => setTheme((prev) => (prev === "dark" ? "light" : "dark"))}
     >
@@ -207,11 +213,20 @@ export default function App() {
           clientId={clientId}
           clientName={clientName}
           platforms={platforms}
+          platformsLoaded={platformStateLoaded}
+          platformsError={platformStateError}
           onClient={onClient}
           onForgetClient={onForgetClient}
-          busy={discoveryPoll.running}
-          onStopDiscovery={discoveryPoll.cancel}
-          stoppingDiscovery={discoveryPoll.cancelling}
+          // ONLY THIS CLIENT'S SWEEP, the same rule Live Results follows
+          // below. The poller follows one job for the whole app, so client
+          // B's page used to say "run in flight" for client A's sweep -- and
+          // its Stop button cancelled A's sweep, which nobody on B's page
+          // asked for.
+          busy={discoveryPoll.running && discoveryPoll.job?.group_id === clientId}
+          onStopDiscovery={
+            discoveryPoll.job?.group_id === clientId ? discoveryPoll.cancel : undefined
+          }
+          stoppingDiscovery={discoveryPoll.cancelling && discoveryPoll.job?.group_id === clientId}
           onDiscoveryStarted={(jobId) => {
             setError("");
             discoveryPoll.watch(jobId);

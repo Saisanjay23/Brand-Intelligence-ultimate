@@ -309,6 +309,25 @@ async def _claim_rounds_for(platform_id: str) -> int:
     return max(_MAX_CLAIM_ROUNDS, total)
 
 
+def _discovery_vendor(platform_id: str) -> str:
+    """The paid vendor answering this platform's searches right now, or ""
+    when it runs on pooled sessions -- every platform but a configured
+    Instagram (registry.Platform.discovery_vendor_path). Read when a sweep
+    starts, so a settings change applies from the next job on."""
+    plat = registry.PLATFORMS.get(platform_id)
+    hook = getattr(plat, "discovery_vendor", None)
+    return hook() if callable(hook) else ""
+
+
+def _vendor_item(vendor: str) -> dict:
+    """The stand-in a vendor-served platform's one worker gets in place of a
+    claimed session: NO id, so every pool call on the way (hold/release,
+    mark failed/ok, budgets) has nothing to act on, and `vendor` set so
+    `_keyword_worker` starts no browser. One worker because there is one key
+    behind it -- the same reason an API-key platform is pinned to one."""
+    return {"id": "", "identifier": vendor, "vendor": vendor}
+
+
 def _sessions_wanted(platform_id: str, keyword_count: int) -> int:
     """How many sessions it is worth claiming for this platform's sweep.
     Never more than there are keywords to sweep -- a claimed session is
@@ -425,6 +444,16 @@ class _PlatformSweepRun:
     # _requeue_keyword), which only removes that one session and lets the
     # others carry on.
     hard_stop: bool = False
+    # The platform's note when `hard_stop` came from a paid search vendor's
+    # refusal (a rejected key, an empty balance -- see
+    # resilience.PROVIDER_FATAL_STOPS), in the vendor's own words. Empty for
+    # every other hard stop, which keep their existing wording.
+    hard_note: str = ""
+    # Set when an account reached its DAILY ceiling (shared/account_budget).
+    # The reason the keywords left on the queue were not reached -- named
+    # on the platform's note instead of "every session failed", which is
+    # not what happened.
+    budget_note: str = ""
     # HOW THE SWEEPS THAT DID NOT EXHAUST THEIR RESULTS ENDED, split by
     # outcome rather than pooled into one `incomplete` tally -- see
     # shared/resilience.py::sweep_outcome for why the old single counter
@@ -1034,6 +1063,12 @@ class DiscoveryRunner:
             if not plat.enabled or not plat.can_discover:
                 skipped[platform_id] = "platform has no discovery phase"
                 continue
+            if _discovery_vendor(platform_id):
+                # A paid vendor answers this platform's searches (Instagram
+                # with HIKERAPI_KEY set): its session pool is irrelevant to
+                # discovery, so a dead or missing account does not skip it.
+                ready.append(platform_id)
+                continue
             state = await registry.session_state(plat)
             if state == "ready":
                 ready.append(platform_id)
@@ -1451,13 +1486,26 @@ class DiscoveryRunner:
         setup_error = ""
         worker_error = ""
         rounds = 0
-        max_rounds = await _claim_rounds_for(platform_id)
+        # A VENDOR-SERVED PLATFORM CLAIMS NOTHING FROM THE POOL. Instagram
+        # with a HikerAPI key searches through the vendor, so asking the pool
+        # for an account would only lock one (and wait on Threads sharing
+        # it) for a sweep that never uses it -- or skip the platform when
+        # the pool is dead, which is the very case the vendor exists for.
+        # One round: there is no second identity to fail over to.
+        vendor = _discovery_vendor(platform_id)
+        max_rounds = 1 if vendor else await _claim_rounds_for(platform_id)
 
         try:
             while rounds < max_rounds and run.queue and not job.cancel.is_set() and not run.hard_stop:
                 rounds += 1
                 try:
-                    plat_obj, claimed = await self._claim_sessions(platform_id, want)
+                    if vendor:
+                        plat_obj, claimed = registry.get(platform_id), [_vendor_item(vendor)]
+                        log.info(
+                            f"[{platform_id}] searching through {vendor} -- no account "
+                            f"claimed, no browser started")
+                    else:
+                        plat_obj, claimed = await self._claim_sessions(platform_id, want)
                 except Exception as e:
                     if rounds == 1:
                         # Nothing to sweep with AT ALL -- the pool is empty,
@@ -1553,7 +1601,7 @@ class DiscoveryRunner:
             # rather than the silent gap between keywords_done and
             # keywords_total this used to leave with no note explaining it.
             if not prog.note:
-                prog.note = setup_error or worker_error or (
+                prog.note = run.budget_note or setup_error or worker_error or (
                     "every available session for this platform failed or checkpointed -- "
                     "see the earlier failed sweep(s) for why")
             # THE CASE THIS LEDGER WAS BUILT FOR. `_MAX_CLAIM_ROUNDS` is
@@ -1750,6 +1798,11 @@ class DiscoveryRunner:
         prog = run.prog
         session_id = str(session_item.get("id") or "")
         label = session_item.get("identifier") or session_id or "anonymous"
+        # Set when a paid vendor answers this platform's searches (see
+        # `_vendor_item`): no browser, no account, so none of the
+        # account-protecting machinery below -- the breaker, the per-account
+        # ceilings, session verdicts -- has anything to protect.
+        vendor = str(session_item.get("vendor") or "")
         # The platform's stealth level (stealth/levels.py) may set its own
         # median; every other platform keeps the table above.
         inter_keyword_delay = stealth_levels.value(
@@ -1815,6 +1868,13 @@ class DiscoveryRunner:
                         anon_cm = plat_obj.anonymous_context()()
                         ctx = await anon_cm.__aenter__()
                         make_discoverer = lambda o, _c=ctx: plat_obj.discoverer()(o, _c, anonymous=True)
+                        discoverer = make_discoverer(options)
+                    elif vendor:
+                        # No browser context to hand over: the engine sends
+                        # its searches to the vendor (instagram/
+                        # vendor_search.py), told so explicitly rather than
+                        # left to infer it from a None context.
+                        make_discoverer = lambda o: plat_obj.discoverer()(o, None, vendor=True)
                         discoverer = make_discoverer(options)
                     elif not plat_obj.session_path:
                         make_discoverer = lambda o: plat_obj.discoverer()(o, None)
@@ -2049,7 +2109,10 @@ class DiscoveryRunner:
                             # pool as expired on cookies that were never touched. A cancel
                             # says nothing about the session, so it is recorded against the
                             # item/keyword and nowhere else.
-                            if ((reason := classify_failure(e))
+                            # A vendor-served sweep has no session to blame
+                            # (and nothing to hand the keyword to), so its
+                            # exception is the keyword's last word, below.
+                            if (not vendor and (reason := classify_failure(e))
                                     and not job.cancel.is_set()):
                                 await sessions_engine.mark_session_failed(
                                     platform_id, session_id, reason, detail=str(e))
@@ -2247,22 +2310,47 @@ class DiscoveryRunner:
                             # exactly like the exception path above, so a
                             # session that fails THIS way is just as eligible
                             # for another worker to take over from.
-                            session_reason = classify_failure(
-                                getattr(sweep, "error", "") or getattr(sweep, "stopped", "")
-                            )
-                            # THE STOP CODE IS THE ENGINE'S OWN VERDICT. Only
-                            # the error text was read whenever there was one,
-                            # so a sweep that stopped "rate_limited" or
-                            # "checkpoint" with a message in the platform's
-                            # own words ("slow down", "verify to continue")
-                            # left the account in rotation, still warned.
-                            if not session_reason and sweep_stopped in _PUSHBACK_STOPS:
-                                session_reason = classify_failure(sweep_stopped)
+                            if vendor:
+                                # NO ACCOUNT TO JUDGE. The vendor's refusals
+                                # read like session problems to
+                                # classify_failure ("HikerAPI key rejected"
+                                # contains "api key"; a 429 says rate limit),
+                                # and acting on that would requeue the
+                                # keyword for a "replacement session" that is
+                                # the same key. The stop code decides instead.
+                                session_reason = None
+                            else:
+                                session_reason = classify_failure(
+                                    getattr(sweep, "error", "") or getattr(sweep, "stopped", "")
+                                )
+                                # THE STOP CODE IS THE ENGINE'S OWN VERDICT. Only
+                                # the error text was read whenever there was one,
+                                # so a sweep that stopped "rate_limited" or
+                                # "checkpoint" with a message in the platform's
+                                # own words ("slow down", "verify to continue")
+                                # left the account in rotation, still warned.
+                                if not session_reason and sweep_stopped in _PUSHBACK_STOPS:
+                                    session_reason = classify_failure(sweep_stopped)
+                            if (vendor and sweep_stopped in resilience.PROVIDER_FATAL_STOPS
+                                    and not job.cancel.is_set()):
+                                # THE KEY OR THE BALANCE, NOT THE KEYWORD.
+                                # Every keyword still queued would draw the
+                                # identical refusal, so the platform stops
+                                # here -- the hard-stop path Telegram's flood
+                                # wait takes -- and the rest is recorded owed
+                                # under the vendor's own words. This keyword's
+                                # own cell is already recorded BROKEN above.
+                                if fatal_kind[0] != "session":
+                                    fatal_kind[0] = "hard"
+                                stop_reason = sweep_stopped
+                                run.hard_note = (
+                                    f"stopped early: {getattr(sweep, 'error', '') or sweep_stopped}"
+                                    f" -- the remaining keywords are recorded as owed")
                             # Gated on the cancel for the same reason the raised-exception
                             # path above is: a sweep cut short by Stop reports an `error`
                             # shaped like the platform's, and quarantining on it costs a
                             # healthy account hours of cooldown for pressing a button.
-                            if session_reason and not job.cancel.is_set():
+                            elif session_reason and not job.cancel.is_set():
                                 await sessions_engine.mark_session_failed(
                                     platform_id, session_id, session_reason,
                                     detail=getattr(sweep, "error", "") or getattr(sweep, "stopped", ""),
@@ -2314,18 +2402,39 @@ class DiscoveryRunner:
                     while run.queue and not job.cancel.is_set() and not run.hard_stop:
                         # The platform's circuit breaker, asked BEFORE a
                         # keyword is taken off the queue so a held worker
-                        # never has a keyword in its hands.
-                        await _hold_for_breaker(platform_id, job, run, label)
+                        # never has a keyword in its hands. Not for a
+                        # vendor-served platform: the breaker counts the
+                        # platform pushing back on OUR accounts and IP, and
+                        # a vendor search touches neither.
+                        if not vendor:
+                            await _hold_for_breaker(platform_id, job, run, label)
                         if not run.queue or job.cancel.is_set() or run.hard_stop:
                             break
                         # THE ACCOUNT'S HOURLY CEILING, asked like the breaker
                         # is: before a keyword leaves the queue, so a held
                         # worker never has one in its hands (another account
-                        # may take it meanwhile). Free off Instagram/Threads.
-                        if not await account_budget.hold(
-                                platform_id, session_item, account_budget.SEARCH,
-                                lambda: job.cancel.is_set() or run.hard_stop,
-                                log=log, label=label):
+                        # may take it meanwhile). Free off Instagram/Threads
+                        # -- and off a vendor-served platform, where no
+                        # account of ours does the search.
+                        try:
+                            took_slot = (not (job.cancel.is_set() or run.hard_stop)) if vendor else (
+                                await account_budget.hold(
+                                    platform_id, session_item, account_budget.SEARCH,
+                                    lambda: job.cancel.is_set() or run.hard_stop,
+                                    log=log, label=label))
+                        except account_budget.DailyLimitReached as e:
+                            # THIS ACCOUNT IS DONE FOR THE DAY, NOT BROKEN.
+                            # Rested until the reset so the next claim round
+                            # skips it (another account may carry on); what
+                            # is left stays queued and ends up owed with
+                            # this reason.
+                            run.budget_note = str(e)
+                            log.warning(f"{label}: {e}")
+                            await sessions_engine.rest_session_until(
+                                platform_id, str(session_item.get("id") or ""),
+                                e.resets_at, str(e))
+                            break
+                        if not took_slot:
                             break
                         if not run.queue:
                             break
@@ -2530,7 +2639,7 @@ class DiscoveryRunner:
 
                         if fatal_kind[0] == "hard":
                             run.hard_stop = True
-                            prog.note = f"stopped early: session {reason}"
+                            prog.note = run.hard_note or f"stopped early: session {reason}"
                             return False
 
                         # BREATHING ROOM BEFORE THE NEXT KEYWORD. Only between

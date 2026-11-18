@@ -330,6 +330,27 @@ class SchedulerEngine:
         if _now() < due_at:
             return
 
+        # JUDGE THE MOST RECENT DUE TIME, NOT THE OLDEST. The stored pointer
+        # is the first firing time that went by, so after a long outage it
+        # is days old. Deciding on it alone marked Saturday's 02:00 "missed"
+        # and rolled straight to Tuesday -- Monday's 02:00, one hour late and
+        # well inside the grace window, was never run and never recorded.
+        # Walk forward to the latest occurrence that is already due and
+        # decide about that one; the ones in between are counted and said.
+        first_due = due_at
+        skipped = 0
+        while skipped < 1000:                      # bounded: never spin
+            later, _ = schedule_math.next_run_after(schedule, due_at)
+            if later is None or later > _now():
+                break
+            due_at = later
+            skipped += 1
+        earlier_note = (
+            f" {skipped} earlier scheduled run(s), the first due "
+            f"{first_due.astimezone(timezone.utc):%Y-%m-%d %H:%M} UTC, also went by "
+            f"while the backend was not running and were not run."
+            if skipped else "")
+
         decision, lateness = schedule_math.catch_up_decision(
             due_at, _now(), _CATCH_UP_GRACE)
         if decision == "not_due":
@@ -345,12 +366,16 @@ class SchedulerEngine:
             log.info(f"scheduler: {shift.describe()}")
 
         if decision == "missed":
+            # Worded so it stays true when read later. This text is stored
+            # and shown on the Scheduler page for as long as it is the last
+            # run; "was due 6h 51m ago" was right only at the instant it was
+            # written and then quietly went stale.
             reason = (
-                f"this run was due {schedule_math.humanize(lateness)} ago and the "
-                f"backend was not running then. That is more than the "
+                f"the backend was not running when this run was due, and came "
+                f"back {schedule_math.humanize(lateness)} late. That is more than the "
                 f"{schedule_math.humanize(_CATCH_UP_GRACE)} catch-up window, so it "
-                f"was NOT run. Press Run now to sweep immediately, or wait for the "
-                f"next scheduled time.")
+                f"was NOT run.{earlier_note} Press Run now to sweep immediately, or "
+                f"wait for the next scheduled time.")
             log.warning(f"scheduler: missed run -- {reason}")
             await schedule_db.record_missed(
                 due_at=due_at, late_seconds=lateness.total_seconds(), reason=reason)
@@ -372,14 +397,41 @@ class SchedulerEngine:
                 due_at=due_at, late_seconds=lateness.total_seconds(), reason=reason)
             return
 
+        if skipped:
+            # The latest one runs; the ones before it did not, and say so.
+            reason = earlier_note.strip() + (
+                " The most recent one was within the catch-up window and is "
+                "being run now.")
+            log.warning(f"scheduler: {reason}")
+            await schedule_db.record_missed(
+                due_at=first_due,
+                late_seconds=(_now() - first_due).total_seconds(), reason=reason)
+            self._alert_missed(first_due, reason)
+
         trigger = "catch_up" if lateness > timedelta(seconds=90) else "scheduled"
         if trigger == "catch_up":
             log.warning(
                 f"scheduler: firing a run that was due "
                 f"{schedule_math.humanize(lateness)} ago (within the "
                 f"{schedule_math.humanize(_CATCH_UP_GRACE)} catch-up window)")
-        await self.fire(trigger=trigger, due_at=due_at,
-                        late_seconds=lateness.total_seconds())
+        try:
+            await self.fire(trigger=trigger, due_at=due_at,
+                            late_seconds=lateness.total_seconds())
+        except Exception as e:                              # noqa: BLE001
+            # The pointer has already moved on, so a fire that failed to
+            # START (a Mongo blip on create_run) used to leave tonight's run
+            # with no history row and no alert -- only "tick failed" in the
+            # log. Every run that did not happen leaves a record.
+            reason = (f"the scheduled run could not be started: "
+                      f"{type(e).__name__}: {e}. Press Run now to sweep immediately.")
+            log.error(f"scheduler: {reason}")
+            try:
+                await schedule_db.record_missed(
+                    due_at=due_at, late_seconds=lateness.total_seconds(), reason=reason)
+            except Exception as e2:                         # noqa: BLE001
+                log.error(f"scheduler: could not record the failed start: "
+                          f"{type(e2).__name__}: {e2}")
+            self._alert_missed(due_at, reason)
 
     async def _catch_up_on_start(self) -> None:
         """Decide about a firing time that passed while this process was
@@ -907,9 +959,48 @@ class SchedulerEngine:
         bill of health the ledger exists to prevent -- and the one that
         would be hardest to ever notice, since it looks identical to
         success.
+
+        COUNTED AGAINST THE CLIENT'S CURRENT PLAN, not the whole ledger.
+        The gap-closing lap only ever sweeps cells that are still part of
+        what this client asks for -- its current keywords and permutations
+        (narrowed by its keyword scope), its scheduler platforms, its
+        Facebook tabs -- so a cell left owed by a keyword, platform or tab
+        the analyst has since removed can never be closed. Counting it
+        anyway reported "still owing searches" every night, and alerted on
+        it, for work nobody would ever do. The plan is built exactly the
+        way `_run_entry` builds the sweep (same keyword-scope narrowing,
+        same `discovery_runner._plans_from`, same `tabs_for`), and the
+        filter is `coverage_db.in_scope`, so "owed" here means precisely
+        "what the next gap-closing lap would sweep".
+
+        A client that cannot be read falls back to the ledger-wide count:
+        over-reporting owed work is noisy, but it can never impersonate a
+        clean bill of health.
         """
         try:
-            return int((await coverage_db.summary(group_id))["owed"])
+            client = await self._live_client(group_id)
+            if client is None:
+                return int((await coverage_db.summary(group_id))["owed"])
+            from backend.discovery.runner import tabs_for
+
+            scope = (client.get("scheduler_keyword_scope") or "").strip()
+            individual = _dedupe(list(client.get("name_keywords") or []))
+            domain = _dedupe(list(client.get("domain_keywords") or []))
+            ind = [] if scope == "domain" else individual
+            dom = [] if scope == "individual" else domain
+            plans = discovery_runner._plans_from(client, ind, dom) if (ind or dom) else []
+            fb_tabs = list(client.get("scheduler_facebook_tabs") or []) or None
+            check = coverage_db.in_scope(
+                plans,
+                list(client.get("scheduler_platforms") or []) or None,
+                lambda pid: tabs_for(pid, fb_tabs),
+            )
+            cells = await coverage_db.owed(group_id)
+            owed = sum(1 for c in cells if check(c))
+            if owed < len(cells):
+                log.info(f"scheduler: {group_id} has {len(cells) - owed} owed cell(s) "
+                         f"for keywords/platforms/tabs no longer in its plan -- not counted")
+            return owed
         except Exception as e:                              # noqa: BLE001
             log.warning(f"scheduler: coverage read failed for {group_id} -- "
                         f"recording owed as unknown: {type(e).__name__}: {e}")

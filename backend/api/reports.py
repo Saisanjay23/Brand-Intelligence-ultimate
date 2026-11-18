@@ -68,11 +68,22 @@ class CombinedTotals(BaseModel):
     total: int
     logo_matches: int
     pending: int
+    failed: int = Field(0, description="Clients whose report could not be read. "
+                                       "Their numbers are NOT in the totals above.")
+
+
+class FailedClient(BaseModel):
+    client_id: str
+    name: str
+    error: str
 
 
 class CombinedReport(BaseModel):
     generated_at: str
     clients: list[ClientReport]
+    # Without this the response model silently dropped the list, so the
+    # API showed totals that looked complete while a client was missing.
+    failed: list[FailedClient] = Field(default_factory=list)
     totals: CombinedTotals
 
 
@@ -85,8 +96,8 @@ class SendResult(BaseModel):
 class SendBody(BaseModel):
     to_emails: Optional[list[str]] = Field(
         None,
-        description="Override the configured recipients. Omit to use the alert "
-                    "settings' own list.")
+        description="Override the configured recipients. Omit to use the "
+                    "settings' report list, or the alert list when that is empty.")
 
 
 @router.get("/client/{client_id}", response_model=ClientReport,
@@ -103,9 +114,24 @@ async def combined_report() -> dict:
     return await report_service.build_combined_report()
 
 
+# PREVIEW vs DOWNLOAD. Both routes below always answered with
+# `Content-Disposition: attachment`, so the UI's "Preview" link saved a file
+# exactly like "Download" did -- two buttons, one behaviour, and no way to
+# just look at the report. `?inline=true` switches the disposition to
+# `inline` so the browser renders it in the new tab; the body is the same
+# bytes either way, so what is previewed is still exactly what is mailed.
+# The filename is kept on the inline answer too, so "Save page" from the
+# preview tab still suggests the right name.
+def _disposition(inline: bool) -> str:
+    return "inline" if inline else "attachment"
+
+
 @router.get("/client/{client_id}/html", response_class=Response,
             summary="One client's report, as the email HTML")
-async def client_report_html(client_id: str = Path(...)) -> Response:
+async def client_report_html(
+    client_id: str = Path(...),
+    inline: bool = False,
+) -> Response:
     """The same report the email carries, as a standalone HTML document --
     what the UI previews and what an analyst downloads. Rendering it here
     rather than in the browser means the file on disk and the mail in an
@@ -128,19 +154,19 @@ async def client_report_html(client_id: str = Path(...)) -> Response:
         content=report_service.render_client_html(rep),
         media_type="text/html; charset=utf-8",
         headers={"Content-Disposition": content_disposition(
-            "attachment", f'report-{name}-{rep["generated_at"][:10]}.html', "report.html")},
+            _disposition(inline), f'report-{name}-{rep["generated_at"][:10]}.html', "report.html")},
     )
 
 
 @router.get("/combined/html", response_class=Response,
             summary="The combined digest, as the email HTML")
-async def combined_report_html() -> Response:
+async def combined_report_html(inline: bool = False) -> Response:
     rep = await report_service.build_combined_report()
     return Response(
         content=report_service.render_combined_html(rep),
         media_type="text/html; charset=utf-8",
         headers={"Content-Disposition": content_disposition(
-            "attachment", f'report-all-clients-{rep["generated_at"][:10]}.html', "report.html")},
+            _disposition(inline), f'report-all-clients-{rep["generated_at"][:10]}.html', "report.html")},
     )
 
 

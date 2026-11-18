@@ -145,9 +145,64 @@ class TestOrdinaryEvictionIsUnaffected:
     @pytest.mark.asyncio
     async def test_expired_jobs_are_still_reclaimed_before_the_ceiling_runs(self):
         store = JobStore(max_jobs=5, ttl_seconds=100, terminal_statuses=TERMINAL)
-        stale = FakeJob("stale", created_at=-1000, status=RUNNING)  # 1000s before _NOW
+        stale = FakeJob("stale", created_at=-1000, status=DONE)  # 1000s before _NOW
         await store.put(stale)
         assert await store.get("stale") is None
+
+
+class TestRunningJobsNeverExpire:
+    """THE BUG THIS GUARDS. The TTL used to be measured from `created_at`
+    regardless of status, so a sweep still running after six hours read as
+    "job not found" on its next poll, could not be stopped, and -- for
+    analysis -- had its screenshots deleted by the eviction hook while it
+    was still writing them. Only FINISHED jobs may age out, and their clock
+    starts when they finish."""
+
+    @pytest.mark.asyncio
+    async def test_a_long_running_job_survives_past_the_ttl(self):
+        evicted: list[str] = []
+        store = JobStore(max_jobs=5, ttl_seconds=100, terminal_statuses=TERMINAL,
+                         on_evict=evicted.append)
+        long_runner = FakeJob("long", created_at=-1000, status=RUNNING)
+        long_runner.task = None   # no real task, so cancel() sets only the flag
+        await store.put(long_runner)
+        # A later put() runs the expiry sweep too -- it must spare it as well.
+        await store.put(FakeJob("other", created_at=0.0, status=RUNNING))
+
+        assert await store.get("long") is long_runner, (
+            "a job that is still running must stay pollable however long it runs"
+        )
+        assert evicted == [], "the eviction hook must not fire for a running job"
+        assert await store.cancel("long") is True, "and it must still be stoppable"
+
+    @pytest.mark.asyncio
+    async def test_a_finished_job_ages_from_when_it_finished_not_when_it_started(self):
+        store = JobStore(max_jobs=5, ttl_seconds=100, terminal_statuses=TERMINAL)
+        just_done = FakeJob("just-done", created_at=-1000, status=DONE)
+        just_done.finished_at_ts = time.time() - 10   # finished 10s ago
+        await store.put(just_done)
+        assert await store.get("just-done") is just_done, (
+            "a job that ran for a long time and JUST finished must still be "
+            "readable -- the analyst has not seen its result yet"
+        )
+
+        just_done.finished_at_ts = time.time() - 1000  # finished long ago
+        assert await store.get("just-done") is None
+
+    @pytest.mark.asyncio
+    async def test_a_job_whose_task_died_without_a_terminal_status_can_still_expire(self):
+        """Otherwise a crash past the runner's own bookkeeping would leave
+        a 'running' zombie in the table forever."""
+
+        class _DeadTask:
+            def done(self) -> bool:
+                return True
+
+        store = JobStore(max_jobs=5, ttl_seconds=100, terminal_statuses=TERMINAL)
+        zombie = FakeJob("zombie", created_at=-1000, status=RUNNING)
+        zombie.task = _DeadTask()
+        await store.put(zombie)
+        assert await store.get("zombie") is None
 
 
 class TestUnderTheCeilingNothingIsTouched:

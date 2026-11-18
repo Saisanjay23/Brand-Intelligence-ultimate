@@ -107,6 +107,12 @@ def _format_html_template(
 </html>"""
 
 
+# How a result that reached SOME recipients but not all begins. Never retried
+# (see `send_email`): the accepted recipients already have the mail, and a
+# retry would send it to them twice.
+PARTIAL_DELIVERY = "Partial delivery"
+
+
 def _send_smtp_sync(
     host: str,
     port: int,
@@ -123,12 +129,19 @@ def _send_smtp_sync(
     if not recipients:
         return False, "No recipient email addresses specified."
 
+    # WHAT THE SERVER REFUSED. `sendmail` raises only when EVERY recipient
+    # is refused; when SOME are, it returns them as {address: (code, msg)}
+    # and delivers to the rest. That return used to be thrown away, so a
+    # mail that reached one of three recipients was reported as "Email
+    # sent successfully" -- the two who never got the alert had no way to
+    # know, and neither did anyone looking at the result.
+    refused: object = {}
     try:
         if use_ssl or port == 465:
             with smtplib.SMTP_SSL(host, port, timeout=15) as server:
                 if user and password:
                     server.login(user, password)
-                server.sendmail(sender, recipients, msg.as_string())
+                refused = server.sendmail(sender, recipients, msg.as_string())
         else:
             with smtplib.SMTP(host, port, timeout=15) as server:
                 server.ehlo()
@@ -154,8 +167,22 @@ def _send_smtp_sync(
                                     f"unauthenticated: {tls_err}")
                 if user and password:
                     server.login(user, password)
-                server.sendmail(sender, recipients, msg.as_string())
+                refused = server.sendmail(sender, recipients, msg.as_string())
 
+        if isinstance(refused, dict) and refused:
+            def _why(v: object) -> str:
+                if isinstance(v, tuple) and len(v) == 2:
+                    code, text = v
+                    if isinstance(text, bytes):
+                        text = text.decode("utf-8", "replace")
+                    return f"{code} {text}".strip()
+                return str(v)
+
+            names = "; ".join(f"{addr} ({_why(v)})" for addr, v in refused.items())
+            err = (f"{PARTIAL_DELIVERY}: delivered to {len(recipients) - len(refused)} of "
+                   f"{len(recipients)} recipient(s); refused: {names}")
+            log.error(f"SMTP delivery incomplete: {err}")
+            return False, err
         return True, "Email sent successfully."
     except Exception as e:
         err_msg = f"{type(e).__name__}: {e}"
@@ -168,10 +195,23 @@ async def send_email(
     html_content: str,
     text_content: Optional[str] = None,
     to_emails: Optional[list[str]] = None,
+    *,
+    report: bool = False,
 ) -> tuple[bool, str]:
-    """Asynchronously dispatches an email to the configured recipients or explicitly passed list."""
+    """Asynchronously dispatches an email to the configured recipients or explicitly passed list.
+
+    `report=True` marks a sweep REPORT rather than an alert: it goes to the
+    settings' `report_emails`, falling back to `alert_emails` when that list
+    is empty. `report_emails` used to be saved from the Alerts page and then
+    never read, so an operator who sent reports to a separate list watched
+    them keep arriving at the alert recipients instead."""
     settings = await alert_settings_db.get_settings()
-    recipients = to_emails if to_emails is not None else list(settings.get("alert_emails") or [])
+    if to_emails is not None:
+        recipients = to_emails
+    elif report and settings.get("report_emails"):
+        recipients = list(settings.get("report_emails") or [])
+    else:
+        recipients = list(settings.get("alert_emails") or [])
 
     if not recipients:
         log.debug("no alert email recipients configured, skipping email dispatch")
@@ -201,7 +241,7 @@ async def send_email(
     ok, detail = await asyncio.to_thread(
         _send_smtp_sync, host, port, user, password, sender, recipients, msg, use_ssl
     )
-    if not ok and _transient_smtp(detail):
+    if not ok and _transient_smtp(detail) and not detail.startswith(PARTIAL_DELIVERY):
         # ONE RETRY FOR A MOMENTARY FAILURE. A mail server that drops the
         # connection or times out once (seen live: "SMTPServerDisconnected:
         # Connection unexpectedly closed: The read operation timed out")
